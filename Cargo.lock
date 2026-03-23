@@ -4108,6 +4108,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfang-agent-definition"
+version = "0.5.1"
+dependencies = [
+ "arky-claude-code",
+ "arky-config",
+ "openfang-provider-binding",
+ "openfang-types",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml 0.8.2",
+]
+
+[[package]]
 name = "openfang-api"
 version = "0.5.1"
 dependencies = [

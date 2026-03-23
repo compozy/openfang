@@ -25,7 +25,7 @@ members = [
     "crates/openfang-desktop",
     "crates/openfang-hands",
     "crates/openfang-extensions",
-    "xtask",
+    "xtask", "crates/openfang-agent-definition",
 ]
 
 [workspace.package]

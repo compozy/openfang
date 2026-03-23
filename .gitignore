@@ -2,6 +2,8 @@
 /target
 **/*.rs.bk
 *.pdb
+.tmp
+.codex/CONTINUITY*
 
 # Environment & secrets
 .env
