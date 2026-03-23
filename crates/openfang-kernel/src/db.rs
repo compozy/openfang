@@ -6,7 +6,6 @@
 
 use crate::error::{KernelError, KernelResult};
 
-use openfang_memory::MemorySubstrate;
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -46,36 +45,20 @@ impl DatabaseManager {
         }
     }
 
-    /// Open both SQLite databases in the required boot order and build the runtime substrate
-    /// only after both raw connections are available.
-    pub(crate) fn open(
-        runtime_path: &Path,
-        decay_rate: f32,
-        compozy_path: &Path,
-    ) -> KernelResult<(Arc<MemorySubstrate>, Self)> {
+    /// Open both SQLite databases in the required boot order.
+    pub(crate) fn open(runtime_path: &Path, compozy_path: &Path) -> KernelResult<Self> {
         let runtime_db = Self::open_connection(runtime_path, "runtime.db")?;
         let compozy_db = Self::open_connection(compozy_path, "compozy.db")?;
 
-        // Task 3 wires the shared migration runner here. For Task 2 we still need the
-        // runtime schema available, but only after both raw connections are confirmed open.
-        let memory = Arc::new(
-            MemorySubstrate::from_shared_connection(Arc::clone(&runtime_db), decay_rate).map_err(
-                |error| {
-                    KernelError::BootFailed(format!(
-                        "Failed to initialize runtime.db at {}: {error}",
-                        runtime_path.display()
-                    ))
-                },
-            )?,
-        );
+        Ok(Self {
+            runtime_db,
+            compozy_db,
+        })
+    }
 
-        Ok((
-            memory,
-            Self {
-                runtime_db,
-                compozy_db,
-            },
-        ))
+    /// Return the kernel-owned `runtime.db` connection handle.
+    pub(crate) fn runtime_db(&self) -> Arc<Mutex<Connection>> {
+        Arc::clone(&self.runtime_db)
     }
 
     /// Ensure the parent directory for a database path exists before opening SQLite.

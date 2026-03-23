@@ -12,6 +12,7 @@ pub mod config;
 pub mod config_reload;
 pub mod cron;
 mod db;
+mod db_migration;
 pub mod error;
 pub mod event_bus;
 pub mod heartbeat;

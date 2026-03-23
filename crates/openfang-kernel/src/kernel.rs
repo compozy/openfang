@@ -5,6 +5,7 @@ use crate::background::{self, BackgroundExecutor};
 use crate::capabilities::CapabilityManager;
 use crate::config::load_config;
 use crate::db::DatabaseManager;
+use crate::db_migration::{self, DatabaseIdentity, MigrationStep};
 use crate::error::{KernelError, KernelResult};
 use crate::event_bus::EventBus;
 use crate::metering::MeteringEngine;
@@ -506,6 +507,36 @@ fn gethostname() -> Option<String> {
     }
 }
 
+fn apply_migration_stream(
+    connection: &Arc<Mutex<Connection>>,
+    database: DatabaseIdentity,
+    steps: &[MigrationStep<'_>],
+) -> KernelResult<()> {
+    let conn = connection.lock().map_err(|error| {
+        KernelError::BootFailed(format!(
+            "Failed to acquire {database} connection lock: {error}"
+        ))
+    })?;
+
+    db_migration::run_migrations(&conn, database, steps)
+        .map_err(|error| KernelError::BootFailed(format!("{database} migration failed: {error}")))
+}
+
+fn initialize_runtime_memory(
+    runtime_db: Arc<Mutex<Connection>>,
+    runtime_path: &Path,
+    decay_rate: f32,
+) -> KernelResult<Arc<MemorySubstrate>> {
+    MemorySubstrate::from_shared_connection(runtime_db, decay_rate)
+        .map(Arc::new)
+        .map_err(|error| {
+            KernelError::BootFailed(format!(
+                "Failed to initialize runtime.db at {}: {error}",
+                runtime_path.display()
+            ))
+        })
+}
+
 impl OpenFangKernel {
     /// Boot the kernel with configuration from the given path.
     pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
@@ -514,7 +545,19 @@ impl OpenFangKernel {
     }
 
     /// Boot the kernel with an explicit configuration.
-    pub fn boot_with_config(mut config: KernelConfig) -> KernelResult<Self> {
+    pub fn boot_with_config(config: KernelConfig) -> KernelResult<Self> {
+        Self::boot_with_config_and_migrations(
+            config,
+            db_migration::runtime_migration_steps(),
+            db_migration::compozy_migration_steps(),
+        )
+    }
+
+    fn boot_with_config_and_migrations(
+        mut config: KernelConfig,
+        runtime_migrations: &[MigrationStep<'_>],
+        compozy_migrations: &[MigrationStep<'_>],
+    ) -> KernelResult<Self> {
         use openfang_types::config::KernelMode;
 
         // Env var overrides — useful for Docker where config.toml is baked in.
@@ -571,9 +614,16 @@ impl OpenFangKernel {
         DatabaseManager::ensure_parent_directory(&compozy_db_path, "compozy.db")?;
 
         // Open both databases before constructing any dependent subsystem.
-        let (memory, database_manager) =
-            DatabaseManager::open(&runtime_db_path, config.memory.decay_rate, &compozy_db_path)?;
+        let database_manager = DatabaseManager::open(&runtime_db_path, &compozy_db_path)?;
+        let runtime_db = database_manager.runtime_db();
         let compozy_db = database_manager.compozy_db();
+        apply_migration_stream(&runtime_db, DatabaseIdentity::Runtime, runtime_migrations)?;
+        apply_migration_stream(&compozy_db, DatabaseIdentity::Compozy, compozy_migrations)?;
+        let memory = initialize_runtime_memory(
+            Arc::clone(&runtime_db),
+            &runtime_db_path,
+            config.memory.decay_rate,
+        )?;
 
         // Initialize credential resolver (vault → dotenv → env var)
         let credential_resolver = {
@@ -6487,7 +6537,9 @@ impl openfang_wire::peer::PeerHandle for OpenFangKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db_migration::{self, MigrationStep};
     use openfang_types::config::PersistenceConfig;
+    use rusqlite::{Connection, OptionalExtension};
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -6497,6 +6549,32 @@ mod tests {
             data_dir: root.join("data"),
             ..KernelConfig::default()
         }
+    }
+
+    fn schema_migration_exists(path: &Path) -> bool {
+        let conn = Connection::open(path).expect("open sqlite file");
+        conn.query_row(
+            "SELECT name
+             FROM sqlite_master
+             WHERE type = 'table' AND name = 'schema_migration'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .expect("schema_migration exists query")
+        .is_some()
+    }
+
+    fn schema_migration_rows(path: &Path) -> Vec<(u32, String, String)> {
+        let conn = Connection::open(path).expect("open sqlite file");
+        let mut stmt = conn
+            .prepare("SELECT version, name, applied_at FROM schema_migration ORDER BY version")
+            .expect("prepare schema_migration query");
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query schema_migration rows");
+
+        rows.map(|row| row.expect("schema_migration row")).collect()
     }
 
     #[test]
@@ -6626,6 +6704,180 @@ mod tests {
             OpenFangKernel::boot_with_config(config).is_err(),
             "boot must fail instead of returning a degraded kernel"
         );
+    }
+
+    #[test]
+    fn boot_should_apply_runtime_db_migrations_before_compozy_db() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let runtime_db = config.persistence.resolve_runtime_db(&config.data_dir);
+        let compozy_steps = [
+            MigrationStep::new(
+                1,
+                "schema_migrations_bootstrap",
+                "
+                CREATE TABLE IF NOT EXISTS schema_migration (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );",
+            ),
+            MigrationStep::new(
+                2,
+                "broken_compozy_step",
+                "CREATE TABL invalid_compozy_statement (id INTEGER PRIMARY KEY);",
+            ),
+        ];
+
+        match OpenFangKernel::boot_with_config_and_migrations(
+            config,
+            db_migration::runtime_migration_steps(),
+            &compozy_steps,
+        ) {
+            Err(KernelError::BootFailed(message)) => {
+                assert!(message.contains("compozy.db"), "{message}");
+            }
+            Ok(_) => panic!("boot should fail"),
+            Err(other) => panic!("expected BootFailed, got {other:?}"),
+        }
+
+        assert!(
+            schema_migration_exists(&runtime_db),
+            "runtime.db migrations should complete before compozy.db migration starts"
+        );
+        assert_eq!(schema_migration_rows(&runtime_db).len(), 1);
+    }
+
+    #[test]
+    fn boot_should_create_schema_migration_in_both_databases() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let runtime_db = config.persistence.resolve_runtime_db(&config.data_dir);
+        let compozy_db = config.persistence.resolve_compozy_db(&config.data_dir);
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel should boot");
+
+        assert!(schema_migration_exists(&runtime_db));
+        assert!(schema_migration_exists(&compozy_db));
+        assert!(!schema_migration_rows(&runtime_db).is_empty());
+        assert!(!schema_migration_rows(&compozy_db).is_empty());
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn boot_should_fail_clearly_when_runtime_db_migration_fails() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let compozy_db = config.persistence.resolve_compozy_db(&config.data_dir);
+        let runtime_steps = [
+            MigrationStep::new(
+                1,
+                "schema_migrations_bootstrap",
+                "
+                CREATE TABLE IF NOT EXISTS schema_migration (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );",
+            ),
+            MigrationStep::new(
+                2,
+                "broken_runtime_step",
+                "CREATE TABL invalid_runtime_statement (id INTEGER PRIMARY KEY);",
+            ),
+        ];
+
+        match OpenFangKernel::boot_with_config_and_migrations(
+            config,
+            &runtime_steps,
+            db_migration::compozy_migration_steps(),
+        ) {
+            Err(KernelError::BootFailed(message)) => {
+                assert!(message.contains("runtime.db"), "{message}");
+            }
+            Ok(_) => panic!("boot should fail"),
+            Err(other) => panic!("expected BootFailed, got {other:?}"),
+        }
+
+        assert!(
+            !schema_migration_exists(&compozy_db),
+            "compozy.db migrations must not run after runtime.db failure"
+        );
+    }
+
+    #[test]
+    fn boot_should_fail_clearly_when_compozy_db_migration_fails() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let runtime_db = config.persistence.resolve_runtime_db(&config.data_dir);
+        let compozy_steps = [
+            MigrationStep::new(
+                1,
+                "schema_migrations_bootstrap",
+                "
+                CREATE TABLE IF NOT EXISTS schema_migration (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );",
+            ),
+            MigrationStep::new(
+                2,
+                "broken_compozy_step",
+                "CREATE TABL invalid_compozy_statement (id INTEGER PRIMARY KEY);",
+            ),
+        ];
+
+        match OpenFangKernel::boot_with_config_and_migrations(
+            config,
+            db_migration::runtime_migration_steps(),
+            &compozy_steps,
+        ) {
+            Err(KernelError::BootFailed(message)) => {
+                assert!(message.contains("compozy.db"), "{message}");
+            }
+            Ok(_) => panic!("boot should fail"),
+            Err(other) => panic!("expected BootFailed, got {other:?}"),
+        }
+
+        assert!(
+            schema_migration_exists(&runtime_db),
+            "runtime.db migrations should remain applied when compozy.db fails later"
+        );
+    }
+
+    #[test]
+    fn second_boot_against_migrated_databases_succeeds_without_error() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+
+        let first_kernel = OpenFangKernel::boot_with_config(config.clone()).expect("first boot");
+        first_kernel.shutdown();
+
+        let second_kernel = OpenFangKernel::boot_with_config(config).expect("second boot");
+        second_kernel.shutdown();
+    }
+
+    #[test]
+    fn migration_status_is_queryable_after_boot() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let runtime_db = config.persistence.resolve_runtime_db(&config.data_dir);
+        let compozy_db = config.persistence.resolve_compozy_db(&config.data_dir);
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel should boot");
+        let runtime_rows = schema_migration_rows(&runtime_db);
+        let compozy_rows = schema_migration_rows(&compozy_db);
+
+        assert_eq!(runtime_rows.len(), 1);
+        assert_eq!(compozy_rows.len(), 1);
+        assert_eq!(runtime_rows[0].0, 1);
+        assert_eq!(compozy_rows[0].0, 1);
+        assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
+        assert_eq!(compozy_rows[0].1, "schema_migrations_bootstrap");
+
+        kernel.shutdown();
     }
 
     #[test]
