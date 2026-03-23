@@ -13,8 +13,11 @@ use crate::error::ValidationIssue;
 const MAX_REQUEST_EXTRA_DEPTH: usize = 4;
 const MAX_REQUEST_EXTRA_ENTRIES: usize = 32;
 const FORBIDDEN_REQUEST_EXTRA_KEYS: &[&str] = &[
+    "allow_npx",
     "api_key",
     "apikey",
+    "app_server_args",
+    "args",
     "auth_token",
     "binary",
     "bootstrap",
@@ -26,14 +29,20 @@ const FORBIDDEN_REQUEST_EXTRA_KEYS: &[&str] = &[
     "cwd",
     "env",
     "environment",
+    "experimental_api",
     "headers",
     "idle_shutdown_timeout",
+    "idle_shutdown_timeout_ms",
     "process",
     "request_timeout",
+    "request_timeout_ms",
     "runtime_dir",
+    "sanitize_environment",
     "scheduler_timeout",
+    "scheduler_timeout_ms",
     "shared_app_server_key",
     "startup_timeout",
+    "startup_timeout_ms",
     "transport",
     "version_args",
 ];
@@ -697,10 +706,43 @@ fn expected_namespace(driver: &str) -> Option<&'static str> {
 }
 
 fn is_forbidden_request_extra_key(key: &str) -> bool {
-    let normalized = key.to_ascii_lowercase().replace('-', "_");
+    let normalized = normalize_layer_key(key);
     FORBIDDEN_REQUEST_EXTRA_KEYS
         .iter()
         .any(|forbidden| normalized == *forbidden || normalized.ends_with(&format!("_{forbidden}")))
+}
+
+fn normalize_layer_key(key: &str) -> String {
+    let mut normalized = String::with_capacity(key.len());
+    let mut previous_was_separator = false;
+    let mut previous_was_lower_or_digit = false;
+
+    for character in key.chars() {
+        if character == '-' || character == '_' || character == ' ' {
+            if !normalized.is_empty() && !previous_was_separator {
+                normalized.push('_');
+            }
+            previous_was_separator = true;
+            previous_was_lower_or_digit = false;
+            continue;
+        }
+
+        if character.is_ascii_uppercase() {
+            if !normalized.is_empty() && !previous_was_separator && previous_was_lower_or_digit {
+                normalized.push('_');
+            }
+            normalized.push(character.to_ascii_lowercase());
+            previous_was_separator = false;
+            previous_was_lower_or_digit = false;
+            continue;
+        }
+
+        normalized.push(character.to_ascii_lowercase());
+        previous_was_separator = false;
+        previous_was_lower_or_digit = character.is_ascii_lowercase() || character.is_ascii_digit();
+    }
+
+    normalized
 }
 
 fn merge_optional<T>(base: Option<T>, overlay: Option<T>) -> Option<T>
@@ -756,5 +798,205 @@ impl MergeLayer for ClaudeCodeBehaviorLayer {
 impl MergeLayer for ClaudeCompatibleBehaviorLayer {
     fn merge_layer(self, overlay: Self) -> Self {
         self.merge(overlay)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    use arky_protocol::ReasoningEffort;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::{
+        validate_request_extra, ClaudeCodeBehaviorLayer, CodexBehaviorLayer,
+        ProviderRequestDefaults, FORBIDDEN_REQUEST_EXTRA_KEYS,
+    };
+    use crate::ValidationIssue;
+
+    #[test]
+    fn provider_request_defaults_merge_should_prefer_overlay() {
+        let base = ProviderRequestDefaults {
+            max_tokens: Some(256),
+            reasoning_effort: Some(ReasoningEffort::Low),
+        };
+        let overlay = ProviderRequestDefaults {
+            max_tokens: Some(1_024),
+            reasoning_effort: None,
+        };
+
+        let actual = base.merge(&overlay);
+
+        let expected = ProviderRequestDefaults {
+            max_tokens: Some(1_024),
+            reasoning_effort: Some(ReasoningEffort::Low),
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn codex_behavior_layer_merge_should_prefer_overlay_fields() {
+        let base = CodexBehaviorLayer {
+            sandbox_mode: Some("read-only".to_owned()),
+            sandbox_network_access: Some(false),
+            include_plan_tool: Some(false),
+            resume_last: Some(false),
+            web_search: Some(false),
+            rmcp_client: Some(false),
+            reasoning_summary: Some("auto".to_owned()),
+            model_verbosity: Some("low".to_owned()),
+        };
+        let overlay = CodexBehaviorLayer {
+            sandbox_mode: None,
+            sandbox_network_access: Some(true),
+            include_plan_tool: Some(true),
+            resume_last: Some(true),
+            web_search: Some(true),
+            rmcp_client: Some(true),
+            reasoning_summary: Some("detailed".to_owned()),
+            model_verbosity: None,
+        };
+
+        let actual = base.merge(overlay);
+
+        let expected = CodexBehaviorLayer {
+            sandbox_mode: Some("read-only".to_owned()),
+            sandbox_network_access: Some(true),
+            include_plan_tool: Some(true),
+            resume_last: Some(true),
+            web_search: Some(true),
+            rmcp_client: Some(true),
+            reasoning_summary: Some("detailed".to_owned()),
+            model_verbosity: Some("low".to_owned()),
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn claude_code_behavior_layer_merge_should_prefer_overlay_fields() {
+        let base = ClaudeCodeBehaviorLayer {
+            continue_conversation: Some(false),
+            fork_session: Some(false),
+            additional_directories: Some(vec![PathBuf::from("/base")]),
+            enable_file_checkpointing: Some(false),
+            allowed_tools: Some(vec!["Read".to_owned()]),
+            disallowed_tools: Some(vec!["Bash".to_owned()]),
+            mcp_servers: Some(BTreeMap::from([(
+                "base".to_owned(),
+                json!({"url": "stdio://"}),
+            )])),
+            max_budget_usd: Some(10.0),
+            fallback_model: Some("claude-3".to_owned()),
+        };
+        let overlay = ClaudeCodeBehaviorLayer {
+            continue_conversation: Some(true),
+            fork_session: Some(true),
+            additional_directories: None,
+            enable_file_checkpointing: Some(true),
+            allowed_tools: Some(vec!["Edit".to_owned()]),
+            disallowed_tools: None,
+            mcp_servers: Some(BTreeMap::from([(
+                "overlay".to_owned(),
+                json!({"url": "http://localhost"}),
+            )])),
+            max_budget_usd: Some(25.0),
+            fallback_model: None,
+        };
+
+        let actual = base.merge(overlay);
+
+        let expected = ClaudeCodeBehaviorLayer {
+            continue_conversation: Some(true),
+            fork_session: Some(true),
+            additional_directories: Some(vec![PathBuf::from("/base")]),
+            enable_file_checkpointing: Some(true),
+            allowed_tools: Some(vec!["Edit".to_owned()]),
+            disallowed_tools: Some(vec!["Bash".to_owned()]),
+            mcp_servers: Some(BTreeMap::from([(
+                "overlay".to_owned(),
+                json!({"url": "http://localhost"}),
+            )])),
+            max_budget_usd: Some(25.0),
+            fallback_model: Some("claude-3".to_owned()),
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn forbidden_request_extra_key_should_produce_validation_issue() {
+        for forbidden_key in FORBIDDEN_REQUEST_EXTRA_KEYS {
+            let mut issues = Vec::new();
+            let request_extra = BTreeMap::from([((*forbidden_key).to_owned(), json!("blocked"))]);
+
+            validate_request_extra(&request_extra, "request_extra", &mut issues);
+
+            let actual = issues
+                .iter()
+                .map(|issue| (issue.field().to_owned(), issue.message().to_owned()))
+                .collect::<Vec<_>>();
+            let expected = vec![(
+                format!("request_extra.{forbidden_key}"),
+                "is reserved for installation/workspace provider config and is not allowed in request_extra"
+                    .to_owned(),
+            )];
+
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn request_extra_nesting_beyond_limit_should_produce_validation_issue() {
+        let request_extra = BTreeMap::from([(
+            "nested".to_owned(),
+            json!({
+                "level1": {
+                    "level2": {
+                        "level3": {
+                            "level4": "too deep"
+                        }
+                    }
+                }
+            }),
+        )]);
+        let mut issues = Vec::new();
+
+        validate_request_extra(&request_extra, "request_extra", &mut issues);
+
+        let actual = issue_fields(&issues);
+        let expected = vec!["request_extra.nested.level1.level2.level3.level4".to_owned()];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn request_extra_entry_count_beyond_limit_should_produce_validation_issue() {
+        let request_extra = (0..33)
+            .map(|index| (format!("key_{index}"), json!(index)))
+            .collect::<BTreeMap<_, _>>();
+        let mut issues = Vec::new();
+
+        validate_request_extra(&request_extra, "request_extra", &mut issues);
+
+        let actual = issues
+            .iter()
+            .map(|issue| (issue.field().to_owned(), issue.message().to_owned()))
+            .collect::<Vec<_>>();
+        let expected = vec![(
+            "request_extra".to_owned(),
+            "must not contain more than 32 nested request_extra entries".to_owned(),
+        )];
+
+        assert_eq!(actual, expected);
+    }
+
+    fn issue_fields(issues: &[ValidationIssue]) -> Vec<String> {
+        issues
+            .iter()
+            .map(|issue| issue.field().to_owned())
+            .collect()
     }
 }

@@ -16,10 +16,12 @@ use crate::{
         AgentConfig, ArkyConfig, PartialAgentConfig, PartialArkyConfig, PartialProviderConfig,
         PartialWorkspaceConfig, ProviderConfig, WorkspaceConfig,
     },
+    merge::merge_profile,
 };
 
-pub fn validate_config(config: PartialArkyConfig) -> Result<ArkyConfig, ConfigError> {
+pub fn validate_config(mut config: PartialArkyConfig) -> Result<ArkyConfig, ConfigError> {
     let mut issues = Vec::new();
+    merge_workspace_profiles(&mut config);
 
     let workspace = finalize_workspace(config.workspace, &mut issues);
     let providers = finalize_providers(config.providers, &mut issues);
@@ -82,6 +84,18 @@ pub fn find_binary_on_path(binary: &str) -> Option<PathBuf> {
     }
 
     None
+}
+
+fn merge_workspace_profiles(config: &mut PartialArkyConfig) {
+    let workspace_profiles = std::mem::take(&mut config.workspace.profiles);
+
+    for (name, profile) in workspace_profiles {
+        let merged = match config.profiles.remove(&name) {
+            Some(existing) => merge_profile(profile, existing),
+            None => profile,
+        };
+        config.profiles.insert(name, merged);
+    }
 }
 
 fn finalize_workspace(
@@ -238,6 +252,11 @@ fn finalize_agents(
             .get(provider.as_str())
             .map(ProviderConfig::driver)
             .unwrap_or_default();
+        let driver = validate_driver(
+            partial.driver,
+            format!("{field_prefix}.driver").as_str(),
+            issues,
+        );
         let profile =
             validate_optional_string(partial.profile, format!("{field_prefix}.profile"), issues);
         let profile_config = profile
@@ -266,6 +285,22 @@ fn finalize_agents(
             }
         }
 
+        if let Some(driver) = driver.as_deref() {
+            if driver != install_driver {
+                issues.push(ValidationIssue::new(
+                    format!("{field_prefix}.driver"),
+                    format!(
+                        "targets driver `{driver}` but provider `{provider}` uses `{install_driver}`"
+                    ),
+                ));
+                continue;
+            }
+        }
+
+        let effective_driver = driver
+            .clone()
+            .or_else(|| profile_config.map(|config| config.driver().to_owned()))
+            .unwrap_or_else(|| install_driver.to_owned());
         let model =
             validate_optional_string(partial.model, format!("{field_prefix}.model"), issues);
         let defaults = validate_defaults(
@@ -274,7 +309,7 @@ fn finalize_agents(
             issues,
         );
         let config = partial.config.finalize_for_driver(
-            install_driver,
+            effective_driver.as_str(),
             format!("{field_prefix}.config").as_str(),
             issues,
         );
@@ -304,6 +339,7 @@ fn finalize_agents(
             name,
             AgentConfig {
                 provider,
+                driver,
                 profile,
                 model,
                 defaults,

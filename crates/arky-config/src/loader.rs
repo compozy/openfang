@@ -172,6 +172,10 @@ impl ArkyConfig {
         let agent = self.agent(name)?;
         let install = self.provider(agent.provider())?.clone();
         let profile = agent.profile().and_then(|value| self.profile(value));
+        let driver = agent
+            .driver()
+            .or_else(|| profile.map(ProviderProfileConfig::driver))
+            .unwrap_or_else(|| install.driver());
 
         let model = agent
             .model()
@@ -195,7 +199,7 @@ impl ArkyConfig {
 
         Some(ResolvedAgentProviderConfig {
             provider: agent.provider().to_owned(),
-            driver: install.driver().to_owned(),
+            driver: driver.to_owned(),
             profile: agent.profile().map(ToOwned::to_owned),
             install,
             model,
@@ -383,6 +387,7 @@ impl ProviderConfig {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AgentConfig {
     pub(crate) provider: String,
+    pub(crate) driver: Option<String>,
     pub(crate) profile: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) defaults: ProviderRequestDefaults,
@@ -404,6 +409,12 @@ impl AgentConfig {
     #[must_use]
     pub const fn provider(&self) -> &str {
         self.provider.as_str()
+    }
+
+    /// Returns the explicit driver override for the agent, if set.
+    #[must_use]
+    pub fn driver(&self) -> Option<&str> {
+        self.driver.as_deref()
     }
 
     /// Returns the reusable provider profile selected by this agent.
@@ -716,6 +727,20 @@ impl ProviderProfileConfigBuilder {
         self
     }
 
+    /// Replaces the profile request defaults.
+    #[must_use]
+    pub fn defaults(mut self, defaults: ProviderRequestDefaults) -> Self {
+        self.partial.defaults = self.partial.defaults.merge(&defaults);
+        self
+    }
+
+    /// Replaces the typed provider behavior config.
+    #[must_use]
+    pub fn config(mut self, config: PartialProviderBehaviorConfig) -> Self {
+        self.partial.config = self.partial.config.merge(config);
+        self
+    }
+
     fn into_partial(self) -> PartialProviderProfileConfig {
         self.partial
     }
@@ -738,6 +763,13 @@ impl AgentConfigBuilder {
     #[must_use]
     pub fn provider(mut self, provider: impl Into<String>) -> Self {
         self.partial.provider = Some(provider.into());
+        self
+    }
+
+    /// Sets the explicit provider driver for the agent.
+    #[must_use]
+    pub fn driver(mut self, driver: impl Into<String>) -> Self {
+        self.partial.driver = Some(driver.into());
         self
     }
 
@@ -1055,6 +1087,8 @@ pub struct PartialWorkspaceConfig {
     pub default_provider: Option<String>,
     pub data_dir: Option<PathBuf>,
     pub env: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, PartialProviderProfileConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1080,6 +1114,7 @@ pub struct PartialProviderConfig {
 #[serde(deny_unknown_fields)]
 pub struct PartialAgentConfig {
     pub provider: Option<String>,
+    pub driver: Option<String>,
     pub profile: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
@@ -1096,17 +1131,25 @@ pub struct PartialAgentConfig {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
     };
 
+    use arky_protocol::ReasoningEffort;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
     use super::{
-        ArkyConfig, ArkyConfigBuilder, ConfigLoader, ProviderConfigBuilder, WorkspaceConfigBuilder,
+        AgentConfigBuilder, ArkyConfig, ArkyConfigBuilder, ConfigLoader, PartialAgentConfig,
+        PartialArkyConfig, PartialProviderConfig, PartialWorkspaceConfig, ProviderConfigBuilder,
+        ProviderProfileConfigBuilder, WorkspaceConfigBuilder,
     };
-    use crate::ConfigError;
+    use crate::{
+        validate::validate_config, ClaudeCodeBehaviorLayer, CodexBehaviorLayer, ConfigError,
+        PartialProviderBehaviorConfig, PartialProviderProfileConfig, ProviderRequestDefaults,
+        ResolvedProviderBehaviorConfig,
+    };
 
     #[test]
     fn file_loading_should_parse_valid_toml() {
@@ -1335,5 +1378,417 @@ agents:
         );
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn provider_profile_config_builder_should_expose_defaults_and_config() {
+        let config = ArkyConfig::builder()
+            .provider("default", ProviderConfigBuilder::new().driver("codex"))
+            .profile(
+                "fast-research",
+                ProviderProfileConfigBuilder::new()
+                    .driver("codex")
+                    .model("gpt-4o")
+                    .defaults(ProviderRequestDefaults {
+                        max_tokens: Some(700),
+                        reasoning_effort: Some(ReasoningEffort::Medium),
+                    })
+                    .config(PartialProviderBehaviorConfig {
+                        codex: Some(CodexBehaviorLayer {
+                            web_search: Some(true),
+                            ..CodexBehaviorLayer::default()
+                        }),
+                        ..PartialProviderBehaviorConfig::default()
+                    }),
+            )
+            .agent(
+                "writer",
+                AgentConfigBuilder::new()
+                    .provider("default")
+                    .profile("fast-research"),
+            )
+            .build()
+            .expect("config should build");
+
+        let profile = config
+            .profile("fast-research")
+            .expect("profile should be present");
+
+        assert_eq!(profile.driver(), "codex");
+        assert_eq!(profile.model(), Some("gpt-4o"));
+        assert_eq!(profile.defaults().max_tokens, Some(700));
+        assert_eq!(
+            profile.defaults().reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn profile_driver_mismatch_should_produce_validation_issue() {
+        let error = validate_config(PartialArkyConfig {
+            workspace: PartialWorkspaceConfig::default(),
+            providers: BTreeMap::from([(
+                "default".to_owned(),
+                PartialProviderConfig {
+                    driver: Some("codex".to_owned()),
+                    ..PartialProviderConfig::default()
+                },
+            )]),
+            profiles: BTreeMap::from([(
+                "default".to_owned(),
+                PartialProviderProfileConfig {
+                    driver: Some("codex".to_owned()),
+                    config: PartialProviderBehaviorConfig {
+                        claude_code: Some(ClaudeCodeBehaviorLayer {
+                            continue_conversation: Some(true),
+                            ..ClaudeCodeBehaviorLayer::default()
+                        }),
+                        ..PartialProviderBehaviorConfig::default()
+                    },
+                    ..PartialProviderProfileConfig::default()
+                },
+            )]),
+            agents: BTreeMap::new(),
+        })
+        .expect_err("profile typed namespace mismatch should fail");
+
+        let actual = collect_validation_messages(error);
+        let expected = vec![(
+            "profiles.default.config.claude_code".to_owned(),
+            "is not supported for driver `codex`; use `profiles.default.config.codex`".to_owned(),
+        )];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn agent_driver_mismatch_should_produce_validation_issue() {
+        let error = validate_config(PartialArkyConfig {
+            workspace: PartialWorkspaceConfig::default(),
+            providers: BTreeMap::from([(
+                "default".to_owned(),
+                PartialProviderConfig {
+                    driver: Some("claude-code".to_owned()),
+                    ..PartialProviderConfig::default()
+                },
+            )]),
+            profiles: BTreeMap::new(),
+            agents: BTreeMap::from([(
+                "writer".to_owned(),
+                PartialAgentConfig {
+                    provider: Some("default".to_owned()),
+                    driver: Some("claude-code".to_owned()),
+                    config: PartialProviderBehaviorConfig {
+                        codex: Some(CodexBehaviorLayer {
+                            web_search: Some(true),
+                            ..CodexBehaviorLayer::default()
+                        }),
+                        ..PartialProviderBehaviorConfig::default()
+                    },
+                    ..PartialAgentConfig::default()
+                },
+            )]),
+        })
+        .expect_err("agent typed namespace mismatch should fail");
+
+        let actual = collect_validation_messages(error);
+        let expected = vec![(
+            "agents.writer.config.codex".to_owned(),
+            "is not supported for driver `claude-code`; use `agents.writer.config.claude_code`"
+                .to_owned(),
+        )];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn resolve_agent_provider_should_merge_workspace_profile_agent_in_order() {
+        let directory = tempdir().expect("temp directory should be created");
+        let path = directory.path().join("layered.toml");
+        fs::write(
+            &path,
+            r#"
+                [workspace]
+                default_provider = "default"
+
+                [workspace.profiles.fast-research]
+                driver = "codex"
+                model = "gpt-4o"
+
+                [workspace.profiles.fast-research.defaults]
+                reasoning_effort = "medium"
+
+                [workspace.profiles.fast-research.config.codex]
+                include_plan_tool = true
+
+                [providers.default]
+                driver = "codex"
+                binary = "cargo"
+                model = "install-model"
+
+                [agents.writer]
+                provider = "default"
+                profile = "fast-research"
+
+                [agents.writer.defaults]
+                max_tokens = 1200
+
+                [agents.writer.config.codex]
+                resume_last = true
+            "#,
+        )
+        .expect("config file should be written");
+
+        let config = ConfigLoader::from_path(&path)
+            .load()
+            .expect("config should load");
+        let resolved = config
+            .resolve_agent_provider("writer")
+            .expect("writer provider should resolve");
+
+        assert_eq!(resolved.install.binary(), Some(Path::new("cargo")));
+        assert_eq!(resolved.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(resolved.defaults.max_tokens, Some(1_200));
+        assert_eq!(
+            resolved.defaults.reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        );
+
+        match resolved.config.expect("config should resolve") {
+            ResolvedProviderBehaviorConfig::Codex(config) => {
+                assert!(config.workspace.include_plan_tool);
+                assert!(config.workspace.resume_last);
+            }
+            other => panic!("expected codex config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_defaults_should_override_workspace_and_agent_overrides_profile() {
+        let config = validate_config(PartialArkyConfig {
+            workspace: PartialWorkspaceConfig::default(),
+            providers: BTreeMap::from([(
+                "default".to_owned(),
+                PartialProviderConfig {
+                    driver: Some("codex".to_owned()),
+                    model: Some("install-model".to_owned()),
+                    ..PartialProviderConfig::default()
+                },
+            )]),
+            profiles: BTreeMap::from([(
+                "safe-doc-writer".to_owned(),
+                PartialProviderProfileConfig {
+                    driver: Some("codex".to_owned()),
+                    model: Some("profile-model".to_owned()),
+                    defaults: ProviderRequestDefaults {
+                        max_tokens: Some(700),
+                        reasoning_effort: Some(ReasoningEffort::Low),
+                    },
+                    ..PartialProviderProfileConfig::default()
+                },
+            )]),
+            agents: BTreeMap::from([
+                (
+                    "profile_only".to_owned(),
+                    PartialAgentConfig {
+                        provider: Some("default".to_owned()),
+                        profile: Some("safe-doc-writer".to_owned()),
+                        ..PartialAgentConfig::default()
+                    },
+                ),
+                (
+                    "agent_override".to_owned(),
+                    PartialAgentConfig {
+                        provider: Some("default".to_owned()),
+                        profile: Some("safe-doc-writer".to_owned()),
+                        model: Some("agent-model".to_owned()),
+                        defaults: ProviderRequestDefaults {
+                            max_tokens: Some(900),
+                            reasoning_effort: None,
+                        },
+                        ..PartialAgentConfig::default()
+                    },
+                ),
+            ]),
+        })
+        .expect("config should validate");
+
+        let profile_only = config
+            .resolve_agent_provider("profile_only")
+            .expect("profile_only should resolve");
+        let agent_override = config
+            .resolve_agent_provider("agent_override")
+            .expect("agent_override should resolve");
+
+        assert_eq!(profile_only.install.model(), Some("install-model"));
+        assert_eq!(profile_only.model.as_deref(), Some("profile-model"));
+        assert_eq!(profile_only.defaults.max_tokens, Some(700));
+        assert_eq!(
+            profile_only.defaults.reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(agent_override.model.as_deref(), Some("agent-model"));
+        assert_eq!(agent_override.defaults.max_tokens, Some(900));
+        assert_eq!(
+            agent_override.defaults.reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn profile_table_should_parse_and_validate_to_provider_profile_config() {
+        let directory = tempdir().expect("temp directory should be created");
+        let path = directory.path().join("profiles.toml");
+        fs::write(
+            &path,
+            r#"
+                [providers.default]
+                driver = "codex"
+
+                [profiles.fast-research]
+                driver = "codex"
+                model = "gpt-4o"
+
+                [profiles.fast-research.config.codex]
+                web_search = true
+            "#,
+        )
+        .expect("config file should be written");
+
+        let config = ConfigLoader::from_path(&path)
+            .load()
+            .expect("config should load");
+        let profile = config
+            .profile("fast-research")
+            .expect("profile should be parsed");
+
+        assert_eq!(profile.driver(), "codex");
+        assert_eq!(profile.model(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn safe_doc_writer_profile_reference_should_resolve_merged_config() {
+        let directory = tempdir().expect("temp directory should be created");
+        let path = directory.path().join("safe-doc-writer.toml");
+        fs::write(
+            &path,
+            r#"
+                [providers.default]
+                driver = "codex"
+                binary = "cargo"
+
+                [profiles.safe-doc-writer]
+                driver = "codex"
+                model = "gpt-4o"
+
+                [profiles.safe-doc-writer.defaults]
+                reasoning_effort = "medium"
+
+                [profiles.safe-doc-writer.config.codex]
+                include_plan_tool = true
+
+                [agents.writer]
+                provider = "default"
+                profile = "safe-doc-writer"
+
+                [agents.writer.config.codex]
+                resume_last = true
+            "#,
+        )
+        .expect("config file should be written");
+
+        let config = ConfigLoader::from_path(&path)
+            .load()
+            .expect("config should load");
+        let resolved = config
+            .resolve_agent_provider("writer")
+            .expect("writer should resolve");
+
+        assert_eq!(resolved.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            resolved.defaults.reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        );
+
+        match resolved.config.expect("config should resolve") {
+            ResolvedProviderBehaviorConfig::Codex(config) => {
+                assert!(config.workspace.include_plan_tool);
+                assert!(config.workspace.resume_last);
+            }
+            other => panic!("expected codex config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_profile_reference_should_fail_with_profile_name() {
+        let directory = tempdir().expect("temp directory should be created");
+        let path = directory.path().join("missing-profile.toml");
+        fs::write(
+            &path,
+            r#"
+                [providers.default]
+                driver = "codex"
+
+                [agents.writer]
+                provider = "default"
+                profile = "missing-profile"
+            "#,
+        )
+        .expect("config file should be written");
+
+        let error = ConfigLoader::from_path(&path)
+            .load()
+            .expect_err("missing profile should fail");
+
+        let actual = collect_validation_messages(error);
+        let expected = vec![(
+            "agents.writer.profile".to_owned(),
+            "references unknown profile `missing-profile`".to_owned(),
+        )];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn request_extra_api_key_should_fail_validation_before_compilation() {
+        let directory = tempdir().expect("temp directory should be created");
+        let path = directory.path().join("request-extra.toml");
+        fs::write(
+            &path,
+            r#"
+                [providers.default]
+                driver = "codex"
+
+                [agents.writer]
+                provider = "default"
+
+                [agents.writer.request_extra]
+                api_key = "secret"
+            "#,
+        )
+        .expect("config file should be written");
+
+        let error = ConfigLoader::from_path(&path)
+            .load()
+            .expect_err("request_extra should fail validation");
+
+        let actual = collect_validation_messages(error);
+        let expected = vec![(
+            "agents.writer.request_extra.api_key".to_owned(),
+            "is reserved for installation/workspace provider config and is not allowed in request_extra"
+                .to_owned(),
+        )];
+
+        assert_eq!(actual, expected);
+    }
+
+    fn collect_validation_messages(error: ConfigError) -> Vec<(String, String)> {
+        match error {
+            ConfigError::ValidationFailed { issues, .. } => issues
+                .iter()
+                .map(|issue| (issue.field().to_owned(), issue.message().to_owned()))
+                .collect(),
+            other => panic!("expected validation error, got {other:?}"),
+        }
     }
 }

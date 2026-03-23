@@ -27,6 +27,7 @@ pub fn merge_workspace(
         default_provider: overlay.default_provider.or(base.default_provider),
         data_dir: overlay.data_dir.or(base.data_dir),
         env: merge_string_map(base.env, overlay.env),
+        profiles: merge_named_map(base.profiles, overlay.profiles, merge_profile),
     }
 }
 
@@ -72,6 +73,7 @@ pub fn merge_agent(base: PartialAgentConfig, overlay: PartialAgentConfig) -> Par
 
     PartialAgentConfig {
         provider: overlay.provider.or(base.provider),
+        driver: overlay.driver.or(base.driver),
         profile: overlay.profile.or(base.profile),
         model: overlay.model.or(base.model),
         defaults,
@@ -184,6 +186,7 @@ mod tests {
                 default_provider: Some("default".to_owned()),
                 data_dir: Some(PathBuf::from("file-dir")),
                 env: Some(BTreeMap::from([("RUST_LOG".to_owned(), "info".to_owned())])),
+                profiles: BTreeMap::new(),
             },
             providers: BTreeMap::from([(
                 "default".to_owned(),
@@ -236,6 +239,7 @@ mod tests {
                     "RUST_LOG".to_owned(),
                     "debug".to_owned(),
                 )])),
+                profiles: BTreeMap::new(),
             },
             providers: BTreeMap::from([(
                 "default".to_owned(),
@@ -285,6 +289,7 @@ mod tests {
                 default_provider: None,
                 data_dir: None,
                 env: None,
+                profiles: BTreeMap::new(),
             },
             providers: BTreeMap::from([(
                 "default".to_owned(),
