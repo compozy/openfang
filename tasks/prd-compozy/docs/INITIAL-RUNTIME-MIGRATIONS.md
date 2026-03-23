@@ -11,6 +11,12 @@ delivery slice for:
 - Phase 0
 - Phase 1
 
+> **Phase label note:** Phase 0 and Phase 1 in this document now correspond to
+> the 43-task Phase 0 (tasks 1-9) defined in the design decisions, which includes
+> both `runtime.db` and `compozy.db` initial schemas. See
+> `docs/plans/2026-03-23-prd-decisions-design.md` section 15 for the full phase
+> map.
+
 It is intentionally more specific than [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md),
 but still stops short of freezing every exact SQL type or ORM detail.
 
@@ -43,15 +49,16 @@ Recommended structure:
 ```text
 migrations/
   runtime/
-    0001_schema_migrations.sql
-    0002_agent_runtime_core.sql
-    0003_agent_sessions_and_messages.sql
-    0004_schedule_runtime_core.sql
+    20260321_001_schema_migrations.sql
+    20260321_002_agent_runtime_core.sql
+    20260321_003_agent_sessions_and_messages.sql
+    20260321_004_schedule_runtime_core.sql
+    20260321_005_trigger_runtime.sql
   compozy/
-    0001_schema_migrations.sql
-    0002_workflow_run_core.sql
-    0003_workflow_checkpoint.sql
-    0004_workflow_signal.sql
+    20260321_001_schema_migrations.sql
+    20260321_002_workflow_run_core.sql
+    20260321_003_workflow_checkpoint.sql
+    20260321_004_workflow_signal.sql
 ```
 
 Design rules:
@@ -65,7 +72,7 @@ Design rules:
 
 ### `runtime.db`
 
-#### `0001_schema_migrations.sql`
+#### `20260321_001_schema_migrations.sql`
 
 Purpose:
 
@@ -81,7 +88,7 @@ Representative columns:
 - `name`
 - `applied_at`
 
-#### `0002_agent_runtime_core.sql`
+#### `20260321_002_agent_runtime_core.sql`
 
 Purpose:
 
@@ -103,7 +110,7 @@ Minimum fields:
 - `last_active_at`
 - `updated_at`
 
-#### `0003_agent_sessions_and_messages.sql`
+#### `20260321_003_agent_sessions_and_messages.sql`
 
 Purpose:
 
@@ -115,7 +122,7 @@ Tables:
 - `agent_session`
 - `agent_message`
 
-#### `0004_schedule_runtime_core.sql`
+#### `20260321_004_schedule_runtime_core.sql`
 
 Purpose:
 
@@ -126,9 +133,28 @@ Tables:
 - `schedule_runtime`
 - `schedule_execution`
 
+#### `20260321_005_trigger_runtime.sql`
+
+Purpose:
+
+- establish durable runtime state for trigger fire tracking
+
+Tables:
+
+- `trigger_runtime`
+
+Minimum fields:
+
+- `trigger_id`
+- `enabled`
+- `fire_count`
+- `last_fired_at`
+- `loaded_at`
+- `updated_at`
+
 ### `compozy.db`
 
-#### `0001_schema_migrations.sql`
+#### `20260321_001_schema_migrations.sql`
 
 Purpose:
 
@@ -176,7 +202,7 @@ Phase 0 should introduce:
 
 ## 5. Phase 1 `compozy.db` Migrations
 
-### `0002_workflow_run_core.sql`
+### `20260321_002_workflow_run_core.sql`
 
 Purpose:
 
@@ -206,7 +232,7 @@ Minimum fields:
 - `updated_at`
 - `completed_at`
 
-### `0003_workflow_checkpoint.sql`
+### `20260321_003_workflow_checkpoint.sql`
 
 Purpose:
 
@@ -236,8 +262,9 @@ Recommended minimum checkpoint kinds for Phase 1:
 - `run_resumed`
 - `run_completed`
 - `run_failed`
+- `shutdown_requested` — written during graceful shutdown before status transitions to `paused`
 
-### `0004_workflow_signal.sql`
+### `20260321_004_workflow_signal.sql`
 
 Purpose:
 

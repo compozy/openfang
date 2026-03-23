@@ -5,10 +5,12 @@ These questions remain open after the architecture reset. They do not block the 
 ## Workflow Runtime
 
 - How much of the existing OpenFang `WorkflowEngine` can be refactored in place behind the new Compozy workflow surface?
-- Should checkpoints be event-like rows, coarse snapshots, or a hybrid?
+- ~~Should checkpoints be event-like rows, coarse snapshots, or a hybrid?~~ **Resolved:** Event-like rows for major transitions; no separate snapshot table.
 - When does `workflow_step_run` become necessary as a first-class table instead of derived or embedded run state?
 
 ## Definitions and Packaging
+
+Pack system design decided — see `docs/plans/2026-03-23-prd-decisions-design.md` sections 10 and 15.
 
 ## Tool Runtime
 
@@ -26,7 +28,7 @@ These questions remain open after the architecture reset. They do not block the 
 
 ## Persistence and Schema
 
-- What exact SQL types, indexes, and retention policies should back the table outline in `DATABASE-SCHEMA.md`?
+- ~~What exact SQL types, indexes, and retention policies should back the table outline in `DATABASE-SCHEMA.md`?~~ **Partially resolved:** Timestamp prefix migration numbering (`YYYYMMDD_NNN_`). Specific indexes defined per table in task files. Retention: configurable max + age threshold for `workflow_checkpoint`.
 
 ## Networking
 

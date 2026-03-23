@@ -69,6 +69,7 @@ Representative objects:
 - `agent_session`
 - `agent_message`
 - `schedule_runtime`
+- `trigger_runtime`
 - scheduler execution receipts or similar runtime metadata
 
 The rule is:
@@ -133,6 +134,13 @@ but not a competing source of truth for the same user-authored definition.
 - runtime objects and domain objects may reference the same definition IDs, but
   their ownership boundary remains unchanged
 
+Each cross-database operation has a leader database. The leader write happens
+first; the secondary write is best-effort with retry. On boot, a reconciliation
+scan runs after both databases are open and migrations are applied, before
+subsystems start accepting work. The scan detects and resolves cross-database
+inconsistencies (e.g., orphaned `schedule_execution` without matching
+`workflow_run`).
+
 ## 7. Write Path Rules
 
 For config-first resources:
@@ -145,6 +153,10 @@ For config-first resources:
 For runtime and domain resources:
 
 - write directly to the owning database
+
+File-backed definition writes use the shared `definition_store.rs` module in
+`openfang-kernel`, which provides atomic write (tmp + rename), load, and delete
+operations for all definition types (agents, workflows, triggers, schedules).
 
 This keeps authoring flows and execution flows separate.
 

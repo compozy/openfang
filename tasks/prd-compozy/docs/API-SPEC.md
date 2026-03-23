@@ -20,9 +20,12 @@ This spec currently freezes payload conventions and public resource shapes for:
 - `workflows`
 - `triggers`
 - `schedules`
+- `skills`
 - `packs`
 - `tasks`
 - `subtasks`
+- `artifacts`
+- `docs`
 - `events`
 - `runs`
 - `dispatches`
@@ -1312,6 +1315,33 @@ returns:
 - `POST /api/v1/packs/{id}/upgrade`
 - `POST /api/v1/packs/{id}/upgrade/dry-run`
 - `POST /api/v1/packs/{id}/uninstall`
+- `POST /api/v1/packs/{id}/fork`
+
+### Pack Fork
+
+`POST /api/v1/packs/{id}/fork` forks a managed pack object to user-owned.
+
+Request:
+
+```json
+{
+  "resource_type": "workflow",
+  "resource_id": "sdlc-main"
+}
+```
+
+Response:
+
+```json
+{
+  "accepted": true,
+  "resource_id": "sdlc-main",
+  "forked_from": {
+    "pack_id": "sdlc",
+    "version": "1.2.0"
+  }
+}
+```
 
 ### Pack Design Rules
 
@@ -2082,7 +2112,7 @@ The CLI mirrors the same public model:
 - `compozy schedules enable|disable|run-now`
 - `compozy schedules run-now --dry-run`
 
-- `compozy packs list|get|objects|install|upgrade|uninstall`
+- `compozy packs list|get|objects|install|upgrade|uninstall|fork`
 - `compozy packs upgrade --dry-run`
 
 - `compozy tasks list|get|create|update|delete|replan`
@@ -2099,6 +2129,117 @@ The CLI mirrors the same public model:
 - `compozy looper-runs list|get|create|subtasks|pause|resume|cancel`
 - `compozy looper-runs watch`
 
+- `compozy skills list|get`
+
+- `compozy artifacts list|get|versions`
+- `compozy docs list|get|versions`
+
 The CLI should prefer structured output modes such as JSON whenever possible,
 because internal agents are expected to use it as a machine-friendly control
 surface.
+
+## 15. Skills
+
+Skills are file-backed under `~/.compozy/skills/` and loaded at boot. Read-only through the API.
+
+### Endpoints
+
+| Method | Path | Summary |
+|--------|------|---------|
+| GET | `/api/v1/skills` | List loaded skills (paginated) |
+| GET | `/api/v1/skills/{id}` | Skill detail |
+
+### List Filters
+
+- `q`
+
+### List Response
+
+List response follows `{ items, next_cursor }` convention. Each item includes:
+
+```json
+{
+  "id": "writing",
+  "name": "Writing",
+  "description": "Skill for structured document writing",
+  "source": "~/.compozy/skills/writing.toml",
+  "loaded_at": "2026-03-21T12:00:00Z"
+}
+```
+
+## 16. Standalone Artifact And Doc Endpoints
+
+Top-level read-only access to artifacts and documents, not scoped to a specific task.
+
+### Endpoints
+
+| Method | Path | Summary |
+|--------|------|---------|
+| GET | `/api/v1/artifacts` | List all artifacts (paginated, filterable by `artifact_type`, `task_id`) |
+| GET | `/api/v1/artifacts/{id}` | Artifact detail with current version |
+| GET | `/api/v1/artifacts/{id}/versions` | Version history for an artifact |
+| GET | `/api/v1/docs` | List all documents (paginated, filterable by `doc_type`, `task_id`) |
+| GET | `/api/v1/docs/{id}` | Document detail with current version |
+| GET | `/api/v1/docs/{id}/versions` | Version history for a document |
+
+All responses follow `{ items, next_cursor }` pagination convention.
+
+### Artifact List Filters
+
+- `artifact_type`
+- `task_id`
+- `q`
+
+### Doc List Filters
+
+- `doc_type`
+- `task_id`
+- `q`
+
+### Artifact Detail Shape
+
+```json
+{
+  "id": "artifact_001",
+  "task_id": "task_001",
+  "type": "prd",
+  "current_version_id": "artifact_v3",
+  "created_at": "2026-03-21T14:00:00Z",
+  "updated_at": "2026-03-21T14:05:00Z"
+}
+```
+
+### Artifact Version Shape
+
+```json
+{
+  "id": "artifact_v3",
+  "artifact_id": "artifact_001",
+  "version_number": 3,
+  "created_at": "2026-03-21T14:05:00Z"
+}
+```
+
+### Doc Detail Shape
+
+```json
+{
+  "id": "doc_001",
+  "task_id": "task_001",
+  "type": "brief",
+  "current_version_id": "doc_v2",
+  "created_at": "2026-03-21T14:00:00Z",
+  "updated_at": "2026-03-21T14:03:00Z"
+}
+```
+
+### Doc Version Shape
+
+```json
+{
+  "id": "doc_v2",
+  "doc_id": "doc_001",
+  "version_number": 2,
+  "created_at": "2026-03-21T14:03:00Z"
+}
+```

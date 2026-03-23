@@ -111,10 +111,24 @@ Representative columns:
 - `effect_json`
 - `error`
 
+### `trigger_runtime`
+
+Runtime projection for file-backed trigger definitions.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `trigger_id` | TEXT PK | Matches the file-backed trigger definition ID |
+| `enabled` | INTEGER NOT NULL DEFAULT 1 | Boolean: trigger participates in matching |
+| `fire_count` | INTEGER NOT NULL DEFAULT 0 | Total times this trigger has fired |
+| `last_fired_at` | TEXT | ISO 8601 timestamp of last fire |
+| `loaded_at` | TEXT NOT NULL | When the trigger was loaded into runtime |
+| `updated_at` | TEXT NOT NULL | Last state change |
+
 ### Optional advanced runtime tables
 
 These are likely but not frozen yet:
 
+- `trigger_runtime` (promoted above — now outlined)
 - `channel_runtime`
 - `network_peer`
 - `runtime_receipt`
@@ -204,6 +218,9 @@ Representative columns:
 - `started_at`
 - `updated_at`
 - `completed_at`
+- `provider_driver`
+- `session_id`
+- `provider_resume_token`
 
 ### `hitl_request`
 
@@ -293,6 +310,7 @@ Representative columns:
 - `content_json`
 - `created_by_kind`
 - `created_by_ref`
+- `content_hash`
 - `created_at`
 
 ### `doc`
@@ -324,7 +342,24 @@ Representative columns:
 - `content_json`
 - `created_by_kind`
 - `created_by_ref`
+- `content_hash`
 - `created_at`
+
+### `pack`
+
+Installed pack metadata and managed object inventory.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `pack_id` | TEXT PK | Unique pack identifier |
+| `name` | TEXT NOT NULL | Display name |
+| `version` | TEXT NOT NULL | Installed version string |
+| `source_kind` | TEXT NOT NULL | `bundled` or `external` |
+| `installed` | INTEGER NOT NULL DEFAULT 0 | Count of installed objects |
+| `managed` | INTEGER NOT NULL DEFAULT 0 | Count of managed (non-forked) objects |
+| `installed_at` | TEXT NOT NULL | ISO 8601 installation timestamp |
+| `updated_at` | TEXT NOT NULL | Last modification timestamp |
+| `objects_json` | TEXT NOT NULL DEFAULT '{}' | Object counts by type |
 
 ### `task`
 
