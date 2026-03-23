@@ -15,8 +15,10 @@ use crate::workflow_compiler::{
 };
 use chrono::{DateTime, Utc};
 use openfang_memory::{
-    CheckpointKind as DurableCheckpointKind, WorkflowRunRecord,
-    WorkflowRunStatus as DurableWorkflowRunStatus, WorkflowStoreSet, WorkflowTransitionRequest,
+    now_timestamp, CheckpointKind as DurableCheckpointKind, WorkflowCheckpointRecord,
+    WorkflowRunRecord, WorkflowRunStatus as DurableWorkflowRunStatus, WorkflowStoreError,
+    WorkflowStoreSet, WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
+    WORKFLOW_RUN_CORE_MIGRATION_SQL, WORKFLOW_SIGNAL_MIGRATION_SQL,
 };
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -25,11 +27,13 @@ use openfang_types::workflow::{
     ResolvedRuntimeSettings, TemplateNamespace, TemplateReference, TemplateSegment, WorkflowIr,
     WorkflowIrStep, WorkflowIrStepKind, WorkflowV2Definition,
 };
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -165,8 +169,11 @@ pub enum ErrorMode {
 pub enum WorkflowRunState {
     Pending,
     Running,
+    Waiting,
     Completed,
     Failed,
+    Cancelled,
+    Interrupted,
 }
 
 /// A running workflow instance.
@@ -176,10 +183,28 @@ pub struct WorkflowRun {
     pub id: WorkflowRunId,
     /// The workflow being run.
     pub workflow_id: WorkflowId,
+    /// Compiled workflow version for this run.
+    pub workflow_version: String,
     /// Workflow name (copied for quick access).
     pub workflow_name: String,
     /// Initial input to the workflow.
     pub input: String,
+    /// Durable workflow variables encoded as JSON.
+    pub vars_json: String,
+    /// Current step ID mirrored from durable state.
+    pub current_step_id: Option<String>,
+    /// Waiting kind mirrored from durable state.
+    pub waiting_kind: Option<String>,
+    /// Waiting reference mirrored from durable state.
+    pub waiting_ref: Option<String>,
+    /// Active dispatch identifier, if any.
+    pub active_dispatch_id: Option<String>,
+    /// Active HITL request identifier, if any.
+    pub active_hitl_request_id: Option<String>,
+    /// Labels encoded as JSON.
+    pub labels_json: String,
+    /// Metadata encoded as JSON.
+    pub metadata_json: String,
     /// Current state.
     pub state: WorkflowRunState,
     /// Results from each completed step.
@@ -190,6 +215,8 @@ pub struct WorkflowRun {
     pub error: Option<String>,
     /// Started at.
     pub started_at: DateTime<Utc>,
+    /// Updated at.
+    pub updated_at: DateTime<Utc>,
     /// Completed at.
     pub completed_at: Option<DateTime<Utc>>,
 }
@@ -572,6 +599,750 @@ impl WorkflowDefinitionStore {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum TransitionError {
+    #[error(transparent)]
+    Storage(#[from] WorkflowStoreError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("workflow run '{run_id}' was not found in durable storage")]
+    RunNotFound { run_id: String },
+    #[error("invalid workflow transition for run '{run_id}': {from} -> {to}")]
+    InvalidStatusTransition {
+        run_id: String,
+        from: String,
+        to: String,
+    },
+    #[error("failed to parse stored timestamp '{value}': {source}")]
+    InvalidTimestamp {
+        value: String,
+        #[source]
+        source: chrono::ParseError,
+    },
+    #[error("failed to parse stored workflow identifier '{value}': {source}")]
+    InvalidWorkflowId {
+        value: String,
+        #[source]
+        source: uuid::Error,
+    },
+    #[error("failed to parse stored workflow run identifier '{value}': {source}")]
+    InvalidRunId {
+        value: String,
+        #[source]
+        source: uuid::Error,
+    },
+    #[error("workflow durability worker failed: {0}")]
+    Join(String),
+}
+
+fn transition_error_to_string(error: TransitionError) -> String {
+    error.to_string()
+}
+
+fn workflow_state_from_status(status: DurableWorkflowRunStatus) -> WorkflowRunState {
+    match status {
+        DurableWorkflowRunStatus::Pending => WorkflowRunState::Pending,
+        DurableWorkflowRunStatus::Running => WorkflowRunState::Running,
+        DurableWorkflowRunStatus::Waiting => WorkflowRunState::Waiting,
+        DurableWorkflowRunStatus::Completed => WorkflowRunState::Completed,
+        DurableWorkflowRunStatus::Failed => WorkflowRunState::Failed,
+        DurableWorkflowRunStatus::Cancelled => WorkflowRunState::Cancelled,
+        DurableWorkflowRunStatus::Interrupted => WorkflowRunState::Interrupted,
+    }
+}
+
+fn parse_rfc3339_utc(value: &str) -> Result<DateTime<Utc>, TransitionError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|source| TransitionError::InvalidTimestamp {
+            value: value.to_string(),
+            source,
+        })
+}
+
+fn normalize_workflow_input_json(input: &str) -> Result<String, OpenFangError> {
+    match serde_json::from_str::<JsonValue>(input) {
+        Ok(value) => serde_json::to_string(&value).map_err(|error| {
+            OpenFangError::Serialization(format!(
+                "failed to serialize workflow input for durable storage: {error}"
+            ))
+        }),
+        Err(_) => serde_json::to_string(input).map_err(|error| {
+            OpenFangError::Serialization(format!(
+                "failed to wrap workflow input as JSON string: {error}"
+            ))
+        }),
+    }
+}
+
+fn cache_input_from_json(input_json: &str) -> String {
+    match serde_json::from_str::<JsonValue>(input_json) {
+        Ok(JsonValue::String(value)) => value,
+        Ok(other) => other.to_string(),
+        Err(_) => input_json.to_string(),
+    }
+}
+
+fn error_message_from_json(error_json: Option<&str>) -> Option<String> {
+    error_json.and_then(|payload| {
+        serde_json::from_str::<JsonValue>(payload)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("message")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| Some(payload.to_string()))
+    })
+}
+
+fn checkpoint_data_json(value: JsonValue) -> Result<String, TransitionError> {
+    serde_json::to_string(&value).map_err(Into::into)
+}
+
+fn checkpoint_output_summary(output: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    output.chars().take(MAX_CHARS).collect()
+}
+
+fn in_memory_workflow_stores() -> WorkflowStoreSet {
+    let conn =
+        Connection::open_in_memory().expect("workflow engine should open in-memory compozy.db");
+    conn.execute_batch(WORKFLOW_RUN_CORE_MIGRATION_SQL)
+        .expect("workflow engine should apply workflow_run schema");
+    conn.execute_batch(WORKFLOW_CHECKPOINT_MIGRATION_SQL)
+        .expect("workflow engine should apply workflow_checkpoint schema");
+    conn.execute_batch(WORKFLOW_SIGNAL_MIGRATION_SQL)
+        .expect("workflow engine should apply workflow_signal schema");
+    conn.execute_batch(WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL)
+        .expect("workflow engine should apply workflow durability migration");
+    WorkflowStoreSet::new(Arc::new(StdMutex::new(conn)))
+}
+
+#[derive(Clone)]
+struct TransitionWriter {
+    workflow_stores: WorkflowStoreSet,
+    runs: Arc<RwLock<HashMap<WorkflowRunId, WorkflowRun>>>,
+    workflows: Arc<RwLock<HashMap<WorkflowId, Workflow>>>,
+}
+
+impl TransitionWriter {
+    fn new(
+        workflow_stores: WorkflowStoreSet,
+        runs: Arc<RwLock<HashMap<WorkflowRunId, WorkflowRun>>>,
+        workflows: Arc<RwLock<HashMap<WorkflowId, Workflow>>>,
+    ) -> Self {
+        Self {
+            workflow_stores,
+            runs,
+            workflows,
+        }
+    }
+
+    async fn load_run(&self, run_id: WorkflowRunId) -> Result<WorkflowRunRecord, TransitionError> {
+        let repository = self.workflow_stores.workflow_run.clone();
+        let run_id_text = run_id.to_string();
+        let lookup_run_id = run_id_text.clone();
+        let maybe_record =
+            tokio::task::spawn_blocking(move || repository.find_by_id(&lookup_run_id))
+                .await
+                .map_err(|error| TransitionError::Join(error.to_string()))??;
+
+        maybe_record.ok_or(TransitionError::RunNotFound {
+            run_id: run_id_text,
+        })
+    }
+
+    async fn persist_transition(
+        &self,
+        current: WorkflowRunRecord,
+        next: WorkflowRunRecord,
+        checkpoint: WorkflowCheckpointRecord,
+    ) -> Result<(), TransitionError> {
+        let repository = self.workflow_stores.workflow_run.clone();
+        tokio::task::spawn_blocking(move || {
+            repository.persist_transition(&current, &next, &checkpoint)
+        })
+        .await
+        .map_err(|error| TransitionError::Join(error.to_string()))??;
+        Ok(())
+    }
+
+    async fn sync_cache_from_record(
+        &self,
+        record: &WorkflowRunRecord,
+        seed_run: Option<WorkflowRun>,
+    ) -> Result<(), TransitionError> {
+        let run_id = WorkflowRunId(Uuid::parse_str(&record.run_id).map_err(|source| {
+            TransitionError::InvalidRunId {
+                value: record.run_id.clone(),
+                source,
+            }
+        })?);
+        let workflow_id = WorkflowId(Uuid::parse_str(&record.workflow_id).map_err(|source| {
+            TransitionError::InvalidWorkflowId {
+                value: record.workflow_id.clone(),
+                source,
+            }
+        })?);
+        let started_at = parse_rfc3339_utc(&record.started_at)?;
+        let updated_at = parse_rfc3339_utc(&record.updated_at)?;
+        let completed_at = match record.completed_at.as_deref() {
+            Some(value) => Some(parse_rfc3339_utc(value)?),
+            None => None,
+        };
+        let seed_input = seed_run.as_ref().map(|run| run.input.clone());
+        let seed_results = seed_run
+            .as_ref()
+            .map(|run| run.step_results.clone())
+            .unwrap_or_default();
+        let seed_output = seed_run.as_ref().and_then(|run| run.output.clone());
+        let workflow_name = if let Some(run) = seed_run.as_ref() {
+            run.workflow_name.clone()
+        } else {
+            self.workflows
+                .read()
+                .await
+                .get(&workflow_id)
+                .map(|workflow| workflow.name.clone())
+                .unwrap_or_else(|| record.workflow_id.clone())
+        };
+
+        let mut runs = self.runs.write().await;
+        let entry = runs.entry(run_id).or_insert_with(|| WorkflowRun {
+            id: run_id,
+            workflow_id,
+            workflow_version: record.workflow_version.clone(),
+            workflow_name,
+            input: seed_input.unwrap_or_else(|| cache_input_from_json(&record.input_json)),
+            vars_json: record.vars_json.clone(),
+            current_step_id: record.current_step_id.clone(),
+            waiting_kind: record.waiting_kind.clone(),
+            waiting_ref: record.waiting_ref.clone(),
+            active_dispatch_id: record.active_dispatch_id.clone(),
+            active_hitl_request_id: record.active_hitl_request_id.clone(),
+            labels_json: record.labels_json.clone(),
+            metadata_json: record.metadata_json.clone(),
+            state: workflow_state_from_status(record.status),
+            step_results: seed_results,
+            output: seed_output,
+            error: error_message_from_json(record.error_json.as_deref()),
+            started_at,
+            updated_at,
+            completed_at,
+        });
+
+        entry.workflow_id = workflow_id;
+        entry.workflow_version = record.workflow_version.clone();
+        entry.vars_json = record.vars_json.clone();
+        entry.current_step_id = record.current_step_id.clone();
+        entry.waiting_kind = record.waiting_kind.clone();
+        entry.waiting_ref = record.waiting_ref.clone();
+        entry.active_dispatch_id = record.active_dispatch_id.clone();
+        entry.active_hitl_request_id = record.active_hitl_request_id.clone();
+        entry.labels_json = record.labels_json.clone();
+        entry.metadata_json = record.metadata_json.clone();
+        entry.state = workflow_state_from_status(record.status);
+        entry.error = error_message_from_json(record.error_json.as_deref());
+        entry.started_at = started_at;
+        entry.updated_at = updated_at;
+        entry.completed_at = completed_at;
+
+        Ok(())
+    }
+
+    async fn record_run_created(&self, seed_run: WorkflowRun) -> Result<(), TransitionError> {
+        let current = self.load_run(seed_run.id).await?;
+        let mut next = current.clone();
+        next.updated_at = now_timestamp();
+
+        let input = serde_json::from_str::<JsonValue>(&current.input_json)?;
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: None,
+            kind: DurableCheckpointKind::RunCreated,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "workflow_id": current.workflow_id,
+                "workflow_version": current.workflow_version,
+                "input": input,
+            }))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, Some(seed_run)).await
+    }
+
+    async fn record_run_started(
+        &self,
+        run_id: WorkflowRunId,
+        initial_step_id: Option<&str>,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if current.status != DurableWorkflowRunStatus::Pending {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Running.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.status = DurableWorkflowRunStatus::Running;
+        next.current_step_id = initial_step_id.map(ToOwned::to_owned);
+        next.waiting_kind = None;
+        next.waiting_ref = None;
+        next.updated_at = now_timestamp();
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: initial_step_id.map(ToOwned::to_owned),
+            kind: DurableCheckpointKind::RunStarted,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "initial_step_id": initial_step_id,
+            }))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+
+    async fn record_step_started(
+        &self,
+        run_id: WorkflowRunId,
+        step: &WorkflowIrStep,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if current.status != DurableWorkflowRunStatus::Running {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Running.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.current_step_id = Some(step.id.clone());
+        next.updated_at = now_timestamp();
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("step_id".to_string(), JsonValue::String(step.id.clone()));
+        payload.insert(
+            "kind".to_string(),
+            JsonValue::String(WorkflowEngine::step_kind_name(&step.kind).to_string()),
+        );
+        match &step.kind {
+            WorkflowIrStepKind::Agent { agent } => {
+                payload.insert("agent".to_string(), JsonValue::String(agent.clone()));
+            }
+            WorkflowIrStepKind::Primitive { primitive } => {
+                payload.insert(
+                    "primitive".to_string(),
+                    JsonValue::String(primitive.clone()),
+                );
+            }
+            WorkflowIrStepKind::Workflow { workflow } => {
+                payload.insert("workflow".to_string(), JsonValue::String(workflow.clone()));
+            }
+            WorkflowIrStepKind::WaitSignal { signal_name } => {
+                payload.insert(
+                    "signal_name".to_string(),
+                    JsonValue::String(signal_name.clone()),
+                );
+            }
+            WorkflowIrStepKind::StartLooper {
+                task_ref,
+                task_id_binding,
+            } => {
+                if let Some(task_ref) = task_ref.as_ref() {
+                    payload.insert("task_ref".to_string(), JsonValue::String(task_ref.clone()));
+                }
+                if let Some(task_id_binding) = task_id_binding.as_ref() {
+                    payload.insert(
+                        "task_id_binding".to_string(),
+                        JsonValue::String(task_id_binding.clone()),
+                    );
+                }
+            }
+            WorkflowIrStepKind::EmitEvent {
+                event,
+                payload_template,
+            } => {
+                payload.insert("event".to_string(), JsonValue::String(event.clone()));
+                if let Some(payload_template) = payload_template.as_ref() {
+                    payload.insert(
+                        "payload_template".to_string(),
+                        JsonValue::String(payload_template.clone()),
+                    );
+                }
+            }
+            WorkflowIrStepKind::Collect | WorkflowIrStepKind::Noop => {}
+        }
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: Some(step.id.clone()),
+            kind: DurableCheckpointKind::StepStarted,
+            data_json: checkpoint_data_json(JsonValue::Object(payload))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+
+    async fn record_step_completed(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        save_as: Option<&str>,
+        output_summary: &str,
+        vars_json: String,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if current.status != DurableWorkflowRunStatus::Running {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Running.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.current_step_id = Some(step_id.to_string());
+        next.vars_json = vars_json;
+        next.error_json = None;
+        next.updated_at = now_timestamp();
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: Some(step_id.to_string()),
+            kind: DurableCheckpointKind::StepCompleted,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "step_id": step_id,
+                "save_as": save_as,
+                "output_summary": output_summary,
+            }))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+
+    async fn record_step_failed(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        error: &str,
+        attempt: u32,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if current.status != DurableWorkflowRunStatus::Running {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Running.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.current_step_id = Some(step_id.to_string());
+        next.error_json = Some(
+            serde_json::json!({
+                "message": error,
+                "step_id": step_id,
+                "attempt": attempt,
+            })
+            .to_string(),
+        );
+        next.updated_at = now_timestamp();
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: Some(step_id.to_string()),
+            kind: DurableCheckpointKind::StepFailed,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "step_id": step_id,
+                "error": error,
+                "attempt": attempt,
+            }))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+
+    async fn record_step_skipped(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        reason: &str,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if current.status != DurableWorkflowRunStatus::Running {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Running.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.current_step_id = Some(step_id.to_string());
+        next.updated_at = now_timestamp();
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: Some(step_id.to_string()),
+            kind: DurableCheckpointKind::StepSkipped,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "step_id": step_id,
+                "reason": reason,
+            }))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+
+    async fn record_signal_received(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        signal_id: &str,
+        signal_name: &str,
+        payload_summary: &str,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if current.status != DurableWorkflowRunStatus::Waiting {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Running.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.status = DurableWorkflowRunStatus::Running;
+        next.current_step_id = Some(step_id.to_string());
+        next.waiting_kind = None;
+        next.waiting_ref = None;
+        next.updated_at = now_timestamp();
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: Some(step_id.to_string()),
+            kind: DurableCheckpointKind::SignalReceived,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "signal_id": signal_id,
+                "signal_name": signal_name,
+                "payload_summary": payload_summary,
+            }))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        let repository = self.workflow_stores.workflow_run.clone();
+        let signal_id = signal_id.to_string();
+        let consumed_at = next.updated_at.clone();
+        let current_record = current.clone();
+        let next_record = next.clone();
+        let checkpoint_record = checkpoint.clone();
+        tokio::task::spawn_blocking(move || {
+            repository.persist_signal_resume(
+                &current_record,
+                &next_record,
+                &checkpoint_record,
+                &signal_id,
+                &consumed_at,
+            )
+        })
+        .await
+        .map_err(|error| TransitionError::Join(error.to_string()))??;
+        self.sync_cache_from_record(&next, None).await
+    }
+
+    async fn record_run_completed(
+        &self,
+        run_id: WorkflowRunId,
+        final_output_summary: &str,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if current.status != DurableWorkflowRunStatus::Running {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Completed.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.status = DurableWorkflowRunStatus::Completed;
+        next.updated_at = now_timestamp();
+        next.completed_at = Some(next.updated_at.clone());
+        next.waiting_kind = None;
+        next.waiting_ref = None;
+        next.error_json = None;
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: current.current_step_id.clone(),
+            kind: DurableCheckpointKind::RunCompleted,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "final_output_summary": final_output_summary,
+            }))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+
+    async fn record_run_failed(
+        &self,
+        run_id: WorkflowRunId,
+        failing_step_id: Option<&str>,
+        error: &str,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if !matches!(
+            current.status,
+            DurableWorkflowRunStatus::Running | DurableWorkflowRunStatus::Waiting
+        ) {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Failed.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.status = DurableWorkflowRunStatus::Failed;
+        next.current_step_id = failing_step_id
+            .map(ToOwned::to_owned)
+            .or_else(|| current.current_step_id.clone());
+        next.error_json = Some(
+            serde_json::json!({
+                "message": error,
+                "step_id": failing_step_id,
+            })
+            .to_string(),
+        );
+        next.updated_at = now_timestamp();
+        next.completed_at = Some(next.updated_at.clone());
+        next.waiting_kind = None;
+        next.waiting_ref = None;
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: failing_step_id.map(ToOwned::to_owned),
+            kind: DurableCheckpointKind::RunFailed,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "error": error,
+                "failing_step_id": failing_step_id,
+            }))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+
+    async fn record_run_cancelled(
+        &self,
+        run_id: WorkflowRunId,
+        cancelled_by: &str,
+        reason: &str,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if current.status != DurableWorkflowRunStatus::Running {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Cancelled.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.status = DurableWorkflowRunStatus::Cancelled;
+        next.updated_at = now_timestamp();
+        next.completed_at = Some(next.updated_at.clone());
+        next.waiting_kind = None;
+        next.waiting_ref = None;
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: current.current_step_id.clone(),
+            kind: DurableCheckpointKind::RunCancelled,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "cancelled_by": cancelled_by,
+                "reason": reason,
+            }))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+
+    async fn record_run_interrupted(
+        &self,
+        run_id: WorkflowRunId,
+        reason: &str,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if current.status != DurableWorkflowRunStatus::Running {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Interrupted.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.status = DurableWorkflowRunStatus::Interrupted;
+        next.updated_at = now_timestamp();
+        next.waiting_kind = None;
+        next.waiting_ref = None;
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: current.current_step_id.clone(),
+            kind: DurableCheckpointKind::RunInterrupted,
+            data_json: checkpoint_data_json(serde_json::json!({ "reason": reason }))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+}
+
 /// The workflow engine — manages definitions and executes pipeline runs.
 pub struct WorkflowEngine {
     /// Registered workflow definitions.
@@ -590,8 +1361,8 @@ pub struct WorkflowEngine {
     definition_mutation_lock: Arc<Mutex<()>>,
     /// Readiness state for the workflow registry.
     readiness: Arc<AtomicU8>,
-    /// Durable workflow stores, if the kernel boot path provided them.
-    workflow_stores: Option<WorkflowStoreSet>,
+    /// Durable workflow stores.
+    workflow_stores: WorkflowStoreSet,
 }
 
 impl WorkflowEngine {
@@ -628,7 +1399,7 @@ impl WorkflowEngine {
             readiness: Arc::new(AtomicU8::new(
                 WorkflowRegistryReadiness::Bootstrapping as u8,
             )),
-            workflow_stores,
+            workflow_stores: workflow_stores.unwrap_or_else(in_memory_workflow_stores),
         }
     }
 
@@ -829,162 +1600,91 @@ impl WorkflowEngine {
     /// runs are evicted when this limit is exceeded.
     const MAX_RETAINED_RUNS: usize = 200;
 
-    /// Start a workflow run. Returns the run ID and a handle to check progress.
-    ///
-    /// The actual execution is driven externally by calling `execute_run()`
-    /// with the kernel handle, since the workflow engine doesn't own the kernel.
-    async fn persist_run_creation(
-        &self,
-        workflow_id: WorkflowId,
-        run_id: WorkflowRunId,
-        input: &str,
-    ) -> OpenFangResult<()> {
-        let Some(workflow_stores) = self.workflow_stores.clone() else {
-            return Ok(());
-        };
+    fn transition_writer(&self) -> TransitionWriter {
+        TransitionWriter::new(
+            self.workflow_stores.clone(),
+            Arc::clone(&self.runs),
+            Arc::clone(&self.workflows),
+        )
+    }
 
-        let record = WorkflowRunRecord {
-            run_id: run_id.to_string(),
-            workflow_id: workflow_id.to_string(),
-            workflow_version: None,
-            status: DurableWorkflowRunStatus::Pending,
-            input_json: serde_json::to_string(input).map_err(|error| {
-                OpenFangError::Serialization(format!(
-                    "Failed to serialize workflow input for durable run state: {error}"
-                ))
-            })?,
-            vars_json: "{}".to_string(),
-            current_step_id: None,
-            waiting_kind: None,
-            waiting_ref: None,
-            active_dispatch_id: None,
-            active_hitl_request_id: None,
-            labels_json: "[]".to_string(),
-            metadata_json: "{}".to_string(),
-            error_json: None,
-            started_at: None,
-            updated_at: Utc::now().to_rfc3339(),
-            completed_at: None,
-        };
+    async fn evict_terminal_runs_from_cache(&self) {
+        let mut runs = self.runs.write().await;
+        if runs.len() <= Self::MAX_RETAINED_RUNS {
+            return;
+        }
 
-        tokio::task::spawn_blocking(move || workflow_stores.workflow_run.create_run(&record))
+        let mut evictable: Vec<(WorkflowRunId, DateTime<Utc>)> = runs
+            .iter()
+            .filter(|(_, run)| {
+                matches!(
+                    run.state,
+                    WorkflowRunState::Completed
+                        | WorkflowRunState::Failed
+                        | WorkflowRunState::Cancelled
+                )
+            })
+            .map(|(id, run)| (*id, run.started_at))
+            .collect();
+
+        evictable.sort_by_key(|(_, timestamp)| *timestamp);
+        let to_remove = runs.len() - Self::MAX_RETAINED_RUNS;
+        for (run_id, _) in evictable.into_iter().take(to_remove) {
+            runs.remove(&run_id);
+            debug!(run_id = %run_id, "Evicted workflow run from in-memory cache");
+        }
+    }
+
+    pub async fn recover_durable_runs(&self) -> OpenFangResult<usize> {
+        let writer = self.transition_writer();
+        let repository = writer.workflow_stores.workflow_run.clone();
+        let records = tokio::task::spawn_blocking(move || repository.list_non_terminal())
             .await
             .map_err(|error| {
-                OpenFangError::Internal(format!("Workflow run persistence task failed: {error}"))
+                OpenFangError::Internal(format!("Workflow recovery query task failed: {error}"))
             })?
-            .map_err(OpenFangError::from)
+            .map_err(OpenFangError::from)?;
+
+        let mut interrupted = 0usize;
+        for record in records {
+            let run_id = WorkflowRunId(Uuid::parse_str(&record.run_id).map_err(|error| {
+                OpenFangError::Internal(format!(
+                    "Invalid stored workflow run identifier '{}': {error}",
+                    record.run_id
+                ))
+            })?);
+
+            match record.status {
+                DurableWorkflowRunStatus::Running => {
+                    writer
+                        .record_run_interrupted(run_id, "recovered during bootstrap")
+                        .await
+                        .map_err(|error| OpenFangError::Internal(error.to_string()))?;
+                    interrupted += 1;
+                }
+                DurableWorkflowRunStatus::Pending | DurableWorkflowRunStatus::Waiting => {
+                    writer
+                        .sync_cache_from_record(&record, None)
+                        .await
+                        .map_err(|error| OpenFangError::Internal(error.to_string()))?;
+                }
+                DurableWorkflowRunStatus::Completed
+                | DurableWorkflowRunStatus::Failed
+                | DurableWorkflowRunStatus::Cancelled
+                | DurableWorkflowRunStatus::Interrupted => {}
+            }
+        }
+
+        Ok(interrupted)
     }
 
-    async fn persist_transition(
-        &self,
-        run_id: WorkflowRunId,
-        new_status: DurableWorkflowRunStatus,
-        step_id: Option<String>,
-        checkpoint_kind: DurableCheckpointKind,
-        checkpoint_data: serde_json::Value,
-        completed_at: Option<String>,
-    ) -> OpenFangResult<()> {
-        let Some(workflow_stores) = self.workflow_stores.clone() else {
-            return Ok(());
-        };
-
-        let run_id = run_id.to_string();
-        let transition = WorkflowTransitionRequest {
-            new_status,
-            step_id,
-            checkpoint_id: Uuid::new_v4().to_string(),
-            checkpoint_kind,
-            checkpoint_data,
-            updated_at: Utc::now().to_rfc3339(),
-            completed_at,
-        };
-
-        tokio::task::spawn_blocking(move || {
-            workflow_stores
-                .workflow_run
-                .transition(&run_id, &transition)
-        })
-        .await
-        .map_err(|error| {
-            OpenFangError::Internal(format!(
-                "Workflow transition persistence task failed: {error}"
-            ))
-        })?
-        .map_err(OpenFangError::from)
-    }
-
-    async fn mark_run_running(&self, run_id: WorkflowRunId) -> Result<(), String> {
-        self.persist_transition(
-            run_id,
-            DurableWorkflowRunStatus::Running,
-            None,
-            DurableCheckpointKind::RunStarted,
-            serde_json::json!({}),
-            None,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-
-        let mut runs = self.runs.write().await;
-        let run = runs.get_mut(&run_id).ok_or("Workflow run not found")?;
-        run.state = WorkflowRunState::Running;
-        Ok(())
-    }
-
-    async fn mark_run_failed(
-        &self,
-        run_id: WorkflowRunId,
-        error_message: &str,
-    ) -> Result<(), String> {
-        let completed_at = Utc::now();
-        self.persist_transition(
-            run_id,
-            DurableWorkflowRunStatus::Failed,
-            None,
-            DurableCheckpointKind::RunFailed,
-            serde_json::json!({ "error": error_message }),
-            Some(completed_at.to_rfc3339()),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-
-        let mut runs = self.runs.write().await;
-        let run = runs.get_mut(&run_id).ok_or("Workflow run not found")?;
-        run.state = WorkflowRunState::Failed;
-        run.error = Some(error_message.to_string());
-        run.completed_at = Some(completed_at);
-        Ok(())
-    }
-
-    async fn mark_run_completed(
-        &self,
-        run_id: WorkflowRunId,
-        final_output: &str,
-    ) -> Result<(), String> {
-        let completed_at = Utc::now();
-        self.persist_transition(
-            run_id,
-            DurableWorkflowRunStatus::Completed,
-            None,
-            DurableCheckpointKind::RunCompleted,
-            serde_json::json!({ "output": final_output }),
-            Some(completed_at.to_rfc3339()),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-
-        let mut runs = self.runs.write().await;
-        let run = runs.get_mut(&run_id).ok_or("Workflow run not found")?;
-        run.state = WorkflowRunState::Completed;
-        run.output = Some(final_output.to_string());
-        run.completed_at = Some(completed_at);
-        Ok(())
-    }
-
-    pub async fn create_run(
+    pub async fn create_run_with_context(
         &self,
         workflow_id: WorkflowId,
+        workflow_version: impl Into<String>,
         input: String,
+        labels: Vec<String>,
+        metadata: JsonValue,
     ) -> OpenFangResult<WorkflowRunId> {
         let workflow = self
             .workflows
@@ -994,49 +1694,92 @@ impl WorkflowEngine {
             .cloned()
             .ok_or_else(|| OpenFangError::Internal("Workflow definition not found".to_string()))?;
         let run_id = WorkflowRunId::new();
-        self.persist_run_creation(workflow_id, run_id, &input)
-            .await?;
+        let timestamp = now_timestamp();
+        let workflow_version = workflow_version.into();
+        let run_record = WorkflowRunRecord {
+            run_id: run_id.to_string(),
+            workflow_id: workflow_id.to_string(),
+            workflow_version: workflow_version.clone(),
+            status: DurableWorkflowRunStatus::Pending,
+            input_json: normalize_workflow_input_json(&input)?,
+            vars_json: "{}".to_string(),
+            current_step_id: None,
+            waiting_kind: None,
+            waiting_ref: None,
+            active_dispatch_id: None,
+            active_hitl_request_id: None,
+            labels_json: serde_json::to_string(&labels).map_err(|error| {
+                OpenFangError::Serialization(format!(
+                    "Failed to serialize workflow labels for durable state: {error}"
+                ))
+            })?,
+            metadata_json: serde_json::to_string(&metadata).map_err(|error| {
+                OpenFangError::Serialization(format!(
+                    "Failed to serialize workflow metadata for durable state: {error}"
+                ))
+            })?,
+            error_json: None,
+            started_at: timestamp.clone(),
+            updated_at: timestamp.clone(),
+            completed_at: None,
+        };
 
         let run = WorkflowRun {
             id: run_id,
             workflow_id,
+            workflow_version,
             workflow_name: workflow.name,
             input,
+            vars_json: "{}".to_string(),
+            current_step_id: None,
+            waiting_kind: None,
+            waiting_ref: None,
+            active_dispatch_id: None,
+            active_hitl_request_id: None,
+            labels_json: run_record.labels_json.clone(),
+            metadata_json: run_record.metadata_json.clone(),
             state: WorkflowRunState::Pending,
             step_results: Vec::new(),
             output: None,
             error: None,
-            started_at: Utc::now(),
+            started_at: parse_rfc3339_utc(&timestamp)
+                .map_err(|error| OpenFangError::Internal(error.to_string()))?,
+            updated_at: parse_rfc3339_utc(&timestamp)
+                .map_err(|error| OpenFangError::Internal(error.to_string()))?,
             completed_at: None,
         };
 
-        let mut runs = self.runs.write().await;
-        runs.insert(run_id, run);
+        let writer = self.transition_writer();
+        let repository = writer.workflow_stores.workflow_run.clone();
+        let run_record_clone = run_record.clone();
+        tokio::task::spawn_blocking(move || repository.insert_run(&run_record_clone))
+            .await
+            .map_err(|error| {
+                OpenFangError::Internal(format!("Workflow run insert task failed: {error}"))
+            })?
+            .map_err(OpenFangError::from)?;
+        writer
+            .record_run_created(run)
+            .await
+            .map_err(|error| OpenFangError::Internal(error.to_string()))?;
 
-        // Evict oldest completed/failed runs when we exceed the cap
-        if runs.len() > Self::MAX_RETAINED_RUNS {
-            let mut evictable: Vec<(WorkflowRunId, DateTime<Utc>)> = runs
-                .iter()
-                .filter(|(_, r)| {
-                    matches!(
-                        r.state,
-                        WorkflowRunState::Completed | WorkflowRunState::Failed
-                    )
-                })
-                .map(|(id, r)| (*id, r.started_at))
-                .collect();
-
-            // Sort oldest first
-            evictable.sort_by_key(|(_, t)| *t);
-
-            let to_remove = runs.len() - Self::MAX_RETAINED_RUNS;
-            for (id, _) in evictable.into_iter().take(to_remove) {
-                runs.remove(&id);
-                debug!(run_id = %id, "Evicted old workflow run");
-            }
-        }
-
+        self.evict_terminal_runs_from_cache().await;
         Ok(run_id)
+    }
+
+    pub async fn create_run(
+        &self,
+        workflow_id: WorkflowId,
+        input: String,
+    ) -> OpenFangResult<WorkflowRunId> {
+        self.create_run_with_context(
+            workflow_id,
+            "legacy",
+            input,
+            Vec::new(),
+            serde_json::json!({}),
+        )
+        .await
     }
 
     /// Get the current state of a workflow run.
@@ -1055,14 +1798,140 @@ impl WorkflowEngine {
                     .map(|f| match f {
                         "pending" => matches!(r.state, WorkflowRunState::Pending),
                         "running" => matches!(r.state, WorkflowRunState::Running),
+                        "waiting" => matches!(r.state, WorkflowRunState::Waiting),
                         "completed" => matches!(r.state, WorkflowRunState::Completed),
                         "failed" => matches!(r.state, WorkflowRunState::Failed),
+                        "cancelled" => matches!(r.state, WorkflowRunState::Cancelled),
+                        "interrupted" => matches!(r.state, WorkflowRunState::Interrupted),
                         _ => true,
                     })
                     .unwrap_or(true)
             })
             .cloned()
             .collect()
+    }
+
+    /// Clear the in-memory run projection cache.
+    pub async fn clear_run_cache(&self) {
+        self.runs.write().await.clear();
+    }
+
+    /// Mark a durable workflow signal as consumed and resume the waiting run in
+    /// the canonical store and cache.
+    pub async fn record_signal_received_transition(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        signal_id: &str,
+        signal_name: &str,
+        payload_summary: &str,
+    ) -> Result<(), String> {
+        self.transition_writer()
+            .record_signal_received(run_id, step_id, signal_id, signal_name, payload_summary)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    /// Cancel a workflow run through the durable transition writer.
+    pub async fn cancel_run(
+        &self,
+        run_id: WorkflowRunId,
+        cancelled_by: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        self.transition_writer()
+            .record_run_cancelled(run_id, cancelled_by, reason)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    async fn record_run_started_transition(
+        &self,
+        run_id: WorkflowRunId,
+        initial_step_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.transition_writer()
+            .record_run_started(run_id, initial_step_id)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    async fn record_step_started_transition(
+        &self,
+        run_id: WorkflowRunId,
+        step: &WorkflowIrStep,
+    ) -> Result<(), String> {
+        self.transition_writer()
+            .record_step_started(run_id, step)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    async fn record_step_completed_transition(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        save_as: Option<&str>,
+        output_summary: &str,
+        vars_json: String,
+    ) -> Result<(), String> {
+        self.transition_writer()
+            .record_step_completed(run_id, step_id, save_as, output_summary, vars_json)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    async fn record_step_failed_transition(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        error: &str,
+        attempt: u32,
+    ) -> Result<(), String> {
+        self.transition_writer()
+            .record_step_failed(run_id, step_id, error, attempt)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    async fn record_step_skipped_transition(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        self.transition_writer()
+            .record_step_skipped(run_id, step_id, reason)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    async fn record_run_failed_transition(
+        &self,
+        run_id: WorkflowRunId,
+        failing_step_id: Option<&str>,
+        error: &str,
+    ) -> Result<(), String> {
+        self.transition_writer()
+            .record_run_failed(run_id, failing_step_id, error)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    async fn record_run_completed_transition(
+        &self,
+        run_id: WorkflowRunId,
+        final_output: &str,
+    ) -> Result<(), String> {
+        self.transition_writer()
+            .record_run_completed(run_id, &checkpoint_output_summary(final_output))
+            .await
+            .map_err(transition_error_to_string)?;
+
+        if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+            run.output = Some(final_output.to_string());
+        }
+        Ok(())
     }
 
     /// Return the runtime projection for a workflow definition after readiness.
@@ -1076,8 +1945,11 @@ impl WorkflowEngine {
         for run in runs.values().filter(|run| run.workflow_id == workflow.id) {
             match run.state {
                 WorkflowRunState::Running => active_runs += 1,
-                WorkflowRunState::Pending => waiting_runs += 1,
-                WorkflowRunState::Completed | WorkflowRunState::Failed => {}
+                WorkflowRunState::Pending | WorkflowRunState::Waiting => waiting_runs += 1,
+                WorkflowRunState::Completed
+                | WorkflowRunState::Failed
+                | WorkflowRunState::Cancelled
+                | WorkflowRunState::Interrupted => {}
             }
 
             if last_run_at
@@ -1438,6 +2310,9 @@ impl WorkflowEngine {
         Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
     {
         let send_message = &send_message;
+        let vars_json = |variables: &HashMap<String, String>| {
+            serde_json::to_string(variables).unwrap_or_else(|_| "{}".to_string())
+        };
         let (input, run_workflow_id) = {
             let runs = self.runs.read().await;
             let run = runs.get(&run_id).ok_or("Workflow run not found")?;
@@ -1449,7 +2324,15 @@ impl WorkflowEngine {
                 "Workflow IR '{}' does not match run workflow '{}'",
                 workflow.workflow_id, run_workflow_id
             );
-            if let Err(persist_error) = self.mark_run_failed(run_id, &error).await {
+            if let Err(start_error) = self.record_run_started_transition(run_id, None).await {
+                return Err(format!(
+                    "{error}; additionally failed to persist workflow start: {start_error}"
+                ));
+            }
+            if let Err(persist_error) = self
+                .record_run_failed_transition(run_id, None, &error)
+                .await
+            {
                 return Err(format!(
                     "{error}; additionally failed to persist workflow failure: {persist_error}"
                 ));
@@ -1457,7 +2340,11 @@ impl WorkflowEngine {
             return Err(error);
         }
 
-        self.mark_run_running(run_id).await?;
+        self.record_run_started_transition(
+            run_id,
+            workflow.steps.first().map(|step| step.id.as_str()),
+        )
+        .await?;
 
         info!(
             run_id = %run_id,
@@ -1479,23 +2366,72 @@ impl WorkflowEngine {
             match &step.flow.mode {
                 WorkflowV2FlowMode::Sequential => match &step.kind {
                     WorkflowIrStepKind::Collect => {
+                        self.record_step_started_transition(run_id, step).await?;
                         current_input = all_outputs.join("\n\n---\n\n");
                         all_outputs.clear();
                         all_outputs.push(current_input.clone());
                         if let Some(symbol) = step.save_as.as_ref() {
                             variables.insert(symbol.clone(), current_input.clone());
                         }
+                        self.record_step_completed_transition(
+                            run_id,
+                            &step.id,
+                            step.save_as.as_deref(),
+                            &checkpoint_output_summary(&current_input),
+                            vars_json(&variables),
+                        )
+                        .await?;
                     }
                     WorkflowIrStepKind::Noop => {
+                        self.record_step_started_transition(run_id, step).await?;
                         all_outputs.push(current_input.clone());
                         if let Some(symbol) = step.save_as.as_ref() {
                             variables.insert(symbol.clone(), current_input.clone());
                         }
+                        self.record_step_completed_transition(
+                            run_id,
+                            &step.id,
+                            step.save_as.as_deref(),
+                            &checkpoint_output_summary(&current_input),
+                            vars_json(&variables),
+                        )
+                        .await?;
                     }
                     _ => {
-                        let agent = Self::agent_target(step)?;
-                        let (agent_id, agent_name) = agent_resolver(agent)
-                            .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
+                        self.record_step_started_transition(run_id, step).await?;
+                        let agent = match Self::agent_target(step) {
+                            Ok(agent) => agent,
+                            Err(error) => {
+                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
+                                    .await?;
+                                if let Err(persist_error) = self
+                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
+                                    .await
+                                {
+                                    return Err(format!(
+                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
+                                }
+                                return Err(error);
+                            }
+                        };
+                        let (agent_id, agent_name) = match agent_resolver(agent) {
+                            Some(agent) => agent,
+                            None => {
+                                let error = format!("Agent not found for step '{}'", step.name);
+                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
+                                    .await?;
+                                if let Err(persist_error) = self
+                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
+                                    .await
+                                {
+                                    return Err(format!(
+                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
+                                }
+                                return Err(error);
+                            }
+                        };
                         let prompt = Self::render_step_payload(step, &current_input, &variables);
                         let start = std::time::Instant::now();
                         let result = Self::execute_step_with_error_mode(
@@ -1527,6 +2463,14 @@ impl WorkflowEngine {
 
                                 all_outputs.push(output.clone());
                                 current_input = output;
+                                self.record_step_completed_transition(
+                                    run_id,
+                                    &step.id,
+                                    step.save_as.as_deref(),
+                                    &checkpoint_output_summary(&current_input),
+                                    vars_json(&variables),
+                                )
+                                .await?;
                                 info!(
                                     step = index + 1,
                                     name = %step.name,
@@ -1534,10 +2478,21 @@ impl WorkflowEngine {
                                     "Step completed"
                                 );
                             }
-                            Ok(None) => info!(step = index + 1, name = %step.name, "Step skipped"),
+                            Ok(None) => {
+                                self.record_step_skipped_transition(
+                                    run_id,
+                                    &step.id,
+                                    "step returned no output",
+                                )
+                                .await?;
+                                info!(step = index + 1, name = %step.name, "Step skipped");
+                            }
                             Err(error) => {
-                                if let Err(persist_error) =
-                                    self.mark_run_failed(run_id, &error).await
+                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
+                                    .await?;
+                                if let Err(persist_error) = self
+                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
+                                    .await
                                 {
                                     return Err(format!(
                                         "{error}; additionally failed to persist workflow failure: {persist_error}"
@@ -1564,10 +2519,49 @@ impl WorkflowEngine {
                     let mut step_infos = Vec::new();
 
                     for (fan_index, fan_step) in &fan_out_steps {
-                        let agent = Self::agent_target(fan_step)?;
-                        let (agent_id, agent_name) = agent_resolver(agent).ok_or_else(|| {
-                            format!("Agent not found for step '{}'", fan_step.name)
-                        })?;
+                        self.record_step_started_transition(run_id, fan_step)
+                            .await?;
+                        let agent = match Self::agent_target(fan_step) {
+                            Ok(agent) => agent,
+                            Err(error) => {
+                                self.record_step_failed_transition(run_id, &fan_step.id, &error, 1)
+                                    .await?;
+                                if let Err(persist_error) = self
+                                    .record_run_failed_transition(
+                                        run_id,
+                                        Some(&fan_step.id),
+                                        &error,
+                                    )
+                                    .await
+                                {
+                                    return Err(format!(
+                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
+                                }
+                                return Err(error);
+                            }
+                        };
+                        let (agent_id, agent_name) = match agent_resolver(agent) {
+                            Some(agent) => agent,
+                            None => {
+                                let error = format!("Agent not found for step '{}'", fan_step.name);
+                                self.record_step_failed_transition(run_id, &fan_step.id, &error, 1)
+                                    .await?;
+                                if let Err(persist_error) = self
+                                    .record_run_failed_transition(
+                                        run_id,
+                                        Some(&fan_step.id),
+                                        &error,
+                                    )
+                                    .await
+                                {
+                                    return Err(format!(
+                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
+                                }
+                                return Err(error);
+                            }
+                        };
                         let prompt =
                             Self::render_step_payload(fan_step, &current_input, &variables);
 
@@ -1611,14 +2605,35 @@ impl WorkflowEngine {
                                 }
                                 all_outputs.push(output.clone());
                                 current_input = output;
+                                self.record_step_completed_transition(
+                                    run_id,
+                                    &fan_step.id,
+                                    fan_step.save_as.as_deref(),
+                                    &checkpoint_output_summary(&current_input),
+                                    vars_json(&variables),
+                                )
+                                .await?;
                             }
                             Ok(None) => {
+                                self.record_step_skipped_transition(
+                                    run_id,
+                                    &fan_step.id,
+                                    "fan-out step returned no output",
+                                )
+                                .await?;
                                 info!(name = %step_name, "FanOut step skipped");
                             }
                             Err(error) => {
                                 let error = format!("FanOut step '{step_name}' failed: {error}");
-                                if let Err(persist_error) =
-                                    self.mark_run_failed(run_id, &error).await
+                                self.record_step_failed_transition(run_id, &fan_step.id, &error, 1)
+                                    .await?;
+                                if let Err(persist_error) = self
+                                    .record_run_failed_transition(
+                                        run_id,
+                                        Some(&fan_step.id),
+                                        &error,
+                                    )
+                                    .await
                                 {
                                     return Err(format!(
                                         "{error}; additionally failed to persist workflow failure: {persist_error}"
@@ -1633,7 +2648,10 @@ impl WorkflowEngine {
                     continue;
                 }
                 WorkflowV2FlowMode::Conditional { when } => {
+                    self.record_step_started_transition(run_id, step).await?;
                     if !Self::flow_condition_matches(when, &current_input) {
+                        self.record_step_skipped_transition(run_id, &step.id, "condition_not_met")
+                            .await?;
                         info!(
                             step = index + 1,
                             name = %step.name,
@@ -1649,10 +2667,48 @@ impl WorkflowEngine {
                             variables.insert(symbol.clone(), current_input.clone());
                         }
                         all_outputs.push(current_input.clone());
+                        self.record_step_completed_transition(
+                            run_id,
+                            &step.id,
+                            step.save_as.as_deref(),
+                            &checkpoint_output_summary(&current_input),
+                            vars_json(&variables),
+                        )
+                        .await?;
                     } else {
-                        let agent = Self::agent_target(step)?;
-                        let (agent_id, agent_name) = agent_resolver(agent)
-                            .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
+                        let agent = match Self::agent_target(step) {
+                            Ok(agent) => agent,
+                            Err(error) => {
+                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
+                                    .await?;
+                                if let Err(persist_error) = self
+                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
+                                    .await
+                                {
+                                    return Err(format!(
+                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
+                                }
+                                return Err(error);
+                            }
+                        };
+                        let (agent_id, agent_name) = match agent_resolver(agent) {
+                            Some(agent) => agent,
+                            None => {
+                                let error = format!("Agent not found for step '{}'", step.name);
+                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
+                                    .await?;
+                                if let Err(persist_error) = self
+                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
+                                    .await
+                                {
+                                    return Err(format!(
+                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
+                                }
+                                return Err(error);
+                            }
+                        };
                         let prompt = Self::render_step_payload(step, &current_input, &variables);
                         let start = std::time::Instant::now();
                         let result = Self::execute_step_with_error_mode(
@@ -1683,11 +2739,29 @@ impl WorkflowEngine {
                                 }
                                 all_outputs.push(output.clone());
                                 current_input = output;
+                                self.record_step_completed_transition(
+                                    run_id,
+                                    &step.id,
+                                    step.save_as.as_deref(),
+                                    &checkpoint_output_summary(&current_input),
+                                    vars_json(&variables),
+                                )
+                                .await?;
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                self.record_step_skipped_transition(
+                                    run_id,
+                                    &step.id,
+                                    "conditional step returned no output",
+                                )
+                                .await?;
+                            }
                             Err(error) => {
-                                if let Err(persist_error) =
-                                    self.mark_run_failed(run_id, &error).await
+                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
+                                    .await?;
+                                if let Err(persist_error) = self
+                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
+                                    .await
                                 {
                                     return Err(format!(
                                         "{error}; additionally failed to persist workflow failure: {persist_error}"
@@ -1702,6 +2776,7 @@ impl WorkflowEngine {
                     max_iterations,
                     until,
                 } => {
+                    self.record_step_started_transition(run_id, step).await?;
                     if matches!(step.kind, WorkflowIrStepKind::Noop) {
                         for loop_iter in 0..*max_iterations {
                             if Self::flow_condition_matches(until, &current_input) {
@@ -1719,10 +2794,48 @@ impl WorkflowEngine {
                             variables.insert(symbol.clone(), current_input.clone());
                         }
                         all_outputs.push(current_input.clone());
+                        self.record_step_completed_transition(
+                            run_id,
+                            &step.id,
+                            step.save_as.as_deref(),
+                            &checkpoint_output_summary(&current_input),
+                            vars_json(&variables),
+                        )
+                        .await?;
                     } else {
-                        let agent = Self::agent_target(step)?;
-                        let (agent_id, agent_name) = agent_resolver(agent)
-                            .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
+                        let agent = match Self::agent_target(step) {
+                            Ok(agent) => agent,
+                            Err(error) => {
+                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
+                                    .await?;
+                                if let Err(persist_error) = self
+                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
+                                    .await
+                                {
+                                    return Err(format!(
+                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
+                                }
+                                return Err(error);
+                            }
+                        };
+                        let (agent_id, agent_name) = match agent_resolver(agent) {
+                            Some(agent) => agent,
+                            None => {
+                                let error = format!("Agent not found for step '{}'", step.name);
+                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
+                                    .await?;
+                                if let Err(persist_error) = self
+                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
+                                    .await
+                                {
+                                    return Err(format!(
+                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
+                                }
+                                return Err(error);
+                            }
+                        };
 
                         for loop_iter in 0..*max_iterations {
                             let prompt =
@@ -1777,8 +2890,15 @@ impl WorkflowEngine {
                                 }
                                 Ok(None) => break,
                                 Err(error) => {
-                                    if let Err(persist_error) =
-                                        self.mark_run_failed(run_id, &error).await
+                                    self.record_step_failed_transition(run_id, &step.id, &error, 1)
+                                        .await?;
+                                    if let Err(persist_error) = self
+                                        .record_run_failed_transition(
+                                            run_id,
+                                            Some(&step.id),
+                                            &error,
+                                        )
+                                        .await
                                     {
                                         return Err(format!(
                                             "{error}; additionally failed to persist workflow failure: {persist_error}"
@@ -1793,6 +2913,14 @@ impl WorkflowEngine {
                             variables.insert(symbol.clone(), current_input.clone());
                         }
                         all_outputs.push(current_input.clone());
+                        self.record_step_completed_transition(
+                            run_id,
+                            &step.id,
+                            step.save_as.as_deref(),
+                            &checkpoint_output_summary(&current_input),
+                            vars_json(&variables),
+                        )
+                        .await?;
                     }
                 }
             }
@@ -1801,7 +2929,8 @@ impl WorkflowEngine {
         }
 
         let final_output = current_input.clone();
-        self.mark_run_completed(run_id, &final_output).await?;
+        self.record_run_completed_transition(run_id, &final_output)
+            .await?;
         info!(run_id = %run_id, workflow_id = %workflow.workflow_id, "Workflow completed successfully");
         Ok(final_output)
     }
@@ -1967,6 +3096,26 @@ mod tests {
     fn mock_resolver(agent: &str) -> Option<(AgentId, String)> {
         let _ = agent;
         Some((AgentId::new(), "mock-agent".to_string()))
+    }
+
+    fn load_durable_run(engine: &WorkflowEngine, run_id: WorkflowRunId) -> WorkflowRunRecord {
+        engine
+            .workflow_stores
+            .workflow_run
+            .find_by_id(&run_id.to_string())
+            .expect("durable workflow run query should succeed")
+            .expect("durable workflow run should exist")
+    }
+
+    fn load_durable_checkpoints(
+        engine: &WorkflowEngine,
+        run_id: WorkflowRunId,
+    ) -> Vec<WorkflowCheckpointRecord> {
+        engine
+            .workflow_stores
+            .workflow_checkpoint
+            .list_for_run(&run_id.to_string())
+            .expect("durable workflow checkpoint query should succeed")
     }
 
     #[tokio::test]
@@ -2163,6 +3312,149 @@ mod tests {
         let run = engine.get_run(run_id).await.unwrap();
         assert_eq!(run.input, "test input");
         assert!(matches!(run.state, WorkflowRunState::Pending));
+    }
+
+    #[tokio::test]
+    async fn run_creation_persists_workflow_run_row() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = test_workflow();
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+
+        let run_id = engine
+            .create_run(workflow_id, "test input".to_string())
+            .await
+            .expect("workflow run should be created");
+
+        let record = load_durable_run(&engine, run_id);
+        let stored_input: serde_json::Value =
+            serde_json::from_str(&record.input_json).expect("stored input should be valid json");
+
+        assert_eq!(record.workflow_id, workflow_id.to_string());
+        assert_eq!(record.workflow_version, "legacy");
+        assert_eq!(record.status, DurableWorkflowRunStatus::Pending);
+        assert_eq!(stored_input, serde_json::json!("test input"));
+    }
+
+    #[tokio::test]
+    async fn run_creation_appends_run_created_checkpoint() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = test_workflow();
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+
+        let run_id = engine
+            .create_run(workflow_id, "seed input".to_string())
+            .await
+            .expect("workflow run should be created");
+
+        let checkpoints = load_durable_checkpoints(&engine, run_id);
+
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].kind, DurableCheckpointKind::RunCreated);
+        let payload: serde_json::Value = serde_json::from_str(&checkpoints[0].data_json)
+            .expect("run_created checkpoint payload should be valid json");
+        assert_eq!(payload["workflow_id"], workflow_id.to_string());
+        assert_eq!(payload["input"], serde_json::json!("seed input"));
+    }
+
+    #[tokio::test]
+    async fn transition_writer_step_completed_updates_run_and_appends_checkpoint() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = test_workflow();
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "step input".to_string())
+            .await
+            .expect("workflow run should be created");
+
+        engine
+            .record_run_started_transition(run_id, Some("analyze"))
+            .await
+            .expect("run should start");
+        engine
+            .record_step_started_transition(
+                run_id,
+                &WorkflowIrStep {
+                    id: "analyze".to_string(),
+                    name: "Analyze".to_string(),
+                    kind: WorkflowIrStepKind::Agent {
+                        agent: "analyst".to_string(),
+                    },
+                    flow: FlowBlock {
+                        mode: WorkflowV2FlowMode::Sequential,
+                    },
+                    runtime: ResolvedRuntimeSettings::default(),
+                    with: BTreeMap::new(),
+                    save_as: Some("analysis".to_string()),
+                },
+            )
+            .await
+            .expect("step should start");
+        engine
+            .record_step_completed_transition(
+                run_id,
+                "analyze",
+                Some("analysis"),
+                "analysis ready",
+                serde_json::json!({ "analysis": "ready" }).to_string(),
+            )
+            .await
+            .expect("step should complete");
+
+        let record = load_durable_run(&engine, run_id);
+        let checkpoints = load_durable_checkpoints(&engine, run_id);
+
+        assert_eq!(record.current_step_id.as_deref(), Some("analyze"));
+        let vars: serde_json::Value =
+            serde_json::from_str(&record.vars_json).expect("stored vars should be valid json");
+        assert_eq!(vars["analysis"], "ready");
+        assert_eq!(
+            checkpoints.last().map(|checkpoint| checkpoint.kind),
+            Some(DurableCheckpointKind::StepCompleted)
+        );
+    }
+
+    #[tokio::test]
+    async fn transition_writer_rejects_invalid_status_transition() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = test_workflow();
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "pending input".to_string())
+            .await
+            .expect("workflow run should be created");
+
+        let error = engine
+            .transition_writer()
+            .record_run_completed(run_id, "done")
+            .await
+            .expect_err("pending run should not complete directly");
+
+        let record = load_durable_run(&engine, run_id);
+        let checkpoints = load_durable_checkpoints(&engine, run_id);
+
+        assert!(matches!(
+            error,
+            TransitionError::InvalidStatusTransition { .. }
+        ));
+        assert_eq!(record.status, DurableWorkflowRunStatus::Pending);
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].kind, DurableCheckpointKind::RunCreated);
     }
 
     #[tokio::test]
@@ -2540,6 +3832,200 @@ mod tests {
         assert!(matches!(run.state, WorkflowRunState::Completed));
         assert_eq!(run.step_results.len(), 2);
         assert!(run.output.is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_state_run_failed_persists_error_json() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = Workflow {
+            id: WorkflowId::new(),
+            name: "missing-agent".to_string(),
+            description: "fails because the agent cannot be resolved".to_string(),
+            steps: vec![WorkflowStep {
+                name: "missing".to_string(),
+                agent: StepAgent::ByName {
+                    name: "ghost-agent".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+            }],
+            created_at: Utc::now(),
+        };
+        let workflow_ir = legacy_ir(&workflow);
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "input".to_string())
+            .await
+            .expect("workflow run should be created");
+
+        let error = engine
+            .execute_run(
+                run_id,
+                workflow_ir,
+                |_| None,
+                |_id: AgentId, _msg: String| async move { Ok(("unused".to_string(), 0, 0)) },
+            )
+            .await
+            .expect_err("workflow should fail when agent resolution fails");
+
+        let record = load_durable_run(&engine, run_id);
+        let error_json = record
+            .error_json
+            .as_deref()
+            .expect("failed run should persist error json");
+        let payload: serde_json::Value =
+            serde_json::from_str(error_json).expect("error json should be valid");
+
+        assert!(error.contains("Agent not found"));
+        assert_eq!(record.status, DurableWorkflowRunStatus::Failed);
+        assert_eq!(payload["step_id"], "missing");
+        assert!(payload["message"]
+            .as_str()
+            .expect("message should be a string")
+            .contains("Agent not found"));
+    }
+
+    #[tokio::test]
+    async fn terminal_state_run_completed_sets_completed_at() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = test_workflow();
+        let workflow_ir = legacy_ir(&workflow);
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "complete me".to_string())
+            .await
+            .expect("workflow run should be created");
+
+        let result = engine
+            .execute_run(
+                run_id,
+                workflow_ir,
+                mock_resolver,
+                |_id: AgentId, msg: String| async move { Ok((format!("Processed: {msg}"), 1, 1)) },
+            )
+            .await
+            .expect("workflow should complete");
+
+        let record = load_durable_run(&engine, run_id);
+
+        assert!(result.contains("Processed:"));
+        assert_eq!(record.status, DurableWorkflowRunStatus::Completed);
+        assert!(record.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn signal_consumption_appends_signal_received_checkpoint() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = test_workflow();
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "waiting input".to_string())
+            .await
+            .expect("workflow run should be created");
+        let mut waiting_record = load_durable_run(&engine, run_id);
+        waiting_record.status = DurableWorkflowRunStatus::Waiting;
+        waiting_record.current_step_id = Some("await-approval".to_string());
+        waiting_record.waiting_kind = Some("signal".to_string());
+        waiting_record.waiting_ref = Some("approval".to_string());
+        waiting_record.updated_at = now_timestamp();
+        engine
+            .workflow_stores
+            .workflow_run
+            .replace_run(&waiting_record)
+            .expect("waiting run should persist");
+        engine.runs.write().await.clear();
+        let signal = openfang_memory::WorkflowSignalRecord {
+            signal_id: "signal-approval".to_string(),
+            run_id: run_id.to_string(),
+            name: "approval".to_string(),
+            payload_json: serde_json::json!({ "decision": "approved" }).to_string(),
+            source: "api".to_string(),
+            consumed: false,
+            created_at: now_timestamp(),
+            consumed_at: None,
+        };
+        engine
+            .workflow_stores
+            .workflow_signal
+            .insert(&signal)
+            .expect("signal should persist before consumption");
+
+        engine
+            .record_signal_received_transition(
+                run_id,
+                "await-approval",
+                &signal.signal_id,
+                &signal.name,
+                "approved",
+            )
+            .await
+            .expect("signal should resume run");
+
+        let record = load_durable_run(&engine, run_id);
+        let signal_record = engine
+            .workflow_stores
+            .workflow_signal
+            .find_by_id(&signal.signal_id)
+            .expect("signal should load")
+            .expect("signal should exist");
+        let checkpoints = load_durable_checkpoints(&engine, run_id);
+
+        assert_eq!(record.status, DurableWorkflowRunStatus::Running);
+        assert_eq!(record.waiting_kind, None);
+        assert!(signal_record.consumed);
+        assert!(checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.kind == DurableCheckpointKind::SignalReceived));
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_marks_running_runs_interrupted() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = test_workflow();
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "recover me".to_string())
+            .await
+            .expect("workflow run should be created");
+
+        engine
+            .record_run_started_transition(run_id, Some("analyze"))
+            .await
+            .expect("run should start");
+        engine.clear_run_cache().await;
+
+        let interrupted = engine
+            .recover_durable_runs()
+            .await
+            .expect("durable runs should recover");
+        let record = load_durable_run(&engine, run_id);
+        let cached = engine
+            .get_run(run_id)
+            .await
+            .expect("recovered run should be projected into cache");
+
+        assert_eq!(interrupted, 1);
+        assert_eq!(record.status, DurableWorkflowRunStatus::Interrupted);
+        assert!(matches!(cached.state, WorkflowRunState::Interrupted));
     }
 
     #[tokio::test]

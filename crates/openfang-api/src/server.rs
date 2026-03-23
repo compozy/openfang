@@ -342,8 +342,18 @@ pub async fn build_router(
             axum::routing::get(routes::get_workflow_compiled),
         )
         .route(
+            "/api/v1/workflows/{id}/runs",
+            axum::routing::get(routes::list_workflow_runs_v1).post(routes::start_workflow_run_v1),
+        )
+        .route(
             "/api/v1/workflows/{id}/runtime",
             axum::routing::get(routes::get_workflow_runtime),
+        )
+        .route("/api/v1/runs", axum::routing::get(routes::list_runs_v1))
+        .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))
+        .route(
+            "/api/v1/runs/{id}/checkpoints",
+            axum::routing::get(routes::get_run_checkpoints_v1),
         )
         // Skills endpoints
         .route("/api/skills", axum::routing::get(routes::list_skills))

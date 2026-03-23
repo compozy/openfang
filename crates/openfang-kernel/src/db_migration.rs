@@ -6,7 +6,8 @@
 use openfang_memory::{
     AGENT_RUNTIME_CORE_MIGRATION_SQL, AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL,
     SCHEDULE_RUNTIME_CORE_MIGRATION_SQL, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
-    WORKFLOW_RUN_CORE_MIGRATION_SQL, WORKFLOW_SIGNAL_MIGRATION_SQL,
+    WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
+    WORKFLOW_SIGNAL_MIGRATION_SQL,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
@@ -147,6 +148,11 @@ const COMPOZY_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[
         WORKFLOW_CHECKPOINT_MIGRATION_SQL,
     ),
     MigrationStep::new(4, "0004_workflow_signal", WORKFLOW_SIGNAL_MIGRATION_SQL),
+    MigrationStep::new(
+        5,
+        "0005_workflow_runtime_durability",
+        WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
+    ),
 ];
 
 /// Returns the current `runtime.db` migration slice.

@@ -1,5 +1,6 @@
 //! Integration coverage for dual-database kernel bootstrap.
 
+use openfang_kernel::workflow::{WorkflowRunId, WorkflowRunState};
 use openfang_kernel::OpenFangKernel;
 use openfang_memory::{AgentRuntimeRecord, CheckpointKind, WorkflowRunRecord, WorkflowRunStatus};
 use openfang_types::agent::{AgentMode, AgentState};
@@ -78,13 +79,13 @@ fn table_names(path: &std::path::Path) -> Vec<String> {
 
 fn sample_workflow_run(run_id: &str) -> WorkflowRunRecord {
     WorkflowRunRecord {
-        run_id: run_id.to_string(),
+        run_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, run_id.as_bytes()).to_string(),
         workflow_id: Uuid::new_v4().to_string(),
-        workflow_version: Some("2026.03.23".to_string()),
+        workflow_version: "2026.03.23".to_string(),
         status: WorkflowRunStatus::Pending,
         input_json: "\"hello workflow\"".to_string(),
         vars_json: "{}".to_string(),
-        current_step_id: Some("step-1".to_string()),
+        current_step_id: None,
         waiting_kind: None,
         waiting_ref: None,
         active_dispatch_id: None,
@@ -92,7 +93,7 @@ fn sample_workflow_run(run_id: &str) -> WorkflowRunRecord {
         labels_json: "[]".to_string(),
         metadata_json: "{}".to_string(),
         error_json: None,
-        started_at: None,
+        started_at: "2026-03-23T12:00:00Z".to_string(),
         updated_at: "2026-03-23T12:00:00Z".to_string(),
         completed_at: None,
     }
@@ -198,7 +199,7 @@ fn migration_status_is_queryable_after_boot() {
     let compozy_rows = schema_migration_rows(&compozy_db);
 
     assert_eq!(runtime_rows.len(), 4);
-    assert_eq!(compozy_rows.len(), 4);
+    assert_eq!(compozy_rows.len(), 5);
     assert_eq!(runtime_rows[0].0, 1);
     assert_eq!(compozy_rows[0].0, 1);
     assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -209,6 +210,7 @@ fn migration_status_is_queryable_after_boot() {
     assert_eq!(compozy_rows[1].1, "0002_workflow_run_core");
     assert_eq!(compozy_rows[2].1, "0003_workflow_checkpoint");
     assert_eq!(compozy_rows[3].1, "0004_workflow_signal");
+    assert_eq!(compozy_rows[4].1, "0005_workflow_runtime_durability");
 
     kernel.shutdown();
 }
@@ -261,46 +263,52 @@ fn boot_should_create_compozy_db_with_all_phase_1_tables() {
     kernel.shutdown();
 }
 
-#[test]
-fn boot_should_run_recovery_scan_before_workflow_engine_starts() {
+#[tokio::test]
+async fn boot_should_recover_running_workflow_runs_as_interrupted() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let config = boot_test_config(tmp.path());
-    let record = sample_workflow_run("run-recovery-boot");
+    let mut record = sample_workflow_run("run-recovery-boot");
+    record.status = WorkflowRunStatus::Running;
+    record.current_step_id = Some("step-1".to_string());
 
     let first_kernel = OpenFangKernel::boot_with_config(config.clone()).expect("first boot");
     first_kernel
         .workflow_stores
         .workflow_run
-        .create_run(&record)
+        .insert_run(&record)
         .expect("store workflow run");
-    first_kernel
-        .workflow_stores
-        .workflow_run
-        .update_run_status(&record.run_id, WorkflowRunStatus::Running)
-        .expect("mark workflow run as running");
     first_kernel.shutdown();
 
     let second_kernel = OpenFangKernel::boot_with_config(config).expect("second boot");
+    second_kernel.bootstrap_workflow_definitions().await;
     let loaded = second_kernel
         .workflow_stores
         .workflow_run
-        .get_run(&record.run_id)
+        .find_by_id(&record.run_id)
         .expect("load recovered workflow run")
         .expect("workflow run should persist");
     let checkpoints = second_kernel
         .workflow_stores
         .workflow_checkpoint
-        .list_checkpoints_for_run(&record.run_id)
+        .list_for_run(&record.run_id)
         .expect("load checkpoints");
+    let cached = second_kernel
+        .workflows
+        .get_run(WorkflowRunId(
+            Uuid::parse_str(&record.run_id).expect("valid run id"),
+        ))
+        .await
+        .expect("workflow run should be projected into cache");
 
-    assert_eq!(loaded.status, WorkflowRunStatus::Paused);
+    assert_eq!(loaded.status, WorkflowRunStatus::Interrupted);
     assert_eq!(
         checkpoints
             .iter()
-            .filter(|checkpoint| checkpoint.kind == CheckpointKind::RunRecoveredNeedsResume)
+            .filter(|checkpoint| checkpoint.kind == CheckpointKind::RunInterrupted)
             .count(),
         1
     );
+    assert!(matches!(cached.state, WorkflowRunState::Interrupted));
 
     second_kernel.shutdown();
 }
@@ -315,7 +323,7 @@ fn workflow_run_should_survive_restart() {
     first_kernel
         .workflow_stores
         .workflow_run
-        .create_run(&record)
+        .insert_run(&record)
         .expect("store workflow run");
     first_kernel.shutdown();
 
@@ -323,7 +331,7 @@ fn workflow_run_should_survive_restart() {
     let loaded = second_kernel
         .workflow_stores
         .workflow_run
-        .get_run(&record.run_id)
+        .find_by_id(&record.run_id)
         .expect("load workflow run")
         .expect("workflow run should persist");
 
@@ -332,41 +340,44 @@ fn workflow_run_should_survive_restart() {
     second_kernel.shutdown();
 }
 
-#[test]
-fn waiting_signal_run_should_survive_restart_and_remain_resumable() {
+#[tokio::test]
+async fn waiting_run_should_survive_restart_and_remain_resumable() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let config = boot_test_config(tmp.path());
-    let record = sample_workflow_run("run-waiting-survival");
+    let mut record = sample_workflow_run("run-waiting-survival");
+    record.status = WorkflowRunStatus::Waiting;
+    record.current_step_id = Some("step-approval".to_string());
+    record.waiting_kind = Some("signal".to_string());
+    record.waiting_ref = Some("approval-42".to_string());
 
     let first_kernel = OpenFangKernel::boot_with_config(config.clone()).expect("first boot");
     first_kernel
         .workflow_stores
         .workflow_run
-        .create_run(&record)
+        .insert_run(&record)
         .expect("store workflow run");
-    first_kernel
-        .workflow_stores
-        .workflow_run
-        .update_run_waiting_state(&record.run_id, Some("signal"), Some("approval-42"))
-        .expect("update waiting state");
-    first_kernel
-        .workflow_stores
-        .workflow_run
-        .update_run_status(&record.run_id, WorkflowRunStatus::WaitingSignal)
-        .expect("mark workflow run as waiting_signal");
     first_kernel.shutdown();
 
     let second_kernel = OpenFangKernel::boot_with_config(config).expect("second boot");
+    second_kernel.bootstrap_workflow_definitions().await;
     let loaded = second_kernel
         .workflow_stores
         .workflow_run
-        .get_run(&record.run_id)
+        .find_by_id(&record.run_id)
         .expect("load workflow run")
         .expect("workflow run should persist");
+    let cached = second_kernel
+        .workflows
+        .get_run(WorkflowRunId(
+            Uuid::parse_str(&record.run_id).expect("valid run id"),
+        ))
+        .await
+        .expect("waiting workflow run should be projected into cache");
 
-    assert_eq!(loaded.status, WorkflowRunStatus::WaitingSignal);
+    assert_eq!(loaded.status, WorkflowRunStatus::Waiting);
     assert_eq!(loaded.waiting_kind.as_deref(), Some("signal"));
     assert_eq!(loaded.waiting_ref.as_deref(), Some("approval-42"));
+    assert!(matches!(cached.state, WorkflowRunState::Waiting));
 
     second_kernel.shutdown();
 }

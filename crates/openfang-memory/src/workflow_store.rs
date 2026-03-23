@@ -1,12 +1,10 @@
-//! Typed compozy.db stores for durable workflow runtime state.
+//! Typed `compozy.db` repositories for durable workflow runtime state.
 
 use chrono::Utc;
 use openfang_types::error::OpenFangError;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::Value;
 use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
-use uuid::Uuid;
 
 /// SQL for migration `0002_workflow_run_core`.
 pub const WORKFLOW_RUN_CORE_MIGRATION_SQL: &str =
@@ -20,45 +18,50 @@ pub const WORKFLOW_CHECKPOINT_MIGRATION_SQL: &str =
 pub const WORKFLOW_SIGNAL_MIGRATION_SQL: &str =
     include_str!("../migrations/compozy/20260321_004_workflow_signal.sql");
 
-/// Shared compozy.db store handles.
+/// SQL for migration `0005_workflow_runtime_durability`.
+pub const WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL: &str =
+    include_str!("../migrations/compozy/20260323_005_workflow_runtime_durability.sql");
+
+/// Shared `compozy.db` repository handles.
 #[derive(Clone)]
 pub struct WorkflowStoreSet {
     connection: Arc<Mutex<Connection>>,
-    /// Store for durable workflow runs.
-    pub workflow_run: WorkflowRunStore,
-    /// Store for workflow checkpoints.
-    pub workflow_checkpoint: WorkflowCheckpointStore,
-    /// Store for durable workflow signals.
-    pub workflow_signal: WorkflowSignalStore,
+    /// Repository for durable workflow runs.
+    pub workflow_run: WorkflowRunRepository,
+    /// Repository for durable workflow checkpoints.
+    pub workflow_checkpoint: WorkflowCheckpointRepository,
+    /// Repository for durable workflow signals.
+    pub workflow_signal: WorkflowSignalRepository,
 }
 
 impl WorkflowStoreSet {
-    /// Create the full workflow store set from a shared compozy.db connection.
+    /// Create the full workflow repository set from a shared `compozy.db`
+    /// connection.
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self {
             connection: Arc::clone(&conn),
-            workflow_run: WorkflowRunStore::new(Arc::clone(&conn)),
-            workflow_checkpoint: WorkflowCheckpointStore::new(Arc::clone(&conn)),
-            workflow_signal: WorkflowSignalStore::new(conn),
+            workflow_run: WorkflowRunRepository::new(Arc::clone(&conn)),
+            workflow_checkpoint: WorkflowCheckpointRepository::new(Arc::clone(&conn)),
+            workflow_signal: WorkflowSignalRepository::new(conn),
         }
     }
 
-    /// Return the underlying compozy.db handle for health probes.
+    /// Return the underlying `compozy.db` handle for health probes.
     pub fn connection(&self) -> Arc<Mutex<Connection>> {
         Arc::clone(&self.connection)
     }
 }
 
-/// Typed failures from the workflow store layer.
+/// Typed failures from the workflow repository layer.
 #[derive(Debug, Error)]
 pub enum WorkflowStoreError {
-    /// Failed to acquire the compozy.db connection lock.
+    /// Failed to acquire the `compozy.db` connection lock.
     #[error("failed to acquire compozy.db connection lock: {0}")]
     ConnectionLock(String),
     /// SQLite returned an error for the requested operation.
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    /// JSON serialization failed.
+    /// JSON serialization or deserialization failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     /// The requested workflow run does not exist.
@@ -67,6 +70,25 @@ pub enum WorkflowStoreError {
     /// The requested workflow signal does not exist.
     #[error("workflow signal '{signal_id}' was not found")]
     SignalNotFound { signal_id: String },
+    /// The requested workflow signal was already consumed.
+    #[error("workflow signal '{signal_id}' was already consumed")]
+    SignalAlreadyConsumed { signal_id: String },
+    /// A stored workflow status string was invalid.
+    #[error("invalid workflow run status '{status}'")]
+    InvalidRunStatus { status: String },
+    /// A stored checkpoint kind string was invalid.
+    #[error("invalid workflow checkpoint kind '{kind}'")]
+    InvalidCheckpointKind { kind: String },
+    /// A transition attempted to update a run from an unexpected state.
+    #[error("workflow run '{run_id}' expected current state one of [{expected}], got '{actual}'")]
+    UnexpectedRunState {
+        /// Run identifier.
+        run_id: String,
+        /// Expected current states.
+        expected: String,
+        /// Actual current state found in the database.
+        actual: String,
+    },
 }
 
 impl From<WorkflowStoreError> for OpenFangError {
@@ -78,20 +100,20 @@ impl From<WorkflowStoreError> for OpenFangError {
 /// Durable workflow status stored in `workflow_run.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowRunStatus {
-    /// The run has been created but not yet started.
+    /// The run has been created but execution has not started yet.
     Pending,
-    /// The run is currently executing.
+    /// The run is actively executing.
     Running,
-    /// The run is waiting for an external signal.
-    WaitingSignal,
-    /// The run was paused and requires an explicit resume.
-    Paused,
+    /// The run is durably parked on an external wait condition.
+    Waiting,
     /// The run completed successfully.
     Completed,
     /// The run failed.
     Failed,
     /// The run was cancelled.
     Cancelled,
+    /// The run was interrupted by process restart or crash recovery.
+    Interrupted,
 }
 
 impl WorkflowRunStatus {
@@ -100,12 +122,32 @@ impl WorkflowRunStatus {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
-            Self::WaitingSignal => "waiting_signal",
-            Self::Paused => "paused",
+            Self::Waiting => "waiting",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
         }
+    }
+
+    fn parse_db_text(value: &str) -> Result<Self, WorkflowStoreError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "waiting" => Ok(Self::Waiting),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            other => Err(WorkflowStoreError::InvalidRunStatus {
+                status: other.to_string(),
+            }),
+        }
+    }
+
+    /// Whether the status is terminal.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 }
 
@@ -115,28 +157,48 @@ impl std::fmt::Display for WorkflowRunStatus {
     }
 }
 
+impl std::str::FromStr for WorkflowRunStatus {
+    type Err = WorkflowStoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse_db_text(value)
+    }
+}
+
 /// Durable workflow checkpoint kinds stored in `workflow_checkpoint.kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointKind {
-    /// The workflow run row was created.
+    /// Initial checkpoint emitted after the run row is created.
     RunCreated,
-    /// The workflow run moved to running.
+    /// The run started execution.
     RunStarted,
-    /// The current step selection changed.
-    StepSelected,
-    /// The run is waiting for a signal.
-    WaitingSignal,
-    /// A signal was delivered to the run.
+    /// A workflow step started execution.
+    StepStarted,
+    /// A workflow step completed successfully.
+    StepCompleted,
+    /// A workflow step failed.
+    StepFailed,
+    /// A workflow step was skipped.
+    StepSkipped,
+    /// A durable signal was received and consumed.
     SignalReceived,
-    /// The run was paused.
-    RunPaused,
-    /// The run was resumed.
-    RunResumed,
     /// The run completed successfully.
     RunCompleted,
     /// The run failed.
     RunFailed,
-    /// The run was recovered on boot and needs an explicit resume.
+    /// The run was cancelled.
+    RunCancelled,
+    /// The run was interrupted during restart recovery.
+    RunInterrupted,
+    /// Legacy Task 9 checkpoint kind kept for migration compatibility.
+    StepSelected,
+    /// Legacy Task 9 checkpoint kind kept for migration compatibility.
+    WaitingSignal,
+    /// Legacy Task 9 checkpoint kind kept for migration compatibility.
+    RunPaused,
+    /// Legacy Task 9 checkpoint kind kept for migration compatibility.
+    RunResumed,
+    /// Legacy Task 9 checkpoint kind kept for migration compatibility.
     RunRecoveredNeedsResume,
 }
 
@@ -146,14 +208,44 @@ impl CheckpointKind {
         match self {
             Self::RunCreated => "run_created",
             Self::RunStarted => "run_started",
-            Self::StepSelected => "step_selected",
-            Self::WaitingSignal => "waiting_signal",
+            Self::StepStarted => "step_started",
+            Self::StepCompleted => "step_completed",
+            Self::StepFailed => "step_failed",
+            Self::StepSkipped => "step_skipped",
             Self::SignalReceived => "signal_received",
-            Self::RunPaused => "run_paused",
-            Self::RunResumed => "run_resumed",
             Self::RunCompleted => "run_completed",
             Self::RunFailed => "run_failed",
+            Self::RunCancelled => "run_cancelled",
+            Self::RunInterrupted => "run_interrupted",
+            Self::StepSelected => "step_selected",
+            Self::WaitingSignal => "waiting_signal",
+            Self::RunPaused => "run_paused",
+            Self::RunResumed => "run_resumed",
             Self::RunRecoveredNeedsResume => "run_recovered_needs_resume",
+        }
+    }
+
+    fn parse_db_text(value: &str) -> Result<Self, WorkflowStoreError> {
+        match value {
+            "run_created" => Ok(Self::RunCreated),
+            "run_started" => Ok(Self::RunStarted),
+            "step_started" => Ok(Self::StepStarted),
+            "step_completed" => Ok(Self::StepCompleted),
+            "step_failed" => Ok(Self::StepFailed),
+            "step_skipped" => Ok(Self::StepSkipped),
+            "signal_received" => Ok(Self::SignalReceived),
+            "run_completed" => Ok(Self::RunCompleted),
+            "run_failed" => Ok(Self::RunFailed),
+            "run_cancelled" => Ok(Self::RunCancelled),
+            "run_interrupted" => Ok(Self::RunInterrupted),
+            "step_selected" => Ok(Self::StepSelected),
+            "waiting_signal" => Ok(Self::WaitingSignal),
+            "run_paused" => Ok(Self::RunPaused),
+            "run_resumed" => Ok(Self::RunResumed),
+            "run_recovered_needs_resume" => Ok(Self::RunRecoveredNeedsResume),
+            other => Err(WorkflowStoreError::InvalidCheckpointKind {
+                kind: other.to_string(),
+            }),
         }
     }
 }
@@ -164,6 +256,14 @@ impl std::fmt::Display for CheckpointKind {
     }
 }
 
+impl std::str::FromStr for CheckpointKind {
+    type Err = WorkflowStoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse_db_text(value)
+    }
+}
+
 /// Durable workflow run record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowRunRecord {
@@ -171,17 +271,17 @@ pub struct WorkflowRunRecord {
     pub run_id: String,
     /// Stable workflow definition identifier.
     pub workflow_id: String,
-    /// Optional workflow definition version.
-    pub workflow_version: Option<String>,
+    /// Compiled workflow version.
+    pub workflow_version: String,
     /// Current durable run status.
     pub status: WorkflowRunStatus,
     /// Workflow input payload encoded as JSON text.
     pub input_json: String,
     /// Durable workflow variables encoded as JSON text.
     pub vars_json: String,
-    /// Currently selected step, if any.
+    /// Currently active step identifier, if any.
     pub current_step_id: Option<String>,
-    /// Waiting state kind, if the run is blocked on an external event.
+    /// Waiting state kind, if the run is blocked externally.
     pub waiting_kind: Option<String>,
     /// Waiting state reference, if any.
     pub waiting_ref: Option<String>,
@@ -195,8 +295,8 @@ pub struct WorkflowRunRecord {
     pub metadata_json: String,
     /// Serialized error payload, if any.
     pub error_json: Option<String>,
-    /// Workflow start timestamp, if execution began.
-    pub started_at: Option<String>,
+    /// Run creation timestamp.
+    pub started_at: String,
     /// Last update timestamp.
     pub updated_at: String,
     /// Completion timestamp, if the run finished.
@@ -231,8 +331,8 @@ pub struct WorkflowSignalRecord {
     pub name: String,
     /// Signal payload encoded as JSON text.
     pub payload_json: String,
-    /// Optional source identifier.
-    pub source: Option<String>,
+    /// Signal source, such as `api`, `trigger`, or `schedule`.
+    pub source: String,
     /// Whether the signal was consumed.
     pub consumed: bool,
     /// Creation timestamp.
@@ -241,102 +341,135 @@ pub struct WorkflowSignalRecord {
     pub consumed_at: Option<String>,
 }
 
-/// Atomic status transition and checkpoint append request.
-#[derive(Debug, Clone, PartialEq)]
-pub struct WorkflowTransitionRequest {
-    /// New durable status.
-    pub new_status: WorkflowRunStatus,
-    /// Optional step ID to set or preserve when absent.
-    pub step_id: Option<String>,
-    /// Stable checkpoint identifier.
-    pub checkpoint_id: String,
-    /// Checkpoint kind to append.
-    pub checkpoint_kind: CheckpointKind,
-    /// JSON checkpoint payload.
-    pub checkpoint_data: Value,
-    /// Timestamp to store on the run and checkpoint.
-    pub updated_at: String,
-    /// Optional terminal timestamp for completed/failed/cancelled transitions.
-    pub completed_at: Option<String>,
+/// Filter arguments for durable run listing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowRunListQuery {
+    /// Filter by workflow definition ID.
+    pub workflow_id: Option<String>,
+    /// Filter by status.
+    pub status: Option<WorkflowRunStatus>,
+    /// Filter by waiting kind.
+    pub waiting_kind: Option<String>,
+    /// Filter by label membership.
+    pub label: Option<String>,
+    /// Free-text search over run and workflow identifiers plus JSON payloads.
+    pub search: Option<String>,
 }
 
-/// Store for `workflow_run`.
+/// Repository for `workflow_run`.
 #[derive(Clone)]
-pub struct WorkflowRunStore {
+pub struct WorkflowRunRepository {
     conn: Arc<Mutex<Connection>>,
 }
 
-/// Store for `workflow_checkpoint`.
+/// Repository for `workflow_checkpoint`.
 #[derive(Clone)]
-pub struct WorkflowCheckpointStore {
+pub struct WorkflowCheckpointRepository {
     conn: Arc<Mutex<Connection>>,
 }
 
-/// Store for `workflow_signal`.
+/// Repository for `workflow_signal`.
 #[derive(Clone)]
-pub struct WorkflowSignalStore {
+pub struct WorkflowSignalRepository {
     conn: Arc<Mutex<Connection>>,
 }
 
-impl WorkflowRunStore {
-    /// Create a workflow run store from a shared compozy.db connection.
+/// Backward-compatible alias kept while the rest of the workspace migrates to
+/// the repository terminology.
+pub type WorkflowRunStore = WorkflowRunRepository;
+/// Backward-compatible alias kept while the rest of the workspace migrates to
+/// the repository terminology.
+pub type WorkflowCheckpointStore = WorkflowCheckpointRepository;
+/// Backward-compatible alias kept while the rest of the workspace migrates to
+/// the repository terminology.
+pub type WorkflowSignalStore = WorkflowSignalRepository;
+
+impl WorkflowRunRepository {
+    /// Create a run repository from a shared `compozy.db` connection.
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
 
-    /// Insert a durable workflow run and append the initial `run_created` checkpoint
-    /// in a single SQLite transaction.
-    pub fn create_run(&self, record: &WorkflowRunRecord) -> Result<(), WorkflowStoreError> {
+    /// Insert a durable workflow run row.
+    pub fn insert_run(&self, record: &WorkflowRunRecord) -> Result<(), WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
-        let transaction = conn.unchecked_transaction()?;
-        insert_workflow_run(&transaction, record)?;
-
-        let checkpoint = WorkflowCheckpointRecord {
-            checkpoint_id: Uuid::new_v4().to_string(),
-            run_id: record.run_id.clone(),
-            step_id: record.current_step_id.clone(),
-            kind: CheckpointKind::RunCreated,
-            data_json: "{}".to_string(),
-            created_at: record.updated_at.clone(),
-        };
-        insert_checkpoint(&transaction, &checkpoint)?;
-        transaction.commit()?;
+        insert_workflow_run(&conn, record)?;
         Ok(())
     }
 
-    /// Load one workflow run by ID.
-    pub fn get_run(&self, run_id: &str) -> Result<Option<WorkflowRunRecord>, WorkflowStoreError> {
+    /// Replace the durable workflow run row with the full provided record.
+    pub fn replace_run(&self, record: &WorkflowRunRecord) -> Result<(), WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT
-                run_id,
-                workflow_id,
-                workflow_version,
-                status,
-                input_json,
-                vars_json,
-                current_step_id,
-                waiting_kind,
-                waiting_ref,
-                active_dispatch_id,
-                active_hitl_request_id,
-                labels_json,
-                metadata_json,
-                error_json,
-                started_at,
-                updated_at,
-                completed_at
-             FROM workflow_run
-             WHERE run_id = ?1",
-        )?;
-
-        stmt.query_row([run_id], read_workflow_run_row)
-            .optional()
-            .map_err(Into::into)
+        let rows = update_workflow_run_record(&conn, record, None)?;
+        ensure_row_updated(rows, &record.run_id)?;
+        Ok(())
     }
 
-    /// List all workflow runs ordered by most recent update first.
-    pub fn list_runs(&self) -> Result<Vec<WorkflowRunRecord>, WorkflowStoreError> {
+    /// Load one durable workflow run by ID.
+    pub fn find_by_id(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<WorkflowRunRecord>, WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        load_workflow_run(&conn, run_id)
+    }
+
+    /// List durable workflow runs using optional in-memory filtering over the
+    /// canonical database rows.
+    pub fn list_runs(
+        &self,
+        query: &WorkflowRunListQuery,
+    ) -> Result<Vec<WorkflowRunRecord>, WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        let mut records = list_all_workflow_runs(&conn)?;
+
+        if let Some(workflow_id) = query.workflow_id.as_deref() {
+            records.retain(|record| record.workflow_id == workflow_id);
+        }
+
+        if let Some(status) = query.status {
+            records.retain(|record| record.status == status);
+        }
+
+        if let Some(waiting_kind) = query.waiting_kind.as_deref() {
+            records.retain(|record| record.waiting_kind.as_deref() == Some(waiting_kind));
+        }
+
+        if let Some(label) = query.label.as_deref() {
+            records.retain(|record| {
+                serde_json::from_str::<Vec<String>>(&record.labels_json)
+                    .map(|labels| labels.iter().any(|candidate| candidate == label))
+                    .unwrap_or(false)
+            });
+        }
+
+        if let Some(search) = query.search.as_deref() {
+            let needle = search.to_lowercase();
+            records.retain(|record| {
+                record.run_id.to_lowercase().contains(&needle)
+                    || record.workflow_id.to_lowercase().contains(&needle)
+                    || record.input_json.to_lowercase().contains(&needle)
+                    || record.metadata_json.to_lowercase().contains(&needle)
+            });
+        }
+
+        Ok(records)
+    }
+
+    /// List durable runs for one workflow definition.
+    pub fn list_for_workflow(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<WorkflowRunRecord>, WorkflowStoreError> {
+        self.list_runs(&WorkflowRunListQuery {
+            workflow_id: Some(workflow_id.to_string()),
+            ..WorkflowRunListQuery::default()
+        })
+    }
+
+    /// Return the canonical set of non-terminal runs used for restart
+    /// recovery.
+    pub fn list_non_terminal(&self) -> Result<Vec<WorkflowRunRecord>, WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT
@@ -358,7 +491,8 @@ impl WorkflowRunStore {
                 updated_at,
                 completed_at
              FROM workflow_run
-             ORDER BY updated_at DESC, run_id DESC",
+             WHERE status IN ('pending', 'running', 'waiting')
+             ORDER BY updated_at ASC, run_id ASC",
         )?;
         let rows = stmt.query_map([], read_workflow_run_row)?;
         let mut records = Vec::new();
@@ -368,170 +502,75 @@ impl WorkflowRunStore {
         Ok(records)
     }
 
-    /// Update only the durable workflow status and touch `updated_at`.
-    pub fn update_run_status(
+    /// Append a checkpoint row and then replace the durable run row inside one
+    /// SQLite transaction.
+    pub fn persist_transition(
         &self,
-        run_id: &str,
-        status: WorkflowRunStatus,
-    ) -> Result<(), WorkflowStoreError> {
-        let conn = lock_conn(&self.conn)?;
-        let updated_at = now_timestamp();
-        let rows = conn.execute(
-            "UPDATE workflow_run
-             SET status = ?1,
-                 updated_at = ?2,
-                 started_at = CASE
-                     WHEN ?1 = 'running' AND started_at IS NULL THEN ?2
-                     ELSE started_at
-                 END,
-                 completed_at = CASE
-                     WHEN ?1 IN ('completed', 'failed', 'cancelled') THEN ?2
-                     ELSE completed_at
-                 END
-             WHERE run_id = ?3",
-            params![status.as_str(), updated_at.as_str(), run_id],
-        )?;
-        ensure_row_updated(rows, run_id)?;
-        Ok(())
-    }
-
-    /// Update the durable waiting state and touch `updated_at`.
-    pub fn update_run_waiting_state(
-        &self,
-        run_id: &str,
-        waiting_kind: Option<&str>,
-        waiting_ref: Option<&str>,
-    ) -> Result<(), WorkflowStoreError> {
-        let conn = lock_conn(&self.conn)?;
-        let updated_at = now_timestamp();
-        let rows = conn.execute(
-            "UPDATE workflow_run
-             SET waiting_kind = ?1,
-                 waiting_ref = ?2,
-                 updated_at = ?3
-             WHERE run_id = ?4",
-            params![waiting_kind, waiting_ref, updated_at.as_str(), run_id],
-        )?;
-        ensure_row_updated(rows, run_id)?;
-        Ok(())
-    }
-
-    /// Atomically mutate a workflow run and append a checkpoint.
-    pub fn transition(
-        &self,
-        run_id: &str,
-        transition: &WorkflowTransitionRequest,
+        current: &WorkflowRunRecord,
+        next: &WorkflowRunRecord,
+        checkpoint: &WorkflowCheckpointRecord,
     ) -> Result<(), WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
         let transaction = conn.unchecked_transaction()?;
-        let rows = transaction.execute(
-            "UPDATE workflow_run
-             SET status = ?1,
-                 current_step_id = COALESCE(?2, current_step_id),
-                 updated_at = ?3,
-                 started_at = CASE
-                     WHEN ?1 = 'running' AND started_at IS NULL THEN ?3
-                     ELSE started_at
-                 END,
-                 completed_at = CASE
-                     WHEN ?1 IN ('completed', 'failed', 'cancelled')
-                         THEN COALESCE(?4, ?3)
-                     ELSE completed_at
-                 END
-             WHERE run_id = ?5",
-            params![
-                transition.new_status.as_str(),
-                transition.step_id.as_deref(),
-                transition.updated_at.as_str(),
-                transition.completed_at.as_deref(),
-                run_id,
-            ],
-        )?;
-        ensure_row_updated(rows, run_id)?;
+        insert_checkpoint(&transaction, checkpoint)?;
+        let rows = update_workflow_run_record(&transaction, next, Some(current.status))?;
 
-        let checkpoint = WorkflowCheckpointRecord {
-            checkpoint_id: transition.checkpoint_id.clone(),
-            run_id: run_id.to_string(),
-            step_id: transition.step_id.clone(),
-            kind: transition.checkpoint_kind,
-            data_json: serde_json::to_string(&transition.checkpoint_data)?,
-            created_at: transition.updated_at.clone(),
-        };
-        insert_checkpoint(&transaction, &checkpoint)?;
+        if rows == 0 {
+            return Err(resolve_update_conflict(
+                &transaction,
+                &current.run_id,
+                Some(current.status),
+            ));
+        }
+
         transaction.commit()?;
         Ok(())
     }
 
-    /// Downgrade all `running` rows to `paused` and append a recovery checkpoint.
-    pub fn recover_running_runs(&self) -> Result<usize, WorkflowStoreError> {
+    /// Append a checkpoint, mark a signal consumed, and then replace the
+    /// durable run row inside one SQLite transaction.
+    pub fn persist_signal_resume(
+        &self,
+        current: &WorkflowRunRecord,
+        next: &WorkflowRunRecord,
+        checkpoint: &WorkflowCheckpointRecord,
+        signal_id: &str,
+        consumed_at: &str,
+    ) -> Result<(), WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
-        let running_runs = {
-            let mut stmt = conn.prepare(
-                "SELECT run_id, current_step_id
-                 FROM workflow_run
-                 WHERE status = 'running'
-                 ORDER BY updated_at ASC, run_id ASC",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })?;
-            let mut run_ids = Vec::new();
-            for row in rows {
-                run_ids.push(row?);
-            }
-            run_ids
-        };
-
-        if running_runs.is_empty() {
-            return Ok(0);
-        }
-
         let transaction = conn.unchecked_transaction()?;
-        for (run_id, step_id) in &running_runs {
-            let updated_at = now_timestamp();
-            let rows = transaction.execute(
-                "UPDATE workflow_run
-                 SET status = 'paused',
-                     updated_at = ?1
-                 WHERE run_id = ?2",
-                params![updated_at.as_str(), run_id],
-            )?;
-            ensure_row_updated(rows, run_id)?;
+        insert_checkpoint(&transaction, checkpoint)?;
+        consume_signal_row(&transaction, signal_id, consumed_at)?;
+        let rows = update_workflow_run_record(&transaction, next, Some(current.status))?;
 
-            let checkpoint = WorkflowCheckpointRecord {
-                checkpoint_id: Uuid::new_v4().to_string(),
-                run_id: run_id.clone(),
-                step_id: step_id.clone(),
-                kind: CheckpointKind::RunRecoveredNeedsResume,
-                data_json: "{}".to_string(),
-                created_at: updated_at,
-            };
-            insert_checkpoint(&transaction, &checkpoint)?;
+        if rows == 0 {
+            return Err(resolve_update_conflict(
+                &transaction,
+                &current.run_id,
+                Some(current.status),
+            ));
         }
-        transaction.commit()?;
 
-        Ok(running_runs.len())
+        transaction.commit()?;
+        Ok(())
     }
 }
 
-impl WorkflowCheckpointStore {
-    /// Create a workflow checkpoint store from a shared compozy.db connection.
+impl WorkflowCheckpointRepository {
+    /// Create a checkpoint repository from a shared `compozy.db` connection.
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
 
     /// Append one checkpoint row.
-    pub fn append_checkpoint(
-        &self,
-        checkpoint: &WorkflowCheckpointRecord,
-    ) -> Result<(), WorkflowStoreError> {
+    pub fn append(&self, checkpoint: &WorkflowCheckpointRecord) -> Result<(), WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
         insert_checkpoint(&conn, checkpoint)?;
         Ok(())
     }
 
     /// List checkpoints for one run ordered by creation time.
-    pub fn list_checkpoints_for_run(
+    pub fn list_for_run(
         &self,
         run_id: &str,
     ) -> Result<Vec<WorkflowCheckpointRecord>, WorkflowStoreError> {
@@ -551,14 +590,14 @@ impl WorkflowCheckpointStore {
     }
 }
 
-impl WorkflowSignalStore {
-    /// Create a workflow signal store from a shared compozy.db connection.
+impl WorkflowSignalRepository {
+    /// Create a signal repository from a shared `compozy.db` connection.
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
 
     /// Insert a durable signal row.
-    pub fn insert_signal(&self, signal: &WorkflowSignalRecord) -> Result<(), WorkflowStoreError> {
+    pub fn insert(&self, signal: &WorkflowSignalRecord) -> Result<(), WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
         conn.execute(
             "INSERT INTO workflow_signal (
@@ -576,7 +615,7 @@ impl WorkflowSignalStore {
                 signal.run_id.as_str(),
                 signal.name.as_str(),
                 signal.payload_json.as_str(),
-                signal.source.as_deref(),
+                signal.source.as_str(),
                 bool_to_sql(signal.consumed),
                 signal.created_at.as_str(),
                 signal.consumed_at.as_deref(),
@@ -585,56 +624,76 @@ impl WorkflowSignalStore {
         Ok(())
     }
 
-    /// List pending signals for a run ordered by creation time.
-    pub fn list_pending_signals_for_run(
+    /// Load one durable signal by ID.
+    pub fn find_by_id(
+        &self,
+        signal_id: &str,
+    ) -> Result<Option<WorkflowSignalRecord>, WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        conn.query_row(
+            "SELECT signal_id, run_id, name, payload_json, source, consumed, created_at, consumed_at
+             FROM workflow_signal
+             WHERE signal_id = ?1",
+            [signal_id],
+            read_workflow_signal_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// List signals for one run, optionally filtered by consumed state.
+    pub fn list_for_run(
         &self,
         run_id: &str,
+        consumed: Option<bool>,
     ) -> Result<Vec<WorkflowSignalRecord>, WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT signal_id, run_id, name, payload_json, source, consumed, created_at, consumed_at
              FROM workflow_signal
-             WHERE run_id = ?1 AND consumed = 0
+             WHERE run_id = ?1
              ORDER BY created_at ASC, signal_id ASC",
         )?;
         let rows = stmt.query_map([run_id], read_workflow_signal_row)?;
         let mut records = Vec::new();
         for row in rows {
-            records.push(row?);
+            let record = row?;
+            if consumed
+                .map(|expected| record.consumed == expected)
+                .unwrap_or(true)
+            {
+                records.push(record);
+            }
         }
         Ok(records)
     }
 
-    /// Mark one signal as consumed and set `consumed_at = datetime('now')`.
-    pub fn mark_signal_consumed(&self, signal_id: &str) -> Result<(), WorkflowStoreError> {
+    /// Return the first unconsumed signal matching the run and name.
+    pub fn find_unconsumed(
+        &self,
+        run_id: &str,
+        name: &str,
+    ) -> Result<Option<WorkflowSignalRecord>, WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
-        let rows = conn.execute(
-            "UPDATE workflow_signal
-             SET consumed = 1,
-                 consumed_at = datetime('now')
-             WHERE signal_id = ?1 AND consumed = 0",
-            [signal_id],
-        )?;
+        conn.query_row(
+            "SELECT signal_id, run_id, name, payload_json, source, consumed, created_at, consumed_at
+             FROM workflow_signal
+             WHERE run_id = ?1
+               AND name = ?2
+               AND consumed = 0
+             ORDER BY created_at ASC, signal_id ASC
+             LIMIT 1",
+            params![run_id, name],
+            read_workflow_signal_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
 
-        if rows > 0 {
-            return Ok(());
-        }
-
-        let exists = conn
-            .query_row(
-                "SELECT 1 FROM workflow_signal WHERE signal_id = ?1",
-                [signal_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-
-        if exists.is_some() {
-            return Ok(());
-        }
-
-        Err(WorkflowStoreError::SignalNotFound {
-            signal_id: signal_id.to_string(),
-        })
+    /// Mark one signal as consumed and populate `consumed_at`.
+    pub fn consume(&self, signal_id: &str, consumed_at: &str) -> Result<(), WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        consume_signal_row(&conn, signal_id, consumed_at)
     }
 }
 
@@ -653,6 +712,33 @@ fn ensure_row_updated(rows: usize, run_id: &str) -> Result<(), WorkflowStoreErro
     }
 
     Ok(())
+}
+
+fn resolve_update_conflict(
+    conn: &Connection,
+    run_id: &str,
+    expected_status: Option<WorkflowRunStatus>,
+) -> WorkflowStoreError {
+    let actual = conn
+        .query_row(
+            "SELECT status FROM workflow_run WHERE run_id = ?1",
+            [run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional();
+
+    match actual {
+        Ok(Some(actual)) => WorkflowStoreError::UnexpectedRunState {
+            run_id: run_id.to_string(),
+            expected: expected_status
+                .map(|status| status.as_str().to_string())
+                .unwrap_or_else(|| "any".to_string()),
+            actual,
+        },
+        Ok(None) | Err(_) => WorkflowStoreError::RunNotFound {
+            run_id: run_id.to_string(),
+        },
+    }
 }
 
 fn insert_workflow_run(
@@ -682,7 +768,7 @@ fn insert_workflow_run(
         params![
             record.run_id.as_str(),
             record.workflow_id.as_str(),
-            record.workflow_version.as_deref(),
+            record.workflow_version.as_str(),
             record.status.as_str(),
             record.input_json.as_str(),
             record.vars_json.as_str(),
@@ -694,12 +780,101 @@ fn insert_workflow_run(
             record.labels_json.as_str(),
             record.metadata_json.as_str(),
             record.error_json.as_deref(),
-            record.started_at.as_deref(),
+            record.started_at.as_str(),
             record.updated_at.as_str(),
             record.completed_at.as_deref(),
         ],
     )?;
     Ok(())
+}
+
+fn update_workflow_run_record(
+    conn: &Connection,
+    record: &WorkflowRunRecord,
+    expected_status: Option<WorkflowRunStatus>,
+) -> Result<usize, rusqlite::Error> {
+    match expected_status {
+        Some(expected_status) => conn.execute(
+            "UPDATE workflow_run
+             SET workflow_id = ?2,
+                 workflow_version = ?3,
+                 status = ?4,
+                 input_json = ?5,
+                 vars_json = ?6,
+                 current_step_id = ?7,
+                 waiting_kind = ?8,
+                 waiting_ref = ?9,
+                 active_dispatch_id = ?10,
+                 active_hitl_request_id = ?11,
+                 labels_json = ?12,
+                 metadata_json = ?13,
+                 error_json = ?14,
+                 started_at = ?15,
+                 updated_at = ?16,
+                 completed_at = ?17
+             WHERE run_id = ?1
+               AND status = ?18",
+            params![
+                record.run_id.as_str(),
+                record.workflow_id.as_str(),
+                record.workflow_version.as_str(),
+                record.status.as_str(),
+                record.input_json.as_str(),
+                record.vars_json.as_str(),
+                record.current_step_id.as_deref(),
+                record.waiting_kind.as_deref(),
+                record.waiting_ref.as_deref(),
+                record.active_dispatch_id.as_deref(),
+                record.active_hitl_request_id.as_deref(),
+                record.labels_json.as_str(),
+                record.metadata_json.as_str(),
+                record.error_json.as_deref(),
+                record.started_at.as_str(),
+                record.updated_at.as_str(),
+                record.completed_at.as_deref(),
+                expected_status.as_str(),
+            ],
+        ),
+        None => conn.execute(
+            "UPDATE workflow_run
+             SET workflow_id = ?2,
+                 workflow_version = ?3,
+                 status = ?4,
+                 input_json = ?5,
+                 vars_json = ?6,
+                 current_step_id = ?7,
+                 waiting_kind = ?8,
+                 waiting_ref = ?9,
+                 active_dispatch_id = ?10,
+                 active_hitl_request_id = ?11,
+                 labels_json = ?12,
+                 metadata_json = ?13,
+                 error_json = ?14,
+                 started_at = ?15,
+                 updated_at = ?16,
+                 completed_at = ?17
+             WHERE run_id = ?1",
+            params![
+                record.run_id.as_str(),
+                record.workflow_id.as_str(),
+                record.workflow_version.as_str(),
+                record.status.as_str(),
+                record.input_json.as_str(),
+                record.vars_json.as_str(),
+                record.current_step_id.as_deref(),
+                record.waiting_kind.as_deref(),
+                record.waiting_ref.as_deref(),
+                record.active_dispatch_id.as_deref(),
+                record.active_hitl_request_id.as_deref(),
+                record.labels_json.as_str(),
+                record.metadata_json.as_str(),
+                record.error_json.as_deref(),
+                record.started_at.as_str(),
+                record.updated_at.as_str(),
+                record.completed_at.as_deref(),
+            ],
+        ),
+    }
 }
 
 fn insert_checkpoint(
@@ -727,12 +902,118 @@ fn insert_checkpoint(
     Ok(())
 }
 
+fn consume_signal_row(
+    conn: &Connection,
+    signal_id: &str,
+    consumed_at: &str,
+) -> Result<(), WorkflowStoreError> {
+    let rows = conn.execute(
+        "UPDATE workflow_signal
+         SET consumed = 1,
+             consumed_at = ?2
+         WHERE signal_id = ?1 AND consumed = 0",
+        params![signal_id, consumed_at],
+    )?;
+
+    if rows > 0 {
+        return Ok(());
+    }
+
+    let consumed_state = conn
+        .query_row(
+            "SELECT consumed FROM workflow_signal WHERE signal_id = ?1",
+            [signal_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+
+    match consumed_state {
+        Some(value) if sql_to_bool(value) => Err(WorkflowStoreError::SignalAlreadyConsumed {
+            signal_id: signal_id.to_string(),
+        }),
+        Some(_) => Err(WorkflowStoreError::SignalAlreadyConsumed {
+            signal_id: signal_id.to_string(),
+        }),
+        None => Err(WorkflowStoreError::SignalNotFound {
+            signal_id: signal_id.to_string(),
+        }),
+    }
+}
+
+fn load_workflow_run(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<WorkflowRunRecord>, WorkflowStoreError> {
+    conn.query_row(
+        "SELECT
+            run_id,
+            workflow_id,
+            workflow_version,
+            status,
+            input_json,
+            vars_json,
+            current_step_id,
+            waiting_kind,
+            waiting_ref,
+            active_dispatch_id,
+            active_hitl_request_id,
+            labels_json,
+            metadata_json,
+            error_json,
+            started_at,
+            updated_at,
+            completed_at
+         FROM workflow_run
+         WHERE run_id = ?1",
+        [run_id],
+        read_workflow_run_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn list_all_workflow_runs(conn: &Connection) -> Result<Vec<WorkflowRunRecord>, WorkflowStoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            run_id,
+            workflow_id,
+            workflow_version,
+            status,
+            input_json,
+            vars_json,
+            current_step_id,
+            waiting_kind,
+            waiting_ref,
+            active_dispatch_id,
+            active_hitl_request_id,
+            labels_json,
+            metadata_json,
+            error_json,
+            started_at,
+            updated_at,
+            completed_at
+         FROM workflow_run
+         ORDER BY updated_at DESC, run_id DESC",
+    )?;
+    let rows = stmt.query_map([], read_workflow_run_row)?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row?);
+    }
+    Ok(records)
+}
+
 fn read_workflow_run_row(row: &rusqlite::Row<'_>) -> Result<WorkflowRunRecord, rusqlite::Error> {
+    let status = row.get::<_, String>(3)?;
+    let status = status
+        .parse::<WorkflowRunStatus>()
+        .map_err(invalid_text_error)?;
+
     Ok(WorkflowRunRecord {
         run_id: row.get(0)?,
         workflow_id: row.get(1)?,
         workflow_version: row.get(2)?,
-        status: decode_workflow_run_status(&row.get::<_, String>(3)?)?,
+        status,
         input_json: row.get(4)?,
         vars_json: row.get(5)?,
         current_step_id: row.get(6)?,
@@ -752,11 +1033,14 @@ fn read_workflow_run_row(row: &rusqlite::Row<'_>) -> Result<WorkflowRunRecord, r
 fn read_workflow_checkpoint_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<WorkflowCheckpointRecord, rusqlite::Error> {
+    let kind = row.get::<_, String>(3)?;
+    let kind = kind.parse::<CheckpointKind>().map_err(invalid_text_error)?;
+
     Ok(WorkflowCheckpointRecord {
         checkpoint_id: row.get(0)?,
         run_id: row.get(1)?,
         step_id: row.get(2)?,
-        kind: decode_checkpoint_kind(&row.get::<_, String>(3)?)?,
+        kind,
         data_json: row.get(4)?,
         created_at: row.get(5)?,
     })
@@ -777,41 +1061,8 @@ fn read_workflow_signal_row(
     })
 }
 
-fn decode_workflow_run_status(value: &str) -> Result<WorkflowRunStatus, rusqlite::Error> {
-    match value {
-        "pending" => Ok(WorkflowRunStatus::Pending),
-        "running" => Ok(WorkflowRunStatus::Running),
-        "waiting_signal" => Ok(WorkflowRunStatus::WaitingSignal),
-        "paused" => Ok(WorkflowRunStatus::Paused),
-        "completed" => Ok(WorkflowRunStatus::Completed),
-        "failed" => Ok(WorkflowRunStatus::Failed),
-        "cancelled" => Ok(WorkflowRunStatus::Cancelled),
-        other => Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            format!("invalid workflow run status '{other}'").into(),
-        )),
-    }
-}
-
-fn decode_checkpoint_kind(value: &str) -> Result<CheckpointKind, rusqlite::Error> {
-    match value {
-        "run_created" => Ok(CheckpointKind::RunCreated),
-        "run_started" => Ok(CheckpointKind::RunStarted),
-        "step_selected" => Ok(CheckpointKind::StepSelected),
-        "waiting_signal" => Ok(CheckpointKind::WaitingSignal),
-        "signal_received" => Ok(CheckpointKind::SignalReceived),
-        "run_paused" => Ok(CheckpointKind::RunPaused),
-        "run_resumed" => Ok(CheckpointKind::RunResumed),
-        "run_completed" => Ok(CheckpointKind::RunCompleted),
-        "run_failed" => Ok(CheckpointKind::RunFailed),
-        "run_recovered_needs_resume" => Ok(CheckpointKind::RunRecoveredNeedsResume),
-        other => Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            format!("invalid workflow checkpoint kind '{other}'").into(),
-        )),
-    }
+fn invalid_text_error(error: WorkflowStoreError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
 }
 
 fn bool_to_sql(value: bool) -> i64 {
@@ -826,7 +1077,8 @@ fn sql_to_bool(value: i64) -> bool {
     value != 0
 }
 
-fn now_timestamp() -> String {
+/// Return the current UTC timestamp in RFC 3339 format.
+pub fn now_timestamp() -> String {
     Utc::now().to_rfc3339()
 }
 
@@ -834,7 +1086,6 @@ fn now_timestamp() -> String {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use serde_json::json;
 
     fn compozy_conn() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().expect("open in-memory compozy.db");
@@ -844,14 +1095,16 @@ mod tests {
             .expect("apply workflow_checkpoint schema");
         conn.execute_batch(WORKFLOW_SIGNAL_MIGRATION_SQL)
             .expect("apply workflow_signal schema");
+        conn.execute_batch(WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL)
+            .expect("apply workflow runtime durability migration");
         Arc::new(Mutex::new(conn))
     }
 
     fn sample_run_record(run_id: &str) -> WorkflowRunRecord {
         WorkflowRunRecord {
             run_id: run_id.to_string(),
-            workflow_id: Uuid::new_v4().to_string(),
-            workflow_version: Some("2026.03.23".to_string()),
+            workflow_id: "workflow-alpha".to_string(),
+            workflow_version: "1.0.0".to_string(),
             status: WorkflowRunStatus::Pending,
             input_json: "\"hello world\"".to_string(),
             vars_json: "{}".to_string(),
@@ -860,75 +1113,78 @@ mod tests {
             waiting_ref: None,
             active_dispatch_id: None,
             active_hitl_request_id: None,
-            labels_json: "[]".to_string(),
-            metadata_json: "{}".to_string(),
+            labels_json: "[\"manual\"]".to_string(),
+            metadata_json: "{\"source\":\"api\"}".to_string(),
             error_json: None,
-            started_at: None,
+            started_at: "2026-03-23T12:00:00Z".to_string(),
             updated_at: "2026-03-23T12:00:00Z".to_string(),
             completed_at: None,
         }
     }
 
+    fn sample_checkpoint(
+        run_id: &str,
+        step_id: Option<&str>,
+        kind: CheckpointKind,
+        created_at: &str,
+    ) -> WorkflowCheckpointRecord {
+        WorkflowCheckpointRecord {
+            checkpoint_id: format!("chk-{run_id}-{created_at}"),
+            run_id: run_id.to_string(),
+            step_id: step_id.map(ToOwned::to_owned),
+            kind,
+            data_json: "{}".to_string(),
+            created_at: created_at.to_string(),
+        }
+    }
+
     #[test]
-    fn workflow_run_store_should_create_run_and_write_run_created_checkpoint() {
+    fn workflow_run_repository_should_insert_and_load_rows() {
         let stores = WorkflowStoreSet::new(compozy_conn());
         let record = sample_run_record("run-create");
 
         stores
             .workflow_run
-            .create_run(&record)
-            .expect("create workflow run");
+            .insert_run(&record)
+            .expect("insert workflow run");
 
         let loaded = stores
             .workflow_run
-            .get_run(&record.run_id)
+            .find_by_id(&record.run_id)
             .expect("load workflow run")
             .expect("workflow run should exist");
-        let checkpoints = stores
-            .workflow_checkpoint
-            .list_checkpoints_for_run(&record.run_id)
-            .expect("load checkpoints");
 
         assert_eq!(loaded, record);
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(checkpoints[0].kind, CheckpointKind::RunCreated);
-        assert_eq!(checkpoints[0].run_id, record.run_id);
     }
 
     #[test]
-    fn workflow_run_store_transition_should_write_run_and_checkpoint_atomically() {
+    fn workflow_run_repository_should_persist_checkpoint_before_row_update_atomically() {
         let stores = WorkflowStoreSet::new(compozy_conn());
-        let record = sample_run_record("run-transition");
-        let checkpoint_id = "checkpoint-conflict".to_string();
+        let current = sample_run_record("run-transition");
+        let mut next = current.clone();
+        let conflict = sample_checkpoint(
+            &current.run_id,
+            Some("step-1"),
+            CheckpointKind::RunStarted,
+            "2026-03-23T12:01:00Z",
+        );
 
         stores
             .workflow_run
-            .create_run(&record)
-            .expect("create workflow run");
+            .insert_run(&current)
+            .expect("insert workflow run");
         stores
             .workflow_checkpoint
-            .append_checkpoint(&WorkflowCheckpointRecord {
-                checkpoint_id: checkpoint_id.clone(),
-                run_id: record.run_id.clone(),
-                step_id: None,
-                kind: CheckpointKind::StepSelected,
-                data_json: "{}".to_string(),
-                created_at: "2026-03-23T12:00:01Z".to_string(),
-            })
+            .append(&conflict)
             .expect("insert conflicting checkpoint");
 
-        let result = stores.workflow_run.transition(
-            &record.run_id,
-            &WorkflowTransitionRequest {
-                new_status: WorkflowRunStatus::Completed,
-                step_id: Some("final-step".to_string()),
-                checkpoint_id,
-                checkpoint_kind: CheckpointKind::RunCompleted,
-                checkpoint_data: json!({"result":"ok"}),
-                updated_at: "2026-03-23T12:00:02Z".to_string(),
-                completed_at: Some("2026-03-23T12:00:02Z".to_string()),
-            },
-        );
+        next.status = WorkflowRunStatus::Running;
+        next.current_step_id = Some("step-1".to_string());
+        next.updated_at = "2026-03-23T12:01:00Z".to_string();
+
+        let result = stores
+            .workflow_run
+            .persist_transition(&current, &next, &conflict);
 
         assert!(
             result.is_err(),
@@ -937,47 +1193,82 @@ mod tests {
 
         let loaded = stores
             .workflow_run
-            .get_run(&record.run_id)
+            .find_by_id(&current.run_id)
             .expect("load workflow run")
             .expect("workflow run should exist");
         let checkpoints = stores
             .workflow_checkpoint
-            .list_checkpoints_for_run(&record.run_id)
+            .list_for_run(&current.run_id)
             .expect("load checkpoints");
 
-        assert_eq!(loaded.status, WorkflowRunStatus::Pending);
-        assert_eq!(loaded.current_step_id, None);
-        assert_eq!(loaded.completed_at, None);
-        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(loaded, current);
+        assert_eq!(checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn workflow_run_repository_should_list_non_terminal_rows() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let pending = sample_run_record("run-pending");
+        let mut running = sample_run_record("run-running");
+        let mut waiting = sample_run_record("run-waiting");
+        let mut completed = sample_run_record("run-completed");
+
+        running.status = WorkflowRunStatus::Running;
+        running.updated_at = "2026-03-23T12:01:00Z".to_string();
+        waiting.status = WorkflowRunStatus::Waiting;
+        waiting.waiting_kind = Some("signal".to_string());
+        waiting.waiting_ref = Some("artifact-approved".to_string());
+        waiting.updated_at = "2026-03-23T12:02:00Z".to_string();
+        completed.status = WorkflowRunStatus::Completed;
+        completed.completed_at = Some("2026-03-23T12:03:00Z".to_string());
+        completed.updated_at = "2026-03-23T12:03:00Z".to_string();
+
+        for record in [&pending, &running, &waiting, &completed] {
+            stores
+                .workflow_run
+                .insert_run(record)
+                .expect("insert workflow run");
+        }
+
+        let records = stores
+            .workflow_run
+            .list_non_terminal()
+            .expect("list non-terminal runs");
+        let run_ids = records
+            .into_iter()
+            .map(|record| record.run_id)
+            .collect::<Vec<_>>();
+
         assert_eq!(
-            checkpoints
-                .iter()
-                .filter(|checkpoint| checkpoint.kind == CheckpointKind::RunCompleted)
-                .count(),
-            0
+            run_ids,
+            vec![
+                pending.run_id.clone(),
+                running.run_id.clone(),
+                waiting.run_id.clone(),
+            ]
         );
     }
 
     #[test]
-    fn workflow_signal_store_should_insert_and_consume_signals() {
+    fn workflow_signal_repository_should_insert_list_and_consume_signals() {
         let stores = WorkflowStoreSet::new(compozy_conn());
-        let run_record = sample_run_record("run-signal");
+        let run = sample_run_record("run-signal");
         let first_signal = WorkflowSignalRecord {
             signal_id: "signal-one".to_string(),
-            run_id: run_record.run_id.clone(),
+            run_id: run.run_id.clone(),
             name: "approval".to_string(),
             payload_json: "{\"answer\":\"yes\"}".to_string(),
-            source: Some("human".to_string()),
+            source: "api".to_string(),
             consumed: false,
             created_at: "2026-03-23T12:05:00Z".to_string(),
             consumed_at: None,
         };
         let second_signal = WorkflowSignalRecord {
             signal_id: "signal-two".to_string(),
-            run_id: run_record.run_id.clone(),
+            run_id: run.run_id.clone(),
             name: "approval".to_string(),
             payload_json: "{\"answer\":\"no\"}".to_string(),
-            source: Some("human".to_string()),
+            source: "api".to_string(),
             consumed: false,
             created_at: "2026-03-23T12:06:00Z".to_string(),
             consumed_at: None,
@@ -985,154 +1276,156 @@ mod tests {
 
         stores
             .workflow_run
-            .create_run(&run_record)
-            .expect("create workflow run");
+            .insert_run(&run)
+            .expect("insert workflow run");
         stores
             .workflow_signal
-            .insert_signal(&first_signal)
+            .insert(&first_signal)
             .expect("insert first signal");
         stores
             .workflow_signal
-            .insert_signal(&second_signal)
+            .insert(&second_signal)
             .expect("insert second signal");
         stores
             .workflow_signal
-            .mark_signal_consumed(&first_signal.signal_id)
+            .consume(&first_signal.signal_id, "2026-03-23T12:07:00Z")
             .expect("consume first signal");
 
-        let pending = stores
+        let unconsumed = stores
             .workflow_signal
-            .list_pending_signals_for_run(&run_record.run_id)
-            .expect("list pending signals");
-        let conn = lock_conn(&stores.connection).expect("lock workflow connection");
-        let consumed_row = conn
-            .query_row(
-                "SELECT consumed, consumed_at FROM workflow_signal WHERE signal_id = ?1",
-                [first_signal.signal_id.as_str()],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
-            .expect("load consumed signal");
+            .list_for_run(&run.run_id, Some(false))
+            .expect("list unconsumed signals");
+        let consumed = stores
+            .workflow_signal
+            .find_by_id(&first_signal.signal_id)
+            .expect("load consumed signal")
+            .expect("signal should exist");
 
-        assert_eq!(pending, vec![second_signal]);
-        assert_eq!(consumed_row.0, 1);
-        assert!(consumed_row.1.is_some(), "consumed_at should be populated");
-    }
-
-    #[test]
-    fn workflow_checkpoint_store_should_return_checkpoints_in_created_at_order() {
-        let stores = WorkflowStoreSet::new(compozy_conn());
-        let record = sample_run_record("run-checkpoints");
-        stores
-            .workflow_run
-            .create_run(&record)
-            .expect("create workflow run");
-
-        let newer = WorkflowCheckpointRecord {
-            checkpoint_id: "checkpoint-newer".to_string(),
-            run_id: record.run_id.clone(),
-            step_id: Some("step-two".to_string()),
-            kind: CheckpointKind::StepSelected,
-            data_json: "{}".to_string(),
-            created_at: "2026-03-23T12:10:00Z".to_string(),
-        };
-        let older = WorkflowCheckpointRecord {
-            checkpoint_id: "checkpoint-older".to_string(),
-            run_id: record.run_id.clone(),
-            step_id: Some("step-one".to_string()),
-            kind: CheckpointKind::RunStarted,
-            data_json: "{}".to_string(),
-            created_at: "2026-03-23T12:01:00Z".to_string(),
-        };
-
-        stores
-            .workflow_checkpoint
-            .append_checkpoint(&newer)
-            .expect("append newer checkpoint");
-        stores
-            .workflow_checkpoint
-            .append_checkpoint(&older)
-            .expect("append older checkpoint");
-
-        let checkpoints = stores
-            .workflow_checkpoint
-            .list_checkpoints_for_run(&record.run_id)
-            .expect("list checkpoints");
-
-        assert_eq!(checkpoints[0].kind, CheckpointKind::RunCreated);
-        assert_eq!(checkpoints[1], older);
-        assert_eq!(checkpoints[2], newer);
-    }
-
-    #[test]
-    fn recovery_scan_should_downgrade_running_to_paused_and_write_checkpoint() {
-        let stores = WorkflowStoreSet::new(compozy_conn());
-        let record = sample_run_record("run-recovery");
-
-        stores
-            .workflow_run
-            .create_run(&record)
-            .expect("create workflow run");
-        stores
-            .workflow_run
-            .update_run_status(&record.run_id, WorkflowRunStatus::Running)
-            .expect("mark run as running");
-
-        let recovered = stores
-            .workflow_run
-            .recover_running_runs()
-            .expect("recover running runs");
-        let loaded = stores
-            .workflow_run
-            .get_run(&record.run_id)
-            .expect("load workflow run")
-            .expect("workflow run should exist");
-        let checkpoints = stores
-            .workflow_checkpoint
-            .list_checkpoints_for_run(&record.run_id)
-            .expect("list checkpoints");
-
-        assert_eq!(recovered, 1);
-        assert_eq!(loaded.status, WorkflowRunStatus::Paused);
+        assert_eq!(unconsumed, vec![second_signal]);
+        assert!(consumed.consumed);
         assert_eq!(
-            checkpoints
-                .iter()
-                .filter(|checkpoint| checkpoint.kind == CheckpointKind::RunRecoveredNeedsResume)
-                .count(),
-            1
+            consumed.consumed_at.as_deref(),
+            Some("2026-03-23T12:07:00Z")
         );
     }
 
     #[test]
-    fn recovery_scan_should_not_modify_waiting_signal_runs() {
+    fn workflow_run_repository_should_consume_signal_when_persisting_resume_transition() {
         let stores = WorkflowStoreSet::new(compozy_conn());
-        let record = sample_run_record("run-waiting");
+        let mut current = sample_run_record("run-resume");
+        current.status = WorkflowRunStatus::Waiting;
+        current.current_step_id = Some("await-approval".to_string());
+        current.waiting_kind = Some("signal".to_string());
+        current.waiting_ref = Some("approval".to_string());
+        current.updated_at = "2026-03-23T12:08:00Z".to_string();
+        let signal = WorkflowSignalRecord {
+            signal_id: "signal-resume".to_string(),
+            run_id: current.run_id.clone(),
+            name: "approval".to_string(),
+            payload_json: "{\"decision\":\"approved\"}".to_string(),
+            source: "api".to_string(),
+            consumed: false,
+            created_at: "2026-03-23T12:08:30Z".to_string(),
+            consumed_at: None,
+        };
+        let mut next = current.clone();
+        next.status = WorkflowRunStatus::Running;
+        next.waiting_kind = None;
+        next.waiting_ref = None;
+        next.updated_at = "2026-03-23T12:09:00Z".to_string();
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: "chk-run-resume".to_string(),
+            run_id: current.run_id.clone(),
+            step_id: Some("await-approval".to_string()),
+            kind: CheckpointKind::SignalReceived,
+            data_json: serde_json::json!({
+                "signal_id": signal.signal_id,
+                "signal_name": signal.name,
+                "payload_summary": "approved",
+            })
+            .to_string(),
+            created_at: next.updated_at.clone(),
+        };
 
         stores
             .workflow_run
-            .create_run(&record)
-            .expect("create workflow run");
+            .insert_run(&current)
+            .expect("insert waiting run");
+        stores
+            .workflow_signal
+            .insert(&signal)
+            .expect("insert signal");
         stores
             .workflow_run
-            .update_run_waiting_state(&record.run_id, Some("signal"), Some("approval-1"))
-            .expect("set waiting state");
+            .persist_signal_resume(
+                &current,
+                &next,
+                &checkpoint,
+                &signal.signal_id,
+                &next.updated_at,
+            )
+            .expect("persist signal resume transition");
+
+        let loaded_run = stores
+            .workflow_run
+            .find_by_id(&current.run_id)
+            .expect("load resumed run")
+            .expect("run should exist");
+        let loaded_signal = stores
+            .workflow_signal
+            .find_by_id(&signal.signal_id)
+            .expect("load resumed signal")
+            .expect("signal should exist");
+        let checkpoints = stores
+            .workflow_checkpoint
+            .list_for_run(&current.run_id)
+            .expect("load resume checkpoints");
+
+        assert_eq!(loaded_run.status, WorkflowRunStatus::Running);
+        assert_eq!(loaded_run.waiting_kind, None);
+        assert!(loaded_signal.consumed);
+        assert_eq!(
+            loaded_signal.consumed_at.as_deref(),
+            Some(next.updated_at.as_str())
+        );
+        assert_eq!(checkpoints, vec![checkpoint]);
+    }
+
+    #[test]
+    fn workflow_checkpoint_repository_should_return_checkpoints_in_created_at_order() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let run = sample_run_record("run-checkpoints");
+
         stores
             .workflow_run
-            .update_run_status(&record.run_id, WorkflowRunStatus::WaitingSignal)
-            .expect("mark run as waiting_signal");
+            .insert_run(&run)
+            .expect("insert workflow run");
+        stores
+            .workflow_checkpoint
+            .append(&sample_checkpoint(
+                &run.run_id,
+                Some("step-2"),
+                CheckpointKind::StepCompleted,
+                "2026-03-23T12:10:00Z",
+            ))
+            .expect("append newer checkpoint");
+        stores
+            .workflow_checkpoint
+            .append(&sample_checkpoint(
+                &run.run_id,
+                Some("step-1"),
+                CheckpointKind::StepStarted,
+                "2026-03-23T12:01:00Z",
+            ))
+            .expect("append older checkpoint");
 
-        let recovered = stores
-            .workflow_run
-            .recover_running_runs()
-            .expect("recover running runs");
-        let loaded = stores
-            .workflow_run
-            .get_run(&record.run_id)
-            .expect("load workflow run")
-            .expect("workflow run should exist");
+        let checkpoints = stores
+            .workflow_checkpoint
+            .list_for_run(&run.run_id)
+            .expect("list checkpoints");
 
-        assert_eq!(recovered, 0);
-        assert_eq!(loaded.status, WorkflowRunStatus::WaitingSignal);
-        assert_eq!(loaded.waiting_kind.as_deref(), Some("signal"));
-        assert_eq!(loaded.waiting_ref.as_deref(), Some("approval-1"));
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0].kind, CheckpointKind::StepStarted);
+        assert_eq!(checkpoints[1].kind, CheckpointKind::StepCompleted);
     }
 }

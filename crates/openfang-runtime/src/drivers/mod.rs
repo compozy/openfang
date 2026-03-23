@@ -557,6 +557,44 @@ pub fn known_providers() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock should not be poisoned")
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn test_provider_defaults_groq() {
@@ -699,8 +737,9 @@ mod tests {
     #[test]
     fn test_nvidia_provider_with_env_key() {
         // NVIDIA NIM is a known provider — set API key and verify driver creation succeeds.
+        let _env_lock = env_lock();
         let unique_key = "test-nvidia-key-12345";
-        std::env::set_var("NVIDIA_API_KEY", unique_key);
+        let _guard = EnvVarGuard::set("NVIDIA_API_KEY", unique_key);
         let config = DriverConfig {
             provider: "nvidia".to_string(),
             api_key: None, // picked up from env via provider_defaults
@@ -712,12 +751,13 @@ mod tests {
             driver.is_ok(),
             "NVIDIA provider with env var should succeed"
         );
-        std::env::remove_var("NVIDIA_API_KEY");
     }
 
     #[test]
     fn test_nvidia_provider_no_key_errors() {
         // NVIDIA NIM provider with no API key should error.
+        let _env_lock = env_lock();
+        let _guard = EnvVarGuard::remove("NVIDIA_API_KEY");
         let config = DriverConfig {
             provider: "nvidia".to_string(),
             api_key: None,
@@ -731,8 +771,9 @@ mod tests {
     #[test]
     fn test_custom_provider_key_no_url_helpful_error() {
         // Custom provider with key set (via env) but no base_url should give helpful error.
+        let _env_lock = env_lock();
         let unique_key = "test-custom-key-67890";
-        std::env::set_var("MYCUSTOM_API_KEY", unique_key);
+        let _guard = EnvVarGuard::set("MYCUSTOM_API_KEY", unique_key);
         let config = DriverConfig {
             provider: "mycustom".to_string(),
             api_key: None,
@@ -747,7 +788,6 @@ mod tests {
             "Error should mention base_url: {}",
             err
         );
-        std::env::remove_var("MYCUSTOM_API_KEY");
     }
 
     #[test]

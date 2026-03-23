@@ -11,12 +11,21 @@ use axum::Router;
 use openfang_api::middleware;
 use openfang_api::routes::{self, AppState};
 use openfang_api::ws;
+use openfang_kernel::workflow::{
+    ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
+};
 use openfang_kernel::OpenFangKernel;
+use openfang_memory::{WorkflowRunRecord, WorkflowRunStatus};
+use openfang_types::agent::AgentId;
 use openfang_types::config::{DefaultModelConfig, KernelConfig};
+use openfang_types::workflow::{
+    FlowBlock, FlowMode, ResolvedRuntimeSettings, WorkflowIr, WorkflowIrStep, WorkflowIrStepKind,
+};
 use std::sync::Arc;
 use std::time::Instant;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Test infrastructure
@@ -122,6 +131,16 @@ async fn start_test_server_with_provider(
             "/api/workflows/{id}/runs",
             axum::routing::get(routes::list_workflow_runs),
         )
+        .route(
+            "/api/v1/workflows/{id}/runs",
+            axum::routing::get(routes::list_workflow_runs_v1).post(routes::start_workflow_run_v1),
+        )
+        .route("/api/v1/runs", axum::routing::get(routes::list_runs_v1))
+        .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))
+        .route(
+            "/api/v1/runs/{id}/checkpoints",
+            axum::routing::get(routes::get_run_checkpoints_v1),
+        )
         .route("/api/shutdown", axum::routing::post(routes::shutdown))
         .layer(axum::middleware::from_fn(middleware::request_logging))
         .layer(TraceLayer::new_for_http())
@@ -181,6 +200,33 @@ tools = ["file_read"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 "#;
+
+async fn create_empty_workflow(
+    client: &reqwest::Client,
+    server: &TestServer,
+    name: &str,
+) -> String {
+    let response = client
+        .post(format!("{}/api/workflows", server.base_url))
+        .json(&serde_json::json!({
+            "name": name,
+            "description": "Durable workflow integration test",
+            "steps": [],
+        }))
+        .send()
+        .await
+        .expect("workflow creation request should succeed");
+
+    assert_eq!(response.status(), 201);
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .expect("workflow creation response should deserialize");
+    body["workflow_id"]
+        .as_str()
+        .expect("workflow id should be present")
+        .to_string()
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -522,6 +568,362 @@ async fn test_workflow_crud() {
     assert_eq!(workflows.len(), 1);
     assert_eq!(workflows[0]["name"], "test-workflow");
     assert_eq!(workflows[0]["steps"], 1);
+}
+
+#[tokio::test]
+async fn test_v1_start_workflow_creates_durable_run_record_immediately() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+    let workflow_id = create_empty_workflow(&client, &server, "durable-start").await;
+
+    let response = client
+        .post(format!(
+            "{}/api/v1/workflows/{workflow_id}/runs",
+            server.base_url
+        ))
+        .json(&serde_json::json!({
+            "input": { "issue_id": "ISSUE-123" },
+            "labels": ["manual"],
+            "metadata": { "source": "api" },
+        }))
+        .send()
+        .await
+        .expect("workflow start request should succeed");
+
+    assert_eq!(response.status(), 202);
+    let start_body: serde_json::Value = response
+        .json()
+        .await
+        .expect("workflow start response should deserialize");
+    let run_id = start_body["run_id"]
+        .as_str()
+        .expect("run id should be present")
+        .to_string();
+
+    let detail_response = client
+        .get(format!("{}/api/v1/runs/{run_id}", server.base_url))
+        .send()
+        .await
+        .expect("run detail request should succeed");
+
+    assert_eq!(detail_response.status(), 200);
+    let detail_body: serde_json::Value = detail_response
+        .json()
+        .await
+        .expect("run detail response should deserialize");
+    let durable_record = server
+        .state
+        .kernel
+        .workflow_stores
+        .workflow_run
+        .find_by_id(&run_id)
+        .expect("durable run query should succeed")
+        .expect("durable run should exist");
+
+    assert_eq!(detail_body["id"], run_id);
+    assert_eq!(detail_body["workflow_id"], workflow_id);
+    assert!(!detail_body["status"]
+        .as_str()
+        .expect("status should be a string")
+        .is_empty());
+    assert_eq!(detail_body["input"]["issue_id"], "ISSUE-123");
+    assert_eq!(durable_record.run_id, run_id);
+}
+
+#[tokio::test]
+async fn test_v1_workflow_run_lists_read_from_durable_store_after_cache_clear() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+    let workflow_id = create_empty_workflow(&client, &server, "durable-list").await;
+
+    let response = client
+        .post(format!(
+            "{}/api/v1/workflows/{workflow_id}/runs",
+            server.base_url
+        ))
+        .json(&serde_json::json!({
+            "input": { "ticket": "T-1" }
+        }))
+        .send()
+        .await
+        .expect("workflow start request should succeed");
+    let start_body: serde_json::Value = response
+        .json()
+        .await
+        .expect("workflow start response should deserialize");
+    let run_id = start_body["run_id"]
+        .as_str()
+        .expect("run id should be present")
+        .to_string();
+
+    server.state.kernel.workflows.clear_run_cache().await;
+
+    let v1_list = client
+        .get(format!(
+            "{}/api/v1/workflows/{workflow_id}/runs",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("v1 workflow run list should succeed");
+    let legacy_list = client
+        .get(format!(
+            "{}/api/workflows/{workflow_id}/runs",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("legacy workflow run list should succeed");
+
+    assert_eq!(v1_list.status(), 200);
+    assert_eq!(legacy_list.status(), 200);
+
+    let v1_items = v1_list
+        .json::<serde_json::Value>()
+        .await
+        .expect("v1 run list should deserialize");
+    let legacy_items = legacy_list
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .expect("legacy run list should deserialize");
+
+    assert!(v1_items["items"]
+        .as_array()
+        .expect("v1 items should be an array")
+        .iter()
+        .any(|item| item["id"] == run_id));
+    assert!(legacy_items.iter().any(|item| item["id"] == run_id));
+}
+
+#[tokio::test]
+async fn test_v1_run_checkpoints_reflect_full_lifecycle() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+    let workflow = Workflow {
+        id: WorkflowId::new(),
+        name: "checkpoint-workflow".to_string(),
+        description: "Checkpoint listing integration test".to_string(),
+        steps: vec![
+            WorkflowStep {
+                name: "analyze".to_string(),
+                agent: StepAgent::ByName {
+                    name: "alpha".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: Some("analysis".to_string()),
+            },
+            WorkflowStep {
+                name: "summarize".to_string(),
+                agent: StepAgent::ByName {
+                    name: "beta".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: Some("summary".to_string()),
+            },
+        ],
+        created_at: chrono::Utc::now(),
+    };
+    let workflow_id = server
+        .state
+        .kernel
+        .workflows
+        .register(workflow.clone())
+        .await
+        .expect("workflow registration should succeed");
+    let run_id = server
+        .state
+        .kernel
+        .workflows
+        .create_run(workflow_id, "checkpoint input".to_string())
+        .await
+        .expect("workflow run should be created");
+    let workflow_ir = WorkflowIr {
+        workflow_id: workflow_id.to_string(),
+        workflow_version: "legacy".to_string(),
+        defaults: ResolvedRuntimeSettings::default(),
+        input_contract: serde_json::from_value(serde_json::json!({ "kind": "any" }))
+            .expect("static any contract should deserialize"),
+        output_contract: serde_json::from_value(serde_json::json!({ "kind": "any" }))
+            .expect("static any contract should deserialize"),
+        steps: vec![
+            WorkflowIrStep {
+                id: "analyze".to_string(),
+                name: "analyze".to_string(),
+                kind: WorkflowIrStepKind::Agent {
+                    agent: "alpha".to_string(),
+                },
+                flow: FlowBlock {
+                    mode: FlowMode::Sequential,
+                },
+                runtime: ResolvedRuntimeSettings::default(),
+                with: std::collections::BTreeMap::new(),
+                save_as: Some("analysis".to_string()),
+            },
+            WorkflowIrStep {
+                id: "summarize".to_string(),
+                name: "summarize".to_string(),
+                kind: WorkflowIrStepKind::Agent {
+                    agent: "beta".to_string(),
+                },
+                flow: FlowBlock {
+                    mode: FlowMode::Sequential,
+                },
+                runtime: ResolvedRuntimeSettings::default(),
+                with: std::collections::BTreeMap::new(),
+                save_as: Some("summary".to_string()),
+            },
+        ],
+        symbol_table: std::collections::BTreeMap::from([
+            ("analysis".to_string(), "analyze".to_string()),
+            ("summary".to_string(), "summarize".to_string()),
+        ]),
+        outputs: std::collections::BTreeMap::new(),
+    };
+
+    server
+        .state
+        .kernel
+        .workflows
+        .execute_run(
+            run_id,
+            workflow_ir,
+            |agent| Some((AgentId::new(), agent.to_string())),
+            |_agent_id: AgentId, message: String| async move {
+                Ok((format!("processed {message}"), 1, 1))
+            },
+        )
+        .await
+        .expect("workflow execution should succeed");
+
+    let response = client
+        .get(format!(
+            "{}/api/v1/runs/{}/checkpoints",
+            server.base_url, run_id
+        ))
+        .send()
+        .await
+        .expect("checkpoint request should succeed");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .expect("checkpoint response should deserialize");
+    let kinds = body["items"]
+        .as_array()
+        .expect("checkpoint items should be an array")
+        .iter()
+        .map(|item| item["kind"].as_str().expect("kind should be a string"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        kinds,
+        vec![
+            "run_created",
+            "run_started",
+            "step_started",
+            "step_completed",
+            "step_started",
+            "step_completed",
+            "run_completed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_v1_interrupted_run_is_visible_after_restart() {
+    let tmp = tempfile::tempdir().expect("temp dir should be created");
+    let config = KernelConfig {
+        home_dir: tmp.path().to_path_buf(),
+        data_dir: tmp.path().join("data"),
+        default_model: DefaultModelConfig {
+            provider: "ollama".to_string(),
+            model: "test-model".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url: None,
+        },
+        ..KernelConfig::default()
+    };
+    let run_id = Uuid::new_v4().to_string();
+    let first_kernel = OpenFangKernel::boot_with_config(config.clone()).expect("first boot");
+    first_kernel
+        .workflow_stores
+        .workflow_run
+        .insert_run(&WorkflowRunRecord {
+            run_id: run_id.clone(),
+            workflow_id: Uuid::new_v4().to_string(),
+            workflow_version: "1.0.0".to_string(),
+            status: WorkflowRunStatus::Running,
+            input_json: serde_json::json!({ "ticket": "T-42" }).to_string(),
+            vars_json: "{}".to_string(),
+            current_step_id: Some("analyze".to_string()),
+            waiting_kind: None,
+            waiting_ref: None,
+            active_dispatch_id: None,
+            active_hitl_request_id: None,
+            labels_json: "[]".to_string(),
+            metadata_json: "{}".to_string(),
+            error_json: None,
+            started_at: "2026-03-23T12:00:00Z".to_string(),
+            updated_at: "2026-03-23T12:00:00Z".to_string(),
+            completed_at: None,
+        })
+        .expect("running workflow run should persist");
+    first_kernel.shutdown();
+
+    let kernel = Arc::new(OpenFangKernel::boot_with_config(config).expect("second boot"));
+    kernel.set_self_handle();
+    kernel.bootstrap_workflow_definitions().await;
+    let state = Arc::new(AppState {
+        kernel: Arc::clone(&kernel),
+        started_at: Instant::now(),
+        peer_registry: None,
+        bridge_manager: tokio::sync::Mutex::new(None),
+        channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        clawhub_cache: dashmap::DashMap::new(),
+        provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+    });
+    let app = Router::new()
+        .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))
+        .with_state(Arc::clone(&state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose local address");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("api should serve");
+    });
+
+    let server = TestServer {
+        base_url: format!("http://{}", address),
+        state,
+        _tmp: tmp,
+    };
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{}/api/v1/runs/{run_id}", server.base_url))
+        .send()
+        .await
+        .expect("run detail request should succeed");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .expect("run detail response should deserialize");
+
+    assert_eq!(body["id"], run_id);
+    assert_eq!(body["status"], "interrupted");
 }
 
 #[tokio::test]
@@ -868,6 +1270,16 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         .route(
             "/api/workflows/{id}/runs",
             axum::routing::get(routes::list_workflow_runs),
+        )
+        .route(
+            "/api/v1/workflows/{id}/runs",
+            axum::routing::get(routes::list_workflow_runs_v1).post(routes::start_workflow_run_v1),
+        )
+        .route("/api/v1/runs", axum::routing::get(routes::list_runs_v1))
+        .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))
+        .route(
+            "/api/v1/runs/{id}/checkpoints",
+            axum::routing::get(routes::get_run_checkpoints_v1),
         )
         .route("/api/shutdown", axum::routing::post(routes::shutdown))
         .layer(axum::middleware::from_fn_with_state(

@@ -16,12 +16,117 @@ use openfang_kernel::workflow_compiler::{
 };
 use openfang_kernel::OpenFangKernel;
 use openfang_memory::AgentRuntimeRecord;
+use openfang_memory::{WorkflowRunListQuery, WorkflowRunStatus};
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct RunListQueryParams {
+    #[serde(default)]
+    pub workflow_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub waiting_kind: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default, rename = "q")]
+    pub search: Option<String>,
+}
+
+fn parse_run_status_param(
+    status: Option<&str>,
+) -> Result<Option<WorkflowRunStatus>, (StatusCode, Json<serde_json::Value>)> {
+    status
+        .map(|value| value.parse::<WorkflowRunStatus>())
+        .transpose()
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "invalid_status",
+                        "message": error.to_string(),
+                        "details": [],
+                    }
+                })),
+            )
+        })
+}
+
+fn parse_json_text_field(
+    raw: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    serde_json::from_str(raw).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "invalid_durable_json",
+                    "message": format!("Stored run payload was not valid JSON: {error}"),
+                    "details": [],
+                }
+            })),
+        )
+    })
+}
+
+fn run_record_to_summary(record: &openfang_memory::WorkflowRunRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": record.run_id,
+        "workflow_id": record.workflow_id,
+        "status": record.status.as_str(),
+        "current_step_id": record.current_step_id,
+        "waiting_kind": record.waiting_kind,
+        "started_at": record.started_at,
+        "updated_at": record.updated_at,
+    })
+}
+
+fn run_record_to_detail(
+    record: &openfang_memory::WorkflowRunRecord,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    Ok(serde_json::json!({
+        "id": record.run_id,
+        "workflow_id": record.workflow_id,
+        "workflow_version": record.workflow_version,
+        "status": record.status.as_str(),
+        "input": parse_json_text_field(&record.input_json)?,
+        "vars": parse_json_text_field(&record.vars_json)?,
+        "current_step_id": record.current_step_id,
+        "waiting_kind": record.waiting_kind,
+        "waiting_ref": record.waiting_ref,
+        "active_dispatch_id": record.active_dispatch_id,
+        "active_hitl_request_id": record.active_hitl_request_id,
+        "labels": parse_json_text_field(&record.labels_json)?,
+        "metadata": parse_json_text_field(&record.metadata_json)?,
+        "error": record
+            .error_json
+            .as_deref()
+            .map(parse_json_text_field)
+            .transpose()?,
+        "started_at": record.started_at,
+        "updated_at": record.updated_at,
+        "completed_at": record.completed_at,
+    }))
+}
+
+fn checkpoint_record_to_json(
+    record: &openfang_memory::WorkflowCheckpointRecord,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    Ok(serde_json::json!({
+        "id": record.checkpoint_id,
+        "run_id": record.run_id,
+        "step_id": record.step_id,
+        "kind": record.kind.as_str(),
+        "data": parse_json_text_field(&record.data_json)?,
+        "created_at": record.created_at,
+    }))
+}
 
 /// Shared application state.
 ///
@@ -1224,26 +1329,256 @@ pub async fn run_workflow(
     }
 }
 
+/// POST /api/v1/workflows/{id}/runs — Execute a workflow through the v1 durable
+/// run surface.
+pub async fn start_workflow_run_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let workflow_id = WorkflowId(match id.parse() {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "invalid_workflow_id",
+                        "message": "Invalid workflow ID",
+                        "details": [],
+                    }
+                })),
+            );
+        }
+    });
+
+    let input = serde_json::to_string(req.get("input").unwrap_or(&serde_json::Value::Null))
+        .unwrap_or_else(|_| "null".to_string());
+    let labels = req
+        .get("labels")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let metadata = req
+        .get("metadata")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    match state
+        .kernel
+        .run_workflow_with_context(workflow_id, input, labels, metadata)
+        .await
+    {
+        Ok((run_id, _output)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "accepted": true,
+                "resource_id": id,
+                "status": "accepted",
+                "run_id": run_id.to_string(),
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!("Workflow run failed for {id}: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "workflow_execution_failed",
+                        "message": "Workflow execution failed",
+                        "details": [],
+                    }
+                })),
+            )
+        }
+    }
+}
+
 /// GET /api/workflows/:id/runs — List runs for a workflow.
 pub async fn list_workflow_runs(
     State(state): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let runs = state.kernel.workflows.list_runs(None).await;
-    let list: Vec<serde_json::Value> = runs
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id.to_string(),
-                "workflow_name": r.workflow_name,
-                "state": serde_json::to_value(&r.state).unwrap_or_default(),
-                "steps_completed": r.step_results.len(),
-                "started_at": r.started_at.to_rfc3339(),
-                "completed_at": r.completed_at.map(|t| t.to_rfc3339()),
-            })
-        })
-        .collect();
-    Json(list)
+    match state
+        .kernel
+        .workflow_stores
+        .workflow_run
+        .list_for_workflow(&id)
+    {
+        Ok(runs) => {
+            let items = runs.iter().map(run_record_to_summary).collect::<Vec<_>>();
+            (StatusCode::OK, Json(serde_json::json!(items)))
+        }
+        Err(error) => {
+            tracing::warn!("Failed to list workflow runs for {id}: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to list workflow runs"})),
+            )
+        }
+    }
+}
+
+/// GET /api/v1/workflows/{id}/runs — List durable runs for one workflow.
+pub async fn list_workflow_runs_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .workflow_stores
+        .workflow_run
+        .list_for_workflow(&id)
+    {
+        Ok(runs) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": runs.iter().map(run_record_to_summary).collect::<Vec<_>>(),
+                "next_cursor": serde_json::Value::Null,
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!("Failed to list durable workflow runs for {id}: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "run_list_failed",
+                        "message": "Failed to list workflow runs",
+                        "details": [],
+                    }
+                })),
+            )
+        }
+    }
+}
+
+/// GET /api/v1/runs — List durable runs.
+pub async fn list_runs_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RunListQueryParams>,
+) -> impl IntoResponse {
+    let status = match parse_run_status_param(params.status.as_deref()) {
+        Ok(status) => status,
+        Err(response) => return response,
+    };
+    let query = WorkflowRunListQuery {
+        workflow_id: params.workflow_id,
+        status,
+        waiting_kind: params.waiting_kind,
+        label: params.label,
+        search: params.search,
+    };
+
+    match state.kernel.workflow_stores.workflow_run.list_runs(&query) {
+        Ok(runs) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": runs.iter().map(run_record_to_summary).collect::<Vec<_>>(),
+                "next_cursor": serde_json::Value::Null,
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!("Failed to list durable runs: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "run_list_failed",
+                        "message": "Failed to list runs",
+                        "details": [],
+                    }
+                })),
+            )
+        }
+    }
+}
+
+/// GET /api/v1/runs/{id} — Load one durable run.
+pub async fn get_run_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
+        Ok(Some(run)) => match run_record_to_detail(&run) {
+            Ok(body) => (StatusCode::OK, Json(body)),
+            Err(response) => response,
+        },
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "not_found",
+                    "message": "Run not found",
+                    "details": [],
+                }
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!("Failed to load durable run {id}: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "run_load_failed",
+                        "message": "Failed to load run",
+                        "details": [],
+                    }
+                })),
+            )
+        }
+    }
+}
+
+/// GET /api/v1/runs/{id}/checkpoints — List durable checkpoints for one run.
+pub async fn get_run_checkpoints_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .workflow_stores
+        .workflow_checkpoint
+        .list_for_run(&id)
+    {
+        Ok(records) => {
+            let mut items = Vec::with_capacity(records.len());
+            for record in &records {
+                let item = match checkpoint_record_to_json(record) {
+                    Ok(item) => item,
+                    Err(response) => return response,
+                };
+                items.push(item);
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "items": items,
+                    "next_cursor": serde_json::Value::Null,
+                })),
+            )
+        }
+        Err(error) => {
+            tracing::warn!("Failed to load checkpoints for run {id}: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "checkpoint_list_failed",
+                        "message": "Failed to load run checkpoints",
+                        "details": [],
+                    }
+                })),
+            )
+        }
+    }
 }
 
 /// GET /api/workflows/:id — Get a single workflow by ID.

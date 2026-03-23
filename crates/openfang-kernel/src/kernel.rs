@@ -553,24 +553,6 @@ fn initialize_workflow_stores(compozy_db: Arc<Mutex<Connection>>) -> WorkflowSto
     WorkflowStoreSet::new(compozy_db)
 }
 
-fn recover_inflight_workflow_runs(workflow_stores: &WorkflowStoreSet) -> KernelResult<()> {
-    let recovered = workflow_stores
-        .workflow_run
-        .recover_running_runs()
-        .map_err(|error| {
-            KernelError::BootFailed(format!("Workflow recovery scan failed: {error}"))
-        })?;
-
-    if recovered > 0 {
-        info!(
-            recovered_runs = recovered,
-            "Recovered running workflow rows and downgraded them to paused"
-        );
-    }
-
-    Ok(())
-}
-
 impl OpenFangKernel {
     /// Boot the kernel with configuration from the given path.
     pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
@@ -660,7 +642,6 @@ impl OpenFangKernel {
         )?;
         let runtime_stores = initialize_runtime_stores(Arc::clone(&runtime_db));
         let workflow_stores = initialize_workflow_stores(Arc::clone(&compozy_db));
-        recover_inflight_workflow_runs(&workflow_stores)?;
 
         // Initialize credential resolver (vault → dotenv → env var)
         let credential_resolver = {
@@ -4029,11 +4010,14 @@ impl OpenFangKernel {
             .map_err(Into::into)
     }
 
-    /// Run a workflow pipeline end-to-end.
-    pub async fn run_workflow(
+    /// Run a workflow pipeline end-to-end with optional durable labels and
+    /// metadata.
+    pub async fn run_workflow_with_context(
         &self,
         workflow_id: WorkflowId,
         input: String,
+        labels: Vec<String>,
+        metadata: serde_json::Value,
     ) -> KernelResult<(WorkflowRunId, String)> {
         let workflow = self
             .workflows
@@ -4048,7 +4032,13 @@ impl OpenFangKernel {
 
         let run_id = self
             .workflows
-            .create_run(workflow_id, input)
+            .create_run_with_context(
+                workflow_id,
+                workflow_ir.workflow_version.clone(),
+                input,
+                labels,
+                metadata,
+            )
             .await
             .map_err(KernelError::from)?;
 
@@ -4098,6 +4088,16 @@ impl OpenFangKernel {
         Ok((run_id, output))
     }
 
+    /// Run a workflow pipeline end-to-end.
+    pub async fn run_workflow(
+        &self,
+        workflow_id: WorkflowId,
+        input: String,
+    ) -> KernelResult<(WorkflowRunId, String)> {
+        self.run_workflow_with_context(workflow_id, input, Vec::new(), serde_json::json!({}))
+            .await
+    }
+
     fn workflows_dir(&self) -> PathBuf {
         self.config
             .workflows_dir
@@ -4108,7 +4108,20 @@ impl OpenFangKernel {
     /// Bootstrap workflow definitions from the configured directory.
     pub async fn bootstrap_workflow_definitions(&self) -> WorkflowBootstrapResult {
         let workflows_dir = self.workflows_dir();
-        self.load_workflows_from_dir(&workflows_dir).await
+        let result = self.load_workflows_from_dir(&workflows_dir).await;
+        match self.workflows.recover_durable_runs().await {
+            Ok(interrupted) if interrupted > 0 => {
+                info!(
+                    interrupted_runs = interrupted,
+                    "Recovered durable workflow runs after bootstrap"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!("Workflow durable run recovery failed after bootstrap: {error}");
+            }
+        }
+        result
     }
 
     /// Auto-load workflow definitions from a directory.
@@ -7135,7 +7148,7 @@ mod tests {
         let compozy_rows = schema_migration_rows(&compozy_db);
 
         assert_eq!(runtime_rows.len(), 4);
-        assert_eq!(compozy_rows.len(), 4);
+        assert_eq!(compozy_rows.len(), 5);
         assert_eq!(runtime_rows[0].0, 1);
         assert_eq!(compozy_rows[0].0, 1);
         assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -7146,6 +7159,7 @@ mod tests {
         assert_eq!(compozy_rows[1].1, "0002_workflow_run_core");
         assert_eq!(compozy_rows[2].1, "0003_workflow_checkpoint");
         assert_eq!(compozy_rows[3].1, "0004_workflow_signal");
+        assert_eq!(compozy_rows[4].1, "0005_workflow_runtime_durability");
 
         kernel.shutdown();
     }
