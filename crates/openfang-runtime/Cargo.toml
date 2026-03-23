@@ -6,9 +6,9 @@ license.workspace = true
 description = "Agent runtime and execution environment for OpenFang"
 
 [dependencies]
-openfang-types = { path = "../openfang-types" }
-openfang-memory = { path = "../openfang-memory" }
-openfang-skills = { path = "../openfang-skills" }
+openfang-types = { workspace = true }
+openfang-memory = { workspace = true }
+openfang-skills = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -36,3 +36,6 @@ shlex = "1"
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

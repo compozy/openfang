@@ -6,7 +6,7 @@ license.workspace = true
 description = "Skill system for OpenFang — registry, loader, marketplace, and OpenClaw compatibility"
 
 [dependencies]
-openfang-types = { path = "../openfang-types" }
+openfang-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
@@ -25,3 +25,6 @@ zip = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
+
+[lints]
+workspace = true

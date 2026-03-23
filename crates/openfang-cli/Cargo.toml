@@ -10,12 +10,12 @@ name = "openfang"
 path = "src/main.rs"
 
 [dependencies]
-openfang-types = { path = "../openfang-types" }
-openfang-kernel = { path = "../openfang-kernel" }
-openfang-api = { path = "../openfang-api" }
-openfang-migrate = { path = "../openfang-migrate" }
-openfang-skills = { path = "../openfang-skills" }
-openfang-extensions = { path = "../openfang-extensions" }
+openfang-types = { workspace = true }
+openfang-kernel = { workspace = true }
+openfang-api = { workspace = true }
+openfang-migrate = { workspace = true }
+openfang-skills = { workspace = true }
+openfang-extensions = { workspace = true }
 zeroize = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -27,7 +27,12 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
-openfang-runtime = { path = "../openfang-runtime" }
+openfang-runtime = { workspace = true }
 uuid = { workspace = true }
 ratatui = { workspace = true }
 colored = { workspace = true }
+
+
+
+[lints]
+workspace = true

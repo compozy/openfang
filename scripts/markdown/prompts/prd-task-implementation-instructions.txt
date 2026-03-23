@@ -1,0 +1,10 @@
+## Implementation Instructions
+
+<critical>
+**MANDATORY READ BEFORE STARTING**:
+- `CLAUDE.md` - Review ALL project rules and coding standards
+- All documents from this PRD directory: `{{PRD_DIR}}`
+  - Especially review `_techspec.md` and `_tasks.md` for full context
+- For ANY external library documentation, use web search / code search tools and return findings with source citations
+</critical>
+

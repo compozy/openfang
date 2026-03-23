@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"approval-1","method":"approval/request","params":{"threadId":"thread-1","toolName":"shell","command":"ls -la"}}
+{"jsonrpc":"2.0","method":"account/status","params":{"scopeId":"workspace-1","status":"ready"}}

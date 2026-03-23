@@ -1,0 +1,47 @@
+## Exploration Phase (MANDATORY FIRST STEP)
+
+<critical>
+**CRITICAL**: Before starting ANY implementation work, you MUST complete the exploration phase.
+
+**MANDATORY WORKFLOW ORDER**:
+
+1. **RECONCILE CURRENT STATE**: Inspect the existing workspace before new edits
+   - Review the current branch, `git status`, recent relevant changes, and any in-progress task artifacts
+   - Resume from current reality; do NOT restart solved investigation work unless required by new evidence
+
+2. **EXPLORATION FIRST**: Discover relevant files, rules, and architectural patterns
+   - Read `CLAUDE.md` for project standards, skills pattern, and mandatory requirements
+   - Explore the codebase to understand existing patterns, conventions, and dependencies
+   - Identify implementation files, test files, coding standards, and architectural patterns
+   - Returns context needed for informed implementation decisions
+
+3. **READ TASK SPECIFICATION**: Read the full task file for requirements, deliverables, acceptance criteria, and tests
+   - Mirror any explicit `Validation`, `Test Plan`, or `Testing` requirements into your execution checklist as mandatory items
+
+4. **PLAN THE VALIDATION BAR**: Refine the execution checklist before coding
+   - Identify the targeted proof that demonstrates the change actually fixes the task
+   - Define the full verification commands required before completion
+
+5. **REPRODUCE FIRST**: Capture a concrete pre-change signal before editing code
+   - Use a failing test, deterministic runtime behavior, command output, or equivalent evidence
+   - If the issue cannot be reproduced directly, record the strongest available baseline signal and proceed carefully
+
+6. **IMPLEMENT**: Execute the implementation based on exploration findings
+   - Use web search / code search for ANY external library documentation research
+   - Update task checklists/notes as meaningful milestones are completed; do not leave completed work unreflected in tracking
+   - Think deeply about complex decisions or when stuck after 2+ attempts
+
+7. **VALIDATE AND CLOSE GAPS**: Run targeted proof and full verification on the final code
+   - Execute every mandatory validation item from the task/PRD docs
+   - Do not rely on stale runs; validation evidence must match the latest code changes
+
+8. **SELF-REVIEW**: Review your implementation for quality assurance
+   - Check that all requirements are met and standards are followed
+   - Confirm acceptance criteria, validation evidence, and task tracking all match reality
+   - Resolve all blocking issues before proceeding
+
+{{AUTO_COMMIT_STEP}}10. **COMPLETE**: Update task status to 'completed'
+
+⚠️ **TASK WILL BE INVALIDATED** if exploration phase is skipped.
+</critical>
+

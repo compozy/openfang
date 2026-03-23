@@ -1,0 +1,61 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Unit Tests",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--all-features",
+          "--lib",
+          "--package=${input:crate}"
+        ],
+        "filter": {
+          "name": "${input:crate}",
+          "kind": "lib"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Debug Binary",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--release",
+          "--package=${input:crate}"
+        ]
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "crate",
+      "description": "Select crate to debug",
+      "type": "pickString",
+      "options": [
+        "openfang-types",
+        "openfang-memory",
+        "openfang-runtime",
+        "openfang-wire",
+        "openfang-api",
+        "openfang-kernel",
+        "openfang-cli",
+        "openfang-channels",
+        "openfang-migrate",
+        "openfang-skills",
+        "openfang-desktop",
+        "openfang-hands",
+        "openfang-extensions"
+      ]
+    }
+  ]
+}

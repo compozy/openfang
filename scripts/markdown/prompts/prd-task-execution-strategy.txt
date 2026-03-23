@@ -1,0 +1,14 @@
+## Execution Strategy Guidelines
+
+Use these strategies during execution:
+
+- **Exploration (MANDATORY FIRST STEP)**: Read `CLAUDE.md` first to discover relevant files, rules, and dependencies for this task. Explore codebase patterns before writing code.
+- **Continuation Discipline**: Resume from the existing workspace state and avoid restarting solved work without a concrete reason.
+- **Acceptance/Validation Discipline**: Treat explicit `Validation`, `Test Plan`, and `Testing` sections as mandatory completion requirements, not suggestions.
+- **Reproduce Before Change**: Capture a concrete signal before editing, then use the matching after-change proof to verify the result.
+- **Tracking Accuracy**: Keep task checkboxes, notes, and final status aligned with real progress as milestones happen.
+- **External Research**: Use web search / code search for ALL external library documentation, API references, and version-specific guidance. Never guess at library APIs.
+- **Deep Analysis for Complex Decisions**: For architectural trade-offs, difficult bugs after repeated attempts, or high-risk decisions, step back and deeply analyze before proceeding.
+- **Scope Control**: Document meaningful out-of-scope findings separately instead of expanding the task silently.
+- **Blocker Threshold**: Only pause early for true external blockers; otherwise continue autonomously until the task reaches the completion bar.
+{{SELF_REVIEW_STRATEGY}}

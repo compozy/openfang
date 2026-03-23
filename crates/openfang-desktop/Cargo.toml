@@ -9,9 +9,9 @@ description = "Native desktop application for the OpenFang Agent OS (Tauri 2.0)"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-openfang-kernel = { path = "../openfang-kernel" }
-openfang-api = { path = "../openfang-api" }
-openfang-types = { path = "../openfang-types" }
+openfang-kernel = { workspace = true }
+openfang-api = { workspace = true }
+openfang-types = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
@@ -36,3 +36,6 @@ custom-protocol = ["tauri/custom-protocol"]
 [[bin]]
 name = "openfang-desktop"
 path = "src/main.rs"
+
+[lints]
+workspace = true

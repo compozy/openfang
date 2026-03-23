@@ -1,0 +1,26 @@
+<critical>
+**DO NOT SKIP ANY COMPLETION STEPS**
+Your task is NOT complete until ALL steps above are done, including:
+- All deliverables produced
+- Every explicit acceptance criterion satisfied
+- Every explicit `Validation`, `Test Plan`, or `Testing` item executed
+- Concrete before/after evidence recorded for the change
+- All tests passing
+- All linting passing
+- **Self-review completed with zero blocking issues**
+{{BLOCKING_ISSUES_REQUIREMENT}}- All subtask checkboxes marked
+- Status changed to 'completed'
+- Master tasks list updated
+{{COMMIT_COMPLETION_REQUIREMENT}}
+**MANDATORY ORDER OF OPERATIONS**:
+1. Reproduce and capture the pre-change signal
+2. Implement and fix issues
+3. Run targeted validation plus tests/linting/typecheck on the final code (must pass)
+4. **Self-review implementation (zero blocking issues)**
+5. **Resolve any blocking issues, then review again until clean**
+{{AUTO_COMMIT_ORDER_REQUIREMENT}}⚠️ **TASK WILL BE INVALIDATED** if:
+{{AUTO_COMMIT_INVALIDATION_CHECKLIST}}
+- You declare completion while required acceptance or validation items remain unchecked
+- You rely on stale verification output that does not reflect the latest code
+</critical>
+

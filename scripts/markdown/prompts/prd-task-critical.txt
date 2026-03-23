@@ -1,0 +1,52 @@
+<CRITICAL>
+**EXECUTION MODE: ONE-SHOT DIRECT IMPLEMENTATION**
+
+You MUST complete this task in ONE continuous execution from beginning to end:
+
+**MANDATORY EXPLORATION PHASE (FIRST STEP)**:
+- **EXPLORE FIRST**: Read `CLAUDE.md` and `AGENTS.md` as the FIRST step before any implementation
+- Discover relevant files, rules, coding standards, and architectural patterns
+- Read all PRD documents (especially `_techspec.md` and `_tasks.md`) for full context
+- Do NOT start implementation until exploration is complete
+
+**EXECUTION GUIDELINES**:
+- **NO ASKING**: Do not ask for clarification, confirmation, or approval
+- **NO PLANNING MODE**: Execute directly without presenting plans
+- **NO PARTIAL WORK**: Complete ALL requirements, subtasks, and deliverables
+- **CONTINUE, DON'T RESTART**: Resume from the current workspace state and avoid repeating already-completed investigation unless new changes require it
+- **FOLLOW ALL STANDARDS**: Adhere to ALL project rules and skills pattern from `CLAUDE.md`
+- **USE RELEVANT SKILLS**: Check and use appropriate skills for your domain (backend, frontend, etc.)
+- **BEST PRACTICES ONLY**: No workarounds, hacks, or shortcuts
+- **PROPER SOLUTIONS**: Implement production-ready, maintainable code
+- **RESEARCH EXTERNAL LIBS**: For ANY external library documentation, API references, or best practices, use web search/code search tools and return findings with source citations
+- **ESCALATE WHEN STUCK**: After 2-3 failed attempts at solving ANY problem, step back and deeply analyze the issue before trying again. This is NON-NEGOTIABLE.
+- **NO WORKAROUNDS WHEN STRUGGLING**: If you find yourself considering a workaround, STOP and research the proper solution first.
+- **TRUE BLOCKERS ONLY**: Only stop early for a real blocker such as missing required auth, permissions, secrets, or an unreconcilable requirement conflict
+
+<MOST_CRITICAL>
+**Git Commands Restriction**
+
+- **ABSOLUTELY FORBIDDEN**: **NEVER** run `git restore`, `git checkout`, `git reset`, `git clean`, `git rm` **WITHOUT EXPLICIT USER PERMISSION**.
+- **DATA LOSS RISK**: These commands can **PERMANENTLY LOSE CODE CHANGES** that are not related to your task.
+- **REQUIRED**: **NEVER restore files that are already in git and not related to your changes - THIS IS TOTALLY WRONG**. Only modify files directly related to your assigned task. If you see files in `git status` you didn't modify, **DO NOT TOUCH THEM**.
+- **VIOLATION**: Running destructive git commands without permission = **IMMEDIATE TASK REJECTION** and **IRREVERSIBLE DATA LOSS**.
+</MOST_CRITICAL>
+
+**VALIDATION REQUIREMENTS**:
+- All tests MUST pass (`pnpm run test`)
+- All linting MUST pass (`pnpm run lint`)
+- All type checking MUST pass (`pnpm run typecheck`)
+{{AUTO_COMMIT_VALIDATION_REQUIREMENTS}}- All subtasks MUST be marked complete
+- Task status MUST be updated to 'completed'
+
+⚠️  **WORK WILL BE INVALIDATED** if:
+- Exploration phase is skipped (not reading CLAUDE.md/AGENTS.md first)
+- Any requirement is incomplete
+- Tests/linting fails
+- Project standards are violated
+- Workarounds are used instead of proper solutions
+- Any destructive git command is executed without explicit user permission
+- Unknown libraries/APIs are used without researching documentation first
+- 3+ failed attempts at solving any problem without stepping back to analyze
+{{AUTO_COMMIT_INVALIDATION_REQUIREMENTS}}</CRITICAL>
+

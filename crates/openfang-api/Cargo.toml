@@ -6,16 +6,16 @@ license.workspace = true
 description = "HTTP/WebSocket API server for the OpenFang Agent OS daemon"
 
 [dependencies]
-openfang-types = { path = "../openfang-types" }
-openfang-kernel = { path = "../openfang-kernel" }
-openfang-runtime = { path = "../openfang-runtime" }
-openfang-memory = { path = "../openfang-memory" }
-openfang-channels = { path = "../openfang-channels" }
-openfang-wire = { path = "../openfang-wire" }
-openfang-skills = { path = "../openfang-skills" }
-openfang-hands = { path = "../openfang-hands" }
-openfang-extensions = { path = "../openfang-extensions" }
-openfang-migrate = { path = "../openfang-migrate" }
+openfang-types = { workspace = true }
+openfang-kernel = { workspace = true }
+openfang-runtime = { workspace = true }
+openfang-memory = { workspace = true }
+openfang-channels = { workspace = true }
+openfang-wire = { workspace = true }
+openfang-skills = { workspace = true }
+openfang-hands = { workspace = true }
+openfang-extensions = { workspace = true }
+openfang-migrate = { workspace = true }
 dashmap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -43,3 +43,6 @@ reqwest = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"serverInfo":{"name":"codex-fixture","version":"0.1.0"},"capabilities":{}}}
+{"jsonrpc":"2.0","id":1,"result":{"thread":{"id":"thread-1"}}}
+{"jsonrpc":"2.0","id":2,"result":{"turn":{"id":"turn-thread-1-1"}}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1"}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","item":{"id":"message-1","type":"agentMessage","text":""}}}
+{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-1","delta":"hello"}} 
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-1","item":{"id":"message-1","type":"agentMessage","text":"hello"}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","usage":{"input_tokens":1,"output_tokens":1}}}

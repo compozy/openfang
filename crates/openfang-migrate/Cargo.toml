@@ -6,7 +6,7 @@ license.workspace = true
 description = "Migration engine for importing from other agent frameworks into OpenFang"
 
 [dependencies]
-openfang-types = { path = "../openfang-types" }
+openfang-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -21,3 +21,6 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

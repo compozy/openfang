@@ -22,9 +22,24 @@ version = "0.5.1"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/RightNow-AI/openfang"
-rust-version = "1.75"
+rust-version = "1.94.0"
 
 [workspace.dependencies]
+# Internal crates
+openfang-types = { path = "crates/openfang-types" }
+openfang-memory = { path = "crates/openfang-memory" }
+openfang-runtime = { path = "crates/openfang-runtime" }
+openfang-wire = { path = "crates/openfang-wire" }
+openfang-api = { path = "crates/openfang-api" }
+openfang-kernel = { path = "crates/openfang-kernel" }
+openfang-cli = { path = "crates/openfang-cli" }
+openfang-channels = { path = "crates/openfang-channels" }
+openfang-migrate = { path = "crates/openfang-migrate" }
+openfang-skills = { path = "crates/openfang-skills" }
+openfang-desktop = { path = "crates/openfang-desktop" }
+openfang-hands = { path = "crates/openfang-hands" }
+openfang-extensions = { path = "crates/openfang-extensions" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -147,6 +162,9 @@ openssl = { version = "0.10", features = ["vendored"] }
 # Testing
 tokio-test = "0.4"
 tempfile = "3"
+
+[workspace.lints.clippy]
+collapsible_if = "allow"
 
 [profile.release]
 lto = true

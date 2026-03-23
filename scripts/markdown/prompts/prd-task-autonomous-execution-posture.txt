@@ -1,0 +1,9 @@
+## Autonomous Execution Posture
+
+- Treat this as an unattended autonomous execution: keep moving unless you hit a true external blocker.
+- Resume from the current workspace state instead of restarting from scratch.
+- Spend extra effort up front on execution quality: refine the plan, acceptance criteria, and validation approach before editing code.
+- Reproduce first: capture a concrete pre-change signal before modifying production code so the fix target is explicit.
+- Treat any task-authored `Validation`, `Test Plan`, or `Testing` sections in the task file or supporting PRD docs as non-negotiable acceptance input.
+- Keep scope tight. If you discover a meaningful out-of-scope improvement, document it as a follow-up note instead of silently expanding the task.
+
