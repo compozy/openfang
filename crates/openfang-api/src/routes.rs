@@ -806,59 +806,76 @@ pub async fn shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 // Workflow routes
 // ---------------------------------------------------------------------------
 
-/// POST /api/workflows — Register a new workflow.
-pub async fn create_workflow(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<serde_json::Value>,
-) -> impl IntoResponse {
+fn workflow_bad_request(message: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message.into() })),
+    )
+}
+
+fn workflow_internal_error(
+    operation: &str,
+    workflow_id: Option<WorkflowId>,
+    error: &impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::error!(
+        workflow_id = workflow_id.map(|id| id.to_string()),
+        error = %error,
+        "Failed to {operation} workflow definition"
+    );
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": format!("Failed to {operation} workflow definition")
+        })),
+    )
+}
+
+fn workflow_from_request(
+    workflow_id: WorkflowId,
+    created_at: chrono::DateTime<chrono::Utc>,
+    req: &serde_json::Value,
+) -> Result<Workflow, (StatusCode, Json<serde_json::Value>)> {
     let name = req["name"].as_str().unwrap_or("unnamed").to_string();
     let description = req["description"].as_str().unwrap_or("").to_string();
 
-    let steps_json = match req["steps"].as_array() {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Missing 'steps' array"})),
-            );
-        }
-    };
+    let steps_json = req["steps"]
+        .as_array()
+        .ok_or_else(|| workflow_bad_request("Missing 'steps' array"))?;
 
-    let mut steps = Vec::new();
-    for s in steps_json {
-        let step_name = s["name"].as_str().unwrap_or("step").to_string();
-        let agent = if let Some(id) = s["agent_id"].as_str() {
+    let mut steps = Vec::with_capacity(steps_json.len());
+    for step in steps_json {
+        let step_name = step["name"].as_str().unwrap_or("step").to_string();
+        let agent = if let Some(id) = step["agent_id"].as_str() {
             StepAgent::ById { id: id.to_string() }
-        } else if let Some(name) = s["agent_name"].as_str() {
+        } else if let Some(name) = step["agent_name"].as_str() {
             StepAgent::ByName {
                 name: name.to_string(),
             }
         } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({"error": format!("Step '{}' needs 'agent_id' or 'agent_name'", step_name)}),
-                ),
-            );
+            return Err(workflow_bad_request(format!(
+                "Step '{step_name}' needs 'agent_id' or 'agent_name'"
+            )));
         };
 
-        let mode = match s["mode"].as_str().unwrap_or("sequential") {
+        let mode = match step["mode"].as_str().unwrap_or("sequential") {
             "fan_out" => StepMode::FanOut,
             "collect" => StepMode::Collect,
             "conditional" => StepMode::Conditional {
-                condition: s["condition"].as_str().unwrap_or("").to_string(),
+                condition: step["condition"].as_str().unwrap_or("").to_string(),
             },
             "loop" => StepMode::Loop {
-                max_iterations: s["max_iterations"].as_u64().unwrap_or(5) as u32,
-                until: s["until"].as_str().unwrap_or("").to_string(),
+                max_iterations: step["max_iterations"].as_u64().unwrap_or(5) as u32,
+                until: step["until"].as_str().unwrap_or("").to_string(),
             },
             _ => StepMode::Sequential,
         };
 
-        let error_mode = match s["error_mode"].as_str().unwrap_or("fail") {
+        let error_mode = match step["error_mode"].as_str().unwrap_or("fail") {
             "skip" => ErrorMode::Skip,
             "retry" => ErrorMode::Retry {
-                max_retries: s["max_retries"].as_u64().unwrap_or(3) as u32,
+                max_retries: step["max_retries"].as_u64().unwrap_or(3) as u32,
             },
             _ => ErrorMode::Fail,
         };
@@ -866,46 +883,41 @@ pub async fn create_workflow(
         steps.push(WorkflowStep {
             name: step_name,
             agent,
-            prompt_template: s["prompt"].as_str().unwrap_or("{{input}}").to_string(),
+            prompt_template: step["prompt"].as_str().unwrap_or("{{input}}").to_string(),
             mode,
-            timeout_secs: s["timeout_secs"].as_u64().unwrap_or(120),
+            timeout_secs: step["timeout_secs"].as_u64().unwrap_or(120),
             error_mode,
-            output_var: s["output_var"].as_str().map(String::from),
+            output_var: step["output_var"].as_str().map(String::from),
         });
     }
 
-    let workflow = Workflow {
-        id: WorkflowId::new(),
+    Ok(Workflow {
+        id: workflow_id,
         name,
         description,
         steps,
-        created_at: chrono::Utc::now(),
+        created_at,
+    })
+}
+
+/// POST /api/workflows — Register a new workflow.
+pub async fn create_workflow(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let workflow_id = WorkflowId::new();
+    let workflow = match workflow_from_request(workflow_id, chrono::Utc::now(), &req) {
+        Ok(workflow) => workflow,
+        Err(response) => return response,
     };
 
-    let id = state.kernel.register_workflow(workflow.clone()).await;
-
-    // Persist workflow to disk so it survives daemon restarts (#751)
-    let wf_dir = state
-        .kernel
-        .config
-        .workflows_dir
-        .clone()
-        .unwrap_or_else(|| state.kernel.config.home_dir.join("workflows"));
-    if let Err(e) = std::fs::create_dir_all(&wf_dir) {
-        tracing::warn!("Failed to create workflows dir: {e}");
-    } else {
-        let wf_path = wf_dir.join(format!("{}.json", id));
-        if let Ok(json) = serde_json::to_string_pretty(&workflow) {
-            if let Err(e) = std::fs::write(&wf_path, json) {
-                tracing::warn!("Failed to persist workflow {id}: {e}");
-            }
-        }
+    match state.kernel.register_workflow(workflow).await {
+        Ok(id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"workflow_id": id.to_string()})),
+        ),
+        Err(error) => workflow_internal_error("create", Some(workflow_id), &error),
     }
-
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({"workflow_id": id.to_string()})),
-    )
 }
 
 /// GET /api/workflows — List all workflows.
@@ -1034,92 +1046,25 @@ pub async fn update_workflow(
         }
     });
 
-    let name = req["name"].as_str().unwrap_or("unnamed").to_string();
-    let description = req["description"].as_str().unwrap_or("").to_string();
-
-    let steps_json = match req["steps"].as_array() {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Missing 'steps' array"})),
-            );
-        }
+    let updated = match workflow_from_request(workflow_id, chrono::Utc::now(), &req) {
+        Ok(workflow) => workflow,
+        Err(response) => return response,
     };
 
-    let mut steps = Vec::new();
-    for s in steps_json {
-        let step_name = s["name"].as_str().unwrap_or("step").to_string();
-        let agent = if let Some(id) = s["agent_id"].as_str() {
-            StepAgent::ById { id: id.to_string() }
-        } else if let Some(name) = s["agent_name"].as_str() {
-            StepAgent::ByName {
-                name: name.to_string(),
-            }
-        } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({"error": format!("Step '{}' needs 'agent_id' or 'agent_name'", step_name)}),
-                ),
-            );
-        };
-
-        let mode = match s["mode"].as_str().unwrap_or("sequential") {
-            "fan_out" => StepMode::FanOut,
-            "collect" => StepMode::Collect,
-            "conditional" => StepMode::Conditional {
-                condition: s["condition"].as_str().unwrap_or("").to_string(),
-            },
-            "loop" => StepMode::Loop {
-                max_iterations: s["max_iterations"].as_u64().unwrap_or(5) as u32,
-                until: s["until"].as_str().unwrap_or("").to_string(),
-            },
-            _ => StepMode::Sequential,
-        };
-
-        let error_mode = match s["error_mode"].as_str().unwrap_or("fail") {
-            "skip" => ErrorMode::Skip,
-            "retry" => ErrorMode::Retry {
-                max_retries: s["max_retries"].as_u64().unwrap_or(3) as u32,
-            },
-            _ => ErrorMode::Fail,
-        };
-
-        steps.push(WorkflowStep {
-            name: step_name,
-            agent,
-            prompt_template: s["prompt"].as_str().unwrap_or("{{input}}").to_string(),
-            mode,
-            timeout_secs: s["timeout_secs"].as_u64().unwrap_or(120),
-            error_mode,
-            output_var: s["output_var"].as_str().map(String::from),
-        });
-    }
-
-    let updated = Workflow {
-        id: workflow_id,
-        name,
-        description,
-        steps,
-        created_at: chrono::Utc::now(), // preserved by engine
-    };
-
-    if state
+    match state
         .kernel
-        .workflows
-        .update_workflow(workflow_id, updated)
+        .update_workflow_definition(workflow_id, updated)
         .await
     {
-        (
+        Ok(true) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "updated", "workflow_id": id})),
-        )
-    } else {
-        (
+        ),
+        Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Workflow not found"})),
-        )
+        ),
+        Err(error) => workflow_internal_error("update", Some(workflow_id), &error),
     }
 }
 
@@ -1138,16 +1083,16 @@ pub async fn delete_workflow(
         }
     });
 
-    if state.kernel.workflows.remove_workflow(workflow_id).await {
-        (
+    match state.kernel.remove_workflow_definition(workflow_id).await {
+        Ok(true) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "removed", "workflow_id": id})),
-        )
-    } else {
-        (
+        ),
+        Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Workflow not found"})),
-        )
+        ),
+        Err(error) => workflow_internal_error("delete", Some(workflow_id), &error),
     }
 }
 

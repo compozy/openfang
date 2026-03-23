@@ -142,7 +142,10 @@ memory_write = ["self.*"]
         created_at: chrono::Utc::now(),
     };
 
-    let wf_id = kernel.register_workflow(workflow).await;
+    let wf_id = kernel
+        .register_workflow(workflow)
+        .await
+        .expect("workflow registration should succeed");
 
     // Verify workflow is registered
     let workflows = kernel.workflows.list_workflows().await;
@@ -216,7 +219,10 @@ memory_write = ["self.*"]
         created_at: chrono::Utc::now(),
     };
 
-    let wf_id = kernel.register_workflow(workflow).await;
+    let wf_id = kernel
+        .register_workflow(workflow)
+        .await
+        .expect("workflow registration should succeed");
 
     // Can create run (agent resolution happens at execute time)
     let run_id = kernel
@@ -357,7 +363,10 @@ async fn test_workflow_e2e_with_groq() {
         created_at: chrono::Utc::now(),
     };
 
-    let wf_id = kernel.register_workflow(workflow).await;
+    let wf_id = kernel
+        .register_workflow(workflow)
+        .await
+        .expect("workflow registration should succeed");
 
     // Run the workflow
     let result = kernel

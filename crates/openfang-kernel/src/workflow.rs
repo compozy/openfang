@@ -12,10 +12,12 @@
 
 use chrono::{DateTime, Utc};
 use openfang_types::agent::AgentId;
+use openfang_types::error::{OpenFangError, OpenFangResult};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -64,7 +66,7 @@ impl std::fmt::Display for WorkflowRunId {
 }
 
 /// A workflow definition — a named sequence of steps.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workflow {
     /// Unique identifier.
     pub id: WorkflowId,
@@ -79,7 +81,7 @@ pub struct Workflow {
 }
 
 /// A single step in a workflow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowStep {
     /// Step name for logging/display.
     pub name: String,
@@ -105,7 +107,7 @@ fn default_timeout() -> u64 {
 }
 
 /// How to identify the agent for a step.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StepAgent {
     /// Reference an agent by UUID.
@@ -115,7 +117,7 @@ pub enum StepAgent {
 }
 
 /// Execution mode for a workflow step.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepMode {
     /// Execute sequentially — this step runs after the previous completes.
@@ -132,7 +134,7 @@ pub enum StepMode {
 }
 
 /// Error handling mode for a workflow step.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorMode {
     /// Abort the workflow on error (default).
@@ -197,29 +199,193 @@ pub struct StepResult {
     pub duration_ms: u64,
 }
 
+/// Canonical file-backed storage for workflow definitions.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowDefinitionStore {
+    dir: PathBuf,
+}
+
+impl WorkflowDefinitionStore {
+    pub(crate) fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    fn workflow_path(&self, id: WorkflowId) -> PathBuf {
+        self.dir.join(format!("{id}.json"))
+    }
+
+    fn temp_path(&self, id: WorkflowId) -> PathBuf {
+        self.dir.join(format!("{id}.json.tmp"))
+    }
+
+    pub(crate) fn persist(&self, workflow: &Workflow) -> OpenFangResult<()> {
+        std::fs::create_dir_all(&self.dir).map_err(|error| {
+            OpenFangError::Internal(format!(
+                "Failed to create workflow definitions directory '{}': {error}",
+                self.dir.display()
+            ))
+        })?;
+
+        let payload = serde_json::to_string_pretty(workflow).map_err(|error| {
+            OpenFangError::Serialization(format!(
+                "Failed to serialize workflow definition {}: {error}",
+                workflow.id
+            ))
+        })?;
+        let tmp_path = self.temp_path(workflow.id);
+        let workflow_path = self.workflow_path(workflow.id);
+
+        std::fs::write(&tmp_path, payload.as_bytes()).map_err(|error| {
+            OpenFangError::Internal(format!(
+                "Failed to write workflow definition temp file '{}': {error}",
+                tmp_path.display()
+            ))
+        })?;
+
+        if let Err(error) = std::fs::rename(&tmp_path, &workflow_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(OpenFangError::Internal(format!(
+                "Failed to replace workflow definition file '{}': {error}",
+                workflow_path.display()
+            )));
+        }
+
+        let persisted = std::fs::read_to_string(&workflow_path).map_err(|error| {
+            OpenFangError::Internal(format!(
+                "Failed to read back workflow definition '{}': {error}",
+                workflow_path.display()
+            ))
+        })?;
+        let reloaded = serde_json::from_str::<Workflow>(&persisted).map_err(|error| {
+            OpenFangError::Serialization(format!(
+                "Failed to deserialize persisted workflow definition '{}': {error}",
+                workflow_path.display()
+            ))
+        })?;
+
+        if reloaded != *workflow {
+            return Err(OpenFangError::Internal(format!(
+                "Persisted workflow definition '{}' did not round-trip cleanly",
+                workflow_path.display()
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn delete(&self, id: WorkflowId) -> OpenFangResult<bool> {
+        let workflow_path = self.workflow_path(id);
+        match std::fs::remove_file(&workflow_path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(OpenFangError::Internal(format!(
+                "Failed to remove workflow definition '{}': {error}",
+                workflow_path.display()
+            ))),
+        }
+    }
+
+    pub(crate) fn load_all(&self) -> OpenFangResult<Vec<Workflow>> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(OpenFangError::Internal(format!(
+                    "Failed to read workflows directory '{}': {error}",
+                    self.dir.display()
+                )));
+            }
+        };
+
+        let mut workflow_files = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        workflow_files.sort();
+
+        let mut seen_ids = HashSet::with_capacity(workflow_files.len());
+        let mut workflows = Vec::with_capacity(workflow_files.len());
+
+        for workflow_path in workflow_files {
+            let content = match std::fs::read_to_string(&workflow_path) {
+                Ok(content) => content,
+                Err(error) => {
+                    warn!(
+                        path = ?workflow_path,
+                        error = %error,
+                        "Failed to read workflow definition file"
+                    );
+                    continue;
+                }
+            };
+
+            match serde_json::from_str::<Workflow>(&content) {
+                Ok(workflow) => {
+                    if !seen_ids.insert(workflow.id) {
+                        warn!(
+                            path = ?workflow_path,
+                            workflow_id = %workflow.id,
+                            "Skipped duplicate workflow definition while loading from disk"
+                        );
+                        continue;
+                    }
+
+                    workflows.push(workflow);
+                }
+                Err(error) => {
+                    warn!(
+                        path = ?workflow_path,
+                        error = %error,
+                        "Invalid workflow definition JSON, skipping"
+                    );
+                }
+            }
+        }
+
+        Ok(workflows)
+    }
+}
+
 /// The workflow engine — manages definitions and executes pipeline runs.
 pub struct WorkflowEngine {
     /// Registered workflow definitions.
     workflows: Arc<RwLock<HashMap<WorkflowId, Workflow>>>,
     /// Active and completed workflow runs.
     runs: Arc<RwLock<HashMap<WorkflowRunId, WorkflowRun>>>,
+    /// Canonical file-backed workflow definition storage.
+    definition_store: WorkflowDefinitionStore,
+    /// Serializes definition mutations and reloads so memory and disk stay coherent.
+    definition_mutation_lock: Arc<Mutex<()>>,
 }
 
 impl WorkflowEngine {
     /// Create a new workflow engine.
     pub fn new() -> Self {
+        Self::with_definitions_dir(
+            std::env::temp_dir().join(format!("openfang-workflows-{}", Uuid::new_v4())),
+        )
+    }
+
+    /// Create a new workflow engine with an explicit definitions directory.
+    pub fn with_definitions_dir(workflows_dir: PathBuf) -> Self {
         Self {
             workflows: Arc::new(RwLock::new(HashMap::new())),
             runs: Arc::new(RwLock::new(HashMap::new())),
+            definition_store: WorkflowDefinitionStore::new(workflows_dir),
+            definition_mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
     /// Register a new workflow definition.
-    pub async fn register(&self, workflow: Workflow) -> WorkflowId {
+    pub async fn register(&self, workflow: Workflow) -> OpenFangResult<WorkflowId> {
+        let _mutation_guard = self.definition_mutation_lock.lock().await;
         let id = workflow.id;
-        self.workflows.write().await.insert(id, workflow);
+        let mut workflows = self.workflows.write().await;
+        self.definition_store.persist(&workflow)?;
+        workflows.insert(id, workflow);
         info!(workflow_id = %id, "Workflow registered");
-        id
+        Ok(id)
     }
 
     /// List all registered workflows.
@@ -233,8 +399,28 @@ impl WorkflowEngine {
     }
 
     /// Remove a workflow definition.
-    pub async fn remove_workflow(&self, id: WorkflowId) -> bool {
-        self.workflows.write().await.remove(&id).is_some()
+    pub async fn remove_workflow(&self, id: WorkflowId) -> OpenFangResult<bool> {
+        let _mutation_guard = self.definition_mutation_lock.lock().await;
+        let mut workflows = self.workflows.write().await;
+        if !workflows.contains_key(&id) {
+            return Ok(false);
+        }
+
+        let file_removed = self.definition_store.delete(id)?;
+        if !file_removed {
+            warn!(
+                workflow_id = %id,
+                "Workflow definition file was already missing during delete; removing in-memory entry"
+            );
+        }
+
+        if workflows.remove(&id).is_none() {
+            return Err(OpenFangError::Internal(format!(
+                "Workflow {id} disappeared from the in-memory registry during delete"
+            )));
+        }
+
+        Ok(true)
     }
 
     /// Update an existing workflow definition.
@@ -242,17 +428,35 @@ impl WorkflowEngine {
     /// Preserves the original `id` and `created_at`. Replaces `name`,
     /// `description`, and `steps`. Returns `true` if the workflow was
     /// found and updated.
-    pub async fn update_workflow(&self, id: WorkflowId, updated: Workflow) -> bool {
+    pub async fn update_workflow(&self, id: WorkflowId, updated: Workflow) -> OpenFangResult<bool> {
+        let _mutation_guard = self.definition_mutation_lock.lock().await;
         let mut workflows = self.workflows.write().await;
-        if let Some(existing) = workflows.get_mut(&id) {
-            existing.name = updated.name;
-            existing.description = updated.description;
-            existing.steps = updated.steps;
+        if let Some(existing) = workflows.get(&id).cloned() {
+            let mut canonical = updated;
+            canonical.id = id;
+            canonical.created_at = existing.created_at;
+            self.definition_store.persist(&canonical)?;
+            workflows.insert(id, canonical);
             info!(workflow_id = %id, "Workflow updated");
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
+    }
+
+    /// Replace the in-memory workflow registry with the workflows currently on disk.
+    pub(crate) async fn reload_from_store(
+        &self,
+        store: WorkflowDefinitionStore,
+    ) -> OpenFangResult<usize> {
+        let _mutation_guard = self.definition_mutation_lock.lock().await;
+        let loaded_workflows = store.load_all()?;
+        let mut workflows = self.workflows.write().await;
+        *workflows = loaded_workflows
+            .into_iter()
+            .map(|workflow| (workflow.id, workflow))
+            .collect();
+        Ok(workflows.len())
     }
 
     /// Maximum number of retained workflow runs. Oldest completed/failed
@@ -806,6 +1010,36 @@ impl Default for WorkflowEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn test_engine(workflows_dir: PathBuf) -> WorkflowEngine {
+        WorkflowEngine::with_definitions_dir(workflows_dir)
+    }
+
+    fn workflow_path(workflows_dir: &std::path::Path, workflow_id: WorkflowId) -> PathBuf {
+        workflows_dir.join(format!("{workflow_id}.json"))
+    }
+
+    fn workflow_ids_from_disk(workflows_dir: &std::path::Path) -> HashSet<WorkflowId> {
+        let mut workflow_ids = HashSet::new();
+        let Ok(entries) = std::fs::read_dir(workflows_dir) else {
+            return workflow_ids;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+
+            let content = std::fs::read_to_string(&path).expect("workflow file should be readable");
+            let workflow: Workflow =
+                serde_json::from_str(&content).expect("workflow file should deserialize");
+            workflow_ids.insert(workflow.id);
+        }
+
+        workflow_ids
+    }
 
     fn test_workflow() -> Workflow {
         Workflow {
@@ -847,9 +1081,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_workflow() {
-        let engine = WorkflowEngine::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
         let wf = test_workflow();
-        let id = engine.register(wf.clone()).await;
+        let id = engine
+            .register(wf.clone())
+            .await
+            .expect("workflow registration should succeed");
         assert_eq!(id, wf.id);
 
         let retrieved = engine.get_workflow(id).await;
@@ -859,9 +1097,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_run() {
-        let engine = WorkflowEngine::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
         let wf = test_workflow();
-        let wf_id = engine.register(wf).await;
+        let wf_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
 
         let run_id = engine.create_run(wf_id, "test input".to_string()).await;
         assert!(run_id.is_some());
@@ -873,9 +1115,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_workflows() {
-        let engine = WorkflowEngine::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
         let wf = test_workflow();
-        engine.register(wf).await;
+        engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
 
         let list = engine.list_workflows().await;
         assert_eq!(list.len(), 1);
@@ -883,19 +1129,316 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_workflow() {
-        let engine = WorkflowEngine::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
         let wf = test_workflow();
-        let id = engine.register(wf).await;
+        let id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
 
-        assert!(engine.remove_workflow(id).await);
+        assert!(engine
+            .remove_workflow(id)
+            .await
+            .expect("workflow removal should succeed"));
         assert!(engine.get_workflow(id).await.is_none());
     }
 
     #[tokio::test]
+    async fn workflow_update_persists_canonical_definition() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().join("workflows");
+        let engine = test_engine(workflows_dir.clone());
+        let workflow = test_workflow();
+        let workflow_id = engine
+            .register(workflow.clone())
+            .await
+            .expect("workflow registration should succeed");
+
+        let updated = Workflow {
+            id: workflow_id,
+            name: "updated-pipeline".to_string(),
+            description: "Updated description".to_string(),
+            steps: vec![WorkflowStep {
+                name: "rewrite".to_string(),
+                agent: StepAgent::ByName {
+                    name: "writer".to_string(),
+                },
+                prompt_template: "Updated {{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 45,
+                error_mode: ErrorMode::Fail,
+                output_var: Some("updated".to_string()),
+            }],
+            created_at: Utc::now(),
+        };
+
+        let updated_result = engine
+            .update_workflow(workflow_id, updated)
+            .await
+            .expect("workflow update should succeed");
+        assert!(updated_result);
+
+        let persisted_content = std::fs::read_to_string(workflow_path(&workflows_dir, workflow_id))
+            .expect("workflow file should exist");
+        let persisted_workflow: Workflow =
+            serde_json::from_str(&persisted_content).expect("workflow file should deserialize");
+        let in_memory_workflow = engine
+            .get_workflow(workflow_id)
+            .await
+            .expect("workflow should remain registered");
+
+        assert_eq!(persisted_workflow, in_memory_workflow);
+        assert_eq!(persisted_workflow.name, "updated-pipeline");
+        assert_eq!(persisted_workflow.description, "Updated description");
+        assert_eq!(
+            persisted_workflow.steps[0].prompt_template,
+            "Updated {{input}}"
+        );
+        assert_eq!(persisted_workflow.created_at, workflow.created_at);
+    }
+
+    #[tokio::test]
+    async fn workflow_delete_removes_definition_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().join("workflows");
+        let engine = test_engine(workflows_dir.clone());
+        let workflow = test_workflow();
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let definition_path = workflow_path(&workflows_dir, workflow_id);
+
+        assert!(definition_path.exists());
+
+        let removed = engine
+            .remove_workflow(workflow_id)
+            .await
+            .expect("workflow removal should succeed");
+        assert!(removed);
+        assert!(!definition_path.exists());
+    }
+
+    #[tokio::test]
+    async fn workflow_create_rolls_back_on_disk_failure() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let blocked_parent = temp_dir.path().join("blocked-parent");
+        std::fs::write(&blocked_parent, "not a directory")
+            .expect("blocked parent file should be created");
+        let engine = test_engine(blocked_parent.join("workflows"));
+        let workflow = test_workflow();
+
+        let result = engine.register(workflow.clone()).await;
+
+        assert!(result.is_err());
+        assert!(engine.get_workflow(workflow.id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn workflow_update_rolls_back_on_disk_failure() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().join("workflows");
+        let engine = test_engine(workflows_dir.clone());
+        let workflow = test_workflow();
+        let workflow_id = engine
+            .register(workflow.clone())
+            .await
+            .expect("workflow registration should succeed");
+        let old_in_memory = engine
+            .get_workflow(workflow_id)
+            .await
+            .expect("workflow should exist");
+
+        std::fs::create_dir_all(workflows_dir.join(format!("{workflow_id}.json.tmp")))
+            .expect("blocking temp path should be created");
+
+        let updated = Workflow {
+            id: workflow_id,
+            name: "should-not-stick".to_string(),
+            description: "should-not-stick".to_string(),
+            steps: vec![WorkflowStep {
+                name: "rewrite".to_string(),
+                agent: StepAgent::ByName {
+                    name: "writer".to_string(),
+                },
+                prompt_template: "BROKEN {{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 99,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+            }],
+            created_at: Utc::now(),
+        };
+
+        let result = engine.update_workflow(workflow_id, updated).await;
+
+        assert!(result.is_err());
+        let current_in_memory = engine
+            .get_workflow(workflow_id)
+            .await
+            .expect("workflow should still exist");
+        assert_eq!(current_in_memory, old_in_memory);
+
+        let persisted_content = std::fs::read_to_string(workflow_path(&workflows_dir, workflow_id))
+            .expect("workflow file should still exist");
+        let persisted_workflow: Workflow =
+            serde_json::from_str(&persisted_content).expect("workflow file should deserialize");
+        assert_eq!(persisted_workflow, old_in_memory);
+    }
+
+    #[tokio::test]
+    async fn runtime_registry_and_file_store_stay_aligned() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().join("workflows");
+        let engine = test_engine(workflows_dir.clone());
+        let workflow = test_workflow();
+        let workflow_id = engine
+            .register(workflow.clone())
+            .await
+            .expect("workflow registration should succeed");
+
+        let in_memory_ids = engine
+            .list_workflows()
+            .await
+            .into_iter()
+            .map(|workflow| workflow.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(in_memory_ids, workflow_ids_from_disk(&workflows_dir));
+
+        let updated = Workflow {
+            id: workflow_id,
+            name: "aligned".to_string(),
+            description: "aligned".to_string(),
+            steps: vec![WorkflowStep {
+                name: "aligned".to_string(),
+                agent: StepAgent::ByName {
+                    name: "writer".to_string(),
+                },
+                prompt_template: "Aligned {{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 30,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+            }],
+            created_at: Utc::now(),
+        };
+
+        let updated_result = engine
+            .update_workflow(workflow_id, updated)
+            .await
+            .expect("workflow update should succeed");
+        assert!(updated_result);
+
+        let updated_in_memory_ids = engine
+            .list_workflows()
+            .await
+            .into_iter()
+            .map(|workflow| workflow.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            updated_in_memory_ids,
+            workflow_ids_from_disk(&workflows_dir)
+        );
+
+        let removed = engine
+            .remove_workflow(workflow_id)
+            .await
+            .expect("workflow removal should succeed");
+        assert!(removed);
+
+        let final_in_memory_ids = engine
+            .list_workflows()
+            .await
+            .into_iter()
+            .map(|workflow| workflow.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(final_in_memory_ids, workflow_ids_from_disk(&workflows_dir));
+        assert!(final_in_memory_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_from_store_replaces_registry_with_current_disk_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let managed_dir = temp_dir.path().join("managed");
+        let reload_dir = temp_dir.path().join("reload");
+        let engine = test_engine(managed_dir);
+        let existing_workflow = test_workflow();
+        let new_workflow = Workflow {
+            id: WorkflowId::new(),
+            name: "reloaded".to_string(),
+            description: "from disk".to_string(),
+            steps: vec![WorkflowStep {
+                name: "reloaded".to_string(),
+                agent: StepAgent::ByName {
+                    name: "writer".to_string(),
+                },
+                prompt_template: "Reloaded {{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 30,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+            }],
+            created_at: Utc::now(),
+        };
+
+        engine
+            .register(existing_workflow)
+            .await
+            .expect("workflow registration should succeed");
+        std::fs::create_dir_all(&reload_dir).expect("reload dir should be created");
+        std::fs::write(
+            reload_dir.join("replacement.json"),
+            serde_json::to_string_pretty(&new_workflow).expect("workflow should serialize"),
+        )
+        .expect("replacement workflow should be written");
+
+        let reloaded = engine
+            .reload_from_store(WorkflowDefinitionStore::new(reload_dir))
+            .await
+            .expect("reload from store should succeed");
+        assert_eq!(reloaded, 1);
+
+        let workflows = engine.list_workflows().await;
+        assert_eq!(workflows.len(), 1);
+        assert_eq!(workflows[0], new_workflow);
+    }
+
+    #[tokio::test]
+    async fn reload_from_store_skips_duplicate_workflow_ids() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().join("duplicates");
+        let engine = test_engine(temp_dir.path().join("managed"));
+        let workflow = test_workflow();
+
+        std::fs::create_dir_all(&workflows_dir).expect("workflow dir should be created");
+        let serialized =
+            serde_json::to_string_pretty(&workflow).expect("workflow should serialize");
+        std::fs::write(workflows_dir.join("first.json"), &serialized)
+            .expect("first workflow file should be written");
+        std::fs::write(workflows_dir.join("second.json"), &serialized)
+            .expect("second workflow file should be written");
+
+        let reloaded = engine
+            .reload_from_store(WorkflowDefinitionStore::new(workflows_dir))
+            .await
+            .expect("reload from store should succeed");
+        assert_eq!(reloaded, 1);
+
+        let workflows = engine.list_workflows().await;
+        assert_eq!(workflows.len(), 1);
+        assert_eq!(workflows[0], workflow);
+    }
+
+    #[tokio::test]
     async fn test_execute_pipeline() {
-        let engine = WorkflowEngine::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
         let wf = test_workflow();
-        let wf_id = engine.register(wf).await;
+        let wf_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
         let run_id = engine
             .create_run(wf_id, "raw data".to_string())
             .await
@@ -952,7 +1495,10 @@ mod tests {
             ],
             created_at: Utc::now(),
         };
-        let wf_id = engine.register(wf).await;
+        let wf_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
         let run_id = engine
             .create_run(wf_id, "all good".to_string())
             .await
@@ -1004,7 +1550,10 @@ mod tests {
             ],
             created_at: Utc::now(),
         };
-        let wf_id = engine.register(wf).await;
+        let wf_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
 
         // This sender returns output containing "ERROR"
@@ -1043,7 +1592,10 @@ mod tests {
             }],
             created_at: Utc::now(),
         };
-        let wf_id = engine.register(wf).await;
+        let wf_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
         let run_id = engine.create_run(wf_id, "draft".to_string()).await.unwrap();
 
         let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1089,7 +1641,10 @@ mod tests {
             }],
             created_at: Utc::now(),
         };
-        let wf_id = engine.register(wf).await;
+        let wf_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
 
         let sender = |_id: AgentId, _msg: String| async move {
@@ -1136,7 +1691,10 @@ mod tests {
             ],
             created_at: Utc::now(),
         };
-        let wf_id = engine.register(wf).await;
+        let wf_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
 
         let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1182,7 +1740,10 @@ mod tests {
             }],
             created_at: Utc::now(),
         };
-        let wf_id = engine.register(wf).await;
+        let wf_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
 
         let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1250,7 +1811,10 @@ mod tests {
             ],
             created_at: Utc::now(),
         };
-        let wf_id = engine.register(wf).await;
+        let wf_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
         let run_id = engine.create_run(wf_id, "start".to_string()).await.unwrap();
 
         let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1319,7 +1883,10 @@ mod tests {
             ],
             created_at: Utc::now(),
         };
-        let wf_id = engine.register(wf).await;
+        let wf_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
 
         let sender =

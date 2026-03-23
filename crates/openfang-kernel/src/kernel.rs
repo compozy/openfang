@@ -13,7 +13,9 @@ use crate::registry::AgentRegistry;
 use crate::scheduler::AgentScheduler;
 use crate::supervisor::Supervisor;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
-use crate::workflow::{StepAgent, Workflow, WorkflowEngine, WorkflowId, WorkflowRunId};
+use crate::workflow::{
+    StepAgent, Workflow, WorkflowDefinitionStore, WorkflowEngine, WorkflowId, WorkflowRunId,
+};
 
 use openfang_memory::{AgentRuntimeRecord, AgentSessionRecord, MemorySubstrate, RuntimeStoreSet};
 use openfang_runtime::agent_loop::{
@@ -1069,6 +1071,10 @@ impl OpenFangKernel {
         let initial_bindings = config.bindings.clone();
         let initial_broadcast = config.broadcast.clone();
         let auto_reply_engine = crate::auto_reply::AutoReplyEngine::new(config.auto_reply.clone());
+        let workflows_dir = config
+            .workflows_dir
+            .clone()
+            .unwrap_or_else(|| config.home_dir.join("workflows"));
 
         let kernel = Self {
             config,
@@ -1080,7 +1086,7 @@ impl OpenFangKernel {
             runtime_stores: runtime_stores.clone(),
             compozy_db,
             supervisor,
-            workflows: WorkflowEngine::new(),
+            workflows: WorkflowEngine::with_definitions_dir(workflows_dir),
             triggers: TriggerEngine::new(),
             background,
             audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
@@ -3969,8 +3975,28 @@ impl OpenFangKernel {
     }
 
     /// Register a workflow definition.
-    pub async fn register_workflow(&self, workflow: Workflow) -> WorkflowId {
-        self.workflows.register(workflow).await
+    pub async fn register_workflow(&self, workflow: Workflow) -> KernelResult<WorkflowId> {
+        self.workflows.register(workflow).await.map_err(Into::into)
+    }
+
+    /// Update a workflow definition.
+    pub async fn update_workflow_definition(
+        &self,
+        workflow_id: WorkflowId,
+        workflow: Workflow,
+    ) -> KernelResult<bool> {
+        self.workflows
+            .update_workflow(workflow_id, workflow)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Delete a workflow definition.
+    pub async fn remove_workflow_definition(&self, workflow_id: WorkflowId) -> KernelResult<bool> {
+        self.workflows
+            .remove_workflow(workflow_id)
+            .await
+            .map_err(Into::into)
     }
 
     /// Run a workflow pipeline end-to-end.
@@ -4038,45 +4064,24 @@ impl OpenFangKernel {
 
     /// Auto-load workflow definitions from a directory.
     ///
-    /// Scans the given directory for `.json` files, deserializes each as a
-    /// `Workflow`, and registers it. Invalid files are skipped with a warning.
+    /// Replaces the in-memory workflow registry with the canonical definitions
+    /// currently present in the given directory.
     pub async fn load_workflows_from_dir(&self, dir: &std::path::Path) -> usize {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = ?dir, error = %e, "Failed to read workflows directory");
-                }
-                return 0;
+        let store = WorkflowDefinitionStore::new(dir.to_path_buf());
+        match self.workflows.reload_from_store(store).await {
+            Ok(count) => {
+                info!(path = ?dir, count, "Loaded canonical workflow definitions from disk");
+                count
             }
-        };
-
-        let mut count = 0;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(path = ?path, error = %e, "Failed to read workflow file");
-                    continue;
-                }
-            };
-            match serde_json::from_str::<Workflow>(&content) {
-                Ok(wf) => {
-                    let name = wf.name.clone();
-                    let wf_id = self.register_workflow(wf).await;
-                    tracing::info!(path = ?path, id = %wf_id, name = %name, "Auto-loaded workflow");
-                    count += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(path = ?path, error = %e, "Invalid workflow JSON, skipping");
-                }
+            Err(error) => {
+                warn!(
+                    path = ?dir,
+                    error = %error,
+                    "Failed to reload workflow definitions from disk"
+                );
+                0
             }
         }
-        count
     }
 
     /// Start background loops for all non-reactive agents.
