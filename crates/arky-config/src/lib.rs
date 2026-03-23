@@ -14,10 +14,10 @@ mod validation;
 pub use crate::{
     error::{ConfigError, ValidationIssue},
     layered::{
-        normalize_driver, ClaudeCodeBehaviorLayer, ClaudeCompatibleBehaviorLayer,
-        CodexBehaviorLayer, PartialProviderBehaviorConfig, PartialProviderProfileConfig,
-        ProviderBehaviorLayer, ProviderProfileConfig, ProviderRequestDefaults,
-        ResolvedAgentProviderConfig, ResolvedClaudeCodeBehaviorConfig,
+        normalize_driver, validate_request_extra, ClaudeCodeBehaviorLayer,
+        ClaudeCompatibleBehaviorLayer, CodexBehaviorLayer, PartialProviderBehaviorConfig,
+        PartialProviderProfileConfig, ProviderBehaviorLayer, ProviderProfileConfig,
+        ProviderRequestDefaults, ResolvedAgentProviderConfig, ResolvedClaudeCodeBehaviorConfig,
         ResolvedClaudeCompatibleBehaviorConfig, ResolvedCodexBehaviorConfig,
         ResolvedProviderBehaviorConfig,
     },

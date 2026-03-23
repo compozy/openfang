@@ -250,7 +250,7 @@ impl ClaudeCompatibleBehaviorLayer {
 }
 
 /// Typed behavior config attached to one provider layer.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProviderBehaviorLayer {
     Codex(CodexBehaviorLayer),
     ClaudeCode(ClaudeCodeBehaviorLayer),
@@ -386,7 +386,7 @@ impl PartialProviderBehaviorConfig {
 }
 
 /// Finalized reusable profile sitting between workspace installs and agents.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderProfileConfig {
     driver: String,
     model: Option<String>,
@@ -444,7 +444,7 @@ pub struct PartialProviderProfileConfig {
 }
 
 /// Concrete Codex behavior after profile + agent layering has been resolved.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedCodexBehaviorConfig {
     #[serde(flatten)]
     pub sandbox: CodexSandboxConfig,
@@ -483,7 +483,7 @@ impl CodexBehaviorLayer {
 }
 
 /// Concrete Claude behavior after profile + agent layering has been resolved.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedClaudeCodeBehaviorConfig {
     #[serde(flatten)]
     pub session: ClaudeSessionConfig,
@@ -526,7 +526,7 @@ impl ClaudeCodeBehaviorLayer {
 }
 
 /// Concrete wrapper behavior after profile + agent layering has been resolved.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedClaudeCompatibleBehaviorConfig {
     pub base: ResolvedClaudeCodeBehaviorConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -549,7 +549,7 @@ impl ClaudeCompatibleBehaviorLayer {
 }
 
 /// Fully merged provider-specific behavior for one agent.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ResolvedProviderBehaviorConfig {
     Codex(ResolvedCodexBehaviorConfig),
     ClaudeCode(ResolvedClaudeCodeBehaviorConfig),
@@ -557,7 +557,7 @@ pub enum ResolvedProviderBehaviorConfig {
 }
 
 /// Fully merged provider state for one agent.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedAgentProviderConfig<TInstall> {
     pub provider: String,
     pub driver: String,

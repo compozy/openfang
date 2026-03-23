@@ -4362,6 +4362,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfang-provider-binding"
+version = "0.5.1"
+dependencies = [
+ "arky-claude-code",
+ "arky-codex",
+ "arky-config",
+ "arky-error",
+ "arky-protocol",
+ "arky-provider",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "openfang-runtime"
 version = "0.5.1"
 dependencies = [

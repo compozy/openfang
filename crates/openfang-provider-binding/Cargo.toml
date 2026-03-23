@@ -1,0 +1,27 @@
+[package]
+name = "openfang-provider-binding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Compiled provider binding layer for Compozy agent definitions"
+
+[dependencies]
+arky-claude-code.workspace = true
+arky-config.workspace = true
+arky-error.workspace = true
+arky-protocol.workspace = true
+arky-provider.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+arky-codex.workspace = true
+pretty_assertions.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

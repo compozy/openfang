@@ -8,7 +8,7 @@ use std::{
 };
 
 use arky_provider::ProviderError;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::SpawnFailurePolicy;
@@ -173,7 +173,7 @@ pub struct ClaudePermissionConfig {
 }
 
 /// Session-related Claude runtime options.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ClaudeSessionConfig {
     /// Whether the conversation should continue.
     pub continue_conversation: bool,
@@ -190,7 +190,7 @@ pub struct ClaudeSessionConfig {
 }
 
 /// Filesystem-related Claude runtime options.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ClaudeFilesystemConfig {
     /// Additional directories exposed to Claude.
     pub additional_directories: Vec<PathBuf>,

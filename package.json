@@ -1,7 +1,10 @@
 {
   "private": true,
   "scripts": {
-    "prepare": "husky"
+    "prepare": "husky",
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace --all-targets -- -D warnings",
+    "typecheck": "cargo check --workspace"
   },
   "devDependencies": {
     "@commitlint/cli": "^19.0.0",
