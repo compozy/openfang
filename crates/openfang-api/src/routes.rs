@@ -1,7 +1,7 @@
 //! Route handlers for the OpenFang API.
 
 use crate::types::*;
-use axum::extract::{Path, Query, State};
+use axum::extract::{rejection::JsonRejection, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -10,12 +10,16 @@ use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
 };
+use openfang_kernel::workflow_compiler::{
+    compile_workflow_definition, normalize_workflow_definition, validate_normalized_workflow,
+    validate_workflow_definition, WorkflowCompileError,
+};
 use openfang_kernel::OpenFangKernel;
 use openfang_memory::AgentRuntimeRecord;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -832,6 +836,90 @@ fn workflow_internal_error(
     )
 }
 
+fn workflow_v2_error_response(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    details: Option<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message.into(),
+                "details": details.unwrap_or(serde_json::Value::Null),
+            }
+        })),
+    )
+}
+
+fn workflow_v2_json_rejection(rejection: JsonRejection) -> (StatusCode, Json<serde_json::Value>) {
+    match rejection {
+        JsonRejection::MissingJsonContentType(_) => workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Missing `Content-Type: application/json` header",
+            None,
+        ),
+        JsonRejection::JsonDataError(error) => workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Invalid JSON body: {error}"),
+            None,
+        ),
+        JsonRejection::JsonSyntaxError(error) => workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Invalid JSON body: {error}"),
+            None,
+        ),
+        JsonRejection::BytesRejection(error) => workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Failed to read request body: {error}"),
+            None,
+        ),
+        rejection => workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Invalid request body: {rejection}"),
+            None,
+        ),
+    }
+}
+
+fn workflow_v2_compile_error_response(
+    error: &WorkflowCompileError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::BAD_REQUEST,
+        "validation_error",
+        "workflow definition is invalid",
+        Some(serde_json::to_value(error.issues()).unwrap_or(serde_json::Value::Null)),
+    )
+}
+
+fn workflow_v2_available_agent_refs(state: &AppState) -> BTreeSet<String> {
+    let mut agents = BTreeSet::new();
+    for entry in state.kernel.registry.list() {
+        agents.insert(entry.id.to_string());
+        agents.insert(entry.name);
+    }
+    agents
+}
+
+fn workflow_v2_is_valid(
+    issues: &[openfang_types::workflow::ValidationIssue],
+    strict: bool,
+) -> bool {
+    if strict {
+        issues.is_empty()
+    } else {
+        !issues.iter().any(|issue| issue.severity.is_error())
+    }
+}
+
 fn workflow_from_request(
     workflow_id: WorkflowId,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -936,6 +1024,119 @@ pub async fn list_workflows(State(state): State<Arc<AppState>>) -> impl IntoResp
         })
         .collect();
     Json(list)
+}
+
+/// POST /api/v1/workflows/validate — Validate a Workflow v2 definition.
+pub async fn validate_workflow(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<WorkflowValidateRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+
+    let WorkflowValidateRequest {
+        definition,
+        strict,
+        context: _context,
+    } = request;
+    let strict = strict.unwrap_or(false);
+    let registry = state
+        .kernel
+        .workflows
+        .build_compile_registry(
+            workflow_v2_available_agent_refs(&state),
+            std::iter::once(definition.id.clone()),
+        )
+        .await;
+
+    let mut issues = validate_workflow_definition(&definition, &registry);
+    let mut normalized = None;
+
+    if !issues.iter().any(|issue| issue.severity.is_error()) {
+        let candidate = normalize_workflow_definition(&definition);
+        issues.extend(validate_normalized_workflow(&candidate));
+
+        if !issues.iter().any(|issue| issue.severity.is_error()) {
+            normalized = Some(candidate);
+        }
+    }
+
+    let valid = workflow_v2_is_valid(&issues, strict);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(WorkflowValidateResponse {
+            valid,
+            issues,
+            normalized,
+        })),
+    )
+}
+
+/// POST /api/v1/workflows/compile — Compile a Workflow v2 definition into IR.
+pub async fn compile_workflow(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<WorkflowCompileRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+
+    let WorkflowCompileRequest {
+        definition,
+        context: _context,
+    } = request;
+    let registry = state
+        .kernel
+        .workflows
+        .build_compile_registry(
+            workflow_v2_available_agent_refs(&state),
+            std::iter::once(definition.id.clone()),
+        )
+        .await;
+
+    match compile_workflow_definition(&definition, &registry) {
+        Ok(workflow_ir) => {
+            let definition_id = definition.id.clone();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!(WorkflowCompileResponse {
+                    definition_id,
+                    normalized: normalize_workflow_definition(&definition),
+                    compiled: WorkflowCompiledPayload { workflow_ir },
+                })),
+            )
+        }
+        Err(error) => workflow_v2_compile_error_response(&error),
+    }
+}
+
+/// GET /api/v1/workflows/{id}/compiled — Return the cached compiled IR.
+pub async fn get_workflow_compiled(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.workflows.get_compiled_workflow(&id).await {
+        Some(workflow_ir) => {
+            let definition_id = workflow_ir.workflow_id.clone();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!(WorkflowCompiledResponse {
+                    definition_id,
+                    compiled: WorkflowCompiledPayload { workflow_ir },
+                })),
+            )
+        }
+        None => workflow_v2_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Workflow not found",
+            None,
+        ),
+    }
 }
 
 /// GET /api/v1/workflows/:id/runtime — Get workflow runtime status.

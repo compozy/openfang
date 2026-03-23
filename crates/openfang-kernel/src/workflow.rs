@@ -655,13 +655,20 @@ impl WorkflowEngine {
         *known_primitives = primitives.into_iter().map(Into::into).collect();
     }
 
-    /// Register a Workflow v2 definition and cache its compiled IR.
-    pub async fn register_workflow_v2_definition(
+    /// Builds the current workflow compile registry from known in-memory
+    /// definitions plus any additional agent and workflow references supplied
+    /// by the caller.
+    pub async fn build_compile_registry<I, S, J, T>(
         &self,
-        definition: WorkflowV2Definition,
-        available_agents: impl IntoIterator<Item = String>,
-    ) -> Result<(), WorkflowCompileError> {
-        let _mutation_guard = self.definition_mutation_lock.lock().await;
+        available_agents: I,
+        additional_workflows: J,
+    ) -> WorkflowCompileRegistry
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        J: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
         let mut registry = WorkflowCompileRegistry::new();
         registry.set_agents(available_agents);
         registry.set_primitives(
@@ -678,10 +685,22 @@ impl WorkflowEngine {
                 .await
                 .keys()
                 .cloned()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .chain(std::iter::once(definition.id.clone())),
+                .chain(additional_workflows.into_iter().map(Into::into))
+                .collect::<BTreeSet<_>>(),
         );
+        registry
+    }
+
+    /// Register a Workflow v2 definition and cache its compiled IR.
+    pub async fn register_workflow_v2_definition(
+        &self,
+        definition: WorkflowV2Definition,
+        available_agents: impl IntoIterator<Item = String>,
+    ) -> Result<(), WorkflowCompileError> {
+        let _mutation_guard = self.definition_mutation_lock.lock().await;
+        let registry = self
+            .build_compile_registry(available_agents, std::iter::once(definition.id.clone()))
+            .await;
 
         let compiled = compile_workflow_definition(&definition, &registry)?;
 

@@ -285,6 +285,43 @@ pub fn normalize_workflow_definition(definition: &WorkflowV2Definition) -> Norma
     }
 }
 
+/// Validates normalized template bindings and output projections without
+/// emitting workflow IR.
+#[must_use]
+pub fn validate_normalized_workflow(workflow: &NormalizedWorkflow) -> Vec<ValidationIssue> {
+    let all_symbols = collect_all_symbols(workflow);
+    let mut available_symbols = BTreeMap::new();
+    let mut issues = Vec::new();
+
+    for (index, step) in workflow.steps.iter().enumerate() {
+        let step_path = format!("steps[{index}]");
+        let _ = compile_template_bindings(
+            &step.with,
+            &step_path,
+            &workflow.input,
+            &available_symbols,
+            &all_symbols,
+            &mut issues,
+        );
+
+        if let Some(symbol) = step.save_as.as_ref() {
+            if let Some(step_id) = all_symbols.get(symbol) {
+                available_symbols.insert(symbol.clone(), step_id.clone());
+            }
+        }
+    }
+
+    let _ = compile_output_projection(
+        &workflow.outputs,
+        &workflow.output,
+        &workflow.input,
+        &all_symbols,
+        &mut issues,
+    );
+
+    issues
+}
+
 /// Compiles a normalized workflow into stable IR.
 pub fn compile_normalized_workflow(
     workflow: &NormalizedWorkflow,
@@ -1274,7 +1311,8 @@ fn compile_step_kind(
 mod tests {
     use super::{
         compile_workflow_definition, compile_workflow_value, normalize_workflow_definition,
-        validate_workflow_definition, validate_workflow_value, WorkflowCompileRegistry,
+        validate_normalized_workflow, validate_workflow_definition, validate_workflow_value,
+        WorkflowCompileRegistry,
     };
     use openfang_types::workflow::{
         FlowMode, ValidationSeverity, WorkflowIrStepKind, WorkflowV2Definition,
@@ -1499,6 +1537,25 @@ mod tests {
             .expect_err("dangling output reference should fail");
         let issue = error
             .issues()
+            .iter()
+            .find(|issue| issue.code == "dangling_reference")
+            .expect("dangling reference issue should exist");
+        assert_eq!(issue.severity, ValidationSeverity::Error);
+        assert_eq!(issue.path, "outputs.result");
+    }
+
+    #[test]
+    fn normalized_validation_reports_dangling_output_reference() {
+        let mut definition = valid_definition_json();
+        definition["outputs"] = json!({
+            "result": "{{ vars.missing }}"
+        });
+
+        let definition = parse_definition(definition);
+        let normalized = normalize_workflow_definition(&definition);
+        let issues = validate_normalized_workflow(&normalized);
+
+        let issue = issues
             .iter()
             .find(|issue| issue.code == "dangling_reference")
             .expect("dangling reference issue should exist");

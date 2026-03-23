@@ -1,5 +1,8 @@
 //! Request/response types for the OpenFang API.
 
+use openfang_types::workflow::{
+    NormalizedWorkflow, ValidationIssue, WorkflowIr, WorkflowV2Definition,
+};
 use serde::{Deserialize, Serialize};
 
 /// Request to spawn an agent from a TOML manifest string or a template name.
@@ -106,4 +109,66 @@ pub struct MigrateScanRequest {
 pub struct ClawHubInstallRequest {
     /// ClawHub skill slug (e.g., "github-helper").
     pub slug: String,
+}
+
+/// Request payload for workflow validation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowValidateRequest {
+    /// Workflow definition to validate.
+    pub definition: WorkflowV2Definition,
+    /// Whether warnings should also mark the definition as invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+    /// Optional control-plane validation context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+}
+
+/// Response payload for workflow validation.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowValidateResponse {
+    /// Whether the definition passed validation under the selected strictness.
+    pub valid: bool,
+    /// Collected validation issues.
+    pub issues: Vec<ValidationIssue>,
+    /// Normalized workflow definition when validation can produce one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized: Option<NormalizedWorkflow>,
+}
+
+/// Request payload for workflow compilation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowCompileRequest {
+    /// Workflow definition to compile.
+    pub definition: WorkflowV2Definition,
+    /// Optional control-plane compilation context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+}
+
+/// Wrapper around the compiled workflow payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowCompiledPayload {
+    /// Stable workflow IR returned by the compiler.
+    pub workflow_ir: WorkflowIr,
+}
+
+/// Response payload for workflow compilation.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowCompileResponse {
+    /// Stable workflow definition identifier.
+    pub definition_id: String,
+    /// Normalized workflow definition used during compilation.
+    pub normalized: NormalizedWorkflow,
+    /// Compiled workflow IR payload.
+    pub compiled: WorkflowCompiledPayload,
+}
+
+/// Response payload for fetching a cached compiled workflow.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowCompiledResponse {
+    /// Stable workflow definition identifier.
+    pub definition_id: String,
+    /// Cached compiled workflow IR payload.
+    pub compiled: WorkflowCompiledPayload,
 }

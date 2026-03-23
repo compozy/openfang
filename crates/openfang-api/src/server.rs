@@ -330,6 +330,18 @@ pub async fn build_router(
             axum::routing::get(routes::list_workflow_runs),
         )
         .route(
+            "/api/v1/workflows/validate",
+            axum::routing::post(routes::validate_workflow),
+        )
+        .route(
+            "/api/v1/workflows/compile",
+            axum::routing::post(routes::compile_workflow),
+        )
+        .route(
+            "/api/v1/workflows/{id}/compiled",
+            axum::routing::get(routes::get_workflow_compiled),
+        )
+        .route(
             "/api/v1/workflows/{id}/runtime",
             axum::routing::get(routes::get_workflow_runtime),
         )
