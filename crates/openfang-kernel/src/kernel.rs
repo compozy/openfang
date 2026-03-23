@@ -14,7 +14,8 @@ use crate::scheduler::AgentScheduler;
 use crate::supervisor::Supervisor;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{
-    StepAgent, Workflow, WorkflowDefinitionStore, WorkflowEngine, WorkflowId, WorkflowRunId,
+    StepAgent, Workflow, WorkflowBootstrapResult, WorkflowDefinitionStore, WorkflowEngine,
+    WorkflowId, WorkflowRunId,
 };
 
 use openfang_memory::{AgentRuntimeRecord, AgentSessionRecord, MemorySubstrate, RuntimeStoreSet};
@@ -4062,26 +4063,45 @@ impl OpenFangKernel {
         Ok((run_id, output))
     }
 
+    fn workflows_dir(&self) -> PathBuf {
+        self.config
+            .workflows_dir
+            .clone()
+            .unwrap_or_else(|| self.config.home_dir.join("workflows"))
+    }
+
+    /// Bootstrap workflow definitions from the configured directory.
+    pub async fn bootstrap_workflow_definitions(&self) -> WorkflowBootstrapResult {
+        let workflows_dir = self.workflows_dir();
+        self.load_workflows_from_dir(&workflows_dir).await
+    }
+
     /// Auto-load workflow definitions from a directory.
     ///
     /// Replaces the in-memory workflow registry with the canonical definitions
     /// currently present in the given directory.
-    pub async fn load_workflows_from_dir(&self, dir: &std::path::Path) -> usize {
+    pub async fn load_workflows_from_dir(&self, dir: &std::path::Path) -> WorkflowBootstrapResult {
         let store = WorkflowDefinitionStore::new(dir.to_path_buf());
-        match self.workflows.reload_from_store(store).await {
-            Ok(count) => {
-                info!(path = ?dir, count, "Loaded canonical workflow definitions from disk");
-                count
-            }
-            Err(error) => {
-                warn!(
-                    path = ?dir,
-                    error = %error,
-                    "Failed to reload workflow definitions from disk"
-                );
-                0
-            }
+        let result = self.workflows.bootstrap_from_store(store).await;
+
+        if result.errors.is_empty() {
+            info!(
+                path = ?dir,
+                loaded = result.loaded,
+                skipped = result.skipped,
+                "Workflow bootstrap completed"
+            );
+        } else {
+            warn!(
+                path = ?dir,
+                loaded = result.loaded,
+                skipped = result.skipped,
+                errors = result.errors.len(),
+                "Workflow bootstrap completed with recoverable errors"
+            );
         }
+
+        result
     }
 
     /// Start background loops for all non-reactive agents.
@@ -4312,24 +4332,6 @@ impl OpenFangKernel {
             tokio::spawn(async move {
                 kernel.run_extension_health_loop().await;
             });
-        }
-
-        // Auto-load workflow definitions from configured directory
-        {
-            let wf_dir = self
-                .config
-                .workflows_dir
-                .clone()
-                .unwrap_or_else(|| self.config.home_dir.join("workflows"));
-            if wf_dir.exists() {
-                let kernel = Arc::clone(self);
-                tokio::spawn(async move {
-                    let count = kernel.load_workflows_from_dir(&wf_dir).await;
-                    if count > 0 {
-                        info!("Auto-loaded {count} workflow(s) from {}", wf_dir.display());
-                    }
-                });
-            }
         }
 
         // Cron scheduler tick loop — fires due jobs every 15 seconds

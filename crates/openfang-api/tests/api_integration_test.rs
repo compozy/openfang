@@ -68,6 +68,7 @@ async fn start_test_server_with_provider(
     let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
+    kernel.bootstrap_workflow_definitions().await;
 
     let state = Arc::new(AppState {
         kernel,
@@ -802,6 +803,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
     let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
+    kernel.bootstrap_workflow_definitions().await;
 
     let state = Arc::new(AppState {
         kernel,

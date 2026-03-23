@@ -33,6 +33,13 @@ impl WorkflowTestServer {
 }
 
 async fn start_workflow_test_server(workflows_dir: PathBuf) -> WorkflowTestServer {
+    start_workflow_test_server_with_bootstrap(workflows_dir, true).await
+}
+
+async fn start_workflow_test_server_with_bootstrap(
+    workflows_dir: PathBuf,
+    bootstrap_workflows: bool,
+) -> WorkflowTestServer {
     let temp_dir = tempfile::tempdir().expect("temp dir should be created");
     let config = KernelConfig {
         home_dir: temp_dir.path().to_path_buf(),
@@ -50,6 +57,9 @@ async fn start_workflow_test_server(workflows_dir: PathBuf) -> WorkflowTestServe
     let kernel = OpenFangKernel::boot_with_config(config).expect("kernel should boot");
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
+    if bootstrap_workflows {
+        kernel.bootstrap_workflow_definitions().await;
+    }
 
     let state = Arc::new(AppState {
         kernel,
@@ -73,6 +83,18 @@ async fn start_workflow_test_server(workflows_dir: PathBuf) -> WorkflowTestServe
                 .put(routes::update_workflow)
                 .delete(routes::delete_workflow),
         )
+        .route(
+            "/api/workflows/{id}/runtime",
+            axum::routing::get(routes::get_workflow_runtime),
+        )
+        .route(
+            "/api/workflows/{id}/run",
+            axum::routing::post(routes::run_workflow),
+        )
+        .route(
+            "/api/v1/workflows/{id}/runtime",
+            axum::routing::get(routes::get_workflow_runtime),
+        )
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -90,6 +112,25 @@ async fn start_workflow_test_server(workflows_dir: PathBuf) -> WorkflowTestServe
         _temp_dir: temp_dir,
         workflows_dir,
     }
+}
+
+fn stored_workflow(name: &str, description: &str) -> Workflow {
+    Workflow {
+        id: WorkflowId::new(),
+        name: name.to_string(),
+        description: description.to_string(),
+        steps: Vec::new(),
+        created_at: chrono::Utc::now(),
+    }
+}
+
+fn write_workflow_definition(workflows_dir: &Path, file_name: &str, workflow: &Workflow) {
+    std::fs::create_dir_all(workflows_dir).expect("workflow dir should be created");
+    std::fs::write(
+        workflows_dir.join(file_name),
+        serde_json::to_string_pretty(workflow).expect("workflow should serialize"),
+    )
+    .expect("workflow file should be written");
 }
 
 fn workflow_payload(name: &str, description: &str, prompt: &str) -> serde_json::Value {
@@ -165,6 +206,27 @@ async fn delete_workflow(
     (status, body)
 }
 
+async fn get_workflow_runtime(
+    client: &reqwest::Client,
+    server: &WorkflowTestServer,
+    workflow_id: &str,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let response = client
+        .get(format!(
+            "{}/api/v1/workflows/{workflow_id}/runtime",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("workflow runtime request should succeed");
+    let status = response.status();
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .expect("workflow runtime body should deserialize");
+    (status, body)
+}
+
 fn load_workflow_file(path: &Path) -> Workflow {
     let content = std::fs::read_to_string(path).expect("workflow file should exist");
     serde_json::from_str(&content).expect("workflow file should deserialize")
@@ -186,6 +248,79 @@ fn workflow_ids_from_disk(workflows_dir: &Path) -> HashSet<WorkflowId> {
     }
 
     workflow_ids
+}
+
+#[tokio::test]
+async fn api_server_workflow_list_is_populated_before_first_request() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let workflows_dir = temp_dir.path().join("workflows");
+    let preloaded_workflow = stored_workflow("startup-ready", "loaded before bind");
+    write_workflow_definition(&workflows_dir, "b-startup.json", &preloaded_workflow);
+
+    let server = start_workflow_test_server(workflows_dir).await;
+    let client = reqwest::Client::new();
+
+    let list_response = client
+        .get(format!("{}/api/workflows", server.base_url))
+        .send()
+        .await
+        .expect("list workflows request should succeed");
+    assert_eq!(list_response.status(), reqwest::StatusCode::OK);
+    let workflows = list_response
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .expect("workflow list should deserialize");
+    let returned_ids = workflows
+        .iter()
+        .filter_map(|workflow| workflow["id"].as_str().map(ToOwned::to_owned))
+        .collect::<HashSet<_>>();
+    assert!(returned_ids.contains(&preloaded_workflow.id.to_string()));
+
+    let run_response = client
+        .post(format!(
+            "{}/api/workflows/{}/run",
+            server.base_url, preloaded_workflow.id
+        ))
+        .json(&serde_json::json!({ "input": "boot input" }))
+        .send()
+        .await
+        .expect("workflow run request should succeed");
+    assert_eq!(run_response.status(), reqwest::StatusCode::OK);
+    let run_body = run_response
+        .json::<serde_json::Value>()
+        .await
+        .expect("workflow run body should deserialize");
+    assert_eq!(run_body["status"], "completed");
+}
+
+#[tokio::test]
+async fn workflow_runtime_endpoint_reports_not_loaded_until_bootstrap_finishes() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let workflows_dir = temp_dir.path().join("workflows");
+    let preloaded_workflow = stored_workflow("runtime-ready", "runtime check");
+    write_workflow_definition(&workflows_dir, "a-runtime.json", &preloaded_workflow);
+
+    let server = start_workflow_test_server_with_bootstrap(workflows_dir, false).await;
+    let client = reqwest::Client::new();
+
+    let (status, body) =
+        get_workflow_runtime(&client, &server, &preloaded_workflow.id.to_string()).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["loaded"], false);
+    assert_eq!(body["healthy"], false);
+
+    let bootstrap = server.state.kernel.bootstrap_workflow_definitions().await;
+    assert_eq!(bootstrap.loaded, 1);
+    assert_eq!(bootstrap.skipped, 0);
+
+    let (status, body) =
+        get_workflow_runtime(&client, &server, &preloaded_workflow.id.to_string()).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["loaded"], true);
+    assert_eq!(body["healthy"], true);
+    assert_eq!(body["active_runs"], 0);
+    assert_eq!(body["waiting_runs"], 0);
+    assert!(body["last_run_at"].is_null());
 }
 
 #[tokio::test]
@@ -281,12 +416,8 @@ async fn create_then_restart_then_reload_returns_same_definition() {
         .to_string();
     let on_disk = load_workflow_file(&server.workflow_path(&workflow_id));
 
-    let reloaded = server
-        .state
-        .kernel
-        .load_workflows_from_dir(&server.workflows_dir)
-        .await;
-    assert_eq!(reloaded, 1);
+    let reloaded = server.state.kernel.bootstrap_workflow_definitions().await;
+    assert_eq!(reloaded.loaded, 1);
 
     let in_memory = server
         .state
@@ -325,12 +456,8 @@ async fn update_then_restart_then_reload_reflects_updated_definition() {
     .await;
     assert_eq!(update_status, reqwest::StatusCode::OK);
 
-    let reloaded = server
-        .state
-        .kernel
-        .load_workflows_from_dir(&server.workflows_dir)
-        .await;
-    assert_eq!(reloaded, 1);
+    let reloaded = server.state.kernel.bootstrap_workflow_definitions().await;
+    assert_eq!(reloaded.loaded, 1);
 
     let reloaded_workflow = load_workflow_file(&server.workflow_path(&workflow_id));
     let in_memory = server
@@ -373,12 +500,8 @@ async fn delete_then_restart_does_not_resurrect_workflow() {
     assert_eq!(delete_status, reqwest::StatusCode::OK);
     assert!(!server.workflow_path(&workflow_id).exists());
 
-    let reloaded = server
-        .state
-        .kernel
-        .load_workflows_from_dir(&server.workflows_dir)
-        .await;
-    assert_eq!(reloaded, 0);
+    let reloaded = server.state.kernel.bootstrap_workflow_definitions().await;
+    assert_eq!(reloaded.loaded, 0);
     assert!(server
         .state
         .kernel
@@ -448,8 +571,7 @@ async fn concurrent_update_and_reload_is_coherent() {
     };
     let reload_task = {
         let kernel = server.state.kernel.clone();
-        let workflows_dir = server.workflows_dir.clone();
-        tokio::spawn(async move { kernel.load_workflows_from_dir(&workflows_dir).await })
+        tokio::spawn(async move { kernel.bootstrap_workflow_definitions().await })
     };
 
     let update_response = update_task
@@ -463,7 +585,7 @@ async fn concurrent_update_and_reload_is_coherent() {
     reader.await.expect("reader task should join successfully");
 
     assert_eq!(update_response.status(), reqwest::StatusCode::OK);
-    assert_eq!(reloaded, 1);
+    assert_eq!(reloaded.loaded, 1);
 
     let final_workflow = server
         .state

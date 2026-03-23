@@ -15,10 +15,11 @@ use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Unique identifier for a workflow definition.
@@ -199,6 +200,119 @@ pub struct StepResult {
     pub duration_ms: u64,
 }
 
+/// Workflow registry readiness state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowRegistryReadiness {
+    Bootstrapping = 0,
+    Ready = 1,
+}
+
+impl WorkflowRegistryReadiness {
+    fn from_stored(value: u8) -> Self {
+        match value {
+            1 => Self::Ready,
+            _ => Self::Bootstrapping,
+        }
+    }
+}
+
+/// Severity of a workflow bootstrap error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowBootstrapErrorLevel {
+    Warn,
+    Error,
+}
+
+impl WorkflowBootstrapErrorLevel {
+    pub fn is_error(self) -> bool {
+        matches!(self, Self::Error)
+    }
+}
+
+/// Outcome of a workflow bootstrap attempt for a specific path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowBootstrapOutcome {
+    Loaded,
+    Skipped,
+    MissingDirectory,
+}
+
+/// Per-path workflow bootstrap event in the order it occurred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowBootstrapEvent {
+    pub path: PathBuf,
+    pub outcome: WorkflowBootstrapOutcome,
+}
+
+/// A workflow bootstrap error with the originating path and severity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowBootstrapError {
+    pub path: PathBuf,
+    pub message: String,
+    pub level: WorkflowBootstrapErrorLevel,
+}
+
+/// Observable workflow bootstrap summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowBootstrapResult {
+    pub loaded: usize,
+    pub skipped: usize,
+    pub errors: Vec<WorkflowBootstrapError>,
+    pub events: Vec<WorkflowBootstrapEvent>,
+}
+
+impl WorkflowBootstrapResult {
+    fn record_loaded(&mut self, path: PathBuf) {
+        self.loaded += 1;
+        self.events.push(WorkflowBootstrapEvent {
+            path,
+            outcome: WorkflowBootstrapOutcome::Loaded,
+        });
+    }
+
+    fn record_missing_directory(&mut self, path: PathBuf) {
+        self.events.push(WorkflowBootstrapEvent {
+            path,
+            outcome: WorkflowBootstrapOutcome::MissingDirectory,
+        });
+    }
+
+    fn record_skipped(
+        &mut self,
+        path: PathBuf,
+        message: impl Into<String>,
+        level: WorkflowBootstrapErrorLevel,
+    ) {
+        let message = message.into();
+        self.skipped += 1;
+        self.errors.push(WorkflowBootstrapError {
+            path: path.clone(),
+            message,
+            level,
+        });
+        self.events.push(WorkflowBootstrapEvent {
+            path,
+            outcome: WorkflowBootstrapOutcome::Skipped,
+        });
+    }
+}
+
+struct WorkflowLoadReport {
+    workflows: Vec<Workflow>,
+    result: WorkflowBootstrapResult,
+}
+
+/// Runtime projection for a workflow definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRuntimeStatus {
+    pub workflow_id: WorkflowId,
+    pub loaded: bool,
+    pub healthy: bool,
+    pub active_runs: usize,
+    pub waiting_runs: usize,
+    pub last_run_at: Option<DateTime<Utc>>,
+}
+
 /// Canonical file-backed storage for workflow definitions.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkflowDefinitionStore {
@@ -285,23 +399,95 @@ impl WorkflowDefinitionStore {
         }
     }
 
-    pub(crate) fn load_all(&self) -> OpenFangResult<Vec<Workflow>> {
+    fn supported_definition_file(path: &Path) -> bool {
+        matches!(
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase()),
+            Some(ext) if ext == "json" || ext == "toml"
+        )
+    }
+
+    fn deserialize_workflow(
+        &self,
+        workflow_path: &Path,
+        content: &str,
+    ) -> Result<Workflow, String> {
+        match workflow_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("toml") => toml::from_str::<Workflow>(content)
+                .map_err(|error| format!("Invalid workflow definition TOML: {error}")),
+            _ => serde_json::from_str::<Workflow>(content)
+                .map_err(|error| format!("Invalid workflow definition JSON: {error}")),
+        }
+    }
+
+    fn load_all(&self) -> WorkflowLoadReport {
+        let mut result = WorkflowBootstrapResult::default();
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                info!(
+                    path = ?self.dir,
+                    "Workflow definitions directory does not exist yet; skipping bootstrap"
+                );
+                result.record_missing_directory(self.dir.clone());
+                return WorkflowLoadReport {
+                    workflows: Vec::new(),
+                    result,
+                };
+            }
             Err(error) => {
-                return Err(OpenFangError::Internal(format!(
-                    "Failed to read workflows directory '{}': {error}",
-                    self.dir.display()
-                )));
+                error!(
+                    path = ?self.dir,
+                    error = %error,
+                    "Failed to read workflow definitions directory"
+                );
+                result.record_skipped(
+                    self.dir.clone(),
+                    format!(
+                        "Failed to read workflows directory '{}': {error}",
+                        self.dir.display()
+                    ),
+                    WorkflowBootstrapErrorLevel::Error,
+                );
+                return WorkflowLoadReport {
+                    workflows: Vec::new(),
+                    result,
+                };
             }
         };
 
-        let mut workflow_files = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-            .collect::<Vec<_>>();
+        let mut workflow_files = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if Self::supported_definition_file(&path) {
+                        workflow_files.push(path);
+                    }
+                }
+                Err(error) => {
+                    error!(
+                        path = ?self.dir,
+                        error = %error,
+                        "Failed to inspect workflow directory entry"
+                    );
+                    result.record_skipped(
+                        self.dir.clone(),
+                        format!(
+                            "Failed to inspect workflow directory entry in '{}': {error}",
+                            self.dir.display()
+                        ),
+                        WorkflowBootstrapErrorLevel::Error,
+                    );
+                }
+            }
+        }
         workflow_files.sort();
 
         let mut seen_ids = HashSet::with_capacity(workflow_files.len());
@@ -311,16 +497,24 @@ impl WorkflowDefinitionStore {
             let content = match std::fs::read_to_string(&workflow_path) {
                 Ok(content) => content,
                 Err(error) => {
-                    warn!(
+                    error!(
                         path = ?workflow_path,
                         error = %error,
                         "Failed to read workflow definition file"
+                    );
+                    result.record_skipped(
+                        workflow_path.clone(),
+                        format!(
+                            "Failed to read workflow definition file '{}': {error}",
+                            workflow_path.display()
+                        ),
+                        WorkflowBootstrapErrorLevel::Error,
                     );
                     continue;
                 }
             };
 
-            match serde_json::from_str::<Workflow>(&content) {
+            match self.deserialize_workflow(&workflow_path, &content) {
                 Ok(workflow) => {
                     if !seen_ids.insert(workflow.id) {
                         warn!(
@@ -328,22 +522,41 @@ impl WorkflowDefinitionStore {
                             workflow_id = %workflow.id,
                             "Skipped duplicate workflow definition while loading from disk"
                         );
+                        result.record_skipped(
+                            workflow_path.clone(),
+                            format!(
+                                "Skipped duplicate workflow definition for workflow {}",
+                                workflow.id
+                            ),
+                            WorkflowBootstrapErrorLevel::Warn,
+                        );
                         continue;
                     }
 
+                    info!(
+                        path = ?workflow_path,
+                        workflow_id = %workflow.id,
+                        "Loaded workflow definition during bootstrap"
+                    );
+                    result.record_loaded(workflow_path.clone());
                     workflows.push(workflow);
                 }
-                Err(error) => {
+                Err(message) => {
                     warn!(
                         path = ?workflow_path,
-                        error = %error,
-                        "Invalid workflow definition JSON, skipping"
+                        error = %message,
+                        "Invalid workflow definition, skipping"
+                    );
+                    result.record_skipped(
+                        workflow_path.clone(),
+                        message,
+                        WorkflowBootstrapErrorLevel::Warn,
                     );
                 }
             }
         }
 
-        Ok(workflows)
+        WorkflowLoadReport { workflows, result }
     }
 }
 
@@ -357,6 +570,8 @@ pub struct WorkflowEngine {
     definition_store: WorkflowDefinitionStore,
     /// Serializes definition mutations and reloads so memory and disk stay coherent.
     definition_mutation_lock: Arc<Mutex<()>>,
+    /// Readiness state for the workflow registry.
+    readiness: Arc<AtomicU8>,
 }
 
 impl WorkflowEngine {
@@ -374,7 +589,22 @@ impl WorkflowEngine {
             runs: Arc::new(RwLock::new(HashMap::new())),
             definition_store: WorkflowDefinitionStore::new(workflows_dir),
             definition_mutation_lock: Arc::new(Mutex::new(())),
+            readiness: Arc::new(AtomicU8::new(
+                WorkflowRegistryReadiness::Bootstrapping as u8,
+            )),
         }
+    }
+
+    fn set_readiness(&self, readiness: WorkflowRegistryReadiness) {
+        self.readiness.store(readiness as u8, Ordering::Release);
+    }
+
+    pub fn readiness(&self) -> WorkflowRegistryReadiness {
+        WorkflowRegistryReadiness::from_stored(self.readiness.load(Ordering::Acquire))
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.readiness() == WorkflowRegistryReadiness::Ready
     }
 
     /// Register a new workflow definition.
@@ -445,18 +675,24 @@ impl WorkflowEngine {
     }
 
     /// Replace the in-memory workflow registry with the workflows currently on disk.
-    pub(crate) async fn reload_from_store(
+    pub(crate) async fn bootstrap_from_store(
         &self,
         store: WorkflowDefinitionStore,
-    ) -> OpenFangResult<usize> {
+    ) -> WorkflowBootstrapResult {
         let _mutation_guard = self.definition_mutation_lock.lock().await;
-        let loaded_workflows = store.load_all()?;
+        self.set_readiness(WorkflowRegistryReadiness::Bootstrapping);
+        let WorkflowLoadReport {
+            workflows: loaded_workflows,
+            result,
+        } = store.load_all();
         let mut workflows = self.workflows.write().await;
         *workflows = loaded_workflows
             .into_iter()
             .map(|workflow| (workflow.id, workflow))
             .collect();
-        Ok(workflows.len())
+        drop(workflows);
+        self.set_readiness(WorkflowRegistryReadiness::Ready);
+        result
     }
 
     /// Maximum number of retained workflow runs. Oldest completed/failed
@@ -541,6 +777,39 @@ impl WorkflowEngine {
             })
             .cloned()
             .collect()
+    }
+
+    /// Return the runtime projection for a workflow definition after readiness.
+    pub async fn runtime_status(&self, workflow_id: WorkflowId) -> Option<WorkflowRuntimeStatus> {
+        let workflow = self.workflows.read().await.get(&workflow_id)?.clone();
+        let runs = self.runs.read().await;
+        let mut active_runs = 0usize;
+        let mut waiting_runs = 0usize;
+        let mut last_run_at = None;
+
+        for run in runs.values().filter(|run| run.workflow_id == workflow.id) {
+            match run.state {
+                WorkflowRunState::Running => active_runs += 1,
+                WorkflowRunState::Pending => waiting_runs += 1,
+                WorkflowRunState::Completed | WorkflowRunState::Failed => {}
+            }
+
+            if last_run_at
+                .map(|current| run.started_at > current)
+                .unwrap_or(true)
+            {
+                last_run_at = Some(run.started_at);
+            }
+        }
+
+        Some(WorkflowRuntimeStatus {
+            workflow_id,
+            loaded: true,
+            healthy: true,
+            active_runs,
+            waiting_runs,
+            last_run_at,
+        })
     }
 
     /// Replace `{{var_name}}` references in a template with stored variable values.
@@ -1041,6 +1310,32 @@ mod tests {
         workflow_ids
     }
 
+    fn write_workflow_json(path: &std::path::Path, workflow: &Workflow) {
+        std::fs::create_dir_all(
+            path.parent()
+                .expect("workflow definition path should have a parent"),
+        )
+        .expect("workflow definition parent should exist");
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(workflow).expect("workflow should serialize to json"),
+        )
+        .expect("workflow json should be written");
+    }
+
+    fn write_workflow_toml(path: &std::path::Path, workflow: &Workflow) {
+        std::fs::create_dir_all(
+            path.parent()
+                .expect("workflow definition path should have a parent"),
+        )
+        .expect("workflow definition parent should exist");
+        std::fs::write(
+            path,
+            toml::to_string_pretty(workflow).expect("workflow should serialize to toml"),
+        )
+        .expect("workflow toml should be written");
+    }
+
     fn test_workflow() -> Workflow {
         Workflow {
             id: WorkflowId::new(),
@@ -1077,6 +1372,166 @@ mod tests {
     fn mock_resolver(agent: &StepAgent) -> Option<(AgentId, String)> {
         let _ = agent;
         Some((AgentId::new(), "mock-agent".to_string()))
+    }
+
+    #[tokio::test]
+    async fn workflow_registry_readiness_starts_not_ready() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().join("workflows"));
+
+        assert!(!engine.is_ready());
+        assert_eq!(engine.readiness(), WorkflowRegistryReadiness::Bootstrapping);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_workflow_definitions_loads_all_valid_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().join("bootstrap");
+        let engine = test_engine(temp_dir.path().join("managed"));
+        let first = test_workflow();
+        let second = Workflow {
+            id: WorkflowId::new(),
+            name: "toml-workflow".to_string(),
+            description: "loaded from toml".to_string(),
+            steps: Vec::new(),
+            created_at: Utc::now(),
+        };
+
+        write_workflow_json(&workflows_dir.join("b-valid.json"), &first);
+        write_workflow_toml(&workflows_dir.join("a-valid.toml"), &second);
+
+        let bootstrap = engine
+            .bootstrap_from_store(WorkflowDefinitionStore::new(workflows_dir))
+            .await;
+
+        assert_eq!(bootstrap.loaded, 2);
+        assert_eq!(bootstrap.skipped, 0);
+        assert!(bootstrap.errors.is_empty());
+
+        let loaded_ids = engine
+            .list_workflows()
+            .await
+            .into_iter()
+            .map(|workflow| workflow.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(loaded_ids, HashSet::from([first.id, second.id]));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_workflow_definitions_skips_invalid_files_with_warning() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().join("bootstrap");
+        let engine = test_engine(temp_dir.path().join("managed"));
+        let valid = test_workflow();
+
+        write_workflow_json(&workflows_dir.join("a-valid.json"), &valid);
+        std::fs::create_dir_all(&workflows_dir).expect("workflow dir should be created");
+        std::fs::write(workflows_dir.join("b-invalid.json"), "{not valid json")
+            .expect("invalid workflow file should be written");
+
+        let bootstrap = engine
+            .bootstrap_from_store(WorkflowDefinitionStore::new(workflows_dir.clone()))
+            .await;
+
+        assert_eq!(bootstrap.loaded, 1);
+        assert_eq!(bootstrap.skipped, 1);
+        assert_eq!(bootstrap.errors.len(), 1);
+        assert_eq!(bootstrap.errors[0].level, WorkflowBootstrapErrorLevel::Warn);
+        assert!(bootstrap.errors[0]
+            .path
+            .ends_with(std::path::Path::new("b-invalid.json")));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_workflow_definitions_tolerates_missing_directory() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let missing_dir = temp_dir.path().join("missing-workflows");
+        let engine = test_engine(temp_dir.path().join("managed"));
+
+        let bootstrap = engine
+            .bootstrap_from_store(WorkflowDefinitionStore::new(missing_dir.clone()))
+            .await;
+
+        assert_eq!(bootstrap.loaded, 0);
+        assert_eq!(bootstrap.skipped, 0);
+        assert!(bootstrap.errors.is_empty());
+        assert!(engine.is_ready());
+        assert_eq!(
+            bootstrap.events,
+            vec![WorkflowBootstrapEvent {
+                path: missing_dir,
+                outcome: WorkflowBootstrapOutcome::MissingDirectory,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_registry_readiness_set_after_bootstrap() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().join("bootstrap");
+        let engine = test_engine(temp_dir.path().join("managed"));
+        let workflow = test_workflow();
+        write_workflow_json(&workflows_dir.join("ready.json"), &workflow);
+
+        let bootstrap = engine
+            .bootstrap_from_store(WorkflowDefinitionStore::new(workflows_dir))
+            .await;
+
+        assert_eq!(bootstrap.loaded, 1);
+        assert!(engine.is_ready());
+        assert_eq!(engine.readiness(), WorkflowRegistryReadiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_load_order_is_deterministic() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().join("bootstrap");
+        let engine = test_engine(temp_dir.path().join("managed"));
+        let first = test_workflow();
+        let second = Workflow {
+            id: WorkflowId::new(),
+            name: "second".to_string(),
+            description: "second".to_string(),
+            steps: Vec::new(),
+            created_at: Utc::now(),
+        };
+        let third = Workflow {
+            id: WorkflowId::new(),
+            name: "third".to_string(),
+            description: "third".to_string(),
+            steps: Vec::new(),
+            created_at: Utc::now(),
+        };
+
+        write_workflow_json(&workflows_dir.join("c-last.json"), &third);
+        write_workflow_json(&workflows_dir.join("a-first.json"), &first);
+        write_workflow_toml(&workflows_dir.join("b-middle.toml"), &second);
+
+        let bootstrap = engine
+            .bootstrap_from_store(WorkflowDefinitionStore::new(workflows_dir))
+            .await;
+        let loaded_paths = bootstrap
+            .events
+            .iter()
+            .filter(|event| event.outcome == WorkflowBootstrapOutcome::Loaded)
+            .map(|event| {
+                event
+                    .path
+                    .file_name()
+                    .expect("loaded workflow path should have a filename")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            loaded_paths,
+            vec![
+                "a-first.json".to_string(),
+                "b-middle.toml".to_string(),
+                "c-last.json".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1358,7 +1813,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_from_store_replaces_registry_with_current_disk_snapshot() {
+    async fn bootstrap_from_store_replaces_registry_with_current_disk_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let managed_dir = temp_dir.path().join("managed");
         let reload_dir = temp_dir.path().join("reload");
@@ -1394,10 +1849,10 @@ mod tests {
         .expect("replacement workflow should be written");
 
         let reloaded = engine
-            .reload_from_store(WorkflowDefinitionStore::new(reload_dir))
-            .await
-            .expect("reload from store should succeed");
-        assert_eq!(reloaded, 1);
+            .bootstrap_from_store(WorkflowDefinitionStore::new(reload_dir))
+            .await;
+        assert_eq!(reloaded.loaded, 1);
+        assert_eq!(reloaded.skipped, 0);
 
         let workflows = engine.list_workflows().await;
         assert_eq!(workflows.len(), 1);
@@ -1405,7 +1860,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_from_store_skips_duplicate_workflow_ids() {
+    async fn bootstrap_from_store_skips_duplicate_workflow_ids() {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let workflows_dir = temp_dir.path().join("duplicates");
         let engine = test_engine(temp_dir.path().join("managed"));
@@ -1420,10 +1875,11 @@ mod tests {
             .expect("second workflow file should be written");
 
         let reloaded = engine
-            .reload_from_store(WorkflowDefinitionStore::new(workflows_dir))
-            .await
-            .expect("reload from store should succeed");
-        assert_eq!(reloaded, 1);
+            .bootstrap_from_store(WorkflowDefinitionStore::new(workflows_dir))
+            .await;
+        assert_eq!(reloaded.loaded, 1);
+        assert_eq!(reloaded.skipped, 1);
+        assert_eq!(reloaded.errors[0].level, WorkflowBootstrapErrorLevel::Warn);
 
         let workflows = engine.list_workflows().await;
         assert_eq!(workflows.len(), 1);

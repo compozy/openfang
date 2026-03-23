@@ -318,12 +318,20 @@ pub async fn build_router(
                 .delete(routes::delete_workflow),
         )
         .route(
+            "/api/workflows/{id}/runtime",
+            axum::routing::get(routes::get_workflow_runtime),
+        )
+        .route(
             "/api/workflows/{id}/run",
             axum::routing::post(routes::run_workflow),
         )
         .route(
             "/api/workflows/{id}/runs",
             axum::routing::get(routes::list_workflow_runs),
+        )
+        .route(
+            "/api/v1/workflows/{id}/runtime",
+            axum::routing::get(routes::get_workflow_runtime),
         )
         // Skills endpoints
         .route("/api/skills", axum::routing::get(routes::list_skills))
@@ -733,6 +741,7 @@ pub async fn run_daemon(
 
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
+    kernel.bootstrap_workflow_definitions().await;
     kernel.start_background_agents();
 
     // Config file hot-reload watcher (polls every 30 seconds)

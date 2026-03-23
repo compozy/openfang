@@ -938,6 +938,54 @@ pub async fn list_workflows(State(state): State<Arc<AppState>>) -> impl IntoResp
     Json(list)
 }
 
+/// GET /api/v1/workflows/:id/runtime — Get workflow runtime status.
+pub async fn get_workflow_runtime(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let workflow_id = WorkflowId(match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid workflow ID"})),
+            );
+        }
+    });
+
+    if !state.kernel.workflows.is_ready() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "workflow_id": workflow_id.to_string(),
+                "loaded": false,
+                "healthy": false,
+                "active_runs": 0,
+                "waiting_runs": 0,
+                "last_run_at": serde_json::Value::Null,
+            })),
+        );
+    }
+
+    match state.kernel.workflows.runtime_status(workflow_id).await {
+        Some(runtime) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "workflow_id": runtime.workflow_id.to_string(),
+                "loaded": runtime.loaded,
+                "healthy": runtime.healthy,
+                "active_runs": runtime.active_runs,
+                "waiting_runs": runtime.waiting_runs,
+                "last_run_at": runtime.last_run_at.map(|value| value.to_rfc3339()),
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Workflow not found"})),
+        ),
+    }
+}
+
 /// POST /api/workflows/:id/run — Execute a workflow.
 pub async fn run_workflow(
     State(state): State<Arc<AppState>>,
