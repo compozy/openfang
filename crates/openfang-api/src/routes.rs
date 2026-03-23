@@ -11,6 +11,7 @@ use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
 };
 use openfang_kernel::OpenFangKernel;
+use openfang_memory::AgentRuntimeRecord;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
@@ -172,6 +173,15 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
     // Snapshot catalog once for enrichment
     let catalog = state.kernel.model_catalog.read().ok();
     let dm = &state.kernel.config.default_model;
+    let runtime_projections: HashMap<AgentId, AgentRuntimeRecord> = state
+        .kernel
+        .runtime_stores
+        .agent_runtime
+        .list_agent_runtimes()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| (record.agent_id, record))
+        .collect();
 
     let agents: Vec<serde_json::Value> = state
         .kernel
@@ -179,6 +189,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
         .list()
         .into_iter()
         .map(|e| {
+            let runtime_projection = runtime_projections.get(&e.id);
             // Resolve "default" provider/model to actual kernel defaults
             let provider =
                 if e.manifest.model.provider.is_empty() || e.manifest.model.provider == "default" {
@@ -209,16 +220,28 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 })
                 .unwrap_or(("unknown".to_string(), "unknown".to_string()));
 
-            let ready = matches!(e.state, openfang_types::agent::AgentState::Running)
+            let state = runtime_projection
+                .map(|record| record.state)
+                .unwrap_or(e.state);
+            let mode = runtime_projection
+                .map(|record| record.mode)
+                .unwrap_or(e.mode);
+            let last_active = runtime_projection
+                .and_then(|record| record.last_active_at.clone())
+                .unwrap_or_else(|| e.last_active.to_rfc3339());
+            let ready = matches!(state, openfang_types::agent::AgentState::Running)
+                && runtime_projection
+                    .map(|record| record.healthy)
+                    .unwrap_or(true)
                 && auth_status != "missing";
 
             serde_json::json!({
                 "id": e.id.to_string(),
                 "name": e.name,
-                "state": format!("{:?}", e.state),
-                "mode": e.mode,
+                "state": format!("{:?}", state),
+                "mode": mode,
                 "created_at": e.created_at.to_rfc3339(),
-                "last_active": e.last_active.to_rfc3339(),
+                "last_active": last_active,
                 "model_provider": provider,
                 "model_name": model,
                 "model_tier": tier,
@@ -322,6 +345,8 @@ pub fn inject_attachments_into_session(
 
     if let Err(e) = kernel.memory.save_session(&session) {
         tracing::warn!(error = %e, "Failed to save session with image attachments");
+    } else if let Err(error) = kernel.refresh_agent_runtime_projection(agent_id) {
+        tracing::warn!(agent_id = %agent_id, "Failed to refresh runtime session projection: {error}");
     }
 }
 
@@ -691,8 +716,7 @@ pub async fn restart_agent(
     // Reset state to Running (also updates last_active)
     let _ = state
         .kernel
-        .registry
-        .set_state(agent_id, openfang_types::agent::AgentState::Running);
+        .set_agent_state(agent_id, openfang_types::agent::AgentState::Running);
 
     tracing::info!(
         agent = %agent_name,
@@ -715,17 +739,27 @@ pub async fn restart_agent(
 
 /// GET /api/status — Kernel status.
 pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let runtime_projections: HashMap<AgentId, AgentRuntimeRecord> = state
+        .kernel
+        .runtime_stores
+        .agent_runtime
+        .list_agent_runtimes()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| (record.agent_id, record))
+        .collect();
     let agents: Vec<serde_json::Value> = state
         .kernel
         .registry
         .list()
         .into_iter()
         .map(|e| {
+            let runtime_projection = runtime_projections.get(&e.id);
             serde_json::json!({
                 "id": e.id.to_string(),
                 "name": e.name,
-                "state": format!("{:?}", e.state),
-                "mode": e.mode,
+                "state": format!("{:?}", runtime_projection.map(|record| record.state).unwrap_or(e.state)),
+                "mode": runtime_projection.map(|record| record.mode).unwrap_or(e.mode),
                 "created_at": e.created_at.to_rfc3339(),
                 "model_provider": e.manifest.model.provider,
                 "model_name": e.manifest.model.model,
@@ -1296,7 +1330,7 @@ pub async fn set_agent_mode(
         }
     };
 
-    match state.kernel.registry.set_mode(agent_id, body.mode) {
+    match state.kernel.set_agent_mode(agent_id, body.mode) {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1357,17 +1391,36 @@ pub async fn get_agent(
             );
         }
     };
+    let runtime_projection = state
+        .kernel
+        .runtime_stores
+        .agent_runtime
+        .get_agent_runtime(agent_id)
+        .ok()
+        .flatten();
+    let state_value = runtime_projection
+        .as_ref()
+        .map(|record| format!("{:?}", record.state))
+        .unwrap_or_else(|| format!("{:?}", entry.state));
+    let mode_value = runtime_projection
+        .as_ref()
+        .map(|record| record.mode)
+        .unwrap_or(entry.mode);
+    let session_id = runtime_projection
+        .as_ref()
+        .and_then(|record| record.active_session_id)
+        .unwrap_or(entry.session_id);
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "id": entry.id.to_string(),
             "name": entry.name,
-            "state": format!("{:?}", entry.state),
-            "mode": entry.mode,
+            "state": state_value,
+            "mode": mode_value,
             "profile": entry.manifest.profile,
             "created_at": entry.created_at.to_rfc3339(),
-            "session_id": entry.session_id.0.to_string(),
+            "session_id": session_id.0.to_string(),
             "model": {
                 "provider": entry.manifest.model.provider,
                 "model": entry.manifest.model.model,
@@ -3294,11 +3347,18 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Run the database checks on a blocking thread so we never hold the
     // std::sync::Mutex<Connection> on a tokio worker thread.
     let kernel = Arc::clone(&state.kernel);
-    let db_health = tokio::task::spawn_blocking(move || kernel.db_health())
-        .await
-        .unwrap_or_default();
+    let (db_health, runtime_projection_ok) = tokio::task::spawn_blocking(move || {
+        let projection_ok = kernel
+            .runtime_stores
+            .agent_runtime
+            .list_agent_runtimes()
+            .is_ok();
+        (kernel.db_health(), projection_ok)
+    })
+    .await
+    .unwrap_or_default();
 
-    let status = if db_health.is_healthy() {
+    let status = if db_health.is_healthy() && runtime_projection_ok {
         "ok"
     } else {
         "degraded"
@@ -3315,12 +3375,20 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
     let health = state.kernel.supervisor.health();
 
     let kernel = Arc::clone(&state.kernel);
-    let db_health = tokio::task::spawn_blocking(move || kernel.db_health())
-        .await
-        .unwrap_or_default();
+    let (db_health, runtime_agent_count) = tokio::task::spawn_blocking(move || {
+        let runtime_agent_count = kernel
+            .runtime_stores
+            .agent_runtime
+            .list_agent_runtimes()
+            .map(|records| records.len())
+            .ok();
+        (kernel.db_health(), runtime_agent_count)
+    })
+    .await
+    .unwrap_or_default();
 
     let config_warnings = state.kernel.config.validate();
-    let status = if db_health.is_healthy() {
+    let status = if db_health.is_healthy() && runtime_agent_count.is_some() {
         "ok"
     } else {
         "degraded"
@@ -3332,8 +3400,9 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
         "uptime_seconds": state.started_at.elapsed().as_secs(),
         "panic_count": health.panic_count,
         "restart_count": health.restart_count,
-        "agent_count": state.kernel.registry.count(),
+        "agent_count": runtime_agent_count.unwrap_or_else(|| state.kernel.registry.count()),
         "database": if db_health.is_healthy() { "connected" } else { "error" },
+        "runtime_projection": if runtime_agent_count.is_some() { "connected" } else { "error" },
         "config_warnings": config_warnings,
     }))
 }
@@ -5491,11 +5560,26 @@ pub async fn delete_session(
         }
     };
 
+    let existing_session = state.kernel.memory.get_session(session_id).ok().flatten();
     match state.kernel.memory.delete_session(session_id) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "deleted", "session_id": id})),
-        ),
+        Ok(()) => {
+            if let Some(session) = existing_session {
+                if let Some(entry) = state.kernel.registry.get(session.agent_id) {
+                    if entry.session_id == session_id {
+                        let _ = state.kernel.create_agent_session(session.agent_id, None);
+                    } else {
+                        let _ = state
+                            .kernel
+                            .refresh_agent_runtime_projection(session.agent_id);
+                    }
+                }
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "deleted", "session_id": id})),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -5531,15 +5615,29 @@ pub async fn set_session_label(
         }
     }
 
+    let agent_id = state
+        .kernel
+        .memory
+        .get_session(session_id)
+        .ok()
+        .flatten()
+        .map(|session| session.agent_id);
+
     match state.kernel.memory.set_session_label(session_id, label) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "updated",
-                "session_id": id,
-                "label": label,
-            })),
-        ),
+        Ok(()) => {
+            if let Some(agent_id) = agent_id {
+                let _ = state.kernel.refresh_agent_runtime_projection(agent_id);
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "updated",
+                    "session_id": id,
+                    "label": label,
+                })),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

@@ -15,7 +15,7 @@ use crate::supervisor::Supervisor;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{StepAgent, Workflow, WorkflowEngine, WorkflowId, WorkflowRunId};
 
-use openfang_memory::MemorySubstrate;
+use openfang_memory::{AgentRuntimeRecord, AgentSessionRecord, MemorySubstrate, RuntimeStoreSet};
 use openfang_runtime::agent_loop::{
     run_agent_loop, run_agent_loop_streaming, strip_provider_prefix, AgentLoopResult,
 };
@@ -39,6 +39,7 @@ use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tracing::{debug, info, warn};
@@ -73,6 +74,8 @@ pub struct OpenFangKernel {
     pub scheduler: AgentScheduler,
     /// Memory substrate.
     pub memory: Arc<MemorySubstrate>,
+    /// Typed runtime.db projection stores.
+    pub runtime_stores: RuntimeStoreSet,
     /// Compozy durable state database handle.
     pub(crate) compozy_db: Arc<Mutex<Connection>>,
     /// Process supervisor.
@@ -537,6 +540,10 @@ fn initialize_runtime_memory(
         })
 }
 
+fn initialize_runtime_stores(runtime_db: Arc<Mutex<Connection>>) -> RuntimeStoreSet {
+    RuntimeStoreSet::new(runtime_db)
+}
+
 impl OpenFangKernel {
     /// Boot the kernel with configuration from the given path.
     pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
@@ -624,6 +631,7 @@ impl OpenFangKernel {
             &runtime_db_path,
             config.memory.decay_rate,
         )?;
+        let runtime_stores = initialize_runtime_stores(Arc::clone(&runtime_db));
 
         // Initialize credential resolver (vault → dotenv → env var)
         let credential_resolver = {
@@ -1037,8 +1045,12 @@ impl OpenFangKernel {
         }
 
         // Initialize cron scheduler
-        let cron_scheduler =
+        let mut cron_scheduler =
             crate::cron::CronScheduler::new(&config.home_dir, config.max_cron_jobs);
+        cron_scheduler.attach_runtime_stores(
+            runtime_stores.schedule_runtime.clone(),
+            runtime_stores.schedule_execution.clone(),
+        );
         match cron_scheduler.load() {
             Ok(count) => {
                 if count > 0 {
@@ -1065,6 +1077,7 @@ impl OpenFangKernel {
             event_bus: EventBus::new(),
             scheduler: AgentScheduler::new(),
             memory: memory.clone(),
+            runtime_stores: runtime_stores.clone(),
             compozy_db,
             supervisor,
             workflows: WorkflowEngine::new(),
@@ -1246,6 +1259,12 @@ impl OpenFangKernel {
                     if let Err(e) = kernel.registry.register(restored_entry) {
                         tracing::warn!(agent = %name, "Failed to restore agent: {e}");
                     } else {
+                        if let Err(error) = kernel.sync_agent_runtime_projection(agent_id) {
+                            warn!(
+                                agent = %name,
+                                "Failed to restore runtime.db projection for agent: {error}"
+                            );
+                        }
                         tracing::debug!(agent = %name, id = %agent_id, "Restored agent");
                     }
                 }
@@ -1302,6 +1321,182 @@ impl OpenFangKernel {
 
         info!("OpenFang kernel booted successfully");
         Ok(kernel)
+    }
+
+    fn agent_runtime_record(entry: &AgentEntry) -> AgentRuntimeRecord {
+        AgentRuntimeRecord {
+            agent_id: entry.id,
+            loaded: true,
+            state: entry.state,
+            mode: entry.mode,
+            healthy: !matches!(entry.state, AgentState::Crashed | AgentState::Terminated),
+            active_session_id: Some(entry.session_id),
+            active_dispatches: 0,
+            last_active_at: Some(entry.last_active.to_rfc3339()),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn parse_session_id_value(value: &serde_json::Value) -> KernelResult<SessionId> {
+        let Some(session_id) = value.get("session_id").and_then(|item| item.as_str()) else {
+            return Err(KernelError::OpenFang(OpenFangError::Internal(
+                "session metadata missing session_id".to_string(),
+            )));
+        };
+
+        session_id
+            .parse::<uuid::Uuid>()
+            .map(SessionId)
+            .map_err(|error| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "invalid session_id in runtime projection: {error}"
+                )))
+            })
+    }
+
+    fn session_projection_record(
+        entry: &AgentEntry,
+        session: &openfang_memory::session::Session,
+        session_meta: &serde_json::Value,
+        updated_at: &str,
+    ) -> AgentSessionRecord {
+        let created_at = session_meta
+            .get("created_at")
+            .and_then(|value| value.as_str())
+            .unwrap_or(updated_at)
+            .to_string();
+        let message_count = session_meta
+            .get("message_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(session.messages.len() as u64)
+            .min(u64::from(u32::MAX)) as u32;
+
+        AgentSessionRecord {
+            session_id: session.id,
+            agent_id: entry.id,
+            label: session.label.clone().or_else(|| {
+                session_meta
+                    .get("label")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            }),
+            active: session.id == entry.session_id,
+            message_count,
+            dispatch_count: 0,
+            created_at,
+            updated_at: updated_at.to_string(),
+            compacted_at: None,
+        }
+    }
+
+    fn sync_agent_runtime_projection(&self, agent_id: AgentId) -> KernelResult<()> {
+        let Some(entry) = self.registry.get(agent_id) else {
+            self.remove_agent_runtime_projection(agent_id)?;
+            return Ok(());
+        };
+
+        self.runtime_stores
+            .agent_runtime
+            .upsert_agent_runtime(&Self::agent_runtime_record(&entry))
+            .map_err(KernelError::OpenFang)?;
+
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        let session_metadata = self
+            .memory
+            .list_agent_sessions(agent_id)
+            .map_err(KernelError::OpenFang)?;
+        let mut seen_sessions = HashSet::new();
+
+        for session_meta in &session_metadata {
+            let session_id = Self::parse_session_id_value(session_meta)?;
+            let Some(session) = self
+                .memory
+                .get_session(session_id)
+                .map_err(KernelError::OpenFang)?
+            else {
+                continue;
+            };
+
+            let record =
+                Self::session_projection_record(&entry, &session, session_meta, &updated_at);
+            self.runtime_stores
+                .agent_session
+                .upsert_agent_session(&record)
+                .map_err(KernelError::OpenFang)?;
+            self.runtime_stores
+                .agent_message
+                .replace_messages_for_session(agent_id, session_id, &session.messages)
+                .map_err(KernelError::OpenFang)?;
+            seen_sessions.insert(session_id);
+        }
+
+        let existing = self
+            .runtime_stores
+            .agent_session
+            .list_agent_sessions_for_agent(agent_id)
+            .map_err(KernelError::OpenFang)?;
+        for record in existing {
+            if seen_sessions.contains(&record.session_id) {
+                continue;
+            }
+
+            self.runtime_stores
+                .agent_message
+                .delete_messages_for_session(record.session_id)
+                .map_err(KernelError::OpenFang)?;
+            self.runtime_stores
+                .agent_session
+                .remove_agent_session(record.session_id)
+                .map_err(KernelError::OpenFang)?;
+        }
+
+        if seen_sessions.contains(&entry.session_id) {
+            self.runtime_stores
+                .agent_session
+                .mark_active_session(agent_id, entry.session_id)
+                .map_err(KernelError::OpenFang)?;
+        }
+
+        Ok(())
+    }
+
+    fn remove_agent_runtime_projection(&self, agent_id: AgentId) -> KernelResult<()> {
+        self.runtime_stores
+            .agent_message
+            .delete_messages_for_agent(agent_id)
+            .map_err(KernelError::OpenFang)?;
+        self.runtime_stores
+            .agent_session
+            .remove_agent_sessions_for_agent(agent_id)
+            .map_err(KernelError::OpenFang)?;
+        self.runtime_stores
+            .agent_runtime
+            .remove_agent_runtime(agent_id)
+            .map_err(KernelError::OpenFang)?;
+        Ok(())
+    }
+
+    pub fn refresh_agent_runtime_projection(&self, agent_id: AgentId) -> KernelResult<()> {
+        self.sync_agent_runtime_projection(agent_id)
+    }
+
+    pub fn set_agent_state(&self, agent_id: AgentId, state: AgentState) -> KernelResult<()> {
+        self.registry
+            .set_state(agent_id, state)
+            .map_err(KernelError::OpenFang)?;
+        self.sync_agent_runtime_projection(agent_id)
+    }
+
+    pub fn set_agent_mode(&self, agent_id: AgentId, mode: AgentMode) -> KernelResult<()> {
+        self.registry
+            .set_mode(agent_id, mode)
+            .map_err(KernelError::OpenFang)?;
+        if let Some(entry) = self.registry.get(agent_id) {
+            self.memory
+                .save_agent(&entry)
+                .map_err(KernelError::OpenFang)?;
+        }
+        self.sync_agent_runtime_projection(agent_id)
     }
 
     /// Spawn a new agent from a manifest, optionally linking to a parent agent.
@@ -1454,6 +1649,7 @@ impl OpenFangKernel {
         self.memory
             .save_agent(&entry)
             .map_err(KernelError::OpenFang)?;
+        self.sync_agent_runtime_projection(agent_id)?;
 
         info!(agent = %name, id = %agent_id, "Agent spawned");
 
@@ -1642,7 +1838,7 @@ impl OpenFangKernel {
                 self.scheduler.record_usage(agent_id, &result.total_usage);
 
                 // Update last active time
-                let _ = self.registry.set_state(agent_id, AgentState::Running);
+                let _ = self.set_agent_state(agent_id, AgentState::Running);
 
                 // SECURITY: Record successful message in audit trail
                 self.audit_log.record(
@@ -1654,6 +1850,8 @@ impl OpenFangKernel {
                     ),
                     "ok",
                 );
+
+                let _ = self.sync_agent_runtime_projection(agent_id);
 
                 Ok(result)
             }
@@ -1669,6 +1867,7 @@ impl OpenFangKernel {
                 // Record the failure in supervisor for health reporting
                 self.supervisor.record_panic();
                 warn!(agent_id = %agent_id, error = %e, "Agent loop failed — recorded in supervisor");
+                let _ = self.sync_agent_runtime_projection(agent_id);
                 Err(e)
             }
         }
@@ -1741,14 +1940,14 @@ impl OpenFangKernel {
                         kernel_clone
                             .scheduler
                             .record_usage(agent_id, &result.total_usage);
-                        let _ = kernel_clone
-                            .registry
-                            .set_state(agent_id, AgentState::Running);
+                        let _ = kernel_clone.set_agent_state(agent_id, AgentState::Running);
+                        let _ = kernel_clone.sync_agent_runtime_projection(agent_id);
                         Ok(result)
                     }
                     Err(e) => {
                         kernel_clone.supervisor.record_panic();
                         warn!(agent_id = %agent_id, error = %e, "Non-LLM agent failed");
+                        let _ = kernel_clone.sync_agent_runtime_projection(agent_id);
                         Err(e)
                     }
                 }
@@ -2106,9 +2305,8 @@ impl OpenFangKernel {
                             tool_calls: result.iterations.saturating_sub(1),
                         });
 
-                    let _ = kernel_clone
-                        .registry
-                        .set_state(agent_id, AgentState::Running);
+                    let _ = kernel_clone.set_agent_state(agent_id, AgentState::Running);
+                    let _ = kernel_clone.sync_agent_runtime_projection(agent_id);
 
                     // Post-loop compaction check: if session now exceeds token threshold,
                     // trigger compaction in background for the next call.
@@ -2134,6 +2332,7 @@ impl OpenFangKernel {
                 Err(e) => {
                     kernel_clone.supervisor.record_panic();
                     warn!(agent_id = %agent_id, error = %e, "Streaming agent loop failed");
+                    let _ = kernel_clone.sync_agent_runtime_projection(agent_id);
                     Err(KernelError::OpenFang(e))
                 }
             }
@@ -2663,6 +2862,7 @@ impl OpenFangKernel {
             }
         }
 
+        self.sync_agent_runtime_projection(agent_id)?;
         Ok(result)
     }
 
@@ -2706,6 +2906,12 @@ impl OpenFangKernel {
         self.registry
             .update_session_id(agent_id, new_session.id)
             .map_err(KernelError::OpenFang)?;
+        if let Some(updated_entry) = self.registry.get(agent_id) {
+            self.memory
+                .save_agent(&updated_entry)
+                .map_err(KernelError::OpenFang)?;
+        }
+        self.sync_agent_runtime_projection(agent_id)?;
 
         // Reset quota tracking so /new clears "token quota exceeded"
         self.scheduler.reset_usage(agent_id);
@@ -2738,6 +2944,12 @@ impl OpenFangKernel {
         self.registry
             .update_session_id(agent_id, new_session.id)
             .map_err(KernelError::OpenFang)?;
+        if let Some(updated_entry) = self.registry.get(agent_id) {
+            self.memory
+                .save_agent(&updated_entry)
+                .map_err(KernelError::OpenFang)?;
+        }
+        self.sync_agent_runtime_projection(agent_id)?;
 
         info!(agent_id = %agent_id, "All agent history cleared");
         Ok(())
@@ -2790,6 +3002,12 @@ impl OpenFangKernel {
         self.registry
             .update_session_id(agent_id, session.id)
             .map_err(KernelError::OpenFang)?;
+        if let Some(updated_entry) = self.registry.get(agent_id) {
+            self.memory
+                .save_agent(&updated_entry)
+                .map_err(KernelError::OpenFang)?;
+        }
+        self.sync_agent_runtime_projection(agent_id)?;
 
         info!(agent_id = %agent_id, label = ?label, "Created new session");
 
@@ -2828,6 +3046,12 @@ impl OpenFangKernel {
         self.registry
             .update_session_id(agent_id, session_id)
             .map_err(KernelError::OpenFang)?;
+        if let Some(updated_entry) = self.registry.get(agent_id) {
+            self.memory
+                .save_agent(&updated_entry)
+                .map_err(KernelError::OpenFang)?;
+        }
+        self.sync_agent_runtime_projection(agent_id)?;
 
         info!(agent_id = %agent_id, session_id = %session_id.0, "Switched session");
         Ok(())
@@ -3193,6 +3417,7 @@ impl OpenFangKernel {
         self.memory
             .save_session(&updated_session)
             .map_err(KernelError::OpenFang)?;
+        self.sync_agent_runtime_projection(agent_id)?;
 
         // Build result message with audit summary
         let mut msg = format!(
@@ -3283,6 +3508,7 @@ impl OpenFangKernel {
 
         // Remove from persistent storage
         let _ = self.memory.remove_agent(agent_id);
+        let _ = self.remove_agent_runtime_projection(agent_id);
 
         // SECURITY: Record agent kill in audit trail
         self.audit_log.record(
@@ -4454,8 +4680,7 @@ impl OpenFangKernel {
                             if let Some(entry) = kernel.registry.get(status.agent_id) {
                                 if entry.state == AgentState::Crashed {
                                     let _ = kernel
-                                        .registry
-                                        .set_state(status.agent_id, AgentState::Terminated);
+                                        .set_agent_state(status.agent_id, AgentState::Terminated);
                                     warn!(
                                         agent = %status.name,
                                         attempts = failures,
@@ -4497,9 +4722,7 @@ impl OpenFangKernel {
                             attempt,
                             config.max_recovery_attempts
                         );
-                        let _ = kernel
-                            .registry
-                            .set_state(status.agent_id, AgentState::Running);
+                        let _ = kernel.set_agent_state(status.agent_id, AgentState::Running);
 
                         // Publish recovery event
                         let event = Event::new(
@@ -4530,9 +4753,7 @@ impl OpenFangKernel {
                     // --- Unresponsive Running agent ---
                     if status.unresponsive && status.state == AgentState::Running {
                         // Mark as Crashed so next cycle triggers recovery
-                        let _ = kernel
-                            .registry
-                            .set_state(status.agent_id, AgentState::Crashed);
+                        let _ = kernel.set_agent_state(status.agent_id, AgentState::Crashed);
                         warn!(
                             agent = %status.name,
                             inactive_secs = status.inactive_secs,
@@ -4628,7 +4849,7 @@ impl OpenFangKernel {
 
         // Update agent states to Suspended in persistent storage (not delete)
         for entry in self.registry.list() {
-            let _ = self.registry.set_state(entry.id, AgentState::Suspended);
+            let _ = self.set_agent_state(entry.id, AgentState::Suspended);
             // Re-save with Suspended state for clean resume on next boot
             if let Some(updated) = self.registry.get(entry.id) {
                 let _ = self.memory.save_agent(&updated);
@@ -6745,7 +6966,7 @@ mod tests {
             schema_migration_exists(&runtime_db),
             "runtime.db migrations should complete before compozy.db migration starts"
         );
-        assert_eq!(schema_migration_rows(&runtime_db).len(), 1);
+        assert_eq!(schema_migration_rows(&runtime_db).len(), 4);
     }
 
     #[test]
@@ -6870,11 +7091,14 @@ mod tests {
         let runtime_rows = schema_migration_rows(&runtime_db);
         let compozy_rows = schema_migration_rows(&compozy_db);
 
-        assert_eq!(runtime_rows.len(), 1);
+        assert_eq!(runtime_rows.len(), 4);
         assert_eq!(compozy_rows.len(), 1);
         assert_eq!(runtime_rows[0].0, 1);
         assert_eq!(compozy_rows[0].0, 1);
         assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
+        assert_eq!(runtime_rows[1].1, "0002_agent_runtime_core");
+        assert_eq!(runtime_rows[2].1, "0003_agent_sessions_and_messages");
+        assert_eq!(runtime_rows[3].1, "0004_schedule_runtime_core");
         assert_eq!(compozy_rows[0].1, "schema_migrations_bootstrap");
 
         kernel.shutdown();

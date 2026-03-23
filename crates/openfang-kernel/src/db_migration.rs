@@ -3,6 +3,10 @@
 //! The runner keeps `runtime.db` and `compozy.db` on independent migration
 //! streams while sharing a single ordered execution path.
 
+use openfang_memory::{
+    AGENT_RUNTIME_CORE_MIGRATION_SQL, AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL,
+    SCHEDULE_RUNTIME_CORE_MIGRATION_SQL,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
@@ -106,11 +110,28 @@ CREATE TABLE IF NOT EXISTS schema_migration (
     applied_at TEXT NOT NULL
 );";
 
-const RUNTIME_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[MigrationStep::new(
-    1,
-    "schema_migrations_bootstrap",
-    SCHEMA_MIGRATION_BOOTSTRAP_SQL,
-)];
+const RUNTIME_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[
+    MigrationStep::new(
+        1,
+        "schema_migrations_bootstrap",
+        SCHEMA_MIGRATION_BOOTSTRAP_SQL,
+    ),
+    MigrationStep::new(
+        2,
+        "0002_agent_runtime_core",
+        AGENT_RUNTIME_CORE_MIGRATION_SQL,
+    ),
+    MigrationStep::new(
+        3,
+        "0003_agent_sessions_and_messages",
+        AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL,
+    ),
+    MigrationStep::new(
+        4,
+        "0004_schedule_runtime_core",
+        SCHEDULE_RUNTIME_CORE_MIGRATION_SQL,
+    ),
+];
 
 const COMPOZY_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[MigrationStep::new(
     1,
@@ -229,6 +250,7 @@ fn migration_is_applied(
 mod tests {
     use super::*;
     use chrono::NaiveDateTime;
+    use pretty_assertions::assert_eq;
     use rusqlite::params;
 
     fn applied_versions(conn: &Connection) -> Vec<u32> {
@@ -264,6 +286,24 @@ mod tests {
         .optional()
         .expect("table exists query")
         .is_some()
+    }
+
+    fn index_exists(conn: &Connection, index_name: &str) -> bool {
+        conn.query_row(
+            "SELECT name
+             FROM sqlite_master
+             WHERE type = 'index' AND name = ?1",
+            [index_name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .expect("index exists query")
+        .is_some()
+    }
+
+    fn apply_runtime_migrations(conn: &Connection) {
+        run_migrations(conn, DatabaseIdentity::Runtime, runtime_migration_steps())
+            .expect("runtime migrations should succeed");
     }
 
     #[test]
@@ -467,6 +507,98 @@ mod tests {
 
         assert!(table_exists(&conn, "schema_migration"));
         assert_eq!(applied_versions(&conn), vec![1]);
+    }
+
+    #[test]
+    fn runtime_db_migration_should_create_agent_runtime_table() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_runtime_migrations(&conn);
+
+        assert!(table_exists(&conn, "agent_runtime"));
+    }
+
+    #[test]
+    fn runtime_db_migration_should_create_agent_session_and_message_tables() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_runtime_migrations(&conn);
+
+        assert!(table_exists(&conn, "agent_session"));
+        assert!(table_exists(&conn, "agent_message"));
+    }
+
+    #[test]
+    fn runtime_db_migration_should_create_schedule_tables() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_runtime_migrations(&conn);
+
+        assert!(table_exists(&conn, "schedule_runtime"));
+        assert!(table_exists(&conn, "schedule_execution"));
+    }
+
+    #[test]
+    fn runtime_db_migration_should_create_required_indexes() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_runtime_migrations(&conn);
+
+        for index_name in [
+            "idx_agent_session_agent_id",
+            "idx_agent_message_agent_session",
+            "idx_agent_message_session",
+            "idx_schedule_execution_schedule",
+            "idx_schedule_execution_fired",
+        ] {
+            assert!(
+                index_exists(&conn, index_name),
+                "missing required runtime.db index: {index_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_db_migration_should_not_include_compozy_domain_tables() {
+        let runtime_sql = runtime_migration_steps()
+            .iter()
+            .map(|step| step.sql)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for disallowed_table in [
+            "workflow_run",
+            "workflow_checkpoint",
+            "workflow_signal",
+            "task",
+            "subtask",
+            "artifact",
+            "looper_run",
+        ] {
+            assert!(
+                !runtime_sql.contains(disallowed_table),
+                "runtime.db migrations unexpectedly reference {disallowed_table}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_db_migration_should_not_include_agent_definition_fields() {
+        let runtime_sql = runtime_migration_steps()
+            .iter()
+            .map(|step| step.sql)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for disallowed_column in [
+            "system_prompt",
+            "skills",
+            "model",
+            "agent_name",
+            "target_agent",
+            "cron_expression",
+        ] {
+            assert!(
+                !runtime_sql.contains(disallowed_column),
+                "runtime.db migrations unexpectedly reference definition field {disallowed_column}"
+            );
+        }
     }
 
     #[test]

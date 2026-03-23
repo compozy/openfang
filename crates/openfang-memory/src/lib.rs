@@ -10,10 +10,18 @@
 pub mod consolidation;
 pub mod knowledge;
 pub mod migration;
+pub mod runtime_store;
 pub mod semantic;
 pub mod session;
 pub mod structured;
 pub mod usage;
 
 mod substrate;
+pub use runtime_store::{
+    AgentMessageRecord, AgentMessageStore, AgentRuntimeRecord, AgentRuntimeStore,
+    AgentSessionRecord, AgentSessionStore, RuntimeStoreSet, ScheduleExecutionRecord,
+    ScheduleExecutionStore, ScheduleRuntimeRecord, ScheduleRuntimeStore,
+    AGENT_RUNTIME_CORE_MIGRATION_SQL, AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL,
+    SCHEDULE_RUNTIME_CORE_MIGRATION_SQL,
+};
 pub use substrate::MemorySubstrate;
