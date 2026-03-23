@@ -264,6 +264,7 @@ pub fn openfang_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OpenFangKernel;
     use std::io::Write;
 
     #[test]
@@ -453,5 +454,102 @@ mod tests {
 
         let config = load_config(Some(&root));
         assert_eq!(config.log_level, "trace");
+    }
+
+    #[test]
+    fn test_load_config_without_persistence_section_uses_default_database_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        let data_dir = home_dir.join("data");
+        let home_dir_toml = home_dir.display().to_string().replace('\\', "\\\\");
+        let data_dir_toml = data_dir.display().to_string().replace('\\', "\\\\");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let root = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&root).unwrap();
+        writeln!(f, "home_dir = \"{home_dir_toml}\"").unwrap();
+        writeln!(f, "data_dir = \"{data_dir_toml}\"").unwrap();
+        writeln!(f, "api_listen = \"127.0.0.1:4200\"").unwrap();
+        writeln!(f, "[default_model]").unwrap();
+        writeln!(f, "provider = \"ollama\"").unwrap();
+        writeln!(f, "model = \"test-model\"").unwrap();
+        writeln!(f, "api_key_env = \"OLLAMA_API_KEY\"").unwrap();
+        drop(f);
+
+        let config = load_config(Some(&root));
+        assert_eq!(
+            config.persistence.resolve_runtime_db(&config.data_dir),
+            data_dir.join("runtime.db")
+        );
+        assert_eq!(
+            config.persistence.resolve_compozy_db(&config.data_dir),
+            data_dir.join("compozy.db")
+        );
+    }
+
+    #[test]
+    fn test_load_config_with_explicit_persistence_section_uses_exact_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        let data_dir = home_dir.join("data");
+        let runtime_db = dir.path().join("custom").join("runtime.sqlite");
+        let compozy_db = dir.path().join("custom").join("compozy.sqlite");
+        let home_dir_toml = home_dir.display().to_string().replace('\\', "\\\\");
+        let data_dir_toml = data_dir.display().to_string().replace('\\', "\\\\");
+        let runtime_db_toml = runtime_db.display().to_string().replace('\\', "\\\\");
+        let compozy_db_toml = compozy_db.display().to_string().replace('\\', "\\\\");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let root = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&root).unwrap();
+        writeln!(f, "home_dir = \"{home_dir_toml}\"").unwrap();
+        writeln!(f, "data_dir = \"{data_dir_toml}\"").unwrap();
+        writeln!(f, "[default_model]").unwrap();
+        writeln!(f, "provider = \"ollama\"").unwrap();
+        writeln!(f, "model = \"test-model\"").unwrap();
+        writeln!(f, "api_key_env = \"OLLAMA_API_KEY\"").unwrap();
+        writeln!(f, "[persistence]").unwrap();
+        writeln!(f, "runtime_db = \"{runtime_db_toml}\"").unwrap();
+        writeln!(f, "compozy_db = \"{compozy_db_toml}\"").unwrap();
+        drop(f);
+
+        let config = load_config(Some(&root));
+        assert_eq!(
+            config.persistence.resolve_runtime_db(&config.data_dir),
+            runtime_db
+        );
+        assert_eq!(
+            config.persistence.resolve_compozy_db(&config.data_dir),
+            compozy_db
+        );
+    }
+
+    #[test]
+    fn test_kernel_boot_with_toml_without_persistence_section_creates_runtime_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().join("home");
+        let data_dir = home_dir.join("data");
+        let home_dir_toml = home_dir.display().to_string().replace('\\', "\\\\");
+        let data_dir_toml = data_dir.display().to_string().replace('\\', "\\\\");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let root = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&root).unwrap();
+        writeln!(f, "home_dir = \"{home_dir_toml}\"").unwrap();
+        writeln!(f, "data_dir = \"{data_dir_toml}\"").unwrap();
+        writeln!(f, "api_listen = \"127.0.0.1:4200\"").unwrap();
+        writeln!(f, "[default_model]").unwrap();
+        writeln!(f, "provider = \"ollama\"").unwrap();
+        writeln!(f, "model = \"test-model\"").unwrap();
+        writeln!(f, "api_key_env = \"OLLAMA_API_KEY\"").unwrap();
+        drop(f);
+
+        let config = load_config(Some(&root));
+        let runtime_db = config.persistence.resolve_runtime_db(&config.data_dir);
+        let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+
+        assert!(runtime_db.exists());
+
+        kernel.shutdown();
     }
 }

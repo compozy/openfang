@@ -83,6 +83,7 @@ async fn start_test_server_with_provider(
     let app = Router::new()
         .route("/api/health", axum::routing::get(routes::health))
         .route("/api/status", axum::routing::get(routes::status))
+        .route("/api/config", axum::routing::get(routes::get_config))
         .route(
             "/api/agents",
             axum::routing::get(routes::list_agents).post(routes::spawn_agent),
@@ -227,6 +228,48 @@ async fn test_status_endpoint() {
     assert!(body["uptime_seconds"].is_number());
     assert_eq!(body["default_provider"], "ollama");
     assert_eq!(body["agents"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_config_endpoint_includes_resolved_persistence_paths() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/api/config", server.base_url))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["persistence"]["runtime_db"].as_str(),
+        Some(
+            server
+                .state
+                .kernel
+                .config
+                .persistence
+                .resolve_runtime_db(&server.state.kernel.config.data_dir)
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert_eq!(
+        body["persistence"]["compozy_db"].as_str(),
+        Some(
+            server
+                .state
+                .kernel
+                .config
+                .persistence
+                .resolve_compozy_db(&server.state.kernel.config.data_dir)
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
 }
 
 #[tokio::test]

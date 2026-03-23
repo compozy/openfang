@@ -2213,20 +2213,11 @@ decay_rate = 0.05
             all_ok = false;
         }
 
+        let resolved_config = openfang_kernel::config::load_config(Some(&config_path));
+
         // --- Check 4: Port availability ---
         // Read api_listen from config (default: 127.0.0.1:4200)
-        let api_listen = {
-            let cfg_path = openfang_dir.join("config.toml");
-            if cfg_path.exists() {
-                std::fs::read_to_string(&cfg_path)
-                    .ok()
-                    .and_then(|s| toml::from_str::<openfang_types::config::KernelConfig>(&s).ok())
-                    .map(|c| c.api_listen)
-                    .unwrap_or_else(|| "127.0.0.1:4200".to_string())
-            } else {
-                "127.0.0.1:4200".to_string()
-            }
-        };
+        let api_listen = resolved_config.api_listen.clone();
         if !json {
             println!();
         }
@@ -2283,30 +2274,74 @@ decay_rate = 0.05
             checks.push(serde_json::json!({"check": "stale_daemon_json", "status": if repair { "repaired" } else { "warn" }}));
         }
 
-        // --- Check 6: Database file ---
-        let db_path = openfang_dir.join("data").join("openfang.db");
-        if db_path.exists() {
-            // Quick SQLite magic bytes check
-            if let Ok(bytes) = std::fs::read(&db_path) {
-                if bytes.len() >= 16 && bytes.starts_with(b"SQLite format 3") {
-                    if !json {
-                        ui::check_ok("Database file (valid SQLite)");
+        // --- Check 6: Database files ---
+        let runtime_db_path = resolved_config
+            .persistence
+            .resolve_runtime_db(&resolved_config.data_dir);
+        let compozy_db_path = resolved_config
+            .persistence
+            .resolve_compozy_db(&resolved_config.data_dir);
+        let database_paths = [
+            ("runtime database", runtime_db_path),
+            ("compozy database", compozy_db_path),
+        ];
+        let mut database_status = "warn";
+        let mut missing_database_files = 0usize;
+
+        for (label, db_path) in &database_paths {
+            if db_path.exists() {
+                match std::fs::read(db_path) {
+                    Ok(bytes) => {
+                        if bytes.len() >= 16 && bytes.starts_with(b"SQLite format 3") {
+                            if !json {
+                                ui::check_ok(&format!(
+                                    "{label} (valid SQLite): {}",
+                                    db_path.display()
+                                ));
+                            }
+                        } else {
+                            if !json {
+                                ui::check_fail(&format!(
+                                    "{label} exists but is not valid SQLite: {}",
+                                    db_path.display()
+                                ));
+                            }
+                            database_status = "fail";
+                            all_ok = false;
+                        }
                     }
-                    checks.push(serde_json::json!({"check": "database", "status": "ok"}));
-                } else {
-                    if !json {
-                        ui::check_fail("Database file exists but is not valid SQLite");
+                    Err(error) => {
+                        if !json {
+                            ui::check_fail(&format!(
+                                "Failed to read {label} at {}: {error}",
+                                db_path.display(),
+                            ));
+                        }
+                        database_status = "fail";
+                        all_ok = false;
                     }
-                    checks.push(serde_json::json!({"check": "database", "status": "fail"}));
-                    all_ok = false;
+                }
+            } else {
+                missing_database_files += 1;
+                if !json {
+                    ui::check_warn(&format!(
+                        "No {label} file at {} (will be created on first run)",
+                        db_path.display()
+                    ));
                 }
             }
-        } else {
-            if !json {
-                ui::check_warn("No database file (will be created on first run)");
-            }
-            checks.push(serde_json::json!({"check": "database", "status": "warn"}));
         }
+
+        if database_status != "fail" && missing_database_files == 0 {
+            database_status = "ok";
+        }
+
+        checks.push(serde_json::json!({
+            "check": "database",
+            "status": database_status,
+            "runtime_db": database_paths[0].1.display().to_string(),
+            "compozy_db": database_paths[1].1.display().to_string(),
+        }));
 
         // --- Check 7: Disk space ---
         #[cfg(unix)]
@@ -6755,6 +6790,31 @@ api_key_env = "GROQ_API_KEY"
         );
         assert_eq!(config.exec_policy.safe_bins.len(), 3);
         assert_eq!(config.exec_policy.timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_doctor_persistence_config_fields() {
+        let config_toml = r#"
+api_listen = "127.0.0.1:4200"
+
+[default_model]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+api_key_env = "GROQ_API_KEY"
+
+[persistence]
+runtime_db = "custom/runtime.db"
+compozy_db = "custom/compozy.db"
+"#;
+        let config: openfang_types::config::KernelConfig = toml::from_str(config_toml).unwrap();
+        assert_eq!(
+            config.persistence.runtime_db,
+            Some(std::path::PathBuf::from("custom/runtime.db"))
+        );
+        assert_eq!(
+            config.persistence.compozy_db,
+            Some(std::path::PathBuf::from("custom/compozy.db"))
+        );
     }
 
     #[test]

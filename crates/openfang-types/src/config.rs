@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Deserialize a `Vec<String>` that tolerates both string and integer elements.
 ///
@@ -976,6 +976,10 @@ pub struct KernelConfig {
     pub network_enabled: bool,
     /// Default LLM provider configuration.
     pub default_model: DefaultModelConfig,
+    /// Persistence database configuration.
+    /// Configure in config.toml as `[persistence]`.
+    #[serde(default)]
+    pub persistence: PersistenceConfig,
     /// Memory substrate configuration.
     pub memory: MemoryConfig,
     /// Network configuration.
@@ -1269,6 +1273,7 @@ impl Default for KernelConfig {
             api_listen: "127.0.0.1:50051".to_string(),
             network_enabled: false,
             default_model: DefaultModelConfig::default(),
+            persistence: PersistenceConfig::default(),
             memory: MemoryConfig::default(),
             network: NetworkConfig::default(),
             channels: ChannelsConfig::default(),
@@ -1320,6 +1325,11 @@ impl KernelConfig {
             .unwrap_or_else(|| self.home_dir.join("workspaces"))
     }
 
+    /// Validate that the configured persistence database paths are usable.
+    pub fn validate_persistence_paths(&self) -> Result<(), String> {
+        self.persistence.validate_paths(&self.data_dir)
+    }
+
     /// Resolve the API key env var name for a provider.
     ///
     /// Checks: 1) explicit `provider_api_keys` mapping, 2) `auth_profiles` first entry,
@@ -1352,6 +1362,7 @@ impl std::fmt::Debug for KernelConfig {
             .field("api_listen", &self.api_listen)
             .field("network_enabled", &self.network_enabled)
             .field("default_model", &self.default_model)
+            .field("persistence", &self.persistence)
             .field("memory", &self.memory)
             .field("network", &self.network)
             .field("channels", &self.channels)
@@ -1467,12 +1478,142 @@ impl Default for DefaultModelConfig {
     }
 }
 
+/// Persistence database configuration.
+///
+/// Configure in `config.toml` as:
+/// ```toml
+/// [persistence]
+/// runtime_db = "/path/to/runtime.db"
+/// compozy_db = "/path/to/compozy.db"
+/// ```
+///
+/// When omitted, the runtime paths resolve relative to `data_dir`:
+/// - `runtime.db` => `data_dir/runtime.db`
+/// - `compozy.db` => `data_dir/compozy.db`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersistenceConfig {
+    /// Path to the platform runtime database file.
+    /// Defaults to `data_dir.join("runtime.db")` when omitted.
+    #[serde(default)]
+    pub runtime_db: Option<PathBuf>,
+    /// Path to the Compozy domain database file.
+    /// Defaults to `data_dir.join("compozy.db")` when omitted.
+    #[serde(default)]
+    pub compozy_db: Option<PathBuf>,
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            runtime_db: default_runtime_db_path(),
+            compozy_db: default_compozy_db_path(),
+        }
+    }
+}
+
+fn default_runtime_db_path() -> Option<PathBuf> {
+    None
+}
+
+fn default_compozy_db_path() -> Option<PathBuf> {
+    None
+}
+
+impl PersistenceConfig {
+    /// Resolve the runtime database path against the configured data directory.
+    pub fn resolve_runtime_db(&self, data_dir: &Path) -> PathBuf {
+        self.runtime_db
+            .clone()
+            .unwrap_or_else(|| data_dir.join("runtime.db"))
+    }
+
+    /// Resolve the Compozy database path against the configured data directory.
+    pub fn resolve_compozy_db(&self, data_dir: &Path) -> PathBuf {
+        self.compozy_db
+            .clone()
+            .unwrap_or_else(|| data_dir.join("compozy.db"))
+    }
+
+    /// Validate that both configured database paths are usable file targets.
+    pub fn validate_paths(&self, data_dir: &Path) -> Result<(), String> {
+        validate_database_path("persistence.runtime_db", &self.resolve_runtime_db(data_dir))?;
+        validate_database_path("persistence.compozy_db", &self.resolve_compozy_db(data_dir))?;
+        Ok(())
+    }
+}
+
+fn validate_database_path(field_name: &str, path: &Path) -> Result<(), String> {
+    let suggested_file = if field_name.ends_with("runtime_db") {
+        "runtime.db"
+    } else {
+        "compozy.db"
+    };
+
+    if path.as_os_str().is_empty() {
+        return Err(format!(
+            "{field_name} must point to a database file path. Set it to a writable SQLite file path."
+        ));
+    }
+
+    if path.exists() {
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            format!(
+                "Failed to inspect {field_name} at '{}': {error}",
+                path.display()
+            )
+        })?;
+        if metadata.is_dir() {
+            return Err(format!(
+                "{field_name} points to a directory ('{}'). Set it to a writable SQLite file path instead.",
+                path.display()
+            ));
+        }
+    }
+
+    if path.file_name().is_none() {
+        return Err(format!(
+            "{field_name} must include a database file name. Set it to a path like '/path/to/{suggested_file}'."
+        ));
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "{field_name} must include a parent directory. Set it to a writable SQLite file path."
+        )
+    })?;
+
+    if !parent.as_os_str().is_empty() {
+        if parent.exists() {
+            let metadata = std::fs::metadata(parent).map_err(|error| {
+                format!(
+                    "Failed to inspect parent directory '{}' for {field_name}: {error}",
+                    parent.display()
+                )
+            })?;
+            if !metadata.is_dir() {
+                return Err(format!(
+                    "Parent path '{}' for {field_name} is not a directory. Set {field_name} to a writable SQLite file path.",
+                    parent.display()
+                ));
+            }
+        } else {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "Failed to create parent directory '{}' for {field_name}: {error}. Set {field_name} to a writable SQLite file path.",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Memory substrate configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemoryConfig {
-    /// Path to SQLite database file.
-    pub sqlite_path: Option<PathBuf>,
     /// Embedding model for semantic search.
     pub embedding_model: String,
     /// Maximum memories before consolidation is triggered.
@@ -1497,7 +1638,6 @@ fn default_consolidation_interval() -> u64 {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            sqlite_path: None,
             embedding_model: "all-MiniLM-L6-v2".to_string(),
             consolidation_threshold: 10_000,
             decay_rate: 0.1,
@@ -3526,6 +3666,134 @@ mod tests {
         let config = KernelConfig::default();
         let toml_str = toml::to_string_pretty(&config).unwrap();
         assert!(toml_str.contains("log_level"));
+    }
+
+    #[test]
+    fn persistence_config_should_resolve_runtime_db_to_data_dir_default() {
+        let data_dir = PathBuf::from("relative-data");
+        let persistence = PersistenceConfig::default();
+
+        assert_eq!(
+            persistence.resolve_runtime_db(&data_dir),
+            data_dir.join("runtime.db")
+        );
+    }
+
+    #[test]
+    fn persistence_config_should_resolve_compozy_db_to_data_dir_default() {
+        let data_dir = PathBuf::from("relative-data");
+        let persistence = PersistenceConfig::default();
+
+        assert_eq!(
+            persistence.resolve_compozy_db(&data_dir),
+            data_dir.join("compozy.db")
+        );
+    }
+
+    #[test]
+    fn persistence_config_should_accept_explicit_runtime_db_path() {
+        let data_dir = PathBuf::from("relative-data");
+        let explicit_path = PathBuf::from("custom/runtime-explicit.db");
+        let persistence = PersistenceConfig {
+            runtime_db: Some(explicit_path.clone()),
+            ..PersistenceConfig::default()
+        };
+
+        assert_eq!(persistence.resolve_runtime_db(&data_dir), explicit_path);
+    }
+
+    #[test]
+    fn persistence_config_should_accept_explicit_compozy_db_path() {
+        let data_dir = PathBuf::from("relative-data");
+        let explicit_path = PathBuf::from("custom/compozy-explicit.db");
+        let persistence = PersistenceConfig {
+            compozy_db: Some(explicit_path.clone()),
+            ..PersistenceConfig::default()
+        };
+
+        assert_eq!(persistence.resolve_compozy_db(&data_dir), explicit_path);
+    }
+
+    #[test]
+    fn kernel_config_default_should_not_contain_openfang_db_anywhere() {
+        let toml_str = toml::to_string_pretty(&KernelConfig::default()).unwrap();
+
+        assert!(!toml_str.contains("openfang.db"));
+    }
+
+    #[test]
+    fn memory_config_should_not_have_sqlite_path_field() {
+        let memory = MemoryConfig {
+            embedding_model: "test-model".to_string(),
+            consolidation_threshold: 42,
+            decay_rate: 0.2,
+            embedding_provider: Some("ollama".to_string()),
+            embedding_api_key_env: Some("OLLAMA_API_KEY".to_string()),
+            consolidation_interval_hours: 8,
+        };
+
+        assert_eq!(memory.embedding_model, "test-model");
+        assert_eq!(memory.consolidation_threshold, 42);
+    }
+
+    #[test]
+    fn persistence_config_toml_round_trips_correctly() {
+        let persistence = PersistenceConfig {
+            runtime_db: Some(PathBuf::from("custom/runtime.db")),
+            compozy_db: Some(PathBuf::from("custom/compozy.db")),
+        };
+
+        let toml_str = toml::to_string_pretty(&persistence).unwrap();
+        let round_trip: PersistenceConfig = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(round_trip, persistence);
+    }
+
+    #[test]
+    fn persistence_config_validation_should_reject_path_with_missing_parent() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "openfang-types-config-validation-{}-missing-parent",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let blocking_path = temp_dir.join("blocked");
+        std::fs::write(&blocking_path, "not a directory").unwrap();
+
+        let persistence = PersistenceConfig {
+            runtime_db: Some(blocking_path.join("nested").join("runtime.db")),
+            ..PersistenceConfig::default()
+        };
+
+        let error = persistence
+            .validate_paths(&temp_dir)
+            .expect_err("validation should reject an unusable runtime_db path");
+
+        assert!(error.contains("persistence.runtime_db"));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn persistence_config_should_reject_directory_path() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "openfang-types-config-validation-{}-directory",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let persistence = PersistenceConfig {
+            runtime_db: Some(temp_dir.clone()),
+            ..PersistenceConfig::default()
+        };
+
+        let error = persistence
+            .validate_paths(&temp_dir)
+            .expect_err("validation should reject a directory path");
+
+        assert!(error.contains("directory"));
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

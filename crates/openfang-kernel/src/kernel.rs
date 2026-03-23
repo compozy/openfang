@@ -551,16 +551,16 @@ impl OpenFangKernel {
             warn!("Config: {}", w);
         }
 
+        config
+            .validate_persistence_paths()
+            .map_err(KernelError::BootFailed)?;
+
         // Ensure data directory exists
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| KernelError::BootFailed(format!("Failed to create data dir: {e}")))?;
 
         // Initialize memory substrate
-        let db_path = config
-            .memory
-            .sqlite_path
-            .clone()
-            .unwrap_or_else(|| config.data_dir.join("openfang.db"));
+        let db_path = config.persistence.resolve_runtime_db(&config.data_dir);
         let memory = Arc::new(
             MemorySubstrate::open(&db_path, config.memory.decay_rate)
                 .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,

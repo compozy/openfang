@@ -5153,6 +5153,16 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
     Json(serde_json::json!({
         "home_dir": config.home_dir.to_string_lossy(),
         "data_dir": config.data_dir.to_string_lossy(),
+        "persistence": {
+            "runtime_db": config
+                .persistence
+                .resolve_runtime_db(&config.data_dir)
+                .to_string_lossy(),
+            "compozy_db": config
+                .persistence
+                .resolve_compozy_db(&config.data_dir)
+                .to_string_lossy(),
+        },
         "api_key": if config.api_key.is_empty() { "not set" } else { "***" },
         "default_model": {
             "provider": config.default_model.provider,
