@@ -321,53 +321,10 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             None => return format!("Workflow '{name}' not found. Use /workflows to list."),
         };
 
-        let run_id = match self
-            .kernel
-            .workflows
-            .create_run(wf.id, input.to_string())
-            .await
-        {
-            Ok(id) => id,
-            Err(error) => return format!("Failed to create workflow run: {error}"),
-        };
-
-        let kernel = self.kernel.clone();
-        let registry_ref = &self.kernel.registry;
-        let result = self
-            .kernel
-            .workflows
-            .execute_run(
-                run_id,
-                |step_agent| match step_agent {
-                    openfang_kernel::workflow::StepAgent::ById { id } => {
-                        let aid: AgentId = id.parse().ok()?;
-                        let entry = registry_ref.get(aid)?;
-                        Some((aid, entry.name.clone()))
-                    }
-                    openfang_kernel::workflow::StepAgent::ByName { name } => {
-                        let entry = registry_ref.find_by_name(name)?;
-                        Some((entry.id, entry.name.clone()))
-                    }
-                },
-                |agent_id, message| {
-                    let k = kernel.clone();
-                    async move {
-                        let result = k
-                            .send_message(agent_id, &message)
-                            .await
-                            .map_err(|e| format!("{e}"))?;
-                        Ok((
-                            result.response,
-                            result.total_usage.input_tokens,
-                            result.total_usage.output_tokens,
-                        ))
-                    }
-                },
-            )
-            .await;
+        let result = self.kernel.run_workflow(wf.id, input.to_string()).await;
 
         match result {
-            Ok(output) => format!("Workflow '{}' completed:\n{}", wf.name, output),
+            Ok((_, output)) => format!("Workflow '{}' completed:\n{}", wf.name, output),
             Err(e) => format!("Workflow '{}' failed: {}", wf.name, e),
         }
     }

@@ -26,6 +26,7 @@ pub mod triggers;
 pub mod whatsapp_gateway;
 pub mod wizard;
 pub mod workflow;
+pub mod workflow_compiler;
 
 pub use db::DatabaseHealth;
 pub use kernel::DeliveryTracker;

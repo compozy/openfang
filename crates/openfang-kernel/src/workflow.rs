@@ -10,6 +10,9 @@
 //!
 //! Workflows are defined as Rust structs or loaded from JSON.
 
+use crate::workflow_compiler::{
+    compile_workflow_definition, WorkflowCompileError, WorkflowCompileRegistry,
+};
 use chrono::{DateTime, Utc};
 use openfang_memory::{
     CheckpointKind as DurableCheckpointKind, WorkflowRunRecord,
@@ -17,8 +20,13 @@ use openfang_memory::{
 };
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
+use openfang_types::workflow::{
+    CompiledTemplate, ErrorMode as WorkflowV2ErrorMode, FlowBlock, FlowMode as WorkflowV2FlowMode,
+    ResolvedRuntimeSettings, TemplateNamespace, TemplateReference, TemplateSegment, WorkflowIr,
+    WorkflowIrStep, WorkflowIrStepKind, WorkflowV2Definition,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -568,6 +576,12 @@ impl WorkflowDefinitionStore {
 pub struct WorkflowEngine {
     /// Registered workflow definitions.
     workflows: Arc<RwLock<HashMap<WorkflowId, Workflow>>>,
+    /// Registered Workflow v2 definitions.
+    workflow_v2_definitions: Arc<RwLock<BTreeMap<String, WorkflowV2Definition>>>,
+    /// Cached compiled IR projections for Workflow v2 definitions.
+    compiled_workflows: Arc<RwLock<BTreeMap<String, WorkflowIr>>>,
+    /// Known workflow primitives used during validation.
+    known_primitives: Arc<RwLock<BTreeSet<String>>>,
     /// Active and completed workflow runs.
     runs: Arc<RwLock<HashMap<WorkflowRunId, WorkflowRun>>>,
     /// Canonical file-backed workflow definition storage.
@@ -605,6 +619,9 @@ impl WorkflowEngine {
     fn build(workflows_dir: PathBuf, workflow_stores: Option<WorkflowStoreSet>) -> Self {
         Self {
             workflows: Arc::new(RwLock::new(HashMap::new())),
+            workflow_v2_definitions: Arc::new(RwLock::new(BTreeMap::new())),
+            compiled_workflows: Arc::new(RwLock::new(BTreeMap::new())),
+            known_primitives: Arc::new(RwLock::new(BTreeSet::new())),
             runs: Arc::new(RwLock::new(HashMap::new())),
             definition_store: WorkflowDefinitionStore::new(workflows_dir),
             definition_mutation_lock: Arc::new(Mutex::new(())),
@@ -625,6 +642,80 @@ impl WorkflowEngine {
 
     pub fn is_ready(&self) -> bool {
         self.readiness() == WorkflowRegistryReadiness::Ready
+    }
+
+    /// Replaces the known primitive registry used by Workflow v2 validation.
+    pub async fn set_known_primitives<I, S>(&self, primitives: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let _mutation_guard = self.definition_mutation_lock.lock().await;
+        let mut known_primitives = self.known_primitives.write().await;
+        *known_primitives = primitives.into_iter().map(Into::into).collect();
+    }
+
+    /// Register a Workflow v2 definition and cache its compiled IR.
+    pub async fn register_workflow_v2_definition(
+        &self,
+        definition: WorkflowV2Definition,
+        available_agents: impl IntoIterator<Item = String>,
+    ) -> Result<(), WorkflowCompileError> {
+        let _mutation_guard = self.definition_mutation_lock.lock().await;
+        let mut registry = WorkflowCompileRegistry::new();
+        registry.set_agents(available_agents);
+        registry.set_primitives(
+            self.known_primitives
+                .read()
+                .await
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        );
+        registry.set_workflows(
+            self.workflow_v2_definitions
+                .read()
+                .await
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .chain(std::iter::once(definition.id.clone())),
+        );
+
+        let compiled = compile_workflow_definition(&definition, &registry)?;
+
+        self.workflow_v2_definitions
+            .write()
+            .await
+            .insert(definition.id.clone(), definition);
+        self.compiled_workflows
+            .write()
+            .await
+            .insert(compiled.workflow_id.clone(), compiled);
+
+        Ok(())
+    }
+
+    /// Returns a Workflow v2 definition by ID.
+    pub async fn get_workflow_v2_definition(
+        &self,
+        workflow_id: &str,
+    ) -> Option<WorkflowV2Definition> {
+        self.workflow_v2_definitions
+            .read()
+            .await
+            .get(workflow_id)
+            .cloned()
+    }
+
+    /// Returns the cached compiled IR for a Workflow v2 definition.
+    pub async fn get_compiled_workflow(&self, workflow_id: &str) -> Option<WorkflowIr> {
+        self.compiled_workflows
+            .read()
+            .await
+            .get(workflow_id)
+            .cloned()
     }
 
     /// Register a new workflow definition.
@@ -988,18 +1079,256 @@ impl WorkflowEngine {
         })
     }
 
-    /// Replace `{{var_name}}` references in a template with stored variable values.
-    fn expand_variables(template: &str, input: &str, vars: &HashMap<String, String>) -> String {
-        let mut result = template.replace("{{input}}", input);
-        for (key, value) in vars {
-            result = result.replace(&format!("{{{{{key}}}}}"), value);
-        }
-        result
+    fn any_contract() -> openfang_types::contract::ContractNode {
+        serde_json::from_value(serde_json::json!({ "kind": "any" }))
+            .expect("static any contract should deserialize")
     }
 
-    /// Execute a single step with error mode handling. Returns (output, input_tokens, output_tokens).
+    pub(crate) fn legacy_workflow_to_ir(workflow: &Workflow) -> WorkflowIr {
+        let mut steps = Vec::with_capacity(workflow.steps.len());
+        let mut symbol_table = BTreeMap::new();
+
+        for step in &workflow.steps {
+            let flow = match &step.mode {
+                StepMode::Sequential | StepMode::Collect => FlowBlock {
+                    mode: WorkflowV2FlowMode::Sequential,
+                },
+                StepMode::FanOut => FlowBlock {
+                    mode: WorkflowV2FlowMode::FanOut,
+                },
+                StepMode::Conditional { condition } => FlowBlock {
+                    mode: WorkflowV2FlowMode::Conditional {
+                        when: condition.clone(),
+                    },
+                },
+                StepMode::Loop {
+                    max_iterations,
+                    until,
+                } => FlowBlock {
+                    mode: WorkflowV2FlowMode::Loop {
+                        until: until.clone(),
+                        max_iterations: *max_iterations,
+                    },
+                },
+            };
+
+            let kind = if matches!(step.mode, StepMode::Collect) {
+                WorkflowIrStepKind::Collect
+            } else {
+                WorkflowIrStepKind::Agent {
+                    agent: match &step.agent {
+                        StepAgent::ById { id } => id.clone(),
+                        StepAgent::ByName { name } => name.clone(),
+                    },
+                }
+            };
+
+            let with = if matches!(step.mode, StepMode::Collect) {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(
+                    "message".to_string(),
+                    Self::legacy_prompt_to_template(&step.prompt_template),
+                )])
+            };
+
+            if let Some(symbol) = step.output_var.as_ref() {
+                symbol_table.insert(symbol.clone(), step.name.clone());
+            }
+
+            steps.push(WorkflowIrStep {
+                id: step.name.clone(),
+                name: step.name.clone(),
+                kind,
+                flow,
+                runtime: ResolvedRuntimeSettings {
+                    timeout_secs: step.timeout_secs,
+                    error_mode: Self::map_legacy_error_mode(&step.error_mode),
+                },
+                with,
+                save_as: step.output_var.clone(),
+            });
+        }
+
+        WorkflowIr {
+            workflow_id: workflow.id.to_string(),
+            workflow_version: "legacy".to_string(),
+            defaults: ResolvedRuntimeSettings::default(),
+            input_contract: Self::any_contract(),
+            output_contract: Self::any_contract(),
+            steps,
+            symbol_table,
+            outputs: BTreeMap::new(),
+        }
+    }
+
+    fn map_legacy_error_mode(error_mode: &ErrorMode) -> WorkflowV2ErrorMode {
+        match error_mode {
+            ErrorMode::Fail => WorkflowV2ErrorMode::Fail,
+            ErrorMode::Skip => WorkflowV2ErrorMode::Skip,
+            ErrorMode::Retry { max_retries } => WorkflowV2ErrorMode::Retry {
+                max_retries: *max_retries,
+            },
+        }
+    }
+
+    fn legacy_prompt_to_template(prompt: &str) -> CompiledTemplate {
+        let mut segments = Vec::new();
+        let mut cursor = 0usize;
+
+        while let Some(relative_start) = prompt[cursor..].find("{{") {
+            let start = cursor + relative_start;
+            if start > cursor {
+                segments.push(TemplateSegment::Text {
+                    value: prompt[cursor..start].to_string(),
+                });
+            }
+
+            let Some(relative_end) = prompt[start + 2..].find("}}") else {
+                break;
+            };
+            let end = start + 2 + relative_end;
+            let expression = prompt[start + 2..end].trim();
+            let reference = if expression == "input" {
+                TemplateReference {
+                    namespace: TemplateNamespace::Input,
+                    path: Vec::new(),
+                }
+            } else {
+                TemplateReference {
+                    namespace: TemplateNamespace::Vars,
+                    path: vec![expression.to_string()],
+                }
+            };
+            segments.push(TemplateSegment::Reference { reference });
+            cursor = end + 2;
+        }
+
+        if cursor < prompt.len() {
+            segments.push(TemplateSegment::Text {
+                value: prompt[cursor..].to_string(),
+            });
+        }
+
+        if segments.is_empty() {
+            segments.push(TemplateSegment::Text {
+                value: prompt.to_string(),
+            });
+        }
+
+        CompiledTemplate {
+            source: prompt.to_string(),
+            segments,
+        }
+    }
+
+    fn render_template(
+        template: &CompiledTemplate,
+        input: &str,
+        vars: &HashMap<String, String>,
+    ) -> String {
+        let mut rendered = String::new();
+        for segment in &template.segments {
+            match segment {
+                TemplateSegment::Text { value } => rendered.push_str(value),
+                TemplateSegment::Reference { reference } => rendered.push_str(
+                    &Self::resolve_reference_value(reference, input, vars).unwrap_or_default(),
+                ),
+            }
+        }
+        rendered
+    }
+
+    fn resolve_reference_value(
+        reference: &TemplateReference,
+        input: &str,
+        vars: &HashMap<String, String>,
+    ) -> Option<String> {
+        match reference.namespace {
+            TemplateNamespace::Input => Self::resolve_string_path(input, &reference.path),
+            TemplateNamespace::Vars => {
+                let symbol = reference.path.first()?;
+                let raw_value = vars.get(symbol)?;
+                Self::resolve_string_path(raw_value, &reference.path[1..])
+            }
+        }
+    }
+
+    fn resolve_string_path(raw_value: &str, path: &[String]) -> Option<String> {
+        if path.is_empty() {
+            return Some(raw_value.to_string());
+        }
+
+        let mut current = serde_json::from_str::<serde_json::Value>(raw_value).ok()?;
+        for segment in path {
+            current = current.get(segment)?.clone();
+        }
+
+        Some(match current {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::Bool(value) => value.to_string(),
+            serde_json::Value::Number(value) => value.to_string(),
+            serde_json::Value::String(value) => value,
+            other => other.to_string(),
+        })
+    }
+
+    fn render_step_payload(
+        step: &WorkflowIrStep,
+        input: &str,
+        vars: &HashMap<String, String>,
+    ) -> String {
+        if step.with.is_empty() {
+            return input.to_string();
+        }
+
+        let resolved = step
+            .with
+            .iter()
+            .map(|(key, template)| (key.clone(), Self::render_template(template, input, vars)))
+            .collect::<BTreeMap<_, _>>();
+
+        if resolved.len() == 1 {
+            if let Some(message) = resolved.get("message") {
+                return message.clone();
+            }
+        }
+
+        serde_json::to_string(&resolved).unwrap_or_else(|_| input.to_string())
+    }
+
+    fn flow_condition_matches(condition: &str, current_input: &str) -> bool {
+        current_input
+            .to_lowercase()
+            .contains(&condition.to_lowercase())
+    }
+
+    fn step_kind_name(kind: &WorkflowIrStepKind) -> &'static str {
+        match kind {
+            WorkflowIrStepKind::Agent { .. } => "agent",
+            WorkflowIrStepKind::Primitive { .. } => "primitive",
+            WorkflowIrStepKind::Workflow { .. } => "workflow",
+            WorkflowIrStepKind::WaitSignal { .. } => "wait_signal",
+            WorkflowIrStepKind::StartLooper { .. } => "start_looper",
+            WorkflowIrStepKind::EmitEvent { .. } => "emit_event",
+            WorkflowIrStepKind::Collect => "collect",
+            WorkflowIrStepKind::Noop => "noop",
+        }
+    }
+
+    fn agent_target(step: &WorkflowIrStep) -> Result<&str, String> {
+        match &step.kind {
+            WorkflowIrStepKind::Agent { agent } => Ok(agent.as_str()),
+            kind => Err(format!(
+                "Step '{}' uses unsupported runtime step kind '{}'",
+                step.name,
+                Self::step_kind_name(kind)
+            )),
+        }
+    }
+
     async fn execute_step_with_error_mode<F, Fut>(
-        step: &WorkflowStep,
+        step: &WorkflowIrStep,
         agent_id: AgentId,
         prompt: String,
         send_message: &F,
@@ -1008,56 +1337,56 @@ impl WorkflowEngine {
         F: Fn(AgentId, String) -> Fut,
         Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
     {
-        let timeout_dur = std::time::Duration::from_secs(step.timeout_secs);
+        let timeout_dur = std::time::Duration::from_secs(step.runtime.timeout_secs);
 
-        match &step.error_mode {
-            ErrorMode::Fail => {
+        match &step.runtime.error_mode {
+            WorkflowV2ErrorMode::Fail => {
                 let result = tokio::time::timeout(timeout_dur, send_message(agent_id, prompt))
                     .await
                     .map_err(|_| {
                         format!(
                             "Step '{}' timed out after {}s",
-                            step.name, step.timeout_secs
+                            step.name, step.runtime.timeout_secs
                         )
                     })?
-                    .map_err(|e| format!("Step '{}' failed: {}", step.name, e))?;
+                    .map_err(|error| format!("Step '{}' failed: {error}", step.name))?;
                 Ok(Some(result))
             }
-            ErrorMode::Skip => {
+            WorkflowV2ErrorMode::Skip => {
                 match tokio::time::timeout(timeout_dur, send_message(agent_id, prompt)).await {
                     Ok(Ok(result)) => Ok(Some(result)),
-                    Ok(Err(e)) => {
-                        warn!("Step '{}' failed (skipping): {e}", step.name);
+                    Ok(Err(error)) => {
+                        warn!("Step '{}' failed (skipping): {error}", step.name);
                         Ok(None)
                     }
                     Err(_) => {
                         warn!(
                             "Step '{}' timed out (skipping) after {}s",
-                            step.name, step.timeout_secs
+                            step.name, step.runtime.timeout_secs
                         );
                         Ok(None)
                     }
                 }
             }
-            ErrorMode::Retry { max_retries } => {
-                let mut last_err = String::new();
+            WorkflowV2ErrorMode::Retry { max_retries } => {
+                let mut last_error = String::new();
                 for attempt in 0..=*max_retries {
                     match tokio::time::timeout(timeout_dur, send_message(agent_id, prompt.clone()))
                         .await
                     {
                         Ok(Ok(result)) => return Ok(Some(result)),
-                        Ok(Err(e)) => {
-                            last_err = e.to_string();
+                        Ok(Err(error)) => {
+                            last_error = error.to_string();
                             if attempt < *max_retries {
                                 warn!(
-                                    "Step '{}' attempt {} failed: {e}, retrying",
+                                    "Step '{}' attempt {} failed: {error}, retrying",
                                     step.name,
                                     attempt + 1
                                 );
                             }
                         }
                         Err(_) => {
-                            last_err = format!("timed out after {}s", step.timeout_secs);
+                            last_error = format!("timed out after {}s", step.runtime.timeout_secs);
                             if attempt < *max_retries {
                                 warn!(
                                     "Step '{}' attempt {} timed out, retrying",
@@ -1068,381 +1397,393 @@ impl WorkflowEngine {
                         }
                     }
                 }
+
                 Err(format!(
-                    "Step '{}' failed after {} retries: {last_err}",
+                    "Step '{}' failed after {} retries: {last_error}",
                     step.name, max_retries
                 ))
             }
         }
     }
 
-    /// Execute a workflow run step-by-step.
-    ///
-    /// This method takes a closure that sends messages to agents,
-    /// so the workflow engine remains decoupled from the kernel.
+    /// Execute a workflow run from compiled IR.
     pub async fn execute_run<F, Fut>(
         &self,
         run_id: WorkflowRunId,
-        agent_resolver: impl Fn(&StepAgent) -> Option<(AgentId, String)>,
+        workflow: WorkflowIr,
+        agent_resolver: impl Fn(&str) -> Option<(AgentId, String)>,
         send_message: F,
     ) -> Result<String, String>
     where
         F: Fn(AgentId, String) -> Fut,
         Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
     {
-        // Get the run and workflow
-        let (workflow, input) = {
+        let send_message = &send_message;
+        let (input, run_workflow_id) = {
             let runs = self.runs.read().await;
             let run = runs.get(&run_id).ok_or("Workflow run not found")?;
-
-            let workflow = self
-                .workflows
-                .read()
-                .await
-                .get(&run.workflow_id)
-                .ok_or("Workflow definition not found")?
-                .clone();
-
-            (workflow, run.input.clone())
+            (run.input.clone(), run.workflow_id)
         };
+
+        if run_workflow_id.to_string() != workflow.workflow_id {
+            let error = format!(
+                "Workflow IR '{}' does not match run workflow '{}'",
+                workflow.workflow_id, run_workflow_id
+            );
+            if let Err(persist_error) = self.mark_run_failed(run_id, &error).await {
+                return Err(format!(
+                    "{error}; additionally failed to persist workflow failure: {persist_error}"
+                ));
+            }
+            return Err(error);
+        }
 
         self.mark_run_running(run_id).await?;
 
         info!(
             run_id = %run_id,
-            workflow = %workflow.name,
+            workflow_id = %workflow.workflow_id,
             steps = workflow.steps.len(),
             "Starting workflow execution"
         );
 
         let mut current_input = input;
-        let mut all_outputs: Vec<String> = Vec::new();
+        let mut all_outputs = Vec::new();
         let mut variables: HashMap<String, String> = HashMap::new();
-        let mut i = 0;
+        let mut index = 0usize;
 
-        while i < workflow.steps.len() {
-            let step = &workflow.steps[i];
+        while index < workflow.steps.len() {
+            let step = &workflow.steps[index];
 
-            debug!(
-                step = i + 1,
-                name = %step.name,
-                "Executing workflow step"
-            );
+            debug!(step = index + 1, name = %step.name, "Executing workflow step");
 
-            match &step.mode {
-                StepMode::Sequential => {
-                    let (agent_id, agent_name) = agent_resolver(&step.agent)
-                        .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
-
-                    let prompt =
-                        Self::expand_variables(&step.prompt_template, &current_input, &variables);
-
-                    let start = std::time::Instant::now();
-                    let result =
-                        Self::execute_step_with_error_mode(step, agent_id, prompt, &send_message)
-                            .await;
-                    let duration_ms = start.elapsed().as_millis() as u64;
-
-                    match result {
-                        Ok(Some((output, input_tokens, output_tokens))) => {
-                            let step_result = StepResult {
-                                step_name: step.name.clone(),
-                                agent_id: agent_id.to_string(),
-                                agent_name,
-                                output: output.clone(),
-                                input_tokens,
-                                output_tokens,
-                                duration_ms,
-                            };
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
-                                r.step_results.push(step_result);
-                            }
-
-                            if let Some(ref var) = step.output_var {
-                                variables.insert(var.clone(), output.clone());
-                            }
-
-                            all_outputs.push(output.clone());
-                            current_input = output;
-                            info!(step = i + 1, name = %step.name, duration_ms, "Step completed");
-                        }
-                        Ok(None) => {
-                            // Step was skipped (ErrorMode::Skip)
-                            info!(step = i + 1, name = %step.name, "Step skipped");
-                        }
-                        Err(e) => {
-                            if let Err(persist_error) = self.mark_run_failed(run_id, &e).await {
-                                return Err(format!(
-                                    "{e}; additionally failed to persist workflow failure: {persist_error}"
-                                ));
-                            }
-                            return Err(e);
+            match &step.flow.mode {
+                WorkflowV2FlowMode::Sequential => match &step.kind {
+                    WorkflowIrStepKind::Collect => {
+                        current_input = all_outputs.join("\n\n---\n\n");
+                        all_outputs.clear();
+                        all_outputs.push(current_input.clone());
+                        if let Some(symbol) = step.save_as.as_ref() {
+                            variables.insert(symbol.clone(), current_input.clone());
                         }
                     }
-                }
-
-                StepMode::FanOut => {
-                    // Collect consecutive FanOut steps and run them in parallel
-                    let mut fan_out_steps = vec![(i, step)];
-                    let mut j = i + 1;
-                    while j < workflow.steps.len() {
-                        if matches!(workflow.steps[j].mode, StepMode::FanOut) {
-                            fan_out_steps.push((j, &workflow.steps[j]));
-                            j += 1;
-                        } else {
-                            break;
+                    WorkflowIrStepKind::Noop => {
+                        all_outputs.push(current_input.clone());
+                        if let Some(symbol) = step.save_as.as_ref() {
+                            variables.insert(symbol.clone(), current_input.clone());
                         }
                     }
-
-                    // Build all futures
-                    let mut futures = Vec::new();
-                    let mut step_infos = Vec::new();
-
-                    for (idx, fan_step) in &fan_out_steps {
-                        let (agent_id, agent_name) =
-                            agent_resolver(&fan_step.agent).ok_or_else(|| {
-                                format!("Agent not found for step '{}'", fan_step.name)
-                            })?;
-                        let prompt = Self::expand_variables(
-                            &fan_step.prompt_template,
-                            &current_input,
-                            &variables,
-                        );
-                        let timeout_dur = std::time::Duration::from_secs(fan_step.timeout_secs);
-
-                        step_infos.push((*idx, fan_step.name.clone(), agent_id, agent_name));
-                        futures.push(tokio::time::timeout(
-                            timeout_dur,
-                            send_message(agent_id, prompt),
-                        ));
-                    }
-
-                    let start = std::time::Instant::now();
-                    let results = futures::future::join_all(futures).await;
-                    let duration_ms = start.elapsed().as_millis() as u64;
-
-                    for (k, result) in results.into_iter().enumerate() {
-                        let (_, ref step_name, agent_id, ref agent_name) = step_infos[k];
-                        let fan_step = fan_out_steps[k].1;
-
-                        match result {
-                            Ok(Ok((output, input_tokens, output_tokens))) => {
-                                let step_result = StepResult {
-                                    step_name: step_name.clone(),
-                                    agent_id: agent_id.to_string(),
-                                    agent_name: agent_name.clone(),
-                                    output: output.clone(),
-                                    input_tokens,
-                                    output_tokens,
-                                    duration_ms,
-                                };
-                                if let Some(r) = self.runs.write().await.get_mut(&run_id) {
-                                    r.step_results.push(step_result);
-                                }
-                                if let Some(ref var) = fan_step.output_var {
-                                    variables.insert(var.clone(), output.clone());
-                                }
-                                all_outputs.push(output.clone());
-                                current_input = output;
-                            }
-                            Ok(Err(e)) => {
-                                let error_msg =
-                                    format!("FanOut step '{}' failed: {}", step_name, e);
-                                warn!(%error_msg);
-                                if let Err(persist_error) =
-                                    self.mark_run_failed(run_id, &error_msg).await
-                                {
-                                    return Err(format!(
-                                        "{error_msg}; additionally failed to persist workflow failure: {persist_error}"
-                                    ));
-                                }
-                                return Err(error_msg);
-                            }
-                            Err(_) => {
-                                let error_msg = format!(
-                                    "FanOut step '{}' timed out after {}s",
-                                    step_name, fan_step.timeout_secs
-                                );
-                                warn!(%error_msg);
-                                if let Err(persist_error) =
-                                    self.mark_run_failed(run_id, &error_msg).await
-                                {
-                                    return Err(format!(
-                                        "{error_msg}; additionally failed to persist workflow failure: {persist_error}"
-                                    ));
-                                }
-                                return Err(error_msg);
-                            }
-                        }
-                    }
-
-                    info!(
-                        count = fan_out_steps.len(),
-                        duration_ms, "FanOut steps completed"
-                    );
-
-                    // Skip past the fan-out steps we just processed
-                    i = j;
-                    continue;
-                }
-
-                StepMode::Collect => {
-                    current_input = all_outputs.join("\n\n---\n\n");
-                    all_outputs.clear();
-                    all_outputs.push(current_input.clone());
-                    if let Some(ref var) = step.output_var {
-                        variables.insert(var.clone(), current_input.clone());
-                    }
-                }
-
-                StepMode::Conditional { condition } => {
-                    let prev_lower = current_input.to_lowercase();
-                    let cond_lower = condition.to_lowercase();
-
-                    if !prev_lower.contains(&cond_lower) {
-                        info!(
-                            step = i + 1,
-                            name = %step.name,
-                            condition,
-                            "Conditional step skipped (condition not met)"
-                        );
-                        i += 1;
-                        continue;
-                    }
-
-                    // Condition met — execute like sequential
-                    let (agent_id, agent_name) = agent_resolver(&step.agent)
-                        .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
-
-                    let prompt =
-                        Self::expand_variables(&step.prompt_template, &current_input, &variables);
-
-                    let start = std::time::Instant::now();
-                    let result =
-                        Self::execute_step_with_error_mode(step, agent_id, prompt, &send_message)
-                            .await;
-                    let duration_ms = start.elapsed().as_millis() as u64;
-
-                    match result {
-                        Ok(Some((output, input_tokens, output_tokens))) => {
-                            let step_result = StepResult {
-                                step_name: step.name.clone(),
-                                agent_id: agent_id.to_string(),
-                                agent_name,
-                                output: output.clone(),
-                                input_tokens,
-                                output_tokens,
-                                duration_ms,
-                            };
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
-                                r.step_results.push(step_result);
-                            }
-                            if let Some(ref var) = step.output_var {
-                                variables.insert(var.clone(), output.clone());
-                            }
-                            all_outputs.push(output.clone());
-                            current_input = output;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            if let Err(persist_error) = self.mark_run_failed(run_id, &e).await {
-                                return Err(format!(
-                                    "{e}; additionally failed to persist workflow failure: {persist_error}"
-                                ));
-                            }
-                            return Err(e);
-                        }
-                    }
-                }
-
-                StepMode::Loop {
-                    max_iterations,
-                    until,
-                } => {
-                    let (agent_id, agent_name) = agent_resolver(&step.agent)
-                        .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
-
-                    let until_lower = until.to_lowercase();
-
-                    for loop_iter in 0..*max_iterations {
-                        let prompt = Self::expand_variables(
-                            &step.prompt_template,
-                            &current_input,
-                            &variables,
-                        );
-
+                    _ => {
+                        let agent = Self::agent_target(step)?;
+                        let (agent_id, agent_name) = agent_resolver(agent)
+                            .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
+                        let prompt = Self::render_step_payload(step, &current_input, &variables);
                         let start = std::time::Instant::now();
                         let result = Self::execute_step_with_error_mode(
                             step,
                             agent_id,
                             prompt,
-                            &send_message,
+                            send_message,
                         )
                         .await;
                         let duration_ms = start.elapsed().as_millis() as u64;
 
                         match result {
                             Ok(Some((output, input_tokens, output_tokens))) => {
-                                let step_result = StepResult {
-                                    step_name: format!("{} (iter {})", step.name, loop_iter + 1),
-                                    agent_id: agent_id.to_string(),
-                                    agent_name: agent_name.clone(),
-                                    output: output.clone(),
-                                    input_tokens,
-                                    output_tokens,
+                                if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+                                    run.step_results.push(StepResult {
+                                        step_name: step.name.clone(),
+                                        agent_id: agent_id.to_string(),
+                                        agent_name,
+                                        output: output.clone(),
+                                        input_tokens,
+                                        output_tokens,
+                                        duration_ms,
+                                    });
+                                }
+
+                                if let Some(symbol) = step.save_as.as_ref() {
+                                    variables.insert(symbol.clone(), output.clone());
+                                }
+
+                                all_outputs.push(output.clone());
+                                current_input = output;
+                                info!(
+                                    step = index + 1,
+                                    name = %step.name,
                                     duration_ms,
-                                };
-                                if let Some(r) = self.runs.write().await.get_mut(&run_id) {
-                                    r.step_results.push(step_result);
-                                }
-
-                                current_input = output.clone();
-
-                                if output.to_lowercase().contains(&until_lower) {
-                                    info!(
-                                        step = i + 1,
-                                        name = %step.name,
-                                        iterations = loop_iter + 1,
-                                        "Loop terminated (until condition met)"
-                                    );
-                                    break;
-                                }
-
-                                if loop_iter + 1 == *max_iterations {
-                                    info!(
-                                        step = i + 1,
-                                        name = %step.name,
-                                        "Loop terminated (max iterations reached)"
-                                    );
-                                }
+                                    "Step completed"
+                                );
                             }
-                            Ok(None) => break,
-                            Err(e) => {
-                                if let Err(persist_error) = self.mark_run_failed(run_id, &e).await {
+                            Ok(None) => info!(step = index + 1, name = %step.name, "Step skipped"),
+                            Err(error) => {
+                                if let Err(persist_error) =
+                                    self.mark_run_failed(run_id, &error).await
+                                {
                                     return Err(format!(
-                                        "{e}; additionally failed to persist workflow failure: {persist_error}"
+                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
                                     ));
                                 }
-                                return Err(e);
+                                return Err(error);
+                            }
+                        }
+                    }
+                },
+                WorkflowV2FlowMode::FanOut => {
+                    let mut fan_out_steps = vec![(index, step)];
+                    let mut cursor = index + 1;
+                    while cursor < workflow.steps.len() {
+                        if matches!(workflow.steps[cursor].flow.mode, WorkflowV2FlowMode::FanOut) {
+                            fan_out_steps.push((cursor, &workflow.steps[cursor]));
+                            cursor += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    let mut futures = Vec::new();
+                    let mut step_infos = Vec::new();
+
+                    for (fan_index, fan_step) in &fan_out_steps {
+                        let agent = Self::agent_target(fan_step)?;
+                        let (agent_id, agent_name) = agent_resolver(agent).ok_or_else(|| {
+                            format!("Agent not found for step '{}'", fan_step.name)
+                        })?;
+                        let prompt =
+                            Self::render_step_payload(fan_step, &current_input, &variables);
+
+                        step_infos.push((*fan_index, fan_step.name.clone(), agent_id, agent_name));
+                        futures.push(async move {
+                            let start = std::time::Instant::now();
+                            let result = Self::execute_step_with_error_mode(
+                                fan_step,
+                                agent_id,
+                                prompt,
+                                send_message,
+                            )
+                            .await;
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            (result, duration_ms)
+                        });
+                    }
+
+                    let results = futures::future::join_all(futures).await;
+
+                    for (result_index, (result, duration_ms)) in results.into_iter().enumerate() {
+                        let (_, step_name, agent_id, agent_name) = &step_infos[result_index];
+                        let fan_step = fan_out_steps[result_index].1;
+
+                        match result {
+                            Ok(Some((output, input_tokens, output_tokens))) => {
+                                if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+                                    run.step_results.push(StepResult {
+                                        step_name: step_name.clone(),
+                                        agent_id: agent_id.to_string(),
+                                        agent_name: agent_name.clone(),
+                                        output: output.clone(),
+                                        input_tokens,
+                                        output_tokens,
+                                        duration_ms,
+                                    });
+                                }
+
+                                if let Some(symbol) = fan_step.save_as.as_ref() {
+                                    variables.insert(symbol.clone(), output.clone());
+                                }
+                                all_outputs.push(output.clone());
+                                current_input = output;
+                            }
+                            Ok(None) => {
+                                info!(name = %step_name, "FanOut step skipped");
+                            }
+                            Err(error) => {
+                                let error = format!("FanOut step '{step_name}' failed: {error}");
+                                if let Err(persist_error) =
+                                    self.mark_run_failed(run_id, &error).await
+                                {
+                                    return Err(format!(
+                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
+                                }
+                                return Err(error);
                             }
                         }
                     }
 
-                    if let Some(ref var) = step.output_var {
-                        variables.insert(var.clone(), current_input.clone());
+                    index = cursor;
+                    continue;
+                }
+                WorkflowV2FlowMode::Conditional { when } => {
+                    if !Self::flow_condition_matches(when, &current_input) {
+                        info!(
+                            step = index + 1,
+                            name = %step.name,
+                            condition = when,
+                            "Conditional step skipped (condition not met)"
+                        );
+                        index += 1;
+                        continue;
                     }
-                    all_outputs.push(current_input.clone());
+
+                    if matches!(step.kind, WorkflowIrStepKind::Noop) {
+                        if let Some(symbol) = step.save_as.as_ref() {
+                            variables.insert(symbol.clone(), current_input.clone());
+                        }
+                        all_outputs.push(current_input.clone());
+                    } else {
+                        let agent = Self::agent_target(step)?;
+                        let (agent_id, agent_name) = agent_resolver(agent)
+                            .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
+                        let prompt = Self::render_step_payload(step, &current_input, &variables);
+                        let start = std::time::Instant::now();
+                        let result = Self::execute_step_with_error_mode(
+                            step,
+                            agent_id,
+                            prompt,
+                            send_message,
+                        )
+                        .await;
+                        let duration_ms = start.elapsed().as_millis() as u64;
+
+                        match result {
+                            Ok(Some((output, input_tokens, output_tokens))) => {
+                                if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+                                    run.step_results.push(StepResult {
+                                        step_name: step.name.clone(),
+                                        agent_id: agent_id.to_string(),
+                                        agent_name,
+                                        output: output.clone(),
+                                        input_tokens,
+                                        output_tokens,
+                                        duration_ms,
+                                    });
+                                }
+
+                                if let Some(symbol) = step.save_as.as_ref() {
+                                    variables.insert(symbol.clone(), output.clone());
+                                }
+                                all_outputs.push(output.clone());
+                                current_input = output;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                if let Err(persist_error) =
+                                    self.mark_run_failed(run_id, &error).await
+                                {
+                                    return Err(format!(
+                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
+                                }
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                WorkflowV2FlowMode::Loop {
+                    max_iterations,
+                    until,
+                } => {
+                    if matches!(step.kind, WorkflowIrStepKind::Noop) {
+                        for loop_iter in 0..*max_iterations {
+                            if Self::flow_condition_matches(until, &current_input) {
+                                info!(
+                                    step = index + 1,
+                                    name = %step.name,
+                                    iterations = loop_iter + 1,
+                                    "Loop terminated (until condition met)"
+                                );
+                                break;
+                            }
+                        }
+
+                        if let Some(symbol) = step.save_as.as_ref() {
+                            variables.insert(symbol.clone(), current_input.clone());
+                        }
+                        all_outputs.push(current_input.clone());
+                    } else {
+                        let agent = Self::agent_target(step)?;
+                        let (agent_id, agent_name) = agent_resolver(agent)
+                            .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
+
+                        for loop_iter in 0..*max_iterations {
+                            let prompt =
+                                Self::render_step_payload(step, &current_input, &variables);
+                            let start = std::time::Instant::now();
+                            let result = Self::execute_step_with_error_mode(
+                                step,
+                                agent_id,
+                                prompt,
+                                send_message,
+                            )
+                            .await;
+                            let duration_ms = start.elapsed().as_millis() as u64;
+
+                            match result {
+                                Ok(Some((output, input_tokens, output_tokens))) => {
+                                    if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+                                        run.step_results.push(StepResult {
+                                            step_name: format!(
+                                                "{} (iter {})",
+                                                step.name,
+                                                loop_iter + 1
+                                            ),
+                                            agent_id: agent_id.to_string(),
+                                            agent_name: agent_name.clone(),
+                                            output: output.clone(),
+                                            input_tokens,
+                                            output_tokens,
+                                            duration_ms,
+                                        });
+                                    }
+
+                                    current_input = output.clone();
+
+                                    if Self::flow_condition_matches(until, &output) {
+                                        info!(
+                                            step = index + 1,
+                                            name = %step.name,
+                                            iterations = loop_iter + 1,
+                                            "Loop terminated (until condition met)"
+                                        );
+                                        break;
+                                    }
+
+                                    if loop_iter + 1 == *max_iterations {
+                                        info!(
+                                            step = index + 1,
+                                            name = %step.name,
+                                            "Loop terminated (max iterations reached)"
+                                        );
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(error) => {
+                                    if let Err(persist_error) =
+                                        self.mark_run_failed(run_id, &error).await
+                                    {
+                                        return Err(format!(
+                                            "{error}; additionally failed to persist workflow failure: {persist_error}"
+                                        ));
+                                    }
+                                    return Err(error);
+                                }
+                            }
+                        }
+
+                        if let Some(symbol) = step.save_as.as_ref() {
+                            variables.insert(symbol.clone(), current_input.clone());
+                        }
+                        all_outputs.push(current_input.clone());
+                    }
                 }
             }
 
-            i += 1;
+            index += 1;
         }
 
-        // Mark workflow as completed
         let final_output = current_input.clone();
         self.mark_run_completed(run_id, &final_output).await?;
-
-        info!(run_id = %run_id, "Workflow completed successfully");
+        info!(run_id = %run_id, workflow_id = %workflow.workflow_id, "Workflow completed successfully");
         Ok(final_output)
     }
 }
@@ -1457,6 +1798,7 @@ impl Default for WorkflowEngine {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
 
     fn test_engine(workflows_dir: PathBuf) -> WorkflowEngine {
         WorkflowEngine::with_definitions_dir(workflows_dir)
@@ -1546,7 +1888,64 @@ mod tests {
         }
     }
 
-    fn mock_resolver(agent: &StepAgent) -> Option<(AgentId, String)> {
+    fn test_workflow_v2_definition(workflow_id: WorkflowId) -> WorkflowV2Definition {
+        serde_json::from_value(json!({
+            "id": workflow_id.to_string(),
+            "name": "workflow-v2-test",
+            "version": "1.0.0",
+            "description": "Compiled workflow test",
+            "input": {
+                "kind": "object",
+                "required": ["issue"],
+                "open": false,
+                "fields": {
+                    "issue": { "kind": "string" }
+                }
+            },
+            "output": {
+                "kind": "object",
+                "required": ["result"],
+                "open": false,
+                "fields": {
+                    "result": { "kind": "string" }
+                }
+            },
+            "steps": [
+                {
+                    "id": "analyze",
+                    "name": "Analyze",
+                    "kind": "agent",
+                    "uses": { "agent": "analyst" },
+                    "with": {
+                        "message": "Analyze this: {{ input.issue }}"
+                    },
+                    "save_as": "analysis",
+                    "flow": { "mode": "sequential" }
+                },
+                {
+                    "id": "summarize",
+                    "name": "Summarize",
+                    "kind": "agent",
+                    "uses": { "agent": "writer" },
+                    "with": {
+                        "message": "Summarize this analysis: {{ vars.analysis }}"
+                    },
+                    "save_as": "result",
+                    "flow": { "mode": "sequential" }
+                }
+            ],
+            "outputs": {
+                "result": "{{ vars.result }}"
+            }
+        }))
+        .expect("workflow v2 test definition should deserialize")
+    }
+
+    fn legacy_ir(workflow: &Workflow) -> WorkflowIr {
+        WorkflowEngine::legacy_workflow_to_ir(workflow)
+    }
+
+    fn mock_resolver(agent: &str) -> Option<(AgentId, String)> {
         let _ = agent;
         Some((AgentId::new(), "mock-agent".to_string()))
     }
@@ -1745,6 +2144,32 @@ mod tests {
         let run = engine.get_run(run_id).await.unwrap();
         assert_eq!(run.input, "test input");
         assert!(matches!(run.state, WorkflowRunState::Pending));
+    }
+
+    #[tokio::test]
+    async fn register_workflow_v2_definition_caches_compiled_ir() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow_id = WorkflowId::new();
+        let definition = test_workflow_v2_definition(workflow_id);
+
+        engine
+            .register_workflow_v2_definition(
+                definition.clone(),
+                ["analyst".to_string(), "writer".to_string()],
+            )
+            .await
+            .expect("workflow v2 registration should succeed");
+
+        assert_eq!(
+            engine.get_workflow_v2_definition(&definition.id).await,
+            Some(definition.clone())
+        );
+        let compiled = engine
+            .get_compiled_workflow(&definition.id)
+            .await
+            .expect("compiled workflow ir should be cached");
+        assert_eq!(compiled.workflow_id, definition.id);
     }
 
     #[tokio::test]
@@ -2070,6 +2495,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let engine = test_engine(temp_dir.path().to_path_buf());
         let wf = test_workflow();
+        let workflow_ir = legacy_ir(&wf);
         let wf_id = engine
             .register(wf)
             .await
@@ -2083,7 +2509,9 @@ mod tests {
             Ok((format!("Processed: {msg}"), 100u64, 50u64))
         };
 
-        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await;
         assert!(result.is_ok());
 
         let output = result.unwrap();
@@ -2093,6 +2521,81 @@ mod tests {
         assert!(matches!(run.state, WorkflowRunState::Completed));
         assert_eq!(run.step_results.len(), 2);
         assert!(run.output.is_some());
+    }
+
+    #[tokio::test]
+    async fn workflow_v2_ir_executes_end_to_end() {
+        let engine = WorkflowEngine::new();
+        let workflow_id = WorkflowId::new();
+        let definition = test_workflow_v2_definition(workflow_id);
+        let mut registry = WorkflowCompileRegistry::new();
+        registry.set_agents(["analyst".to_string(), "writer".to_string()]);
+        registry.set_workflows(std::iter::once(definition.id.clone()));
+        let workflow_ir = compile_workflow_definition(&definition, &registry)
+            .expect("workflow v2 definition should compile");
+        engine
+            .register(Workflow {
+                id: workflow_id,
+                name: definition.name.clone(),
+                description: definition.description.clone(),
+                steps: Vec::new(),
+                created_at: Utc::now(),
+            })
+            .await
+            .expect("workflow registration should succeed");
+
+        let run_id = engine
+            .create_run(workflow_id, r#"{"issue":"raw data"}"#.to_string())
+            .await
+            .expect("workflow run should be created");
+
+        let sender = |_id: AgentId, msg: String| async move {
+            Ok((format!("Processed: {msg}"), 100u64, 50u64))
+        };
+
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await
+            .expect("compiled workflow ir should execute");
+
+        assert!(result.contains("Processed:"));
+
+        let run = engine
+            .get_run(run_id)
+            .await
+            .expect("workflow run should still exist");
+        assert!(matches!(run.state, WorkflowRunState::Completed));
+        assert_eq!(run.step_results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn execute_run_rejects_workflow_id_mismatch() {
+        let engine = WorkflowEngine::new();
+        let workflow = test_workflow();
+        let workflow_ir = legacy_ir(&test_workflow());
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "input".to_string())
+            .await
+            .expect("workflow run should be created");
+
+        let sender =
+            |_id: AgentId, msg: String| async move { Ok((format!("Processed: {msg}"), 1, 1)) };
+
+        let error = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await
+            .expect_err("mismatched workflow ids should fail");
+        assert!(error.contains("does not match run workflow"));
+
+        let run = engine
+            .get_run(run_id)
+            .await
+            .expect("workflow run should still exist");
+        assert!(matches!(run.state, WorkflowRunState::Failed));
     }
 
     #[tokio::test]
@@ -2130,6 +2633,7 @@ mod tests {
             ],
             created_at: Utc::now(),
         };
+        let workflow_ir = legacy_ir(&wf);
         let wf_id = engine
             .register(wf)
             .await
@@ -2142,7 +2646,9 @@ mod tests {
         let sender =
             |_id: AgentId, msg: String| async move { Ok((format!("OK: {msg}"), 10u64, 5u64)) };
 
-        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await;
         assert!(result.is_ok());
 
         let run = engine.get_run(run_id).await.unwrap();
@@ -2185,6 +2691,7 @@ mod tests {
             ],
             created_at: Utc::now(),
         };
+        let workflow_ir = legacy_ir(&wf);
         let wf_id = engine
             .register(wf)
             .await
@@ -2196,7 +2703,9 @@ mod tests {
             Ok(("Found an ERROR in the data".to_string(), 10u64, 5u64))
         };
 
-        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await;
         assert!(result.is_ok());
 
         let run = engine.get_run(run_id).await.unwrap();
@@ -2227,6 +2736,7 @@ mod tests {
             }],
             created_at: Utc::now(),
         };
+        let workflow_ir = legacy_ir(&wf);
         let wf_id = engine
             .register(wf)
             .await
@@ -2247,7 +2757,9 @@ mod tests {
             }
         };
 
-        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await;
         assert!(result.is_ok());
         assert!(result.unwrap().contains("DONE"));
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
@@ -2276,6 +2788,7 @@ mod tests {
             }],
             created_at: Utc::now(),
         };
+        let workflow_ir = legacy_ir(&wf);
         let wf_id = engine
             .register(wf)
             .await
@@ -2286,7 +2799,9 @@ mod tests {
             Ok(("iteration output".to_string(), 10u64, 5u64))
         };
 
-        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await;
         assert!(result.is_ok());
 
         let run = engine.get_run(run_id).await.unwrap();
@@ -2326,6 +2841,7 @@ mod tests {
             ],
             created_at: Utc::now(),
         };
+        let workflow_ir = legacy_ir(&wf);
         let wf_id = engine
             .register(wf)
             .await
@@ -2346,7 +2862,9 @@ mod tests {
             }
         };
 
-        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await;
         assert!(result.is_ok());
 
         let run = engine.get_run(run_id).await.unwrap();
@@ -2375,6 +2893,7 @@ mod tests {
             }],
             created_at: Utc::now(),
         };
+        let workflow_ir = legacy_ir(&wf);
         let wf_id = engine
             .register(wf)
             .await
@@ -2395,7 +2914,9 @@ mod tests {
             }
         };
 
-        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "finally worked");
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
@@ -2446,6 +2967,7 @@ mod tests {
             ],
             created_at: Utc::now(),
         };
+        let workflow_ir = legacy_ir(&wf);
         let wf_id = engine
             .register(wf)
             .await
@@ -2466,7 +2988,9 @@ mod tests {
             }
         };
 
-        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await;
         assert!(result.is_ok());
         let output = result.unwrap();
         // The third step receives "First: alpha | Second: beta" as its prompt
@@ -2518,6 +3042,7 @@ mod tests {
             ],
             created_at: Utc::now(),
         };
+        let workflow_ir = legacy_ir(&wf);
         let wf_id = engine
             .register(wf)
             .await
@@ -2527,7 +3052,9 @@ mod tests {
         let sender =
             |_id: AgentId, msg: String| async move { Ok((format!("Done: {msg}"), 10u64, 5u64)) };
 
-        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await;
         assert!(result.is_ok());
 
         let output = result.unwrap();
@@ -2538,16 +3065,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fan_out_error_mode_skip() {
+        let engine = WorkflowEngine::new();
+        let wf = Workflow {
+            id: WorkflowId::new(),
+            name: "fanout-skip-test".to_string(),
+            description: "".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    name: "task-a".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "Task A: {{input}}".to_string(),
+                    mode: StepMode::FanOut,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Skip,
+                    output_var: None,
+                },
+                WorkflowStep {
+                    name: "task-b".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "b".to_string(),
+                    },
+                    prompt_template: "Task B: {{input}}".to_string(),
+                    mode: StepMode::FanOut,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                },
+                WorkflowStep {
+                    name: "collect".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "c".to_string(),
+                    },
+                    prompt_template: "unused".to_string(),
+                    mode: StepMode::Collect,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                },
+            ],
+            created_at: Utc::now(),
+        };
+        let workflow_ir = legacy_ir(&wf);
+        let workflow_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "data".to_string())
+            .await
+            .expect("workflow run should be created");
+
+        let sender = |_id: AgentId, msg: String| async move {
+            if msg.contains("Task A") {
+                Err("simulated fan-out failure".to_string())
+            } else {
+                Ok((format!("Done: {msg}"), 10u64, 5u64))
+            }
+        };
+
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await
+            .expect("fan-out skip mode should continue");
+
+        assert!(result.contains("Done: Task B"));
+
+        let run = engine
+            .get_run(run_id)
+            .await
+            .expect("workflow run should still exist");
+        assert!(matches!(run.state, WorkflowRunState::Completed));
+        assert_eq!(run.step_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fan_out_error_mode_retry() {
+        let engine = WorkflowEngine::new();
+        let wf = Workflow {
+            id: WorkflowId::new(),
+            name: "fanout-retry-test".to_string(),
+            description: "".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    name: "task-a".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "Task A: {{input}}".to_string(),
+                    mode: StepMode::FanOut,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Retry { max_retries: 1 },
+                    output_var: None,
+                },
+                WorkflowStep {
+                    name: "collect".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "c".to_string(),
+                    },
+                    prompt_template: "unused".to_string(),
+                    mode: StepMode::Collect,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                },
+            ],
+            created_at: Utc::now(),
+        };
+        let workflow_ir = legacy_ir(&wf);
+        let workflow_id = engine
+            .register(wf)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "data".to_string())
+            .await
+            .expect("workflow run should be created");
+
+        let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed_calls = Arc::clone(&call_count);
+        let sender = move |_id: AgentId, _msg: String| {
+            let call_count = Arc::clone(&call_count);
+            async move {
+                let attempt = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    Err("transient fan-out failure".to_string())
+                } else {
+                    Ok(("fan-out recovered".to_string(), 10u64, 5u64))
+                }
+            }
+        };
+
+        let result = engine
+            .execute_run(run_id, workflow_ir, mock_resolver, sender)
+            .await
+            .expect("fan-out retry mode should recover");
+
+        assert_eq!(result, "fan-out recovered");
+        assert_eq!(observed_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn test_expand_variables() {
         let mut vars = HashMap::new();
         vars.insert("name".to_string(), "Alice".to_string());
         vars.insert("task".to_string(), "code review".to_string());
 
-        let result = WorkflowEngine::expand_variables(
+        let template = WorkflowEngine::legacy_prompt_to_template(
             "Hello {{name}}, please do {{task}} on {{input}}",
-            "main.rs",
-            &vars,
         );
+        let result = WorkflowEngine::render_template(&template, "main.rs", &vars);
         assert_eq!(result, "Hello Alice, please do code review on main.rs");
     }
 

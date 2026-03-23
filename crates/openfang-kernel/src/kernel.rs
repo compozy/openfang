@@ -14,8 +14,8 @@ use crate::scheduler::AgentScheduler;
 use crate::supervisor::Supervisor;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{
-    StepAgent, Workflow, WorkflowBootstrapResult, WorkflowDefinitionStore, WorkflowEngine,
-    WorkflowId, WorkflowRunId,
+    Workflow, WorkflowBootstrapResult, WorkflowDefinitionStore, WorkflowEngine, WorkflowId,
+    WorkflowRunId,
 };
 
 use openfang_memory::{
@@ -4035,25 +4035,32 @@ impl OpenFangKernel {
         workflow_id: WorkflowId,
         input: String,
     ) -> KernelResult<(WorkflowRunId, String)> {
+        let workflow = self
+            .workflows
+            .get_workflow(workflow_id)
+            .await
+            .ok_or_else(|| {
+                KernelError::OpenFang(OpenFangError::Internal(
+                    "Workflow definition not found".to_string(),
+                ))
+            })?;
+        let workflow_ir = WorkflowEngine::legacy_workflow_to_ir(&workflow);
+
         let run_id = self
             .workflows
             .create_run(workflow_id, input)
             .await
             .map_err(KernelError::from)?;
 
-        // Agent resolver: looks up by name or ID in the registry
-        let resolver = |agent_ref: &StepAgent| -> Option<(AgentId, String)> {
-            match agent_ref {
-                StepAgent::ById { id } => {
-                    let agent_id: AgentId = id.parse().ok()?;
-                    let entry = self.registry.get(agent_id)?;
-                    Some((agent_id, entry.name.clone()))
-                }
-                StepAgent::ByName { name } => {
-                    let entry = self.registry.find_by_name(name)?;
-                    Some((entry.id, entry.name.clone()))
-                }
+        // Agent resolver: accepts either a stable AgentId string or a human-readable name.
+        let resolver = |agent_ref: &str| -> Option<(AgentId, String)> {
+            if let Ok(agent_id) = agent_ref.parse::<AgentId>() {
+                let entry = self.registry.get(agent_id)?;
+                return Some((agent_id, entry.name.clone()));
             }
+
+            let entry = self.registry.find_by_name(agent_ref)?;
+            Some((entry.id, entry.name.clone()))
         };
 
         // Message sender: sends to agent and returns (output, in_tokens, out_tokens)
@@ -4075,7 +4082,8 @@ impl OpenFangKernel {
 
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(MAX_WORKFLOW_SECS),
-            self.workflows.execute_run(run_id, resolver, send_message),
+            self.workflows
+                .execute_run(run_id, workflow_ir, resolver, send_message),
         )
         .await
         .map_err(|_| {

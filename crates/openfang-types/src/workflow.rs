@@ -323,6 +323,302 @@ pub enum ErrorMode {
     },
 }
 
+/// Severity for machine-readable workflow validation issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationSeverity {
+    /// The definition is invalid and compilation must stop.
+    Error,
+    /// The definition is accepted, but the author should review the issue.
+    Warning,
+}
+
+impl ValidationSeverity {
+    /// Returns `true` when the severity blocks compilation.
+    #[must_use]
+    pub const fn is_error(self) -> bool {
+        matches!(self, Self::Error)
+    }
+}
+
+/// Machine-readable validation issue returned by the workflow compile pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationIssue {
+    /// Severity of the issue.
+    pub severity: ValidationSeverity,
+    /// Stable machine-readable issue code.
+    pub code: String,
+    /// Path to the invalid field or binding.
+    pub path: String,
+    /// Human-readable message explaining the problem.
+    pub message: String,
+}
+
+impl ValidationIssue {
+    /// Creates a validation issue.
+    #[must_use]
+    pub fn new(
+        severity: ValidationSeverity,
+        code: impl Into<String>,
+        path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity,
+            code: code.into(),
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Creates an error issue.
+    #[must_use]
+    pub fn error(
+        code: impl Into<String>,
+        path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new(ValidationSeverity::Error, code, path, message)
+    }
+
+    /// Creates a warning issue.
+    #[must_use]
+    pub fn warning(
+        code: impl Into<String>,
+        path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new(ValidationSeverity::Warning, code, path, message)
+    }
+}
+
+/// Concrete runtime settings after workflow defaults and step overrides have
+/// been merged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedRuntimeSettings {
+    /// Effective timeout for the workflow or step.
+    pub timeout_secs: u64,
+    /// Effective error handling behavior for the workflow or step.
+    pub error_mode: ErrorMode,
+}
+
+impl Default for ResolvedRuntimeSettings {
+    fn default() -> Self {
+        Self {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            error_mode: ErrorMode::default(),
+        }
+    }
+}
+
+impl ResolvedRuntimeSettings {
+    /// Resolves workflow defaults and an optional step-level override into a
+    /// single concrete runtime configuration.
+    #[must_use]
+    pub fn from_workflow_defaults(
+        defaults: &WorkflowDefaults,
+        runtime: Option<&RuntimeBlock>,
+    ) -> Self {
+        Self {
+            timeout_secs: runtime
+                .and_then(|value| value.timeout_secs)
+                .unwrap_or(defaults.timeout_secs),
+            error_mode: runtime
+                .and_then(|value| value.error_mode.clone())
+                .unwrap_or_else(|| defaults.error_mode.clone()),
+        }
+    }
+}
+
+impl From<WorkflowDefaults> for ResolvedRuntimeSettings {
+    fn from(value: WorkflowDefaults) -> Self {
+        Self {
+            timeout_secs: value.timeout_secs,
+            error_mode: value.error_mode,
+        }
+    }
+}
+
+/// Stable workflow shape produced by the normalization phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedWorkflow {
+    /// Stable workflow definition identifier.
+    pub id: String,
+    /// Human-readable workflow name.
+    pub name: String,
+    /// Semantic workflow version.
+    pub version: String,
+    /// Human-readable description of the workflow.
+    pub description: String,
+    /// Whether the workflow is enabled for normal use.
+    pub enabled: bool,
+    /// Secondary workflow classification tags.
+    pub tags: Vec<String>,
+    /// Normalized workflow input contract.
+    pub input: ContractNode,
+    /// Normalized workflow output contract.
+    pub output: ContractNode,
+    /// Workflow-level runtime defaults in concrete form.
+    pub defaults: ResolvedRuntimeSettings,
+    /// Ordered workflow steps with resolved runtime settings.
+    pub steps: Vec<NormalizedWorkflowStep>,
+    /// Normalized projection from runtime symbols into the final output contract.
+    pub outputs: TemplateBindings,
+}
+
+/// Normalized workflow step produced by the normalization phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedWorkflowStep {
+    /// Stable step identifier within the workflow.
+    pub id: String,
+    /// Human-readable step name.
+    pub name: String,
+    /// Explicit step action kind.
+    pub kind: StepKind,
+    /// Target or action configuration for the step.
+    pub uses: Option<StepUses>,
+    /// Step input bindings evaluated against the current namespaces.
+    pub with: TemplateBindings,
+    /// Optional symbol name bound into the `vars` namespace after the step.
+    pub save_as: Option<String>,
+    /// Flow control metadata for the step.
+    pub flow: FlowBlock,
+    /// Effective runtime settings for the step.
+    pub runtime: ResolvedRuntimeSettings,
+}
+
+/// Namespace referenced by a compiled template expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateNamespace {
+    /// Reference into the workflow input contract.
+    Input,
+    /// Reference into the incremental `vars` namespace.
+    Vars,
+}
+
+/// Single reference inside a compiled template expression.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateReference {
+    /// Namespace that owns the referenced symbol.
+    pub namespace: TemplateNamespace,
+    /// Path segments after the namespace, such as `["issue_id"]` for
+    /// `{{ input.issue_id }}`.
+    pub path: Vec<String>,
+}
+
+/// Tokenized template segment stored in compiled IR to avoid reparsing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TemplateSegment {
+    /// Literal text segment between template references.
+    Text {
+        /// Literal text value.
+        value: String,
+    },
+    /// Symbol reference segment.
+    Reference {
+        /// Referenced namespace path.
+        reference: TemplateReference,
+    },
+}
+
+/// Template string after structural validation and tokenization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledTemplate {
+    /// Original source string from the definition.
+    pub source: String,
+    /// Tokenized template segments.
+    pub segments: Vec<TemplateSegment>,
+}
+
+/// IR step kind after the compile phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkflowIrStepKind {
+    /// Dispatch to the named agent definition.
+    Agent {
+        /// Agent definition identifier or name.
+        agent: String,
+    },
+    /// Invoke a domain primitive.
+    Primitive {
+        /// Primitive identifier.
+        primitive: String,
+    },
+    /// Invoke a nested workflow definition.
+    Workflow {
+        /// Nested workflow identifier.
+        workflow: String,
+    },
+    /// Suspend until the named signal arrives.
+    WaitSignal {
+        /// Signal name that resumes the workflow.
+        signal_name: String,
+    },
+    /// Launch a looper run.
+    StartLooper {
+        /// Static task reference for the looper run, if present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_ref: Option<String>,
+        /// Binding that resolves to the task identifier at runtime, if present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id_binding: Option<String>,
+    },
+    /// Emit an event into the system pipeline.
+    EmitEvent {
+        /// Event name to emit.
+        event: String,
+        /// Optional payload template source retained for the runtime.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_template: Option<String>,
+    },
+    /// Collect results from a preceding fan-out group.
+    Collect,
+    /// No-op placeholder step.
+    Noop,
+}
+
+/// Single compiled step inside `WorkflowIr`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowIrStep {
+    /// Stable step identifier within the workflow.
+    pub id: String,
+    /// Human-readable step name.
+    pub name: String,
+    /// Compiled step action.
+    pub kind: WorkflowIrStepKind,
+    /// Flow control metadata for the step.
+    pub flow: FlowBlock,
+    /// Effective runtime settings for the step.
+    pub runtime: ResolvedRuntimeSettings,
+    /// Tokenized and validated step input bindings.
+    pub with: BTreeMap<String, CompiledTemplate>,
+    /// Optional symbol name introduced into the `vars` namespace after this step.
+    pub save_as: Option<String>,
+}
+
+/// Stable compiled workflow IR used as the runtime execution boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowIr {
+    /// Stable workflow definition identifier.
+    pub workflow_id: String,
+    /// Semantic workflow version.
+    pub workflow_version: String,
+    /// Workflow-level runtime defaults.
+    pub defaults: ResolvedRuntimeSettings,
+    /// Validated workflow input contract.
+    pub input_contract: ContractNode,
+    /// Validated workflow output contract.
+    pub output_contract: ContractNode,
+    /// Compiled workflow steps with validated bindings.
+    pub steps: Vec<WorkflowIrStep>,
+    /// Mapping from `save_as` symbol names to the step IDs that introduce them.
+    pub symbol_table: BTreeMap<String, String>,
+    /// Tokenized output projection mapping.
+    pub outputs: BTreeMap<String, CompiledTemplate>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
