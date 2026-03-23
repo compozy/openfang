@@ -8,8 +8,8 @@ use arky_session::{
     NewSession, PersistedEvent, ReplayCursor, SessionFilter, SessionStore, SqliteSessionStore,
 };
 use pretty_assertions::assert_eq;
+use rusqlite::{params, Connection, OptionalExtension};
 use tempfile::TempDir;
-use tokio_rusqlite::rusqlite::{Connection, OptionalExtension, params};
 
 fn temp_db_path() -> (TempDir, std::path::PathBuf) {
     let temp_dir = tempfile::tempdir().expect("temporary directory should be created");

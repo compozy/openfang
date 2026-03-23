@@ -670,9 +670,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
+        validate_claude_model_id, validate_prompt_length, validate_session_id_format,
         ClaudeCliBehaviorConfig, ClaudeCodeProviderConfig, ClaudeInputFormat,
         ClaudePermissionConfig, ClaudePluginConfig, ClaudeSandboxConfig, MAX_PROMPT_WARNING_LENGTH,
-        validate_claude_model_id, validate_prompt_length, validate_session_id_format,
     };
 
     #[test]
@@ -692,10 +692,8 @@ mod tests {
             hooks: Some(json!({ "before": ["echo hi"] })),
             agents: Some(json!({ "researcher": { "prompt": "Investigate" } })),
             sandbox: Some(json!({ "mode": "workspace-write" })),
-            plugins: vec![
-                ClaudePluginConfig::local("./plugins/plugin-a/index.js")
-                    .to_value(Some(Path::new("/workspace"))),
-            ],
+            plugins: vec![ClaudePluginConfig::local("./plugins/plugin-a/index.js")
+                .to_value(Some(Path::new("/workspace")))],
             cwd: Some(PathBuf::from("/workspace")),
             ..ClaudeCodeProviderConfig::default()
         };
@@ -704,27 +702,21 @@ mod tests {
             .cli_args("hello".to_owned(), "sonnet".to_owned(), Some("session-123"))
             .expect("args should build");
 
-        assert!(
-            args.windows(2)
-                .any(|window| { window == ["--resume".to_owned(), "session-123".to_owned()] })
-        );
-        assert!(
-            args.windows(2)
-                .any(|window| { window == ["--permission-mode".to_owned(), "dontAsk".to_owned()] })
-        );
-        assert!(
-            args.windows(2).any(|window| {
-                window[0] == "--mcp-config" && window[1].contains("\"mcpServers\"")
-            })
-        );
-        assert!(
-            args.windows(2)
-                .any(|window| { window[0] == "--agents" && window[1].contains("researcher") })
-        );
-        assert!(
-            args.windows(2)
-                .any(|window| { window[0] == "--append-system-prompt" && window[1] == "extra" })
-        );
+        assert!(args
+            .windows(2)
+            .any(|window| { window == ["--resume".to_owned(), "session-123".to_owned()] }));
+        assert!(args
+            .windows(2)
+            .any(|window| { window == ["--permission-mode".to_owned(), "dontAsk".to_owned()] }));
+        assert!(args
+            .windows(2)
+            .any(|window| { window[0] == "--mcp-config" && window[1].contains("\"mcpServers\"") }));
+        assert!(args
+            .windows(2)
+            .any(|window| { window[0] == "--agents" && window[1].contains("researcher") }));
+        assert!(args
+            .windows(2)
+            .any(|window| { window[0] == "--append-system-prompt" && window[1] == "extra" }));
         assert!(args.windows(2).any(|window| {
             window[0] == "--plugin-dir" && window[1].contains("/workspace/./plugins/plugin-a")
         }));
@@ -768,20 +760,17 @@ mod tests {
             .cli_args("hello".to_owned(), "sonnet".to_owned(), None)
             .expect("args should build");
 
-        assert!(
-            args.windows(2)
-                .any(|window| { window == ["--model".to_owned(), "claude-fallback".to_owned()] })
-        );
+        assert!(args
+            .windows(2)
+            .any(|window| { window == ["--model".to_owned(), "claude-fallback".to_owned()] }));
     }
 
     #[test]
     fn plugin_flags_should_resolve_relative_paths_against_cwd() {
         let config = ClaudeCodeProviderConfig {
             cwd: Some(PathBuf::from("/workspace")),
-            plugins: vec![
-                ClaudePluginConfig::local("./plugins/researcher.js")
-                    .to_value(Some(Path::new("/workspace"))),
-            ],
+            plugins: vec![ClaudePluginConfig::local("./plugins/researcher.js")
+                .to_value(Some(Path::new("/workspace")))],
             ..ClaudeCodeProviderConfig::default()
         };
 
@@ -797,11 +786,9 @@ mod tests {
         assert!(args.windows(2).any(|window| {
             window[0] == "--plugin-dir" && window[1].contains("/workspace/./plugins")
         }));
-        assert!(
-            args.windows(2).any(|window| {
-                window == ["--input-format".to_owned(), "stream-json".to_owned()]
-            })
-        );
+        assert!(args
+            .windows(2)
+            .any(|window| { window == ["--input-format".to_owned(), "stream-json".to_owned()] }));
     }
 
     #[test]
@@ -821,14 +808,12 @@ mod tests {
             .expect("args should build");
 
         assert!(args.contains(&"--debug".to_owned()));
-        assert!(
-            args.windows(2)
-                .any(|window| { window[0] == "--debug-file" && window[1] == "claude.debug.log" })
-        );
-        assert!(
-            args.windows(2)
-                .any(|window| { window[0] == "--settings" && window[1].contains("\"sandbox\"") })
-        );
+        assert!(args
+            .windows(2)
+            .any(|window| { window[0] == "--debug-file" && window[1] == "claude.debug.log" }));
+        assert!(args
+            .windows(2)
+            .any(|window| { window[0] == "--settings" && window[1].contains("\"sandbox\"") }));
     }
 
     #[test]

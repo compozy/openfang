@@ -4,15 +4,14 @@ use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
 };
 
 use arky_error::ClassifiedError;
 use arky_tools::ToolRegistry;
 use rmcp::{
-    ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResult, Implementation, InitializeResult, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerInfo,
@@ -21,15 +20,16 @@ use rmcp::{
     transport::{
         stdio,
         streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+            session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
         },
     },
+    ServerHandler, ServiceExt,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::{McpError, decode_export_tool_name, mcp_tool_from_descriptor, tool_result_to_mcp};
+use crate::{decode_export_tool_name, mcp_tool_from_descriptor, tool_result_to_mcp, McpError};
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
 

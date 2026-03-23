@@ -14,8 +14,8 @@ mod server;
 pub use crate::{
     auth::{McpAuth, McpOAuthAuth, McpOAuthFlow, McpOAuthOptions},
     bridge::{
-        McpToolBridge, McpToolBridgeBuilder, mcp_tool_from_descriptor, tool_descriptor_from_mcp,
-        tool_result_from_mcp, tool_result_to_mcp,
+        mcp_tool_from_descriptor, tool_descriptor_from_mcp, tool_result_from_mcp,
+        tool_result_to_mcp, McpToolBridge, McpToolBridgeBuilder,
     },
     client::{
         ConnectionState, McpClient, McpClientConfig, McpHttpClientConfig, McpStdioClientConfig,

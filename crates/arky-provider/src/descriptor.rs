@@ -240,8 +240,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CapabilityWarning, ProviderCapabilities, ProviderDescriptor, ProviderFamily,
-        messages_have_image_inputs, validate_capabilities,
+        messages_have_image_inputs, validate_capabilities, CapabilityWarning, ProviderCapabilities,
+        ProviderDescriptor, ProviderFamily,
     };
     use crate::ProviderRequest;
     use arky_protocol::{

@@ -3,7 +3,7 @@
 use arky_protocol::ProviderId;
 use serde::{Deserialize, Serialize};
 
-use crate::{ToolError, build_canonical_tool_name, validate_canonical_tool_name};
+use crate::{build_canonical_tool_name, validate_canonical_tool_name, ToolError};
 
 const PROVIDER_SEPARATOR: &str = "__";
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -207,8 +207,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::{
-        ToolIdCodec, create_claude_code_tool_id_codec, create_codex_tool_id_codec,
-        create_opencode_tool_id_codec,
+        create_claude_code_tool_id_codec, create_codex_tool_id_codec,
+        create_opencode_tool_id_codec, ToolIdCodec,
     };
 
     #[test]

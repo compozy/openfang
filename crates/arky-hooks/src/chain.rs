@@ -7,9 +7,9 @@ use std::{
     time::Duration,
 };
 
-use arky_error::{ErrorLogEntry, classify_error};
+use arky_error::{classify_error, ErrorLogEntry};
 use async_trait::async_trait;
-use futures::{FutureExt, future::join_all};
+use futures::{future::join_all, FutureExt};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -603,8 +603,8 @@ mod tests {
     use std::{
         collections::BTreeMap,
         sync::{
-            Arc,
             atomic::{AtomicBool, Ordering},
+            Arc,
         },
         time::{Duration, Instant},
     };

@@ -44,22 +44,22 @@ impl CodexServerRegistry {
             state.slots.get(&key).map(|slot| slot.server.clone())
         };
 
-        if let Some(existing_server) = existing_server
-            && existing_server.is_alive().await
-        {
-            let mut state = self.state.lock().await;
-            if let Some(slot) = state.slots.get_mut(&key)
-                && Arc::ptr_eq(&slot.server, &existing_server)
-            {
-                if let Some(idle_task) = slot.idle_task.take() {
-                    idle_task.abort();
+        if let Some(existing_server) = existing_server {
+            if existing_server.is_alive().await {
+                let mut state = self.state.lock().await;
+                if let Some(slot) = state.slots.get_mut(&key) {
+                    if Arc::ptr_eq(&slot.server, &existing_server) {
+                        if let Some(idle_task) = slot.idle_task.take() {
+                            idle_task.abort();
+                        }
+                        slot.ref_count = slot.ref_count.saturating_add(1);
+                        return Ok(CodexServerLease::new(
+                            self.clone(),
+                            key,
+                            slot.server.clone(),
+                        ));
+                    }
                 }
-                slot.ref_count = slot.ref_count.saturating_add(1);
-                return Ok(CodexServerLease::new(
-                    self.clone(),
-                    key,
-                    slot.server.clone(),
-                ));
             }
         }
 

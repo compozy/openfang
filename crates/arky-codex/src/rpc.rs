@@ -3,18 +3,18 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
 
 use arky_provider::ProviderError;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
-    sync::{Mutex as AsyncMutex, mpsc, oneshot, watch},
+    sync::{mpsc, oneshot, watch, Mutex as AsyncMutex},
     task::JoinHandle,
     time::timeout,
 };
@@ -810,12 +810,12 @@ mod tests {
 
     use arky_provider::ProviderError;
     use pretty_assertions::assert_eq;
-    use serde_json::{Value, json};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
+    use serde_json::{json, Value};
+    use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use super::{
-        IncomingMessage, JsonRpcErrorObject, JsonRpcId, RpcTransport, RpcTransportConfig,
-        parse_incoming,
+        parse_incoming, IncomingMessage, JsonRpcErrorObject, JsonRpcId, RpcTransport,
+        RpcTransportConfig,
     };
 
     fn fixture_dir() -> PathBuf {

@@ -3,7 +3,7 @@
 use arky_protocol::{AgentEvent, EventMetadata, Message, ProviderId, ToolResult, Usage};
 use tokio_util::sync::CancellationToken;
 
-use crate::{CodexNotification, FingerprintDeduper, payload_has_error};
+use crate::{payload_has_error, CodexNotification, FingerprintDeduper};
 
 /// Mutable lifecycle state for one Codex turn stream.
 #[derive(Debug, Clone, Default)]

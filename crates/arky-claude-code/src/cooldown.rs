@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::{
     sync::Mutex,
-    time::{Duration, Instant, sleep_until},
+    time::{sleep_until, Duration, Instant},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,11 +74,11 @@ impl SpawnFailureTracker {
     }
 
     fn normalize(state: &mut SpawnFailureState) {
-        if let Some(until) = state.cooldown_until
-            && Instant::now() >= until
-        {
-            state.consecutive_failures = 0;
-            state.cooldown_until = None;
+        if let Some(until) = state.cooldown_until {
+            if Instant::now() >= until {
+                state.consecutive_failures = 0;
+                state.cooldown_until = None;
+            }
         }
     }
 

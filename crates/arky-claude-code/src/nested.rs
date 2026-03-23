@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::parser::ClaudeToolResultEvent;
 
@@ -141,7 +141,7 @@ impl NestedToolTracker {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     use super::NestedToolTracker;
     use crate::parser::ClaudeToolResultEvent;

@@ -4,15 +4,13 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use arky_protocol::{Message, PersistedEvent, ReplayCursor, SessionId, TurnCheckpoint};
 use async_trait::async_trait;
+use rusqlite::{params, ErrorCode, OptionalExtension, TransactionBehavior};
 use tokio::sync::Mutex;
-use tokio_rusqlite::{
-    Connection, Error as TokioRusqliteError,
-    rusqlite::{self, ErrorCode, OptionalExtension, TransactionBehavior, params},
-};
+use tokio_rusqlite::{Connection, Error as TokioRusqliteError, Result as TokioRusqliteResult};
 
 use crate::{
-    NewSession, SessionError, SessionFilter, SessionMetadata, SessionSnapshot, SessionStore,
     support::{now_ms, validate_event_batch},
+    NewSession, SessionError, SessionFilter, SessionMetadata, SessionSnapshot, SessionStore,
 };
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
@@ -61,19 +59,19 @@ impl SqliteSessionStore {
         config: SqliteSessionStoreConfig,
     ) -> Result<Self, SessionError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                SessionError::storage_failure(
-                    format!(
-                        "failed to create SQLite parent directory `{}`: {error}",
-                        parent.display()
-                    ),
-                    None,
-                    "sqlite_open",
-                )
-            })?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    SessionError::storage_failure(
+                        format!(
+                            "failed to create SQLite parent directory `{}`: {error}",
+                            parent.display()
+                        ),
+                        None,
+                        "sqlite_open",
+                    )
+                })?;
+            }
         }
 
         let writer = Connection::open(&path).await.map_err(|error| {
@@ -109,8 +107,8 @@ impl SqliteSessionStore {
             .with_sqlite_retry("load_metadata", Some(id), || {
                 let session_id = session_id.clone();
                 self.reader.call(move |conn| {
-                    load_session_metadata(conn, &session_id)?
-                        .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)
+                    Ok(load_session_metadata(conn, &session_id)?
+                        .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?)
                 })
             })
             .await?;
@@ -130,7 +128,7 @@ impl SqliteSessionStore {
     ) -> Result<R, SessionError>
     where
         MakeAttempt: Fn() -> AttemptFuture,
-        AttemptFuture: std::future::Future<Output = Result<R, TokioRusqliteError<rusqlite::Error>>>,
+        AttemptFuture: std::future::Future<Output = TokioRusqliteResult<R>>,
     {
         let mut attempt_index = 0usize;
         loop {
@@ -146,10 +144,10 @@ impl SqliteSessionStore {
                 Err(error) => {
                     let retryable = is_busy_or_locked(&error);
                     let retry_after = retryable.then_some(self.config.retry_backoff);
-                    if let Some(session_id) = session_id.cloned()
-                        && is_query_returned_no_rows(&error)
-                    {
-                        return Err(SessionError::NotFound { session_id });
+                    if let Some(session_id) = session_id.cloned() {
+                        if is_query_returned_no_rows(&error) {
+                            return Err(SessionError::NotFound { session_id });
+                        }
                     }
                     return Err(map_sqlite_error(
                         operation,
@@ -191,7 +189,7 @@ impl SessionStore for SqliteSessionStore {
                 let session_id = session_id.clone();
                 self.reader.call(move |conn| {
                     let Some(metadata) = load_session_metadata(conn, &session_id)? else {
-                        return Err(rusqlite::Error::QueryReturnedNoRows);
+                        return Err(rusqlite::Error::QueryReturnedNoRows.into());
                     };
                     let messages = load_messages(conn, &session_id)?;
                     let last_checkpoint = load_checkpoint(conn, &session_id)?;
@@ -241,7 +239,7 @@ impl SessionStore for SqliteSessionStore {
             self.writer.call(move |conn| {
                 let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let Some(mut metadata) = load_session_metadata(&transaction, &session_id)? else {
-                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                    return Err(rusqlite::Error::QueryReturnedNoRows.into());
                 };
                 let start_ordinal = i64::try_from(metadata.message_count)
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
@@ -303,11 +301,11 @@ impl SessionStore for SqliteSessionStore {
             self.writer.call(move |conn| {
                 let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let Some(mut metadata) = load_session_metadata(&transaction, &session_id)? else {
-                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                    return Err(rusqlite::Error::QueryReturnedNoRows.into());
                 };
                 let last_sequence = metadata.last_sequence.unwrap_or(0);
                 if encoded_events[0].sequence <= last_sequence {
-                    return Err(rusqlite::Error::InvalidQuery);
+                    return Err(rusqlite::Error::InvalidQuery.into());
                 }
                 for event in &encoded_events {
                     transaction.execute(
@@ -359,7 +357,7 @@ impl SessionStore for SqliteSessionStore {
             self.writer.call(move |conn| {
                 let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let Some(mut metadata) = load_session_metadata(&transaction, &session_id)? else {
-                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                    return Err(rusqlite::Error::QueryReturnedNoRows.into());
                 };
                 transaction.execute(
                     "INSERT INTO checkpoints (session_id, sequence, payload)
@@ -401,7 +399,7 @@ impl SessionStore for SqliteSessionStore {
         self.with_sqlite_retry("replay_events", Some(id), || {
             let session_id = session_id.clone();
             self.reader
-                .call(move |conn| load_events(conn, &session_id, after_sequence, limit))
+                .call(move |conn| Ok(load_events(conn, &session_id, after_sequence, limit)?))
         })
         .await
     }
@@ -411,7 +409,8 @@ impl SessionStore for SqliteSessionStore {
         let mut sessions = self
             .with_sqlite_retry("list", None, || {
                 let filter = filter_copy.clone();
-                self.reader.call(move |conn| list_sessions(conn, &filter))
+                self.reader
+                    .call(move |conn| Ok(list_sessions(conn, &filter)?))
             })
             .await?;
 
@@ -439,7 +438,7 @@ impl SessionStore for SqliteSessionStore {
                     params![session_id.to_string()],
                 )?;
                 if deleted == 0 {
-                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                    return Err(rusqlite::Error::QueryReturnedNoRows.into());
                 }
                 transaction.commit()?;
                 Ok(())
@@ -459,7 +458,7 @@ struct EncodedEvent {
 fn map_sqlite_error(
     operation: &str,
     session_id: Option<SessionId>,
-    error: &TokioRusqliteError<rusqlite::Error>,
+    error: &TokioRusqliteError,
     retryable: bool,
     retry_after: Option<Duration>,
 ) -> SessionError {
@@ -470,8 +469,11 @@ fn map_sqlite_error(
         TokioRusqliteError::Close((_, inner)) => {
             format!("SQLite close failure during `{operation}`: {inner}")
         }
-        TokioRusqliteError::Error(inner) => {
+        TokioRusqliteError::Rusqlite(inner) => {
             format!("SQLite `{operation}` failed: {inner}")
+        }
+        TokioRusqliteError::Other(inner) => {
+            format!("SQLite `{operation}` failed with driver error: {inner}")
         }
         _ => format!("SQLite `{operation}` failed with a non-exhaustive driver error"),
     };
@@ -483,17 +485,17 @@ fn map_sqlite_error(
     }
 }
 
-const fn is_query_returned_no_rows(error: &TokioRusqliteError<rusqlite::Error>) -> bool {
+const fn is_query_returned_no_rows(error: &TokioRusqliteError) -> bool {
     matches!(
         error,
-        TokioRusqliteError::Error(rusqlite::Error::QueryReturnedNoRows)
+        TokioRusqliteError::Rusqlite(rusqlite::Error::QueryReturnedNoRows)
             | TokioRusqliteError::Close((_, rusqlite::Error::QueryReturnedNoRows))
     )
 }
 
-fn is_busy_or_locked(error: &TokioRusqliteError<rusqlite::Error>) -> bool {
+fn is_busy_or_locked(error: &TokioRusqliteError) -> bool {
     match error {
-        TokioRusqliteError::Error(inner) => matches!(
+        TokioRusqliteError::Rusqlite(inner) => matches!(
             inner.sqlite_error_code(),
             Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
         ),
@@ -520,9 +522,9 @@ async fn configure_connection(
                 PRAGMA wal_autocheckpoint = 1000;
                 ",
             )?;
-            conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            Ok(conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
                 row.get::<_, String>(0)
-            })
+            })?)
         })
         .await
         .map_err(|error| map_sqlite_error("configure_connection", None, &error, false, None))?;
@@ -541,7 +543,7 @@ async fn configure_connection(
 async fn initialize_schema(connection: &Connection) -> Result<(), SessionError> {
     connection
         .call(|conn| {
-            conn.execute_batch(
+            Ok(conn.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,
@@ -589,7 +591,7 @@ async fn initialize_schema(connection: &Connection) -> Result<(), SessionError> 
                     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
                 );
                 ",
-            )
+            )?)
         })
         .await
         .map_err(|error| map_sqlite_error("initialize_schema", None, &error, false, None))?;
@@ -946,15 +948,11 @@ fn list_sessions(
              ORDER BY updated_at_ms DESC, created_at_ms DESC",
         )?;
         let ids = statement.query_map(
-            params![
-                filter
-                    .since
-                    .map(i64::try_from)
-                    .transpose()
-                    .map_err(|error| {
-                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
-                    })?,
-            ],
+            params![filter
+                .since
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|error| { rusqlite::Error::ToSqlConversionFailure(Box::new(error)) })?,],
             |row| row.get::<_, String>(0),
         )?;
         let parsed_ids = ids

@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, io::ErrorKind, path::PathBuf, time::Duration};
 use arky_protocol::Message;
 use async_trait::async_trait;
 use regex::Regex;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
@@ -300,10 +300,10 @@ impl ShellCommandHook {
             ));
         }
 
-        if let Some(error) = stdin_error
-            && !is_recoverable_stdin_error(&error)
-        {
-            return Err(self.execution_error(event, format_stdin_error(&error, &stderr_text)));
+        if let Some(error) = stdin_error {
+            if !is_recoverable_stdin_error(&error) {
+                return Err(self.execution_error(event, format_stdin_error(&error, &stderr_text)));
+            }
         }
 
         Ok(Self::parse_stdout(&stdout, stdout_text, plain_text))

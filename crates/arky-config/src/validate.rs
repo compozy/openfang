@@ -9,8 +9,8 @@ use std::{
 use crate::{
     error::{ConfigError, ValidationIssue},
     layered::{
-        PartialProviderProfileConfig, ProviderProfileConfig, validate_defaults, validate_driver,
-        validate_request_extra,
+        validate_defaults, validate_driver, validate_request_extra, PartialProviderProfileConfig,
+        ProviderProfileConfig,
     },
     loader::{
         AgentConfig, ArkyConfig, PartialAgentConfig, PartialArkyConfig, PartialProviderConfig,
@@ -26,13 +26,13 @@ pub fn validate_config(config: PartialArkyConfig) -> Result<ArkyConfig, ConfigEr
     let profiles = finalize_profiles(config.profiles, &mut issues);
     let agents = finalize_agents(config.agents, &providers, &profiles, &mut issues);
 
-    if let Some(default_provider) = workspace.default_provider()
-        && !providers.contains_key(default_provider)
-    {
-        issues.push(ValidationIssue::new(
-            "workspace.default_provider",
-            format!("references unknown provider `{default_provider}`"),
-        ));
+    if let Some(default_provider) = workspace.default_provider() {
+        if !providers.contains_key(default_provider) {
+            issues.push(ValidationIssue::new(
+                "workspace.default_provider",
+                format!("references unknown provider `{default_provider}`"),
+            ));
+        }
     }
 
     if issues.is_empty() {
@@ -243,27 +243,27 @@ fn finalize_agents(
         let profile_config = profile
             .as_deref()
             .and_then(|profile_name| profiles.get(profile_name));
-        if let Some(profile_name) = profile.as_deref()
-            && profile_config.is_none()
-        {
-            issues.push(ValidationIssue::new(
-                format!("{field_prefix}.profile"),
-                format!("references unknown profile `{profile_name}`"),
-            ));
-            continue;
+        if let Some(profile_name) = profile.as_deref() {
+            if profile_config.is_none() {
+                issues.push(ValidationIssue::new(
+                    format!("{field_prefix}.profile"),
+                    format!("references unknown profile `{profile_name}`"),
+                ));
+                continue;
+            }
         }
 
-        if let Some(profile_config) = profile_config
-            && profile_config.driver() != install_driver
-        {
-            issues.push(ValidationIssue::new(
-                format!("{field_prefix}.profile"),
-                format!(
-                    "targets driver `{}` but provider `{provider}` uses `{install_driver}`",
-                    profile_config.driver()
-                ),
-            ));
-            continue;
+        if let Some(profile_config) = profile_config {
+            if profile_config.driver() != install_driver {
+                issues.push(ValidationIssue::new(
+                    format!("{field_prefix}.profile"),
+                    format!(
+                        "targets driver `{}` but provider `{provider}` uses `{install_driver}`",
+                        profile_config.driver()
+                    ),
+                ));
+                continue;
+            }
         }
 
         let model =
@@ -406,11 +406,11 @@ mod tests {
 
     use super::{check_provider_prerequisites, validate_config};
     use crate::{
-        ConfigError, ResolvedProviderBehaviorConfig,
         layered::PartialProviderProfileConfig,
         loader::{
             PartialAgentConfig, PartialArkyConfig, PartialProviderConfig, PartialWorkspaceConfig,
         },
+        ConfigError, ResolvedProviderBehaviorConfig,
     };
 
     #[test]

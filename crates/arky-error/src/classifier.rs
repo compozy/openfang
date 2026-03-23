@@ -361,16 +361,14 @@ mod tests {
         let mut classifier = ErrorClassifier::new();
         classifier.register_patterns(
             "claude-code",
-            vec![
-                ErrorPattern::new(
-                    "authentication",
-                    "(?i)api key",
-                    ErrorCategory::Authentication,
-                    false,
-                    None,
-                )
-                .expect("pattern should compile"),
-            ],
+            vec![ErrorPattern::new(
+                "authentication",
+                "(?i)api key",
+                ErrorCategory::Authentication,
+                false,
+                None,
+            )
+            .expect("pattern should compile")],
         );
 
         let result = classifier.classify(&ErrorInput {
@@ -416,16 +414,14 @@ mod tests {
         let mut classifier = ErrorClassifier::new();
         classifier.register_patterns(
             "claude-code",
-            vec![
-                ErrorPattern::new(
-                    "config_invalid",
-                    "(?i)unknown field",
-                    ErrorCategory::ConfigInvalid,
-                    false,
-                    None,
-                )
-                .expect("pattern should compile"),
-            ],
+            vec![ErrorPattern::new(
+                "config_invalid",
+                "(?i)unknown field",
+                ErrorCategory::ConfigInvalid,
+                false,
+                None,
+            )
+            .expect("pattern should compile")],
         );
         let original_error = "unknown field `permissionMode`, expected one of `permission_mode`";
         let result = classifier.classify(&ErrorInput {

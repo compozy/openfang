@@ -3,21 +3,21 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     time::Duration,
 };
 
 use arky_provider::{ManagedProcess, ProcessConfig, ProcessManager, ProviderError};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tokio::{io::AsyncReadExt, sync::Mutex};
 
 use crate::{
+    rpc::{InitializeCapabilities, InitializeParams},
     ApprovalHandler, CodexModelDescriptor, CodexModelService, CodexProviderConfig,
     CompactThreadParams, NotificationRouter, RpcTransport, RpcTransportConfig, ThreadManager,
     ThreadOpenParams, TurnNotificationStream, TurnStartParams,
-    rpc::{InitializeCapabilities, InitializeParams},
 };
 
 #[derive(Debug, Clone)]

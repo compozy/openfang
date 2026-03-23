@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use arky_error::ClassifiedError;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use thiserror::Error;
 
 /// A machine-readable validation issue tied to a specific config field.

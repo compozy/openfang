@@ -14,11 +14,12 @@ mod validation;
 pub use crate::{
     error::{ConfigError, ValidationIssue},
     layered::{
-        ClaudeCodeBehaviorLayer, ClaudeCompatibleBehaviorLayer, CodexBehaviorLayer,
-        PartialProviderBehaviorConfig, PartialProviderProfileConfig, ProviderBehaviorLayer,
-        ProviderProfileConfig, ProviderRequestDefaults, ResolvedAgentProviderConfig,
-        ResolvedClaudeCodeBehaviorConfig, ResolvedClaudeCompatibleBehaviorConfig,
-        ResolvedCodexBehaviorConfig, ResolvedProviderBehaviorConfig, normalize_driver,
+        normalize_driver, ClaudeCodeBehaviorLayer, ClaudeCompatibleBehaviorLayer,
+        CodexBehaviorLayer, PartialProviderBehaviorConfig, PartialProviderProfileConfig,
+        ProviderBehaviorLayer, ProviderProfileConfig, ProviderRequestDefaults,
+        ResolvedAgentProviderConfig, ResolvedClaudeCodeBehaviorConfig,
+        ResolvedClaudeCompatibleBehaviorConfig, ResolvedCodexBehaviorConfig,
+        ResolvedProviderBehaviorConfig,
     },
     loader::{
         AgentConfig, AgentConfigBuilder, ArkyConfig, ArkyConfigBuilder, ConfigFormat, ConfigLoader,
@@ -26,5 +27,5 @@ pub use crate::{
         WorkspaceConfigBuilder,
     },
     validate::find_binary_on_path,
-    validation::{RichValidationSchema, validate_against_schema},
+    validation::{validate_against_schema, RichValidationSchema},
 };

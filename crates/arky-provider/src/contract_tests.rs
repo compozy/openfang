@@ -1,6 +1,6 @@
 //! Shared provider contract test helpers.
 
-use crate::{Provider, ProviderDescriptor, ProviderRequest, traits::terminal_message_from_event};
+use crate::{traits::terminal_message_from_event, Provider, ProviderDescriptor, ProviderRequest};
 use arky_protocol::{AgentEvent, Message};
 use futures::StreamExt;
 
@@ -79,20 +79,20 @@ impl ProviderContractTests {
 
         for event in events {
             let metadata = event.metadata();
-            if let Some(expected_session_id) = &session_id
-                && metadata.session_id.as_ref() != Some(expected_session_id)
-            {
-                return Err("event metadata must carry the request session id".to_owned());
+            if let Some(expected_session_id) = &session_id {
+                if metadata.session_id.as_ref() != Some(expected_session_id) {
+                    return Err("event metadata must carry the request session id".to_owned());
+                }
             }
             if metadata.provider_id.as_ref() != Some(&provider_id) {
                 return Err(
                     "provider-originated events must advertise the descriptor id".to_owned(),
                 );
             }
-            if let Some(previous_sequence) = previous_sequence
-                && metadata.sequence <= previous_sequence
-            {
-                return Err("event sequence must be strictly monotonic".to_owned());
+            if let Some(previous_sequence) = previous_sequence {
+                if metadata.sequence <= previous_sequence {
+                    return Err("event sequence must be strictly monotonic".to_owned());
+                }
             }
             previous_sequence = Some(metadata.sequence);
         }

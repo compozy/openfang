@@ -5,13 +5,13 @@ use std::sync::Arc;
 use arky_error::ClassifiedError;
 use arky_protocol::{ToolContent, ToolResult};
 use arky_tools::{ToolDescriptor, ToolOrigin, ToolRegistrationHandle, ToolRegistry};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use rmcp::model::{CallToolResult, Content, RawContent, ResourceContents, Tool};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::{
-    McpClient, McpError, McpServer, McpServerHandle, McpServerTransport,
-    build_import_canonical_name, encode_export_tool_name,
+    build_import_canonical_name, encode_export_tool_name, McpClient, McpError, McpServer,
+    McpServerHandle, McpServerTransport,
 };
 
 /// Translates an MCP tool definition into an Arky `ToolDescriptor`.

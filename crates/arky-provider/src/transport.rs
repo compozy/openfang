@@ -185,7 +185,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, duplex},
+        io::{duplex, AsyncBufReadExt, AsyncWriteExt},
         time::sleep,
     };
     use tokio_util::sync::CancellationToken;

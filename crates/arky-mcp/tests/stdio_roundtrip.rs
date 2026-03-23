@@ -6,8 +6,8 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[tokio::test]
-async fn stdio_client_server_round_trip_should_list_and_call_tool()
--> Result<(), Box<dyn std::error::Error>> {
+async fn stdio_client_server_round_trip_should_list_and_call_tool(
+) -> Result<(), Box<dyn std::error::Error>> {
     let fixture = std::env::var("CARGO_BIN_EXE_mcp_stdio_fixture")?;
     let client = McpClient::stdio(McpStdioClientConfig::new(
         "fixture",

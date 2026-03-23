@@ -12,7 +12,7 @@ use arky_claude_code::{
 use arky_protocol::{AgentEvent, Message, ModelRef, SessionId, SessionRef, TurnContext, TurnId};
 use arky_provider::{Provider, ProviderError, ProviderRequest};
 use futures::StreamExt;
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 
 fn fixture_binary() -> String {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -396,24 +396,16 @@ async fn provider_should_emit_warning_events_for_request_settings() {
         }
     }
 
-    assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.contains("temperature"))
-    );
-    assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.contains("Unknown model ID"))
-    );
-    assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.contains("Very long prompt"))
-    );
-    assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.contains("Unusual session ID format"))
-    );
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.contains("temperature")));
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.contains("Unknown model ID")));
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.contains("Very long prompt")));
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.contains("Unusual session ID format")));
 }

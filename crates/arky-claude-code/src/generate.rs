@@ -1,7 +1,7 @@
 //! Claude Code generate helpers with truncation-aware retry logic.
 
 use arky_provider::{
-    GenerateResponse, Provider, ProviderError, ProviderRequest, generate_response_from_stream,
+    generate_response_from_stream, GenerateResponse, Provider, ProviderError, ProviderRequest,
 };
 
 /// Runs a Claude generation request and retries once when the first attempt

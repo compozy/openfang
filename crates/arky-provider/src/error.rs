@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use arky_error::ClassifiedError;
 use arky_protocol::ProviderId;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use thiserror::Error;
 
 /// Errors shared by the provider contract and subprocess infrastructure.

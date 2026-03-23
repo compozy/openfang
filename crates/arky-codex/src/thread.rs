@@ -10,7 +10,7 @@ use arky_provider::ProviderError;
 use async_trait::async_trait;
 use futures::Stream;
 use serde_json::{Map, Value};
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::{
@@ -406,13 +406,13 @@ mod tests {
     use arky_provider::ProviderError;
     use async_trait::async_trait;
     use pretty_assertions::assert_eq;
-    use serde_json::{Map, Value, json};
+    use serde_json::{json, Map, Value};
     use tokio::sync::Mutex;
 
     use super::{CompactThreadParams, RpcClient, ThreadManager, ThreadOpenParams, TurnStartParams};
     use crate::{
-        JsonRpcId,
         notification::{CodexNotification, NotificationRouter},
+        JsonRpcId,
     };
 
     #[derive(Debug, Default)]

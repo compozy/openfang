@@ -278,7 +278,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
-    use super::{TruncationConfig, truncate_tool_output};
+    use super::{truncate_tool_output, TruncationConfig};
     use crate::ToolContent;
 
     #[test]

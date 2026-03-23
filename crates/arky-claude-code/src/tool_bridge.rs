@@ -6,7 +6,7 @@ use arky_mcp::{McpError, McpToolBridge};
 use arky_provider::ProviderError;
 use arky_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Serializable tool metadata exposed to Claude's MCP bridge configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,12 +201,12 @@ mod tests {
 
     use async_trait::async_trait;
     use pretty_assertions::assert_eq;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ClaudeCombinedToolBridgeConfig, ClaudeToolBridgeConfig, DEFAULT_TOOL_INPUT_LIMITS,
         build_tool_bridge, serialize_tool_input, serialize_tool_input_with_metadata,
+        ClaudeCombinedToolBridgeConfig, ClaudeToolBridgeConfig, DEFAULT_TOOL_INPUT_LIMITS,
     };
     use arky_tools::{Tool, ToolDescriptor, ToolOrigin, ToolRegistry, ToolResult};
 

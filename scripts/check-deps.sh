@@ -28,6 +28,44 @@ import os
 import sys
 
 EXPECTED = {
+    "arky-error": set(),
+    "arky-protocol": {"arky-error"},
+    "arky-tools": {"arky-error", "arky-protocol"},
+    "arky-hooks": {"arky-error", "arky-protocol"},
+    "arky-session": {"arky-error", "arky-protocol"},
+    "arky-provider": {
+        "arky-error",
+        "arky-hooks",
+        "arky-protocol",
+        "arky-session",
+        "arky-tools",
+    },
+    "arky-mcp": {
+        "arky-error",
+        "arky-protocol",
+        "arky-tools",
+    },
+    "arky-codex": {
+        "arky-error",
+        "arky-mcp",
+        "arky-protocol",
+        "arky-provider",
+        "arky-tools",
+    },
+    "arky-claude-code": {
+        "arky-error",
+        "arky-mcp",
+        "arky-protocol",
+        "arky-provider",
+        "arky-tools",
+    },
+    "arky-config": {
+        "arky-claude-code",
+        "arky-codex",
+        "arky-error",
+        "arky-protocol",
+        "arky-provider",
+    },
     "openfang-types": set(),
     "openfang-memory": {"openfang-types"},
     "openfang-wire": {"openfang-types"},
@@ -99,7 +137,7 @@ internal_names = workspace_names.intersection(EXPECTED.keys())
 unknown_workspace = sorted(
     name
     for name in workspace_names
-    if name.startswith("openfang") and name not in EXPECTED
+    if (name.startswith("openfang") or name.startswith("arky")) and name not in EXPECTED
 )
 
 errors = []

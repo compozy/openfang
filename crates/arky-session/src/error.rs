@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use arky_error::ClassifiedError;
 use arky_protocol::SessionId;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use thiserror::Error;
 
 /// Errors returned by session stores.

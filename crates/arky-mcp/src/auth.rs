@@ -3,7 +3,7 @@
 use std::fmt;
 
 use reqwest::Client as HttpClient;
-use rmcp::transport::{AuthClient, AuthError, auth::OAuthState};
+use rmcp::transport::{auth::OAuthState, AuthClient, AuthError};
 
 use crate::McpError;
 

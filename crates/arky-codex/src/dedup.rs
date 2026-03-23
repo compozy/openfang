@@ -78,7 +78,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
-    use super::{FingerprintDeduper, fingerprint_notification};
+    use super::{fingerprint_notification, FingerprintDeduper};
     use crate::CodexNotification;
 
     #[test]

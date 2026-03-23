@@ -163,10 +163,10 @@ mod tests {
     use std::time::Duration;
 
     use pretty_assertions::assert_eq;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use thiserror::Error;
 
-    use super::{ClassifiedError, ErrorLogEntry, HttpErrorMapping, classify_error};
+    use super::{classify_error, ClassifiedError, ErrorLogEntry, HttpErrorMapping};
 
     #[derive(Debug, Error)]
     #[error("default failure for {resource}")]

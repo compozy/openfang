@@ -8,7 +8,7 @@ use arky_provider::{
     ProviderEventStream, ProviderFamily, ProviderRequest,
 };
 
-use crate::{ClaudeCodeProvider, ClaudeCodeProviderConfig, config::KNOWN_CLAUDE_MODEL_IDS};
+use crate::{config::KNOWN_CLAUDE_MODEL_IDS, ClaudeCodeProvider, ClaudeCodeProviderConfig};
 
 /// Shared Claude-compatible base config reused by all derived providers.
 pub type ClaudeCompatibleProviderConfig = ClaudeCodeProviderConfig;
@@ -795,7 +795,7 @@ const fn claude_compatible_capabilities() -> ProviderCapabilities {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use super::{CLAUDE_COMPATIBLE_PROVIDER_IDS, ClaudeCompatibleProviderKind, selected_model};
+    use super::{selected_model, ClaudeCompatibleProviderKind, CLAUDE_COMPATIBLE_PROVIDER_IDS};
     use arky_protocol::{Message, ModelRef, ProviderRequest, SessionRef, TurnContext, TurnId};
 
     fn request_with_model(model: ModelRef) -> ProviderRequest {

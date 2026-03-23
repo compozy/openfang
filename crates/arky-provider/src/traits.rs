@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 
 use crate::{
-    ProviderDescriptor, ProviderError, ProviderRequest,
     request::{GenerateResponse, SessionRef, TurnContext},
+    ProviderDescriptor, ProviderError, ProviderRequest,
 };
 use arky_protocol::{AgentEvent, FinishReason, Message, Usage};
 

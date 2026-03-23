@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [features]
 default = []
-sqlite = ["dep:tokio-rusqlite"]
+sqlite = ["dep:rusqlite", "dep:tokio-rusqlite"]
 
 [dependencies]
 arky-error = { workspace = true }
@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 
 # Optional
+rusqlite = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -28,3 +29,5 @@ pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
+[lints]
+workspace = true

@@ -1,8 +1,8 @@
 //! Integration coverage for multi-hook merge behavior.
 
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 use arky_hooks::{

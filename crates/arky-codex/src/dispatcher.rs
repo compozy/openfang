@@ -595,7 +595,7 @@ fn tool_input(item: &Map<String, Value>) -> Value {
 mod tests {
     use arky_tools::create_codex_tool_id_codec;
     use pretty_assertions::assert_eq;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use std::sync::Arc;
 
     use super::{CodexEventDispatcher, NormalizedNotification};

@@ -3,14 +3,14 @@
 use std::{
     collections::{BTreeSet, HashMap},
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
 };
 
 use arky_provider::ProviderError;
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 
 /// Raw JSON-RPC notification emitted by the Codex app-server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,8 +99,10 @@ impl NotificationRouter {
             .threads
             .get(thread_id)
             .is_some_and(|registration| registration.id == registration_id);
-        if should_remove && let Some(previous) = state.threads.remove(thread_id) {
-            remove_scope_thread(&mut state.scopes, &previous.scope_id, thread_id);
+        if should_remove {
+            if let Some(previous) = state.threads.remove(thread_id) {
+                remove_scope_thread(&mut state.scopes, &previous.scope_id, thread_id);
+            }
         }
     }
 

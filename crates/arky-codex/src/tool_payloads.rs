@@ -1,6 +1,6 @@
 //! Canonical Codex tool payload builders.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Maps provider-specific tool categories onto canonical Arky tool names.
 #[must_use]

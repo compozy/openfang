@@ -14,9 +14,9 @@ use arky_provider::{
     ManagedProcess, ProcessConfig, ProcessManager, Provider, ProviderDescriptor, ProviderError,
     ProviderEventStream, ProviderRequest, StdioTransport, StdioTransportConfig,
 };
-use arky_tools::{ToolIdCodec, create_claude_compatible_tool_id_codec};
+use arky_tools::{create_claude_compatible_tool_id_codec, ToolIdCodec};
 use async_stream::try_stream;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     task::JoinHandle,
@@ -24,22 +24,22 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ClaudeCodeProviderConfig, ClaudeErrorClassifier,
     config::{
-        ClaudeInputFormat, validate_claude_model_id, validate_prompt_length,
-        validate_session_id_format,
+        validate_claude_model_id, validate_prompt_length, validate_session_id_format,
+        ClaudeInputFormat,
     },
-    conversion::{ClaudeInjectedPromptStream, collect_warning_messages},
+    conversion::{collect_warning_messages, ClaudeInjectedPromptStream},
     cooldown::SpawnFailureTracker,
     dedup::{TextDeduplicator, TextSource},
     generate::generate_with_recovery,
     nested::NestedToolTracker,
     parser::{
-        ClaudeEventParser, ClaudeEventSource, ClaudeNormalizedEvent, is_claude_truncation_error,
+        is_claude_truncation_error, ClaudeEventParser, ClaudeEventSource, ClaudeNormalizedEvent,
     },
     profile::ClaudeProviderProfile,
     session::SessionManager,
     tool_fsm::{ToolLifecycleState, ToolLifecycleTracker},
+    ClaudeCodeProviderConfig, ClaudeErrorClassifier,
 };
 
 /// Concrete `Provider` implementation wrapping the Claude CLI.
@@ -106,10 +106,10 @@ impl ClaudeCodeProvider {
                 "failed to read Claude version output: {error}"
             ))
         })?;
-        if let Some(callback) = &self.config.cli_behavior.stderr_callback
-            && !stderr_buffer.trim().is_empty()
-        {
-            callback.call(stderr_buffer.trim());
+        if let Some(callback) = &self.config.cli_behavior.stderr_callback {
+            if !stderr_buffer.trim().is_empty() {
+                callback.call(stderr_buffer.trim());
+            }
         }
         process.wait().await?;
 
@@ -251,10 +251,10 @@ impl ClaudeCodeProvider {
 
             drop(transport);
             let stderr_excerpt = stderr_task.await.unwrap_or_default();
-            if let Some(callback) = &stderr_callback
-                && !stderr_excerpt.trim().is_empty()
-            {
-                callback.call(stderr_excerpt.trim());
+            if let Some(callback) = &stderr_callback {
+                if !stderr_excerpt.trim().is_empty() {
+                    callback.call(stderr_excerpt.trim());
+                }
             }
             if recovered_from_truncation {
                 if let Some(prompt_writer) = prompt_writer.take() {
@@ -465,10 +465,10 @@ fn collect_request_warnings(
     if let Some(warning) = validate_prompt_length(prompt) {
         warnings.push(warning);
     }
-    if let Some(session_id) = runtime_session_id
-        && let Some(warning) = validate_session_id_format(session_id)
-    {
-        warnings.push(warning);
+    if let Some(session_id) = runtime_session_id {
+        if let Some(warning) = validate_session_id_format(session_id) {
+            warnings.push(warning);
+        }
     }
 
     warnings
@@ -700,12 +700,12 @@ impl StreamRuntime {
         &mut self,
         metadata: crate::parser::ClaudeMetadataEvent,
     ) -> Result<Vec<AgentEvent>, ProviderError> {
-        if let Some(session_id) = metadata.session_id.clone()
-            && let Some(request_session_id) = self.emitter.session_id.clone()
-        {
-            self.sessions
-                .record(&request_session_id, session_id.clone())
-                .await;
+        if let Some(session_id) = metadata.session_id.clone() {
+            if let Some(request_session_id) = self.emitter.session_id.clone() {
+                self.sessions
+                    .record(&request_session_id, session_id.clone())
+                    .await;
+            }
         }
         if metadata.session_id.is_none() && metadata.model_id.is_none() {
             return Ok(Vec::new());
@@ -725,10 +725,10 @@ impl StreamRuntime {
         &mut self,
         rate_limit: crate::parser::ClaudeRateLimitEvent,
     ) -> Result<Vec<AgentEvent>, ProviderError> {
-        if let Some(session_id) = rate_limit.session_id.clone()
-            && let Some(request_session_id) = self.emitter.session_id.clone()
-        {
-            self.sessions.record(&request_session_id, session_id).await;
+        if let Some(session_id) = rate_limit.session_id.clone() {
+            if let Some(request_session_id) = self.emitter.session_id.clone() {
+                self.sessions.record(&request_session_id, session_id).await;
+            }
         }
 
         Ok(vec![AgentEvent::Custom {
@@ -888,10 +888,10 @@ impl StreamRuntime {
             tool_name: self.provider.canonical_tool_name(&tool.tool_name),
             args: tool.input,
         });
-        if let Some(parent_tool_call_id) = parent_tool_call_id
-            && let Some(preview) = self.emit_nested_preview(&parent_tool_call_id)
-        {
-            emitted.push(preview);
+        if let Some(parent_tool_call_id) = parent_tool_call_id {
+            if let Some(preview) = self.emit_nested_preview(&parent_tool_call_id) {
+                emitted.push(preview);
+            }
         }
         Ok(emitted)
     }
@@ -1214,10 +1214,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
-    use super::{ClaudeCodeProvider, ClaudeCodeProviderConfig, merged_env_layers};
+    use super::{merged_env_layers, ClaudeCodeProvider, ClaudeCodeProviderConfig};
     use crate::{
-        BedrockProviderConfig, ClaudeCompatibleProviderConfig, OllamaProviderConfig,
-        profile::ClaudeProviderProfile,
+        profile::ClaudeProviderProfile, BedrockProviderConfig, ClaudeCompatibleProviderConfig,
+        OllamaProviderConfig,
     };
     use arky_protocol::{Message, ModelRef, ProviderId, SessionRef, TurnContext, TurnId};
     use arky_provider::{Provider, ProviderRequest};

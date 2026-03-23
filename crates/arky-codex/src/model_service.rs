@@ -64,13 +64,13 @@ where
         let mut models = Vec::new();
 
         loop {
-            if let Some(current_cursor) = cursor.as_deref()
-                && !seen_cursors.insert(current_cursor.to_owned())
-            {
-                return Err(ProviderError::protocol_violation(
-                    format!("model/list returned a repeated cursor: {current_cursor}"),
-                    None,
-                ));
+            if let Some(current_cursor) = cursor.as_deref() {
+                if !seen_cursors.insert(current_cursor.to_owned()) {
+                    return Err(ProviderError::protocol_violation(
+                        format!("model/list returned a repeated cursor: {current_cursor}"),
+                        None,
+                    ));
+                }
             }
 
             let page = self.list_page(cursor.as_deref()).await?;
@@ -158,10 +158,10 @@ mod tests {
     use arky_provider::ProviderError;
     use async_trait::async_trait;
     use pretty_assertions::assert_eq;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use tokio::sync::Mutex;
 
-    use super::{CodexModelService, parse_model_list_page};
+    use super::{parse_model_list_page, CodexModelService};
     use crate::thread::RpcClient;
 
     #[derive(Debug, Default)]

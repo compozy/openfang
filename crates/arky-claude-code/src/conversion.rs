@@ -1,14 +1,14 @@
 //! Claude-specific request/response conversion helpers.
 
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 use arky_protocol::{ContentBlock, FinishReason, Message, ProviderSettings, Role};
 use arky_provider::ProviderError;
-use serde_json::{Value, json};
-use tokio::sync::{Notify, mpsc};
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, Notify};
 
 const MAX_PROMPT_WARNING_LENGTH: usize = 100_000;
 const DEFAULT_INJECTION_BUFFER: usize = 16;
@@ -398,32 +398,33 @@ pub fn collect_runtime_warning_messages(
 ) -> Vec<String> {
     let mut warnings = collect_warning_messages(settings);
 
-    if let Some(model_id) = model_id.map(str::trim)
-        && (model_id.is_empty() || model_id.chars().any(char::is_whitespace))
-    {
-        warnings.push(format!(
-            "model id `{model_id}` looks invalid for Claude Code and may be rejected"
-        ));
+    if let Some(model_id) = model_id.map(str::trim) {
+        if model_id.is_empty() || model_id.chars().any(char::is_whitespace) {
+            warnings.push(format!(
+                "model id `{model_id}` looks invalid for Claude Code and may be rejected"
+            ));
+        }
     }
 
-    if let Some(prompt_text) = prompt_text
-        && prompt_text.len() > MAX_PROMPT_WARNING_LENGTH
-    {
-        warnings.push(format!(
-            "Very long prompt detected ({} characters). Claude Code performance may degrade.",
-            prompt_text.len()
-        ));
+    if let Some(prompt_text) = prompt_text {
+        if prompt_text.len() > MAX_PROMPT_WARNING_LENGTH {
+            warnings.push(format!(
+                "Very long prompt detected ({} characters). Claude Code performance may degrade.",
+                prompt_text.len()
+            ));
+        }
     }
 
-    if let Some(session_id) = session_id.map(str::trim)
-        && !session_id.is_empty()
-        && !session_id.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ':')
-        })
-    {
-        warnings.push(format!(
-            "session id `{session_id}` contains characters outside [A-Za-z0-9-_:]"
-        ));
+    if let Some(session_id) = session_id.map(str::trim) {
+        if !session_id.is_empty()
+            && !session_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ':')
+            })
+        {
+            warnings.push(format!(
+                "session id `{session_id}` contains characters outside [A-Za-z0-9-_:]"
+            ));
+        }
     }
 
     warnings
@@ -546,11 +547,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ClaudeInjectedPromptStream, ClaudeMessageDeliveryCallback,
         collect_runtime_warning_messages, collect_warning_messages, convert_messages,
         extract_structured_output, image_part_from_base64, image_part_from_bytes,
         image_part_from_data_url, image_source_payload, map_finish_reason, map_permission_mode,
-        parse_image_string, structured_output_args,
+        parse_image_string, structured_output_args, ClaudeInjectedPromptStream,
+        ClaudeMessageDeliveryCallback,
     };
     use arky_protocol::{ContentBlock, FinishReason, Message, ProviderSettings};
 

@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::{
-    NewSession, SessionError, SessionFilter, SessionMetadata, SessionSnapshot, SessionStore,
     support::{now_ms, validate_event_batch},
+    NewSession, SessionError, SessionFilter, SessionMetadata, SessionSnapshot, SessionStore,
 };
 
 /// Configuration for [`InMemorySessionStore`].
@@ -390,10 +390,10 @@ impl SessionFilter {
                 return false;
             }
         }
-        if let Some(since) = self.since
-            && metadata.updated_at_ms < since
-        {
-            return false;
+        if let Some(since) = self.since {
+            if metadata.updated_at_ms < since {
+                return false;
+            }
         }
         true
     }
@@ -782,21 +782,17 @@ mod tests {
             expires_at_ms: None,
         };
 
-        assert!(
-            SessionFilter {
-                label: Some((String::from("project"), String::from("arky"))),
-                since: Some(20),
-                limit: None,
-            }
-            .matches(&metadata)
-        );
-        assert!(
-            !SessionFilter {
-                label: Some((String::from("project"), String::from("arky"))),
-                since: Some(21),
-                limit: None,
-            }
-            .matches(&metadata)
-        );
+        assert!(SessionFilter {
+            label: Some((String::from("project"), String::from("arky"))),
+            since: Some(20),
+            limit: None,
+        }
+        .matches(&metadata));
+        assert!(!SessionFilter {
+            label: Some((String::from("project"), String::from("arky"))),
+            since: Some(21),
+            limit: None,
+        }
+        .matches(&metadata));
     }
 }

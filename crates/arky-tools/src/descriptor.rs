@@ -173,8 +173,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        ParsedCanonicalToolName, ToolDescriptor, ToolOrigin, parse_canonical_tool_name,
-        validate_canonical_tool_name,
+        parse_canonical_tool_name, validate_canonical_tool_name, ParsedCanonicalToolName,
+        ToolDescriptor, ToolOrigin,
     };
     use arky_protocol::ProviderId;
 

@@ -22,17 +22,17 @@ pub fn validate_event_batch(
     operation: &'static str,
 ) -> Result<(), SessionError> {
     for event in events {
-        if let Some(event_session_id) = event.event.metadata().session_id.as_ref()
-            && event_session_id != session_id
-        {
-            return Err(SessionError::storage_failure(
-                format!(
-                    "event sequence {} belongs to session `{event_session_id}` instead of `{session_id}`",
-                    event.sequence
-                ),
-                Some(session_id.clone()),
-                operation,
-            ));
+        if let Some(event_session_id) = event.event.metadata().session_id.as_ref() {
+            if event_session_id != session_id {
+                return Err(SessionError::storage_failure(
+                    format!(
+                        "event sequence {} belongs to session `{event_session_id}` instead of `{session_id}`",
+                        event.sequence
+                    ),
+                    Some(session_id.clone()),
+                    operation,
+                ));
+            }
         }
     }
 

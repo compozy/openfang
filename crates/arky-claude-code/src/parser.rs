@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use arky_protocol::{InputTokenDetails, OutputTokenDetails, ToolContent, Usage};
 use arky_provider::ProviderError;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 /// Origin of a normalized Claude event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -946,7 +946,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
-    use super::{ClaudeEventParser, ClaudeNormalizedEvent, is_claude_truncation_error};
+    use super::{is_claude_truncation_error, ClaudeEventParser, ClaudeNormalizedEvent};
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

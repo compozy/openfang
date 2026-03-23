@@ -3,8 +3,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc, RwLock, Weak,
         atomic::{AtomicBool, Ordering},
+        Arc, RwLock, Weak,
     },
 };
 

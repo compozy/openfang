@@ -80,11 +80,12 @@ impl ProviderRegistry {
             return self.get(provider_id);
         }
 
-        if let Some(model) = model
-            && let Some(provider_id) = infer_provider_id(model)
-            && let Some(provider) = self.maybe_get(&provider_id)
-        {
-            return Ok(provider);
+        if let Some(model) = model {
+            if let Some(provider_id) = infer_provider_id(model) {
+                if let Some(provider) = self.maybe_get(&provider_id) {
+                    return Ok(provider);
+                }
+            }
         }
 
         let provider_ids = {
@@ -201,8 +202,8 @@ mod tests {
 
     use super::ProviderRegistry;
     use crate::{
-        Provider, ProviderCapabilities, ProviderDescriptor, ProviderError, ProviderEventStream,
-        ProviderFamily, ProviderRequest, infer_provider_id,
+        infer_provider_id, Provider, ProviderCapabilities, ProviderDescriptor, ProviderError,
+        ProviderEventStream, ProviderFamily, ProviderRequest,
     };
     use arky_protocol::ProviderId;
 

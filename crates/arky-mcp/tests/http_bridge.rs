@@ -132,8 +132,8 @@ async fn bridge_should_import_remote_tools_into_registry() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
-async fn bridge_server_should_proxy_imported_and_local_tools()
--> Result<(), Box<dyn std::error::Error>> {
+async fn bridge_server_should_proxy_imported_and_local_tools(
+) -> Result<(), Box<dyn std::error::Error>> {
     let origin_registry = Arc::new(ToolRegistry::new());
     origin_registry.register(PrefixTool::new("mcp/origin/echo", "Origin Echo", "origin"))?;
 
@@ -190,8 +190,8 @@ async fn bridge_server_should_proxy_imported_and_local_tools()
 }
 
 #[tokio::test]
-async fn bridge_drop_should_cleanup_imported_registrations()
--> Result<(), Box<dyn std::error::Error>> {
+async fn bridge_drop_should_cleanup_imported_registrations(
+) -> Result<(), Box<dyn std::error::Error>> {
     let origin_registry = Arc::new(ToolRegistry::new());
     origin_registry.register(PrefixTool::new("mcp/origin/echo", "Origin Echo", "origin"))?;
 
@@ -219,8 +219,8 @@ async fn bridge_drop_should_cleanup_imported_registrations()
 }
 
 #[tokio::test]
-async fn keepalive_should_mark_http_client_disconnected_after_server_shutdown()
--> Result<(), Box<dyn std::error::Error>> {
+async fn keepalive_should_mark_http_client_disconnected_after_server_shutdown(
+) -> Result<(), Box<dyn std::error::Error>> {
     let origin_registry = Arc::new(ToolRegistry::new());
     origin_registry.register(PrefixTool::new("mcp/origin/echo", "Origin Echo", "origin"))?;
 

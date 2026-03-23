@@ -13,20 +13,20 @@ use arky_tools::{Tool, ToolDescriptor, ToolError};
 use async_trait::async_trait;
 use axum::http::{HeaderName, HeaderValue};
 use rmcp::{
-    ServiceExt,
     model::{CallToolRequestParams, ClientRequest, PingRequest},
     service::{ClientInitializeError, Peer, RoleClient, ServiceError},
     transport::{
-        StreamableHttpClientTransport, TokioChildProcess,
-        streamable_http_client::StreamableHttpClientTransportConfig,
+        streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
+        TokioChildProcess,
     },
+    ServiceExt,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::{McpAuth, McpError, tool_descriptor_from_mcp, tool_result_from_mcp};
+use crate::{tool_descriptor_from_mcp, tool_result_from_mcp, McpAuth, McpError};
 
 #[derive(Debug, Clone)]
 struct ImportedToolDefinition {

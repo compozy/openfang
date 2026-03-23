@@ -3,9 +3,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arky_provider::ProviderError;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::{
-    sync::{Mutex, oneshot},
+    sync::{oneshot, Mutex},
     time::timeout,
 };
 
@@ -245,14 +245,14 @@ const fn approval_rejection(message: String) -> JsonRpcErrorObject {
 mod tests {
     use arky_provider::ProviderError;
     use pretty_assertions::assert_eq;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use tokio::{
-        io::{AsyncBufReadExt, BufReader, duplex},
+        io::{duplex, AsyncBufReadExt, BufReader},
         time::Duration,
     };
 
     use super::{
-        ApprovalDecision, ApprovalHandler, ApprovalMode, ApprovalRequest, approval_response,
+        approval_response, ApprovalDecision, ApprovalHandler, ApprovalMode, ApprovalRequest,
     };
     use crate::{JsonRpcId, RpcTransport, RpcTransportConfig};
 

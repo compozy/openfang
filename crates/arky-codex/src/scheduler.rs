@@ -124,8 +124,8 @@ mod tests {
     use arky_error::ClassifiedError;
     use pretty_assertions::assert_eq;
     use tokio::{
-        sync::{Barrier, oneshot},
-        time::{Duration, sleep},
+        sync::{oneshot, Barrier},
+        time::{sleep, Duration},
     };
 
     use super::Scheduler;

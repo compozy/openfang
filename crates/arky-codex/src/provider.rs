@@ -14,16 +14,16 @@ use arky_provider::{
     Provider, ProviderCapabilities, ProviderDescriptor, ProviderError, ProviderEventStream,
     ProviderFamily, ProviderRequest,
 };
-use arky_tools::{ToolIdCodec, create_codex_tool_id_codec};
+use arky_tools::{create_codex_tool_id_codec, ToolIdCodec};
 use async_stream::try_stream;
 use futures::StreamExt;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 
 use crate::{
-    CodexAppServer, CodexEventDispatcher, CodexModelDescriptor, CodexProviderConfig,
-    CodexServerLease, CodexServerRegistry, CodexStreamPipeline, CompactThreadParams,
-    NormalizedNotification, Scheduler, TextAccumulator, TurnStartParams, accumulator::ToolTracker,
+    accumulator::ToolTracker, CodexAppServer, CodexEventDispatcher, CodexModelDescriptor,
+    CodexProviderConfig, CodexServerLease, CodexServerRegistry, CodexStreamPipeline,
+    CompactThreadParams, NormalizedNotification, Scheduler, TextAccumulator, TurnStartParams,
 };
 
 /// Concrete `Provider` implementation backed by the Codex app-server.
@@ -614,7 +614,7 @@ impl StreamRuntime {
                 input,
                 parent_id,
             } => Ok(vec![
-                self.handle_tool_start(call_id, tool_name, input, parent_id),
+                self.handle_tool_start(call_id, tool_name, input, parent_id)
             ]),
             NormalizedNotification::ToolUpdate {
                 call_id,

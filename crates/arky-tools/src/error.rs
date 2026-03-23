@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use arky_error::ClassifiedError;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use thiserror::Error;
 
 /// Errors produced by the tool system.

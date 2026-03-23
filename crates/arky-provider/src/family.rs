@@ -76,7 +76,7 @@ pub fn resolve_provider_family(value: &str) -> ResolvedProviderFamily {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use super::{ResolvedProviderFamily, resolve_provider_family};
+    use super::{resolve_provider_family, ResolvedProviderFamily};
 
     #[test]
     fn resolve_provider_family_should_detect_gateway_models() {

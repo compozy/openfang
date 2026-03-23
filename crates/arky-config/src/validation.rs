@@ -177,7 +177,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
-    use super::{RichValidationSchema, validate_against_schema};
+    use super::{validate_against_schema, RichValidationSchema};
 
     #[test]
     fn validate_against_schema_should_report_field_level_errors() {
