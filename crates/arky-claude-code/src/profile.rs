@@ -789,6 +789,7 @@ const fn claude_compatible_capabilities() -> ProviderCapabilities {
         .with_tool_calls(true)
         .with_mcp_passthrough(true)
         .with_session_resume(true)
+        .with_extended_thinking(true)
 }
 
 #[cfg(test)]

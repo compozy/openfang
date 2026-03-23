@@ -602,7 +602,7 @@ pub fn compute_next_run_after(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Timelike};
+    use chrono::{Duration, TimeZone, Timelike};
     use openfang_types::scheduler::{CronAction, CronDelivery};
 
     /// Build a minimal valid `CronJob` with an `Every` schedule.
@@ -990,22 +990,24 @@ mod tests {
 
     #[test]
     fn test_compute_next_run_after_skips_current_second() {
-        // A "every 4 hours" cron: next_run should be >= 4 hours from now,
-        // not in the same minute (the bug from #55).
+        // When the caller is exactly on a firing boundary, the scheduler must
+        // skip that instant and advance to the next one instead of refiring
+        // immediately (the bug from #55).
         let schedule = CronSchedule::Cron {
             expr: "0 */4 * * *".into(),
             tz: None,
         };
-        let now = Utc::now();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 23, 4, 0, 0)
+            .single()
+            .expect("fixture timestamp should resolve");
         let next = compute_next_run_after(&schedule, now);
-        // Must be strictly after `now` and at least ~1 hour away
-        // (the closest 4-hourly boundary is at least minutes away).
-        assert!(next > now, "next_run should be strictly after now");
-        let diff = next - now;
-        assert!(
-            diff.num_minutes() >= 1,
-            "Expected next_run at least 1 min away, got {} seconds",
-            diff.num_seconds()
+
+        assert_eq!(
+            next,
+            Utc.with_ymd_and_hms(2026, 3, 23, 8, 0, 0)
+                .single()
+                .expect("fixture timestamp should resolve")
         );
     }
 

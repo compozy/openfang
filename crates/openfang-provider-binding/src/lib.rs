@@ -372,6 +372,7 @@ fn driver_capabilities(driver: &str) -> Result<ProviderCapabilities, CompileErro
             .with_tool_calls(true)
             .with_mcp_passthrough(true)
             .with_session_resume(true)
+            .with_extended_thinking(true)
             .with_steering(true)
             .with_follow_up(true)),
         DriverKind::ClaudeCode | DriverKind::ClaudeCompatible => Ok(ProviderCapabilities::new()
@@ -379,7 +380,8 @@ fn driver_capabilities(driver: &str) -> Result<ProviderCapabilities, CompileErro
             .with_generate(true)
             .with_tool_calls(true)
             .with_mcp_passthrough(true)
-            .with_session_resume(true)),
+            .with_session_resume(true)
+            .with_extended_thinking(true)),
     }
 }
 
@@ -497,46 +499,26 @@ mod tests {
     }
 
     #[test]
-    fn provider_binding_should_enforce_capability_mismatch_for_session_resume_on_codex() {
-        // The task text uses session resume as the example mismatch. The current
-        // Codex runtime descriptor advertises session-resume support, so this
-        // test follows the live contract and falls back to the current
-        // unsupported capability when session resume is available.
+    fn provider_binding_should_accept_reasoning_effort_for_codex() {
         let defaults = ProviderRequestDefaults {
             max_tokens: None,
             reasoning_effort: Some(ReasoningEffort::High),
         };
         let config = Some(resolved_codex_behavior(true));
-        let expected_capability = if driver_capabilities("codex")
-            .expect("codex capabilities should resolve")
-            .session_resume
-        {
-            "extended_thinking"
-        } else {
-            "session_resume"
-        };
 
-        let error = compile_provider_binding(resolved_config(
+        let binding = compile_provider_binding(resolved_config(
             "codex",
             Some("gpt-5"),
             None,
-            defaults,
+            defaults.clone(),
             config,
             BTreeMap::new(),
         ))
-        .expect_err("unsupported capability should fail");
+        .expect("codex should accept reasoning effort");
 
         assert_eq!(
-            error,
-            CompileError::CapabilityMismatch {
-                capability: expected_capability.to_owned(),
-                driver: "codex".to_owned(),
-                message: if expected_capability == "extended_thinking" {
-                    "reasoning effort is not supported by this provider".to_owned()
-                } else {
-                    "session resume is not supported by this provider".to_owned()
-                },
-            }
+            binding.defaults, defaults,
+            "capability validation should stay aligned with the live codex adapter",
         );
     }
 

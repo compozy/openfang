@@ -5,19 +5,20 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Public agent-definition schema and compile pipeline for Compozy"
 
 [dependencies]
-arky-claude-code = { version = "0.5.1", path = "../arky-claude-code" }
-arky-config = { version = "0.5.1", path = "../arky-config" }
-openfang-provider-binding = { version = "0.5.1", path = "../openfang-provider-binding" }
-openfang-types = { version = "0.5.1", path = "../openfang-types" }
+arky-claude-code.workspace = true
+arky-config.workspace = true
+openfang-provider-binding.workspace = true
+openfang-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-toml.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+toml.workspace = true

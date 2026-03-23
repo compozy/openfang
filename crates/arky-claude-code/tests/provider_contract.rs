@@ -48,7 +48,8 @@ async fn claude_provider_should_pass_shared_provider_contract_tests() {
                 .with_generate(true)
                 .with_tool_calls(true)
                 .with_mcp_passthrough(true)
-                .with_session_resume(true),
+                .with_session_resume(true)
+                .with_extended_thinking(true),
         ),
         expected_message: Message::assistant("done"),
         min_event_count: 5,

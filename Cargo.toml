@@ -42,6 +42,7 @@ openfang-memory = { path = "crates/openfang-memory" }
 openfang-runtime = { path = "crates/openfang-runtime" }
 openfang-wire = { path = "crates/openfang-wire" }
 openfang-provider-binding = { path = "crates/openfang-provider-binding" }
+openfang-agent-definition = { path = "crates/openfang-agent-definition" }
 openfang-api = { path = "crates/openfang-api" }
 openfang-kernel = { path = "crates/openfang-kernel" }
 openfang-cli = { path = "crates/openfang-cli" }

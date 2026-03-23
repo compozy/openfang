@@ -57,6 +57,7 @@ impl CodexProvider {
                     .with_tool_calls(true)
                     .with_mcp_passthrough(true)
                     .with_session_resume(true)
+                    .with_extended_thinking(true)
                     .with_steering(true)
                     .with_follow_up(true),
             ),
@@ -919,6 +920,7 @@ mod tests {
         assert_eq!(descriptor.capabilities.generate, true);
         assert_eq!(descriptor.capabilities.tool_calls, true);
         assert_eq!(descriptor.capabilities.session_resume, true);
+        assert_eq!(descriptor.capabilities.extended_thinking, true);
     }
 
     #[test]
