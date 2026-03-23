@@ -9,6 +9,7 @@ description = "Compiled provider binding layer for Compozy agent definitions"
 
 [dependencies]
 arky-claude-code.workspace = true
+arky-codex.workspace = true
 arky-config.workspace = true
 arky-error.workspace = true
 arky-protocol.workspace = true
@@ -16,12 +17,14 @@ arky-provider.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 arky-codex.workspace = true
 pretty_assertions.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

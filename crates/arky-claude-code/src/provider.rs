@@ -68,7 +68,9 @@ impl ClaudeCodeProvider {
         Self::with_profile_config(ClaudeProviderProfile::ClaudeCode, config)
     }
 
-    pub(crate) fn with_profile_config(
+    /// Creates a provider with an explicit compatible-provider profile plus base config.
+    #[must_use]
+    pub fn with_profile_config(
         profile: ClaudeProviderProfile,
         config: ClaudeCodeProviderConfig,
     ) -> Self {

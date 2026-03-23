@@ -3,6 +3,8 @@
 //! This crate owns the derived provider IR that sits between file-backed
 //! `agent_definition` documents and the Arky runtime registry.
 
+mod adapter;
+
 use std::collections::BTreeMap;
 
 use arky_claude_code::{ClaudeCompatibleProviderKind, CLAUDE_COMPATIBLE_PROVIDER_IDS};
@@ -19,6 +21,11 @@ use arky_provider::{validate_capabilities, ProviderCapabilities, ProviderRequest
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
+
+pub use crate::adapter::{
+    binding_to_claude_code_config, binding_to_claude_compatible_config, binding_to_codex_config,
+    build_provider_config, AdapterError, CompozyProviderConfig,
+};
 
 /// Runtime-safe compiled provider binding derived from layered config input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
