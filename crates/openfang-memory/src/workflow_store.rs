@@ -2,7 +2,7 @@
 
 use chrono::Utc;
 use openfang_types::error::OpenFangError;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
@@ -21,6 +21,10 @@ pub const WORKFLOW_SIGNAL_MIGRATION_SQL: &str =
 /// SQL for migration `0005_workflow_runtime_durability`.
 pub const WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL: &str =
     include_str!("../migrations/compozy/20260323_005_workflow_runtime_durability.sql");
+
+/// SQL for migration `0006_workflow_signal_waiting_state`.
+pub const WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL: &str =
+    include_str!("../migrations/compozy/20260323_006_workflow_signal_waiting_state.sql");
 
 /// Shared `compozy.db` repository handles.
 #[derive(Clone)]
@@ -52,6 +56,14 @@ impl WorkflowStoreSet {
     }
 }
 
+pub struct SubmittedSignalResume<'a> {
+    pub signal: &'a WorkflowSignalRecord,
+    pub received_checkpoint: &'a WorkflowCheckpointRecord,
+    pub consumed_checkpoint: &'a WorkflowCheckpointRecord,
+    pub resumed_checkpoint: &'a WorkflowCheckpointRecord,
+    pub consumed_at: &'a str,
+}
+
 /// Typed failures from the workflow repository layer.
 #[derive(Debug, Error)]
 pub enum WorkflowStoreError {
@@ -73,6 +85,16 @@ pub enum WorkflowStoreError {
     /// The requested workflow signal was already consumed.
     #[error("workflow signal '{signal_id}' was already consumed")]
     SignalAlreadyConsumed { signal_id: String },
+    /// A signal with the same idempotency key already exists for the run.
+    #[error(
+        "workflow signal for run '{run_id}' already exists for idempotency key '{idempotency_key}'"
+    )]
+    SignalAlreadyExistsForIdempotency {
+        /// Run identifier.
+        run_id: String,
+        /// Client-supplied idempotency key.
+        idempotency_key: String,
+    },
     /// A stored workflow status string was invalid.
     #[error("invalid workflow run status '{status}'")]
     InvalidRunStatus { status: String },
@@ -105,7 +127,7 @@ pub enum WorkflowRunStatus {
     /// The run is actively executing.
     Running,
     /// The run is durably parked on an external wait condition.
-    Waiting,
+    WaitingSignal,
     /// The run completed successfully.
     Completed,
     /// The run failed.
@@ -122,7 +144,7 @@ impl WorkflowRunStatus {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
-            Self::Waiting => "waiting",
+            Self::WaitingSignal => "waiting_signal",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -134,7 +156,7 @@ impl WorkflowRunStatus {
         match value {
             "pending" => Ok(Self::Pending),
             "running" => Ok(Self::Running),
-            "waiting" => Ok(Self::Waiting),
+            "waiting" | "waiting_signal" => Ok(Self::WaitingSignal),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
@@ -182,6 +204,10 @@ pub enum CheckpointKind {
     StepSkipped,
     /// A durable signal was received and consumed.
     SignalReceived,
+    /// A durable signal was consumed for workflow progression.
+    SignalConsumed,
+    /// A waiting run resumed because a signal was accepted.
+    RunResumedFromSignal,
     /// The run completed successfully.
     RunCompleted,
     /// The run failed.
@@ -213,6 +239,8 @@ impl CheckpointKind {
             Self::StepFailed => "step_failed",
             Self::StepSkipped => "step_skipped",
             Self::SignalReceived => "signal_received",
+            Self::SignalConsumed => "signal_consumed",
+            Self::RunResumedFromSignal => "run_resumed_from_signal",
             Self::RunCompleted => "run_completed",
             Self::RunFailed => "run_failed",
             Self::RunCancelled => "run_cancelled",
@@ -234,6 +262,8 @@ impl CheckpointKind {
             "step_failed" => Ok(Self::StepFailed),
             "step_skipped" => Ok(Self::StepSkipped),
             "signal_received" => Ok(Self::SignalReceived),
+            "signal_consumed" => Ok(Self::SignalConsumed),
+            "run_resumed_from_signal" => Ok(Self::RunResumedFromSignal),
             "run_completed" => Ok(Self::RunCompleted),
             "run_failed" => Ok(Self::RunFailed),
             "run_cancelled" => Ok(Self::RunCancelled),
@@ -333,6 +363,8 @@ pub struct WorkflowSignalRecord {
     pub payload_json: String,
     /// Signal source, such as `api`, `trigger`, or `schedule`.
     pub source: String,
+    /// Client-supplied idempotency key scoped to the run.
+    pub idempotency_key: String,
     /// Whether the signal was consumed.
     pub consumed: bool,
     /// Creation timestamp.
@@ -491,7 +523,7 @@ impl WorkflowRunRepository {
                 updated_at,
                 completed_at
              FROM workflow_run
-             WHERE status IN ('pending', 'running', 'waiting')
+             WHERE status IN ('pending', 'running', 'waiting_signal')
              ORDER BY updated_at ASC, run_id ASC",
         )?;
         let rows = stmt.query_map([], read_workflow_run_row)?;
@@ -527,20 +559,70 @@ impl WorkflowRunRepository {
         Ok(())
     }
 
-    /// Append a checkpoint, mark a signal consumed, and then replace the
-    /// durable run row inside one SQLite transaction.
+    /// Insert an unconsumed signal row and append a `signal_received`
+    /// checkpoint inside one SQLite transaction.
+    pub fn persist_signal_submission(
+        &self,
+        signal: &WorkflowSignalRecord,
+        received_checkpoint: &WorkflowCheckpointRecord,
+    ) -> Result<(), WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        let transaction = conn.unchecked_transaction()?;
+        insert_signal_row(&transaction, signal)?;
+        insert_checkpoint(&transaction, received_checkpoint)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Insert, consume, and resume from a just-submitted signal inside one
+    /// SQLite transaction.
+    pub fn persist_signal_submission_and_resume(
+        &self,
+        current: &WorkflowRunRecord,
+        next: &WorkflowRunRecord,
+        submitted_signal: SubmittedSignalResume<'_>,
+    ) -> Result<(), WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        let transaction = conn.unchecked_transaction()?;
+        insert_signal_row(&transaction, submitted_signal.signal)?;
+        insert_checkpoint(&transaction, submitted_signal.received_checkpoint)?;
+        consume_signal_row(
+            &transaction,
+            &submitted_signal.signal.signal_id,
+            submitted_signal.consumed_at,
+        )?;
+        insert_checkpoint(&transaction, submitted_signal.consumed_checkpoint)?;
+        insert_checkpoint(&transaction, submitted_signal.resumed_checkpoint)?;
+        let rows = update_workflow_run_record(&transaction, next, Some(current.status))?;
+
+        if rows == 0 {
+            return Err(resolve_update_conflict(
+                &transaction,
+                &current.run_id,
+                Some(current.status),
+            ));
+        }
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Mark a pre-existing signal consumed and resume the run inside one SQLite
+    /// transaction.
     pub fn persist_signal_resume(
         &self,
         current: &WorkflowRunRecord,
         next: &WorkflowRunRecord,
-        checkpoint: &WorkflowCheckpointRecord,
+        consumed_checkpoint: &WorkflowCheckpointRecord,
+        resumed_checkpoint: &WorkflowCheckpointRecord,
         signal_id: &str,
         consumed_at: &str,
     ) -> Result<(), WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
         let transaction = conn.unchecked_transaction()?;
-        insert_checkpoint(&transaction, checkpoint)?;
         consume_signal_row(&transaction, signal_id, consumed_at)?;
+        insert_checkpoint(&transaction, consumed_checkpoint)?;
+        insert_checkpoint(&transaction, resumed_checkpoint)?;
         let rows = update_workflow_run_record(&transaction, next, Some(current.status))?;
 
         if rows == 0 {
@@ -599,28 +681,7 @@ impl WorkflowSignalRepository {
     /// Insert a durable signal row.
     pub fn insert(&self, signal: &WorkflowSignalRecord) -> Result<(), WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
-        conn.execute(
-            "INSERT INTO workflow_signal (
-                signal_id,
-                run_id,
-                name,
-                payload_json,
-                source,
-                consumed,
-                created_at,
-                consumed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                signal.signal_id.as_str(),
-                signal.run_id.as_str(),
-                signal.name.as_str(),
-                signal.payload_json.as_str(),
-                signal.source.as_str(),
-                bool_to_sql(signal.consumed),
-                signal.created_at.as_str(),
-                signal.consumed_at.as_deref(),
-            ],
-        )?;
+        insert_signal_row(&conn, signal)?;
         Ok(())
     }
 
@@ -631,7 +692,7 @@ impl WorkflowSignalRepository {
     ) -> Result<Option<WorkflowSignalRecord>, WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
         conn.query_row(
-            "SELECT signal_id, run_id, name, payload_json, source, consumed, created_at, consumed_at
+            "SELECT signal_id, run_id, name, payload_json, source, idempotency_key, consumed, created_at, consumed_at
              FROM workflow_signal
              WHERE signal_id = ?1",
             [signal_id],
@@ -648,24 +709,48 @@ impl WorkflowSignalRepository {
         consumed: Option<bool>,
     ) -> Result<Vec<WorkflowSignalRecord>, WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT signal_id, run_id, name, payload_json, source, consumed, created_at, consumed_at
-             FROM workflow_signal
-             WHERE run_id = ?1
-             ORDER BY created_at ASC, signal_id ASC",
-        )?;
-        let rows = stmt.query_map([run_id], read_workflow_signal_row)?;
         let mut records = Vec::new();
-        for row in rows {
-            let record = row?;
-            if consumed
-                .map(|expected| record.consumed == expected)
-                .unwrap_or(true)
-            {
-                records.push(record);
+        match consumed {
+            Some(consumed) => {
+                let mut stmt = conn.prepare(
+                    "SELECT signal_id, run_id, name, payload_json, source, idempotency_key, consumed, created_at, consumed_at
+                     FROM workflow_signal
+                     WHERE run_id = ?1
+                       AND consumed = ?2
+                     ORDER BY created_at ASC, signal_id ASC",
+                )?;
+                let rows = stmt.query_map(
+                    params![run_id, bool_to_sql(consumed)],
+                    read_workflow_signal_row,
+                )?;
+                for row in rows {
+                    records.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT signal_id, run_id, name, payload_json, source, idempotency_key, consumed, created_at, consumed_at
+                     FROM workflow_signal
+                     WHERE run_id = ?1
+                     ORDER BY created_at ASC, signal_id ASC",
+                )?;
+                let rows = stmt.query_map([run_id], read_workflow_signal_row)?;
+                for row in rows {
+                    records.push(row?);
+                }
             }
         }
         Ok(records)
+    }
+
+    /// Load a signal by `(run_id, idempotency_key)`.
+    pub fn find_by_idempotency_key(
+        &self,
+        run_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<WorkflowSignalRecord>, WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        find_signal_by_idempotency_key(&conn, run_id, idempotency_key)
     }
 
     /// Return the first unconsumed signal matching the run and name.
@@ -676,7 +761,7 @@ impl WorkflowSignalRepository {
     ) -> Result<Option<WorkflowSignalRecord>, WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
         conn.query_row(
-            "SELECT signal_id, run_id, name, payload_json, source, consumed, created_at, consumed_at
+            "SELECT signal_id, run_id, name, payload_json, source, idempotency_key, consumed, created_at, consumed_at
              FROM workflow_signal
              WHERE run_id = ?1
                AND name = ?2
@@ -695,6 +780,70 @@ impl WorkflowSignalRepository {
         let conn = lock_conn(&self.conn)?;
         consume_signal_row(&conn, signal_id, consumed_at)
     }
+}
+
+fn insert_signal_row(
+    conn: &Connection,
+    signal: &WorkflowSignalRecord,
+) -> Result<(), WorkflowStoreError> {
+    match conn.execute(
+        "INSERT INTO workflow_signal (
+            signal_id,
+            run_id,
+            name,
+            payload_json,
+            source,
+            idempotency_key,
+            consumed,
+            created_at,
+            consumed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            signal.signal_id.as_str(),
+            signal.run_id.as_str(),
+            signal.name.as_str(),
+            signal.payload_json.as_str(),
+            signal.source.as_str(),
+            signal.idempotency_key.as_str(),
+            bool_to_sql(signal.consumed),
+            signal.created_at.as_str(),
+            signal.consumed_at.as_deref(),
+        ],
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) if is_unique_constraint(&error) => {
+            Err(WorkflowStoreError::SignalAlreadyExistsForIdempotency {
+                run_id: signal.run_id.clone(),
+                idempotency_key: signal.idempotency_key.clone(),
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn find_signal_by_idempotency_key(
+    conn: &Connection,
+    run_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<WorkflowSignalRecord>, WorkflowStoreError> {
+    conn.query_row(
+        "SELECT signal_id, run_id, name, payload_json, source, idempotency_key, consumed, created_at, consumed_at
+         FROM workflow_signal
+         WHERE run_id = ?1
+           AND idempotency_key = ?2",
+        params![run_id, idempotency_key],
+        read_workflow_signal_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn is_unique_constraint(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(inner.code, ErrorCode::ConstraintViolation)
+    )
 }
 
 fn lock_conn(
@@ -1055,9 +1204,10 @@ fn read_workflow_signal_row(
         name: row.get(2)?,
         payload_json: row.get(3)?,
         source: row.get(4)?,
-        consumed: sql_to_bool(row.get::<_, i64>(5)?),
-        created_at: row.get(6)?,
-        consumed_at: row.get(7)?,
+        idempotency_key: row.get(5)?,
+        consumed: sql_to_bool(row.get::<_, i64>(6)?),
+        created_at: row.get(7)?,
+        consumed_at: row.get(8)?,
     })
 }
 
@@ -1097,6 +1247,8 @@ mod tests {
             .expect("apply workflow_signal schema");
         conn.execute_batch(WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL)
             .expect("apply workflow runtime durability migration");
+        conn.execute_batch(WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL)
+            .expect("apply workflow signal waiting-state migration");
         Arc::new(Mutex::new(conn))
     }
 
@@ -1215,7 +1367,7 @@ mod tests {
 
         running.status = WorkflowRunStatus::Running;
         running.updated_at = "2026-03-23T12:01:00Z".to_string();
-        waiting.status = WorkflowRunStatus::Waiting;
+        waiting.status = WorkflowRunStatus::WaitingSignal;
         waiting.waiting_kind = Some("signal".to_string());
         waiting.waiting_ref = Some("artifact-approved".to_string());
         waiting.updated_at = "2026-03-23T12:02:00Z".to_string();
@@ -1250,27 +1402,18 @@ mod tests {
     }
 
     #[test]
-    fn workflow_signal_repository_should_insert_list_and_consume_signals() {
+    fn signal_insert_persists_payload_and_source() {
         let stores = WorkflowStoreSet::new(compozy_conn());
         let run = sample_run_record("run-signal");
-        let first_signal = WorkflowSignalRecord {
+        let signal = WorkflowSignalRecord {
             signal_id: "signal-one".to_string(),
             run_id: run.run_id.clone(),
             name: "approval".to_string(),
             payload_json: "{\"answer\":\"yes\"}".to_string(),
-            source: "api".to_string(),
+            source: "trigger".to_string(),
+            idempotency_key: "idem-trigger".to_string(),
             consumed: false,
             created_at: "2026-03-23T12:05:00Z".to_string(),
-            consumed_at: None,
-        };
-        let second_signal = WorkflowSignalRecord {
-            signal_id: "signal-two".to_string(),
-            run_id: run.run_id.clone(),
-            name: "approval".to_string(),
-            payload_json: "{\"answer\":\"no\"}".to_string(),
-            source: "api".to_string(),
-            consumed: false,
-            created_at: "2026-03-23T12:06:00Z".to_string(),
             consumed_at: None,
         };
 
@@ -1280,68 +1423,286 @@ mod tests {
             .expect("insert workflow run");
         stores
             .workflow_signal
-            .insert(&first_signal)
+            .insert(&signal)
+            .expect("insert durable signal");
+
+        let loaded = stores
+            .workflow_signal
+            .find_by_id(&signal.signal_id)
+            .expect("load signal")
+            .expect("signal should exist");
+
+        assert_eq!(loaded.name, signal.name);
+        assert_eq!(loaded.payload_json, signal.payload_json);
+        assert_eq!(loaded.source, "trigger");
+        assert_eq!(loaded.idempotency_key, "idem-trigger");
+        assert!(!loaded.consumed);
+        assert_eq!(loaded.consumed_at, None);
+    }
+
+    #[test]
+    fn signal_idempotency_key_prevents_duplicate() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let run = sample_run_record("run-idempotent");
+        let signal = WorkflowSignalRecord {
+            signal_id: "signal-idempotent".to_string(),
+            run_id: run.run_id.clone(),
+            name: "approval".to_string(),
+            payload_json: "{\"decision\":\"approved\"}".to_string(),
+            source: "api".to_string(),
+            idempotency_key: "same-key".to_string(),
+            consumed: false,
+            created_at: "2026-03-23T12:08:00Z".to_string(),
+            consumed_at: None,
+        };
+
+        stores
+            .workflow_run
+            .insert_run(&run)
+            .expect("insert workflow run");
+        stores
+            .workflow_signal
+            .insert(&signal)
+            .expect("insert signal");
+        let duplicate = stores
+            .workflow_signal
+            .insert(&WorkflowSignalRecord {
+                signal_id: "signal-idempotent-duplicate".to_string(),
+                run_id: run.run_id.clone(),
+                idempotency_key: "same-key".to_string(),
+                ..signal.clone()
+            })
+            .expect_err("duplicate idempotency key should be rejected");
+
+        assert!(matches!(
+            duplicate,
+            WorkflowStoreError::SignalAlreadyExistsForIdempotency { .. }
+        ));
+        let existing = stores
+            .workflow_signal
+            .find_by_idempotency_key(&run.run_id, "same-key")
+            .expect("lookup by idempotency key should succeed")
+            .expect("signal should exist");
+        let stored = stores
+            .workflow_signal
+            .list_for_run(&run.run_id, None)
+            .expect("list signals should succeed");
+
+        assert_eq!(existing.signal_id, signal.signal_id);
+        assert_eq!(stored, vec![signal]);
+    }
+
+    #[test]
+    fn list_signals_returns_only_for_requested_run() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let first_run = sample_run_record("run-first");
+        let second_run = sample_run_record("run-second");
+        stores
+            .workflow_run
+            .insert_run(&first_run)
+            .expect("insert first run");
+        stores
+            .workflow_run
+            .insert_run(&second_run)
+            .expect("insert second run");
+        stores
+            .workflow_signal
+            .insert(&WorkflowSignalRecord {
+                signal_id: "signal-first".to_string(),
+                run_id: first_run.run_id.clone(),
+                name: "approval".to_string(),
+                payload_json: "{\"answer\":\"yes\"}".to_string(),
+                source: "schedule".to_string(),
+                idempotency_key: "idem-first".to_string(),
+                consumed: false,
+                created_at: "2026-03-23T12:09:00Z".to_string(),
+                consumed_at: None,
+            })
             .expect("insert first signal");
         stores
             .workflow_signal
-            .insert(&second_signal)
+            .insert(&WorkflowSignalRecord {
+                signal_id: "signal-second".to_string(),
+                run_id: second_run.run_id.clone(),
+                name: "approval".to_string(),
+                payload_json: "{\"answer\":\"no\"}".to_string(),
+                source: "api".to_string(),
+                idempotency_key: "idem-second".to_string(),
+                consumed: false,
+                created_at: "2026-03-23T12:09:30Z".to_string(),
+                consumed_at: None,
+            })
             .expect("insert second signal");
+
+        let listed = stores
+            .workflow_signal
+            .list_for_run(&first_run.run_id, None)
+            .expect("list signals should succeed");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].run_id, first_run.run_id);
+        assert_eq!(listed[0].source, "schedule");
+    }
+
+    #[test]
+    fn list_signals_consumed_filter_works() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let run = sample_run_record("run-consumed-filter");
+        let consumed_signal = WorkflowSignalRecord {
+            signal_id: "signal-consumed".to_string(),
+            run_id: run.run_id.clone(),
+            name: "approval".to_string(),
+            payload_json: "{\"answer\":\"yes\"}".to_string(),
+            source: "api".to_string(),
+            idempotency_key: "idem-consumed".to_string(),
+            consumed: false,
+            created_at: "2026-03-23T12:10:00Z".to_string(),
+            consumed_at: None,
+        };
+        let unconsumed_signal = WorkflowSignalRecord {
+            signal_id: "signal-unconsumed".to_string(),
+            run_id: run.run_id.clone(),
+            name: "approval".to_string(),
+            payload_json: "{\"answer\":\"no\"}".to_string(),
+            source: "schedule".to_string(),
+            idempotency_key: "idem-unconsumed".to_string(),
+            consumed: false,
+            created_at: "2026-03-23T12:10:30Z".to_string(),
+            consumed_at: None,
+        };
+
+        stores
+            .workflow_run
+            .insert_run(&run)
+            .expect("insert workflow run");
         stores
             .workflow_signal
-            .consume(&first_signal.signal_id, "2026-03-23T12:07:00Z")
-            .expect("consume first signal");
+            .insert(&consumed_signal)
+            .expect("insert consumed candidate");
+        stores
+            .workflow_signal
+            .insert(&unconsumed_signal)
+            .expect("insert unconsumed candidate");
+        stores
+            .workflow_signal
+            .consume(&consumed_signal.signal_id, "2026-03-23T12:11:00Z")
+            .expect("consume signal");
 
+        let consumed = stores
+            .workflow_signal
+            .list_for_run(&run.run_id, Some(true))
+            .expect("list consumed signals");
         let unconsumed = stores
             .workflow_signal
             .list_for_run(&run.run_id, Some(false))
             .expect("list unconsumed signals");
-        let consumed = stores
-            .workflow_signal
-            .find_by_id(&first_signal.signal_id)
-            .expect("load consumed signal")
-            .expect("signal should exist");
 
-        assert_eq!(unconsumed, vec![second_signal]);
-        assert!(consumed.consumed);
-        assert_eq!(
-            consumed.consumed_at.as_deref(),
-            Some("2026-03-23T12:07:00Z")
-        );
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].signal_id, consumed_signal.signal_id);
+        assert_eq!(unconsumed.len(), 1);
+        assert_eq!(unconsumed[0].signal_id, unconsumed_signal.signal_id);
+        assert_eq!(unconsumed[0].source, "schedule");
     }
 
     #[test]
-    fn workflow_run_repository_should_consume_signal_when_persisting_resume_transition() {
-        let stores = WorkflowStoreSet::new(compozy_conn());
-        let mut current = sample_run_record("run-resume");
-        current.status = WorkflowRunStatus::Waiting;
+    fn signal_consumption_is_transactional() {
+        let conn = compozy_conn();
+        let stores = WorkflowStoreSet::new(Arc::clone(&conn));
+        let mut current = sample_run_record("run-transactional");
+        current.status = WorkflowRunStatus::WaitingSignal;
         current.current_step_id = Some("await-approval".to_string());
         current.waiting_kind = Some("signal".to_string());
         current.waiting_ref = Some("approval".to_string());
-        current.updated_at = "2026-03-23T12:08:00Z".to_string();
+        let signal = WorkflowSignalRecord {
+            signal_id: "signal-transactional".to_string(),
+            run_id: current.run_id.clone(),
+            name: "approval".to_string(),
+            payload_json: "{\"decision\":\"approved\"}".to_string(),
+            source: "api".to_string(),
+            idempotency_key: "idem-transactional".to_string(),
+            consumed: false,
+            created_at: "2026-03-23T12:11:00Z".to_string(),
+            consumed_at: None,
+        };
+
+        stores
+            .workflow_run
+            .insert_run(&current)
+            .expect("insert waiting run");
+        stores
+            .workflow_signal
+            .insert(&signal)
+            .expect("insert signal");
+
+        let guard = conn.lock().expect("lock connection");
+        let transaction = guard.unchecked_transaction().expect("open transaction");
+        consume_signal_row(&transaction, &signal.signal_id, "2026-03-23T12:12:00Z")
+            .expect("consume signal inside transaction");
+        drop(transaction);
+        drop(guard);
+
+        let loaded_run = stores
+            .workflow_run
+            .find_by_id(&current.run_id)
+            .expect("load run")
+            .expect("run should exist");
+        let loaded_signal = stores
+            .workflow_signal
+            .find_by_id(&signal.signal_id)
+            .expect("load signal")
+            .expect("signal should exist");
+
+        assert_eq!(loaded_run.waiting_kind.as_deref(), Some("signal"));
+        assert!(!loaded_signal.consumed);
+        assert_eq!(loaded_signal.consumed_at, None);
+    }
+
+    #[test]
+    fn consumed_flag_and_timestamp_update_atomically() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let mut current = sample_run_record("run-resume");
+        current.status = WorkflowRunStatus::WaitingSignal;
+        current.current_step_id = Some("await-approval".to_string());
+        current.waiting_kind = Some("signal".to_string());
+        current.waiting_ref = Some("approval".to_string());
+        current.updated_at = "2026-03-23T12:12:00Z".to_string();
         let signal = WorkflowSignalRecord {
             signal_id: "signal-resume".to_string(),
             run_id: current.run_id.clone(),
             name: "approval".to_string(),
             payload_json: "{\"decision\":\"approved\"}".to_string(),
             source: "api".to_string(),
+            idempotency_key: "idem-resume".to_string(),
             consumed: false,
-            created_at: "2026-03-23T12:08:30Z".to_string(),
+            created_at: "2026-03-23T12:12:30Z".to_string(),
             consumed_at: None,
         };
         let mut next = current.clone();
         next.status = WorkflowRunStatus::Running;
+        next.current_step_id = Some("after-approval".to_string());
         next.waiting_kind = None;
         next.waiting_ref = None;
-        next.updated_at = "2026-03-23T12:09:00Z".to_string();
-        let checkpoint = WorkflowCheckpointRecord {
-            checkpoint_id: "chk-run-resume".to_string(),
+        next.updated_at = "2026-03-23T12:13:00Z".to_string();
+        let consumed_checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: "chk-signal-consumed".to_string(),
             run_id: current.run_id.clone(),
             step_id: Some("await-approval".to_string()),
-            kind: CheckpointKind::SignalReceived,
+            kind: CheckpointKind::SignalConsumed,
             data_json: serde_json::json!({
                 "signal_id": signal.signal_id,
                 "signal_name": signal.name,
-                "payload_summary": "approved",
+            })
+            .to_string(),
+            created_at: next.updated_at.clone(),
+        };
+        let resumed_checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: "chk-run-resumed".to_string(),
+            run_id: current.run_id.clone(),
+            step_id: Some("await-approval".to_string()),
+            kind: CheckpointKind::RunResumedFromSignal,
+            data_json: serde_json::json!({
+                "signal_id": signal.signal_id,
+                "signal_name": signal.name,
             })
             .to_string(),
             created_at: next.updated_at.clone(),
@@ -1360,7 +1721,8 @@ mod tests {
             .persist_signal_resume(
                 &current,
                 &next,
-                &checkpoint,
+                &consumed_checkpoint,
+                &resumed_checkpoint,
                 &signal.signal_id,
                 &next.updated_at,
             )
@@ -1383,12 +1745,15 @@ mod tests {
 
         assert_eq!(loaded_run.status, WorkflowRunStatus::Running);
         assert_eq!(loaded_run.waiting_kind, None);
+        assert_eq!(loaded_run.waiting_ref, None);
         assert!(loaded_signal.consumed);
         assert_eq!(
             loaded_signal.consumed_at.as_deref(),
             Some(next.updated_at.as_str())
         );
-        assert_eq!(checkpoints, vec![checkpoint]);
+        assert_eq!(checkpoints.len(), 2);
+        assert!(checkpoints.contains(&consumed_checkpoint));
+        assert!(checkpoints.contains(&resumed_checkpoint));
     }
 
     #[test]

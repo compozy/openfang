@@ -7,7 +7,7 @@ use openfang_memory::{
     AGENT_RUNTIME_CORE_MIGRATION_SQL, AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL,
     SCHEDULE_RUNTIME_CORE_MIGRATION_SQL, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
     WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
-    WORKFLOW_SIGNAL_MIGRATION_SQL,
+    WORKFLOW_SIGNAL_MIGRATION_SQL, WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
@@ -152,6 +152,11 @@ const COMPOZY_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[
         5,
         "0005_workflow_runtime_durability",
         WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
+    ),
+    MigrationStep::new(
+        6,
+        "0006_workflow_signal_waiting_state",
+        WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
     ),
 ];
 
@@ -648,6 +653,7 @@ mod tests {
                 "name".to_string(),
                 "payload_json".to_string(),
                 "source".to_string(),
+                "idempotency_key".to_string(),
                 "consumed".to_string(),
                 "created_at".to_string(),
                 "consumed_at".to_string(),
@@ -668,6 +674,7 @@ mod tests {
             "idx_workflow_signal_run",
             "idx_workflow_signal_run_consumed",
             "idx_workflow_signal_run_name",
+            "idx_workflow_signal_run_idempotency",
         ] {
             assert!(
                 index_exists(&conn, index_name),

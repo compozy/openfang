@@ -8,7 +8,7 @@ use axum::Json;
 use dashmap::DashMap;
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
-    ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
+    ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowRunId, WorkflowStep,
 };
 use openfang_kernel::workflow_compiler::{
     compile_workflow_definition, normalize_workflow_definition, validate_normalized_workflow,
@@ -16,7 +16,7 @@ use openfang_kernel::workflow_compiler::{
 };
 use openfang_kernel::OpenFangKernel;
 use openfang_memory::AgentRuntimeRecord;
-use openfang_memory::{WorkflowRunListQuery, WorkflowRunStatus};
+use openfang_memory::{WorkflowRunListQuery, WorkflowRunStatus, WorkflowSignalRecord};
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
@@ -36,6 +36,12 @@ pub struct RunListQueryParams {
     pub label: Option<String>,
     #[serde(default, rename = "q")]
     pub search: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct RunSignalListQueryParams {
+    #[serde(default)]
+    pub consumed: Option<bool>,
 }
 
 fn parse_run_status_param(
@@ -125,6 +131,21 @@ fn checkpoint_record_to_json(
         "kind": record.kind.as_str(),
         "data": parse_json_text_field(&record.data_json)?,
         "created_at": record.created_at,
+    }))
+}
+
+fn signal_record_to_json(
+    record: &WorkflowSignalRecord,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    Ok(serde_json::json!({
+        "id": record.signal_id,
+        "run_id": record.run_id,
+        "name": record.name,
+        "payload": parse_json_text_field(&record.payload_json)?,
+        "source": record.source,
+        "consumed": record.consumed,
+        "created_at": record.created_at,
+        "consumed_at": record.consumed_at,
     }))
 }
 
@@ -1573,6 +1594,179 @@ pub async fn get_run_checkpoints_v1(
                     "error": {
                         "code": "checkpoint_list_failed",
                         "message": "Failed to load run checkpoints",
+                        "details": [],
+                    }
+                })),
+            )
+        }
+    }
+}
+
+/// GET /api/v1/runs/{id}/signals — List durable signals for one run.
+pub async fn get_run_signals_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<RunSignalListQueryParams>,
+) -> impl IntoResponse {
+    match state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "not_found",
+                        "message": "Run not found",
+                        "details": [],
+                    }
+                })),
+            );
+        }
+        Err(error) => {
+            tracing::warn!("Failed to load durable run {id} before listing signals: {error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "run_load_failed",
+                        "message": "Failed to load run",
+                        "details": [],
+                    }
+                })),
+            );
+        }
+    }
+
+    match state
+        .kernel
+        .workflow_stores
+        .workflow_signal
+        .list_for_run(&id, params.consumed)
+    {
+        Ok(records) => {
+            let mut items = Vec::with_capacity(records.len());
+            for record in &records {
+                let item = match signal_record_to_json(record) {
+                    Ok(item) => item,
+                    Err(response) => return response,
+                };
+                items.push(item);
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "items": items,
+                    "next_cursor": serde_json::Value::Null,
+                })),
+            )
+        }
+        Err(error) => {
+            tracing::warn!("Failed to list signals for run {id}: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "signal_list_failed",
+                        "message": "Failed to list run signals",
+                        "details": [],
+                    }
+                })),
+            )
+        }
+    }
+}
+
+/// POST /api/v1/runs/{id}/signals — Submit a durable signal for one run.
+pub async fn post_run_signal_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<RunSignalSubmitRequest>,
+) -> impl IntoResponse {
+    if req.name.trim().is_empty()
+        || req.source.trim().is_empty()
+        || req.idempotency_key.trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "invalid_signal_request",
+                    "message": "`name`, `source`, and `idempotency_key` are required",
+                    "details": [],
+                }
+            })),
+        );
+    }
+
+    let run_id = WorkflowRunId(match id.parse() {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "invalid_run_id",
+                        "message": "Invalid run ID",
+                        "details": [],
+                    }
+                })),
+            );
+        }
+    });
+
+    match state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "not_found",
+                        "message": "Run not found",
+                        "details": [],
+                    }
+                })),
+            );
+        }
+        Err(error) => {
+            tracing::warn!("Failed to load durable run {id} before signal submit: {error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "run_load_failed",
+                        "message": "Failed to load run",
+                        "details": [],
+                    }
+                })),
+            );
+        }
+    }
+
+    match state
+        .kernel
+        .submit_run_signal(
+            run_id,
+            req.name,
+            req.payload,
+            req.source,
+            req.idempotency_key,
+        )
+        .await
+    {
+        Ok(signal) => match signal_record_to_json(&signal) {
+            Ok(body) => (StatusCode::OK, Json(body)),
+            Err(response) => response,
+        },
+        Err(error) => {
+            tracing::warn!("Failed to submit signal for run {id}: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "signal_submit_failed",
+                        "message": "Failed to submit run signal",
                         "details": [],
                     }
                 })),

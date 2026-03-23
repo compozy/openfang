@@ -19,7 +19,8 @@ use crate::workflow::{
 };
 
 use openfang_memory::{
-    AgentRuntimeRecord, AgentSessionRecord, MemorySubstrate, RuntimeStoreSet, WorkflowStoreSet,
+    AgentRuntimeRecord, AgentSessionRecord, MemorySubstrate, RuntimeStoreSet, WorkflowSignalRecord,
+    WorkflowStoreSet,
 };
 use openfang_runtime::agent_loop::{
     run_agent_loop, run_agent_loop_streaming, strip_provider_prefix, AgentLoopResult,
@@ -4098,6 +4099,74 @@ impl OpenFangKernel {
             .await
     }
 
+    async fn resume_workflow_signal_context(
+        &self,
+        resume: crate::workflow::SignalResumeContext,
+    ) -> KernelResult<()> {
+        let resolver = |agent_ref: &str| -> Option<(AgentId, String)> {
+            if let Ok(agent_id) = agent_ref.parse::<AgentId>() {
+                let entry = self.registry.get(agent_id)?;
+                return Some((agent_id, entry.name.clone()));
+            }
+
+            let entry = self.registry.find_by_name(agent_ref)?;
+            Some((entry.id, entry.name.clone()))
+        };
+
+        let send_message = |agent_id: AgentId, message: String| async move {
+            self.send_message(agent_id, &message)
+                .await
+                .map(|result| {
+                    (
+                        result.response,
+                        result.total_usage.input_tokens,
+                        result.total_usage.output_tokens,
+                    )
+                })
+                .map_err(|error| error.to_string())
+        };
+
+        self.workflows
+            .resume_after_signal(resume, resolver, send_message)
+            .await
+            .map_err(|error| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Workflow signal resume failed: {error}"
+                )))
+            })
+    }
+
+    pub async fn submit_run_signal(
+        self: &Arc<Self>,
+        run_id: WorkflowRunId,
+        name: String,
+        payload: serde_json::Value,
+        source: String,
+        idempotency_key: String,
+    ) -> KernelResult<WorkflowSignalRecord> {
+        let outcome = self
+            .workflows
+            .submit_signal(run_id, name, payload, source, idempotency_key)
+            .await
+            .map_err(|error| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Workflow signal submission failed: {error}"
+                )))
+            })?;
+
+        let signal = outcome.signal.clone();
+        if let Some(resume) = outcome.resume {
+            let kernel = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(error) = kernel.resume_workflow_signal_context(resume).await {
+                    warn!("Failed to resume workflow after signal delivery: {error}");
+                }
+            });
+        }
+
+        Ok(signal)
+    }
+
     fn workflows_dir(&self) -> PathBuf {
         self.config
             .workflows_dir
@@ -7148,7 +7217,7 @@ mod tests {
         let compozy_rows = schema_migration_rows(&compozy_db);
 
         assert_eq!(runtime_rows.len(), 4);
-        assert_eq!(compozy_rows.len(), 5);
+        assert_eq!(compozy_rows.len(), 6);
         assert_eq!(runtime_rows[0].0, 1);
         assert_eq!(compozy_rows[0].0, 1);
         assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -7160,6 +7229,7 @@ mod tests {
         assert_eq!(compozy_rows[2].1, "0003_workflow_checkpoint");
         assert_eq!(compozy_rows[3].1, "0004_workflow_signal");
         assert_eq!(compozy_rows[4].1, "0005_workflow_runtime_durability");
+        assert_eq!(compozy_rows[5].1, "0006_workflow_signal_waiting_state");
 
         kernel.shutdown();
     }

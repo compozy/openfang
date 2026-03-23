@@ -172,3 +172,17 @@ pub struct WorkflowCompiledResponse {
     /// Cached compiled workflow IR payload.
     pub compiled: WorkflowCompiledPayload,
 }
+
+/// Request payload for durable workflow signal submission.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunSignalSubmitRequest {
+    /// Signal name expected by the waiting workflow step.
+    pub name: String,
+    /// Optional arbitrary JSON payload carried by the signal.
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    /// Submission source, such as `api`, `trigger`, or `schedule`.
+    pub source: String,
+    /// Client-provided idempotency key scoped to the run.
+    pub idempotency_key: String,
+}

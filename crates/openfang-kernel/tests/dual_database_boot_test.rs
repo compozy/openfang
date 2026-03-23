@@ -199,7 +199,7 @@ fn migration_status_is_queryable_after_boot() {
     let compozy_rows = schema_migration_rows(&compozy_db);
 
     assert_eq!(runtime_rows.len(), 4);
-    assert_eq!(compozy_rows.len(), 5);
+    assert_eq!(compozy_rows.len(), 6);
     assert_eq!(runtime_rows[0].0, 1);
     assert_eq!(compozy_rows[0].0, 1);
     assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -211,6 +211,7 @@ fn migration_status_is_queryable_after_boot() {
     assert_eq!(compozy_rows[2].1, "0003_workflow_checkpoint");
     assert_eq!(compozy_rows[3].1, "0004_workflow_signal");
     assert_eq!(compozy_rows[4].1, "0005_workflow_runtime_durability");
+    assert_eq!(compozy_rows[5].1, "0006_workflow_signal_waiting_state");
 
     kernel.shutdown();
 }
@@ -345,7 +346,7 @@ async fn waiting_run_should_survive_restart_and_remain_resumable() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let config = boot_test_config(tmp.path());
     let mut record = sample_workflow_run("run-waiting-survival");
-    record.status = WorkflowRunStatus::Waiting;
+    record.status = WorkflowRunStatus::WaitingSignal;
     record.current_step_id = Some("step-approval".to_string());
     record.waiting_kind = Some("signal".to_string());
     record.waiting_ref = Some("approval-42".to_string());
@@ -374,10 +375,10 @@ async fn waiting_run_should_survive_restart_and_remain_resumable() {
         .await
         .expect("waiting workflow run should be projected into cache");
 
-    assert_eq!(loaded.status, WorkflowRunStatus::Waiting);
+    assert_eq!(loaded.status, WorkflowRunStatus::WaitingSignal);
     assert_eq!(loaded.waiting_kind.as_deref(), Some("signal"));
     assert_eq!(loaded.waiting_ref.as_deref(), Some("approval-42"));
-    assert!(matches!(cached.state, WorkflowRunState::Waiting));
+    assert!(matches!(cached.state, WorkflowRunState::WaitingSignal));
 
     second_kernel.shutdown();
 }

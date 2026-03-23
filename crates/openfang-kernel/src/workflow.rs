@@ -15,10 +15,11 @@ use crate::workflow_compiler::{
 };
 use chrono::{DateTime, Utc};
 use openfang_memory::{
-    now_timestamp, CheckpointKind as DurableCheckpointKind, WorkflowCheckpointRecord,
-    WorkflowRunRecord, WorkflowRunStatus as DurableWorkflowRunStatus, WorkflowStoreError,
-    WorkflowStoreSet, WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
-    WORKFLOW_RUN_CORE_MIGRATION_SQL, WORKFLOW_SIGNAL_MIGRATION_SQL,
+    now_timestamp, CheckpointKind as DurableCheckpointKind, SubmittedSignalResume,
+    WorkflowCheckpointRecord, WorkflowRunRecord, WorkflowRunStatus as DurableWorkflowRunStatus,
+    WorkflowStoreError, WorkflowStoreSet, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
+    WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
+    WORKFLOW_SIGNAL_MIGRATION_SQL, WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
 };
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -169,7 +170,7 @@ pub enum ErrorMode {
 pub enum WorkflowRunState {
     Pending,
     Running,
-    Waiting,
+    WaitingSignal,
     Completed,
     Failed,
     Cancelled,
@@ -643,7 +644,7 @@ fn workflow_state_from_status(status: DurableWorkflowRunStatus) -> WorkflowRunSt
     match status {
         DurableWorkflowRunStatus::Pending => WorkflowRunState::Pending,
         DurableWorkflowRunStatus::Running => WorkflowRunState::Running,
-        DurableWorkflowRunStatus::Waiting => WorkflowRunState::Waiting,
+        DurableWorkflowRunStatus::WaitingSignal => WorkflowRunState::WaitingSignal,
         DurableWorkflowRunStatus::Completed => WorkflowRunState::Completed,
         DurableWorkflowRunStatus::Failed => WorkflowRunState::Failed,
         DurableWorkflowRunStatus::Cancelled => WorkflowRunState::Cancelled,
@@ -697,6 +698,11 @@ fn error_message_from_json(error_json: Option<&str>) -> Option<String> {
     })
 }
 
+fn parse_workflow_vars(vars_json: &str) -> Result<HashMap<String, String>, String> {
+    serde_json::from_str(vars_json)
+        .map_err(|error| format!("Failed to parse durable workflow vars JSON: {error}"))
+}
+
 fn checkpoint_data_json(value: JsonValue) -> Result<String, TransitionError> {
     serde_json::to_string(&value).map_err(Into::into)
 }
@@ -717,7 +723,39 @@ fn in_memory_workflow_stores() -> WorkflowStoreSet {
         .expect("workflow engine should apply workflow_signal schema");
     conn.execute_batch(WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL)
         .expect("workflow engine should apply workflow durability migration");
+    conn.execute_batch(WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL)
+        .expect("workflow engine should apply workflow signal waiting-state migration");
     WorkflowStoreSet::new(Arc::new(StdMutex::new(conn)))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SignalResumeContext {
+    run_id: WorkflowRunId,
+    workflow: WorkflowIr,
+    start_index: usize,
+    input: String,
+    variables: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SignalSubmissionOutcome {
+    pub signal: openfang_memory::WorkflowSignalRecord,
+    pub resume: Option<SignalResumeContext>,
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionContext {
+    run_id: WorkflowRunId,
+    workflow: WorkflowIr,
+    start_index: usize,
+    input: String,
+    variables: HashMap<String, String>,
+    start_run: bool,
+}
+
+enum ExecutionOutcome {
+    Completed(String),
+    Parked(String),
 }
 
 #[derive(Clone)]
@@ -1122,16 +1160,59 @@ impl TransitionWriter {
         self.sync_cache_from_record(&next, None).await
     }
 
-    async fn record_signal_received(
+    async fn record_waiting_for_signal(
         &self,
         run_id: WorkflowRunId,
         step_id: &str,
-        signal_id: &str,
         signal_name: &str,
-        payload_summary: &str,
+        resume_input: &str,
     ) -> Result<(), TransitionError> {
         let current = self.load_run(run_id).await?;
-        if current.status != DurableWorkflowRunStatus::Waiting {
+        if current.status != DurableWorkflowRunStatus::Running {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::WaitingSignal.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.status = DurableWorkflowRunStatus::WaitingSignal;
+        next.current_step_id = Some(step_id.to_string());
+        next.waiting_kind = Some("signal".to_string());
+        next.waiting_ref = Some(signal_name.to_string());
+        next.updated_at = now_timestamp();
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: Some(step_id.to_string()),
+            kind: DurableCheckpointKind::WaitingSignal,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "signal_name": signal_name,
+                "resume_input": resume_input,
+            }))?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+
+    async fn record_signal_consumed(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        next_step_id: Option<&str>,
+        signal_id: &str,
+        signal_name: &str,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if !matches!(
+            current.status,
+            DurableWorkflowRunStatus::Running | DurableWorkflowRunStatus::WaitingSignal
+        ) {
             return Err(TransitionError::InvalidStatusTransition {
                 run_id: current.run_id.clone(),
                 from: current.status.to_string(),
@@ -1141,20 +1222,30 @@ impl TransitionWriter {
 
         let mut next = current.clone();
         next.status = DurableWorkflowRunStatus::Running;
-        next.current_step_id = Some(step_id.to_string());
+        next.current_step_id = next_step_id.map(ToOwned::to_owned);
         next.waiting_kind = None;
         next.waiting_ref = None;
         next.updated_at = now_timestamp();
 
-        let checkpoint = WorkflowCheckpointRecord {
+        let consumed_checkpoint = WorkflowCheckpointRecord {
             checkpoint_id: Uuid::new_v4().to_string(),
             run_id: current.run_id.clone(),
             step_id: Some(step_id.to_string()),
-            kind: DurableCheckpointKind::SignalReceived,
+            kind: DurableCheckpointKind::SignalConsumed,
             data_json: checkpoint_data_json(serde_json::json!({
                 "signal_id": signal_id,
                 "signal_name": signal_name,
-                "payload_summary": payload_summary,
+            }))?,
+            created_at: next.updated_at.clone(),
+        };
+        let resumed_checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: Some(step_id.to_string()),
+            kind: DurableCheckpointKind::RunResumedFromSignal,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "signal_id": signal_id,
+                "signal_name": signal_name,
             }))?,
             created_at: next.updated_at.clone(),
         };
@@ -1164,12 +1255,14 @@ impl TransitionWriter {
         let consumed_at = next.updated_at.clone();
         let current_record = current.clone();
         let next_record = next.clone();
-        let checkpoint_record = checkpoint.clone();
+        let consumed_checkpoint_record = consumed_checkpoint.clone();
+        let resumed_checkpoint_record = resumed_checkpoint.clone();
         tokio::task::spawn_blocking(move || {
             repository.persist_signal_resume(
                 &current_record,
                 &next_record,
-                &checkpoint_record,
+                &consumed_checkpoint_record,
+                &resumed_checkpoint_record,
                 &signal_id,
                 &consumed_at,
             )
@@ -1226,7 +1319,7 @@ impl TransitionWriter {
         let current = self.load_run(run_id).await?;
         if !matches!(
             current.status,
-            DurableWorkflowRunStatus::Running | DurableWorkflowRunStatus::Waiting
+            DurableWorkflowRunStatus::Running | DurableWorkflowRunStatus::WaitingSignal
         ) {
             return Err(TransitionError::InvalidStatusTransition {
                 run_id: current.run_id.clone(),
@@ -1662,7 +1755,7 @@ impl WorkflowEngine {
                         .map_err(|error| OpenFangError::Internal(error.to_string()))?;
                     interrupted += 1;
                 }
-                DurableWorkflowRunStatus::Pending | DurableWorkflowRunStatus::Waiting => {
+                DurableWorkflowRunStatus::Pending | DurableWorkflowRunStatus::WaitingSignal => {
                     writer
                         .sync_cache_from_record(&record, None)
                         .await
@@ -1798,7 +1891,7 @@ impl WorkflowEngine {
                     .map(|f| match f {
                         "pending" => matches!(r.state, WorkflowRunState::Pending),
                         "running" => matches!(r.state, WorkflowRunState::Running),
-                        "waiting" => matches!(r.state, WorkflowRunState::Waiting),
+                        "waiting_signal" => matches!(r.state, WorkflowRunState::WaitingSignal),
                         "completed" => matches!(r.state, WorkflowRunState::Completed),
                         "failed" => matches!(r.state, WorkflowRunState::Failed),
                         "cancelled" => matches!(r.state, WorkflowRunState::Cancelled),
@@ -1816,18 +1909,32 @@ impl WorkflowEngine {
         self.runs.write().await.clear();
     }
 
-    /// Mark a durable workflow signal as consumed and resume the waiting run in
-    /// the canonical store and cache.
-    pub async fn record_signal_received_transition(
+    /// Durably park a running workflow at a `wait_signal` step.
+    pub async fn record_waiting_for_signal_transition(
         &self,
         run_id: WorkflowRunId,
         step_id: &str,
-        signal_id: &str,
         signal_name: &str,
-        payload_summary: &str,
+        resume_input: &str,
     ) -> Result<(), String> {
         self.transition_writer()
-            .record_signal_received(run_id, step_id, signal_id, signal_name, payload_summary)
+            .record_waiting_for_signal(run_id, step_id, signal_name, resume_input)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    /// Mark a durable workflow signal as consumed and resume the run in the
+    /// canonical store and cache.
+    pub async fn record_signal_consumed_transition(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        next_step_id: Option<&str>,
+        signal_id: &str,
+        signal_name: &str,
+    ) -> Result<(), String> {
+        self.transition_writer()
+            .record_signal_consumed(run_id, step_id, next_step_id, signal_id, signal_name)
             .await
             .map_err(transition_error_to_string)
     }
@@ -1945,7 +2052,7 @@ impl WorkflowEngine {
         for run in runs.values().filter(|run| run.workflow_id == workflow.id) {
             match run.state {
                 WorkflowRunState::Running => active_runs += 1,
-                WorkflowRunState::Pending | WorkflowRunState::Waiting => waiting_runs += 1,
+                WorkflowRunState::Pending | WorkflowRunState::WaitingSignal => waiting_runs += 1,
                 WorkflowRunState::Completed
                 | WorkflowRunState::Failed
                 | WorkflowRunState::Cancelled
@@ -2297,66 +2404,358 @@ impl WorkflowEngine {
         }
     }
 
-    /// Execute a workflow run from compiled IR.
-    pub async fn execute_run<F, Fut>(
+    async fn workflow_ir_for_record(
+        &self,
+        record: &WorkflowRunRecord,
+    ) -> Result<WorkflowIr, String> {
+        if let Some(workflow) = self.get_compiled_workflow(&record.workflow_id).await {
+            return Ok(workflow);
+        }
+
+        let workflow_id = WorkflowId(Uuid::parse_str(&record.workflow_id).map_err(|error| {
+            format!(
+                "Stored workflow id '{}' is not a UUID-backed workflow: {error}",
+                record.workflow_id
+            )
+        })?);
+        let workflow = self
+            .get_workflow(workflow_id)
+            .await
+            .ok_or_else(|| format!("Workflow definition '{}' not found", record.workflow_id))?;
+        Ok(Self::legacy_workflow_to_ir(&workflow))
+    }
+
+    async fn waiting_resume_input(
         &self,
         run_id: WorkflowRunId,
-        workflow: WorkflowIr,
+        step_id: &str,
+        fallback_input_json: &str,
+    ) -> Result<String, String> {
+        let repository = self.workflow_stores.workflow_checkpoint.clone();
+        let run_id_text = run_id.to_string();
+        let checkpoints =
+            tokio::task::spawn_blocking(move || repository.list_for_run(&run_id_text))
+                .await
+                .map_err(|error| format!("Workflow checkpoint query task failed: {error}"))?
+                .map_err(|error| error.to_string())?;
+
+        for checkpoint in checkpoints.into_iter().rev() {
+            if checkpoint.kind != DurableCheckpointKind::WaitingSignal {
+                continue;
+            }
+            if checkpoint.step_id.as_deref() != Some(step_id) {
+                continue;
+            }
+
+            if let Ok(payload) = serde_json::from_str::<JsonValue>(&checkpoint.data_json) {
+                if let Some(value) = payload.get("resume_input") {
+                    return Ok(match value {
+                        JsonValue::String(value) => value.clone(),
+                        other => other.to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(cache_input_from_json(fallback_input_json))
+    }
+
+    pub(crate) async fn submit_signal(
+        &self,
+        run_id: WorkflowRunId,
+        name: String,
+        payload: JsonValue,
+        source: String,
+        idempotency_key: String,
+    ) -> Result<SignalSubmissionOutcome, String> {
+        let writer = self.transition_writer();
+        let current = writer
+            .load_run(run_id)
+            .await
+            .map_err(transition_error_to_string)?;
+        let workflow = self.workflow_ir_for_record(&current).await?;
+        let signal_repository = self.workflow_stores.workflow_signal.clone();
+        let run_id_text = run_id.to_string();
+        let idempotency_lookup_key = idempotency_key.clone();
+        if let Some(existing) = tokio::task::spawn_blocking(move || {
+            signal_repository.find_by_idempotency_key(&run_id_text, &idempotency_lookup_key)
+        })
+        .await
+        .map_err(|error| format!("Workflow signal query task failed: {error}"))?
+        .map_err(|error| error.to_string())?
+        {
+            return Ok(SignalSubmissionOutcome {
+                signal: existing,
+                resume: None,
+            });
+        }
+
+        let signal = openfang_memory::WorkflowSignalRecord {
+            signal_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            name: name.clone(),
+            payload_json: serde_json::to_string(&payload)
+                .map_err(|error| format!("Failed to serialize workflow signal payload: {error}"))?,
+            source,
+            idempotency_key,
+            consumed: false,
+            created_at: now_timestamp(),
+            consumed_at: None,
+        };
+        let received_checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: current.current_step_id.clone(),
+            kind: DurableCheckpointKind::SignalReceived,
+            data_json: checkpoint_data_json(serde_json::json!({
+                "signal_id": signal.signal_id,
+                "signal_name": signal.name,
+                "source": signal.source,
+                "payload": payload,
+            }))
+            .map_err(transition_error_to_string)?,
+            created_at: signal.created_at.clone(),
+        };
+
+        let waiting_matches = current.status == DurableWorkflowRunStatus::WaitingSignal
+            && current.waiting_kind.as_deref() == Some("signal")
+            && current.waiting_ref.as_deref() == Some(name.as_str());
+
+        if waiting_matches {
+            let step_id = current.current_step_id.clone().ok_or_else(|| {
+                format!(
+                    "Waiting workflow run '{}' had no current step id",
+                    current.run_id
+                )
+            })?;
+            let wait_index = workflow
+                .steps
+                .iter()
+                .position(|step| step.id == step_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Workflow step '{}' was not found in workflow '{}'",
+                        step_id, workflow.workflow_id
+                    )
+                })?;
+            let next_step_id = workflow
+                .steps
+                .get(wait_index + 1)
+                .map(|step| step.id.clone());
+            let mut next = current.clone();
+            next.status = DurableWorkflowRunStatus::Running;
+            next.current_step_id = next_step_id.clone();
+            next.waiting_kind = None;
+            next.waiting_ref = None;
+            next.updated_at = signal.created_at.clone();
+
+            let consumed_checkpoint = WorkflowCheckpointRecord {
+                checkpoint_id: Uuid::new_v4().to_string(),
+                run_id: current.run_id.clone(),
+                step_id: Some(step_id.clone()),
+                kind: DurableCheckpointKind::SignalConsumed,
+                data_json: checkpoint_data_json(serde_json::json!({
+                    "signal_id": signal.signal_id,
+                    "signal_name": signal.name,
+                }))
+                .map_err(transition_error_to_string)?,
+                created_at: signal.created_at.clone(),
+            };
+            let resumed_checkpoint = WorkflowCheckpointRecord {
+                checkpoint_id: Uuid::new_v4().to_string(),
+                run_id: current.run_id.clone(),
+                step_id: Some(step_id.clone()),
+                kind: DurableCheckpointKind::RunResumedFromSignal,
+                data_json: checkpoint_data_json(serde_json::json!({
+                    "signal_id": signal.signal_id,
+                    "signal_name": signal.name,
+                }))
+                .map_err(transition_error_to_string)?,
+                created_at: signal.created_at.clone(),
+            };
+
+            let repository = self.workflow_stores.workflow_run.clone();
+            let current_record = current.clone();
+            let next_record = next.clone();
+            let signal_record = signal.clone();
+            let received_checkpoint_record = received_checkpoint.clone();
+            let consumed_checkpoint_record = consumed_checkpoint.clone();
+            let resumed_checkpoint_record = resumed_checkpoint.clone();
+            match tokio::task::spawn_blocking(move || {
+                repository.persist_signal_submission_and_resume(
+                    &current_record,
+                    &next_record,
+                    SubmittedSignalResume {
+                        signal: &signal_record,
+                        received_checkpoint: &received_checkpoint_record,
+                        consumed_checkpoint: &consumed_checkpoint_record,
+                        resumed_checkpoint: &resumed_checkpoint_record,
+                        consumed_at: &next_record.updated_at,
+                    },
+                )
+            })
+            .await
+            .map_err(|error| format!("Workflow signal persist task failed: {error}"))?
+            {
+                Ok(()) => {
+                    writer
+                        .sync_cache_from_record(&next, None)
+                        .await
+                        .map_err(transition_error_to_string)?;
+                    let resume_input = self
+                        .waiting_resume_input(run_id, &step_id, &current.input_json)
+                        .await?;
+                    let variables = parse_workflow_vars(&current.vars_json)?;
+                    return Ok(SignalSubmissionOutcome {
+                        signal: openfang_memory::WorkflowSignalRecord {
+                            consumed: true,
+                            consumed_at: Some(next.updated_at.clone()),
+                            ..signal
+                        },
+                        resume: Some(SignalResumeContext {
+                            run_id,
+                            workflow,
+                            start_index: wait_index + 1,
+                            input: resume_input,
+                            variables,
+                        }),
+                    });
+                }
+                Err(WorkflowStoreError::UnexpectedRunState { .. }) => {}
+                Err(WorkflowStoreError::SignalAlreadyExistsForIdempotency { .. }) => {
+                    let repository = self.workflow_stores.workflow_signal.clone();
+                    let run_id_text = run_id.to_string();
+                    let idempotency_lookup_key = signal.idempotency_key.clone();
+                    let existing = tokio::task::spawn_blocking(move || {
+                        repository.find_by_idempotency_key(&run_id_text, &idempotency_lookup_key)
+                    })
+                    .await
+                    .map_err(|error| format!("Workflow signal query task failed: {error}"))?
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "Workflow signal for run '{}' disappeared after idempotency conflict",
+                            current.run_id
+                        )
+                    })?;
+                    return Ok(SignalSubmissionOutcome {
+                        signal: existing,
+                        resume: None,
+                    });
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+
+        let repository = self.workflow_stores.workflow_run.clone();
+        let signal_record = signal.clone();
+        let checkpoint_record = received_checkpoint.clone();
+        match tokio::task::spawn_blocking(move || {
+            repository.persist_signal_submission(&signal_record, &checkpoint_record)
+        })
+        .await
+        .map_err(|error| format!("Workflow signal persist task failed: {error}"))?
+        {
+            Ok(()) => Ok(SignalSubmissionOutcome {
+                signal,
+                resume: None,
+            }),
+            Err(WorkflowStoreError::SignalAlreadyExistsForIdempotency { .. }) => {
+                let repository = self.workflow_stores.workflow_signal.clone();
+                let run_id_text = run_id.to_string();
+                let idempotency_lookup_key = signal.idempotency_key.clone();
+                let existing = tokio::task::spawn_blocking(move || {
+                    repository.find_by_idempotency_key(&run_id_text, &idempotency_lookup_key)
+                })
+                .await
+                .map_err(|error| format!("Workflow signal query task failed: {error}"))?
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "Workflow signal for run '{}' disappeared after idempotency conflict",
+                        current.run_id
+                    )
+                })?;
+                Ok(SignalSubmissionOutcome {
+                    signal: existing,
+                    resume: None,
+                })
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub(crate) async fn resume_after_signal<F, Fut>(
+        &self,
+        resume: SignalResumeContext,
         agent_resolver: impl Fn(&str) -> Option<(AgentId, String)>,
         send_message: F,
-    ) -> Result<String, String>
+    ) -> Result<(), String>
     where
         F: Fn(AgentId, String) -> Fut,
         Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
     {
+        let _ = self
+            .execute_steps(
+                ExecutionContext {
+                    run_id: resume.run_id,
+                    workflow: resume.workflow,
+                    start_index: resume.start_index,
+                    input: resume.input,
+                    variables: resume.variables,
+                    start_run: false,
+                },
+                agent_resolver,
+                send_message,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn execute_steps<F, Fut>(
+        &self,
+        execution: ExecutionContext,
+        agent_resolver: impl Fn(&str) -> Option<(AgentId, String)>,
+        send_message: F,
+    ) -> Result<ExecutionOutcome, String>
+    where
+        F: Fn(AgentId, String) -> Fut,
+        Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
+    {
+        let ExecutionContext {
+            run_id,
+            workflow,
+            start_index,
+            input: mut current_input,
+            mut variables,
+            start_run,
+        } = execution;
         let send_message = &send_message;
         let vars_json = |variables: &HashMap<String, String>| {
             serde_json::to_string(variables).unwrap_or_else(|_| "{}".to_string())
         };
-        let (input, run_workflow_id) = {
-            let runs = self.runs.read().await;
-            let run = runs.get(&run_id).ok_or("Workflow run not found")?;
-            (run.input.clone(), run.workflow_id)
-        };
 
-        if run_workflow_id.to_string() != workflow.workflow_id {
-            let error = format!(
-                "Workflow IR '{}' does not match run workflow '{}'",
-                workflow.workflow_id, run_workflow_id
+        if start_run {
+            self.record_run_started_transition(
+                run_id,
+                workflow.steps.first().map(|step| step.id.as_str()),
+            )
+            .await?;
+
+            info!(
+                run_id = %run_id,
+                workflow_id = %workflow.workflow_id,
+                steps = workflow.steps.len(),
+                "Starting workflow execution"
             );
-            if let Err(start_error) = self.record_run_started_transition(run_id, None).await {
-                return Err(format!(
-                    "{error}; additionally failed to persist workflow start: {start_error}"
-                ));
-            }
-            if let Err(persist_error) = self
-                .record_run_failed_transition(run_id, None, &error)
-                .await
-            {
-                return Err(format!(
-                    "{error}; additionally failed to persist workflow failure: {persist_error}"
-                ));
-            }
-            return Err(error);
         }
 
-        self.record_run_started_transition(
-            run_id,
-            workflow.steps.first().map(|step| step.id.as_str()),
-        )
-        .await?;
-
-        info!(
-            run_id = %run_id,
-            workflow_id = %workflow.workflow_id,
-            steps = workflow.steps.len(),
-            "Starting workflow execution"
-        );
-
-        let mut current_input = input;
-        let mut all_outputs = Vec::new();
-        let mut variables: HashMap<String, String> = HashMap::new();
-        let mut index = 0usize;
+        let mut all_outputs = if start_index == 0 {
+            Vec::new()
+        } else {
+            vec![current_input.clone()]
+        };
+        let mut index = start_index;
 
         while index < workflow.steps.len() {
             let step = &workflow.steps[index];
@@ -2396,6 +2795,47 @@ impl WorkflowEngine {
                             vars_json(&variables),
                         )
                         .await?;
+                    }
+                    WorkflowIrStepKind::WaitSignal { signal_name } => {
+                        self.record_step_started_transition(run_id, step).await?;
+                        let repository = self.workflow_stores.workflow_signal.clone();
+                        let run_id_text = run_id.to_string();
+                        let signal_name_text = signal_name.clone();
+                        let maybe_signal = tokio::task::spawn_blocking(move || {
+                            repository.find_unconsumed(&run_id_text, &signal_name_text)
+                        })
+                        .await
+                        .map_err(|error| format!("Workflow signal query task failed: {error}"))?
+                        .map_err(|error| error.to_string())?;
+
+                        if let Some(signal) = maybe_signal {
+                            self.record_signal_consumed_transition(
+                                run_id,
+                                &step.id,
+                                workflow.steps.get(index + 1).map(|next| next.id.as_str()),
+                                &signal.signal_id,
+                                signal_name,
+                            )
+                            .await?;
+                            index += 1;
+                            continue;
+                        }
+
+                        self.record_waiting_for_signal_transition(
+                            run_id,
+                            &step.id,
+                            signal_name,
+                            &current_input,
+                        )
+                        .await?;
+                        info!(
+                            run_id = %run_id,
+                            workflow_id = %workflow.workflow_id,
+                            step_id = %step.id,
+                            signal_name = %signal_name,
+                            "Workflow run parked waiting for signal"
+                        );
+                        return Ok(ExecutionOutcome::Parked(current_input));
                     }
                     _ => {
                         self.record_step_started_transition(run_id, step).await?;
@@ -2932,7 +3372,65 @@ impl WorkflowEngine {
         self.record_run_completed_transition(run_id, &final_output)
             .await?;
         info!(run_id = %run_id, workflow_id = %workflow.workflow_id, "Workflow completed successfully");
-        Ok(final_output)
+        Ok(ExecutionOutcome::Completed(final_output))
+    }
+
+    /// Execute a workflow run from compiled IR.
+    pub async fn execute_run<F, Fut>(
+        &self,
+        run_id: WorkflowRunId,
+        workflow: WorkflowIr,
+        agent_resolver: impl Fn(&str) -> Option<(AgentId, String)>,
+        send_message: F,
+    ) -> Result<String, String>
+    where
+        F: Fn(AgentId, String) -> Fut,
+        Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
+    {
+        let (input, run_workflow_id) = {
+            let runs = self.runs.read().await;
+            let run = runs.get(&run_id).ok_or("Workflow run not found")?;
+            (run.input.clone(), run.workflow_id)
+        };
+
+        if run_workflow_id.to_string() != workflow.workflow_id {
+            let error = format!(
+                "Workflow IR '{}' does not match run workflow '{}'",
+                workflow.workflow_id, run_workflow_id
+            );
+            if let Err(start_error) = self.record_run_started_transition(run_id, None).await {
+                return Err(format!(
+                    "{error}; additionally failed to persist workflow start: {start_error}"
+                ));
+            }
+            if let Err(persist_error) = self
+                .record_run_failed_transition(run_id, None, &error)
+                .await
+            {
+                return Err(format!(
+                    "{error}; additionally failed to persist workflow failure: {persist_error}"
+                ));
+            }
+            return Err(error);
+        }
+
+        match self
+            .execute_steps(
+                ExecutionContext {
+                    run_id,
+                    workflow,
+                    start_index: 0,
+                    input,
+                    variables: HashMap::new(),
+                    start_run: true,
+                },
+                agent_resolver,
+                send_message,
+            )
+            .await?
+        {
+            ExecutionOutcome::Completed(output) | ExecutionOutcome::Parked(output) => Ok(output),
+        }
     }
 }
 
@@ -3087,6 +3585,44 @@ mod tests {
             }
         }))
         .expect("workflow v2 test definition should deserialize")
+    }
+
+    fn test_wait_signal_definition(workflow_id: WorkflowId) -> WorkflowV2Definition {
+        serde_json::from_value(json!({
+            "id": workflow_id.to_string(),
+            "name": "wait-signal-test",
+            "version": "1.0.0",
+            "description": "wait signal workflow test",
+            "input": { "kind": "any" },
+            "output": {
+                "kind": "object",
+                "required": ["result"],
+                "open": false,
+                "fields": {
+                    "result": { "kind": "any" }
+                }
+            },
+            "steps": [
+                {
+                    "id": "await-approval",
+                    "name": "Await approval",
+                    "kind": "wait_signal",
+                    "uses": { "signal_name": "approval" },
+                    "flow": { "mode": "sequential" }
+                },
+                {
+                    "id": "after-approval",
+                    "name": "After approval",
+                    "kind": "noop",
+                    "save_as": "result",
+                    "flow": { "mode": "sequential" }
+                }
+            ],
+            "outputs": {
+                "result": "{{ vars.result }}"
+            }
+        }))
+        .expect("wait signal workflow test definition should deserialize")
     }
 
     fn legacy_ir(workflow: &Workflow) -> WorkflowIr {
@@ -3925,72 +4461,210 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signal_consumption_appends_signal_received_checkpoint() {
+    async fn waiting_run_transitions_status_to_waiting_signal() {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let engine = test_engine(temp_dir.path().to_path_buf());
-        let workflow = test_workflow();
-        let workflow_id = engine
-            .register(workflow)
+        let workflow_id = WorkflowId::new();
+        let definition = test_wait_signal_definition(workflow_id);
+        let mut registry = WorkflowCompileRegistry::new();
+        registry.set_workflows(std::iter::once(definition.id.clone()));
+        let workflow_ir = compile_workflow_definition(&definition, &registry)
+            .expect("wait signal workflow should compile");
+        engine
+            .register_workflow_v2_definition(definition.clone(), Vec::<String>::new())
+            .await
+            .expect("workflow v2 definition should register");
+        engine
+            .register(Workflow {
+                id: workflow_id,
+                name: definition.name.clone(),
+                description: definition.description.clone(),
+                steps: Vec::new(),
+                created_at: Utc::now(),
+            })
             .await
             .expect("workflow registration should succeed");
         let run_id = engine
             .create_run(workflow_id, "waiting input".to_string())
             .await
             .expect("workflow run should be created");
-        let mut waiting_record = load_durable_run(&engine, run_id);
-        waiting_record.status = DurableWorkflowRunStatus::Waiting;
-        waiting_record.current_step_id = Some("await-approval".to_string());
-        waiting_record.waiting_kind = Some("signal".to_string());
-        waiting_record.waiting_ref = Some("approval".to_string());
-        waiting_record.updated_at = now_timestamp();
+
+        let result = engine
+            .execute_run(
+                run_id,
+                workflow_ir,
+                mock_resolver,
+                |_id: AgentId, msg: String| async move { Ok((format!("Processed: {msg}"), 1, 1)) },
+            )
+            .await
+            .expect("workflow should park instead of failing");
+
+        let record = load_durable_run(&engine, run_id);
+        let checkpoints = load_durable_checkpoints(&engine, run_id);
+
+        assert_eq!(result, "waiting input");
+        assert_eq!(record.status, DurableWorkflowRunStatus::WaitingSignal);
+        assert_eq!(record.waiting_kind.as_deref(), Some("signal"));
+        assert_eq!(record.waiting_ref.as_deref(), Some("approval"));
+        assert!(checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.kind == DurableCheckpointKind::WaitingSignal));
+    }
+
+    #[tokio::test]
+    async fn eager_consume_fires_when_signal_arrived_before_wait_step() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow_id = WorkflowId::new();
+        let definition = test_wait_signal_definition(workflow_id);
+        let mut registry = WorkflowCompileRegistry::new();
+        registry.set_workflows(std::iter::once(definition.id.clone()));
+        let workflow_ir = compile_workflow_definition(&definition, &registry)
+            .expect("wait signal workflow should compile");
         engine
-            .workflow_stores
-            .workflow_run
-            .replace_run(&waiting_record)
-            .expect("waiting run should persist");
-        engine.runs.write().await.clear();
-        let signal = openfang_memory::WorkflowSignalRecord {
-            signal_id: "signal-approval".to_string(),
-            run_id: run_id.to_string(),
-            name: "approval".to_string(),
-            payload_json: serde_json::json!({ "decision": "approved" }).to_string(),
-            source: "api".to_string(),
-            consumed: false,
-            created_at: now_timestamp(),
-            consumed_at: None,
-        };
+            .register_workflow_v2_definition(definition.clone(), Vec::<String>::new())
+            .await
+            .expect("workflow v2 definition should register");
+        engine
+            .register(Workflow {
+                id: workflow_id,
+                name: definition.name.clone(),
+                description: definition.description.clone(),
+                steps: Vec::new(),
+                created_at: Utc::now(),
+            })
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "waiting input".to_string())
+            .await
+            .expect("workflow run should be created");
         engine
             .workflow_stores
             .workflow_signal
-            .insert(&signal)
-            .expect("signal should persist before consumption");
+            .insert(&openfang_memory::WorkflowSignalRecord {
+                signal_id: "signal-approval".to_string(),
+                run_id: run_id.to_string(),
+                name: "approval".to_string(),
+                payload_json: serde_json::json!({ "decision": "approved" }).to_string(),
+                source: "schedule".to_string(),
+                idempotency_key: "idem-eager".to_string(),
+                consumed: false,
+                created_at: now_timestamp(),
+                consumed_at: None,
+            })
+            .expect("signal should persist before execution");
 
-        engine
-            .record_signal_received_transition(
+        let result = engine
+            .execute_run(
                 run_id,
-                "await-approval",
-                &signal.signal_id,
-                &signal.name,
-                "approved",
+                workflow_ir,
+                mock_resolver,
+                |_id: AgentId, msg: String| async move { Ok((format!("Processed: {msg}"), 1, 1)) },
             )
             .await
-            .expect("signal should resume run");
+            .expect("workflow should consume pre-arrived signal");
+
+        let record = load_durable_run(&engine, run_id);
+        let signal = engine
+            .workflow_stores
+            .workflow_signal
+            .find_unconsumed(&run_id.to_string(), "approval")
+            .expect("signal lookup should succeed");
+        let checkpoints = load_durable_checkpoints(&engine, run_id);
+
+        assert_eq!(result, "waiting input");
+        assert_eq!(record.status, DurableWorkflowRunStatus::Completed);
+        assert_eq!(record.waiting_kind, None);
+        assert_eq!(signal, None);
+        assert!(checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.kind == DurableCheckpointKind::SignalConsumed));
+        assert!(checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.kind == DurableCheckpointKind::RunResumedFromSignal));
+    }
+
+    #[tokio::test]
+    async fn signal_submission_persists_and_resumes_waiting_run() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow_id = WorkflowId::new();
+        let definition = test_wait_signal_definition(workflow_id);
+        let mut registry = WorkflowCompileRegistry::new();
+        registry.set_workflows(std::iter::once(definition.id.clone()));
+        let workflow_ir = compile_workflow_definition(&definition, &registry)
+            .expect("wait signal workflow should compile");
+        engine
+            .register_workflow_v2_definition(definition.clone(), Vec::<String>::new())
+            .await
+            .expect("workflow v2 definition should register");
+        engine
+            .register(Workflow {
+                id: workflow_id,
+                name: definition.name.clone(),
+                description: definition.description.clone(),
+                steps: Vec::new(),
+                created_at: Utc::now(),
+            })
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "waiting input".to_string())
+            .await
+            .expect("workflow run should be created");
+        engine
+            .execute_run(
+                run_id,
+                workflow_ir.clone(),
+                mock_resolver,
+                |_id: AgentId, msg: String| async move { Ok((format!("Processed: {msg}"), 1, 1)) },
+            )
+            .await
+            .expect("workflow should park");
+
+        let outcome = engine
+            .submit_signal(
+                run_id,
+                "approval".to_string(),
+                json!({ "decision": "approved" }),
+                "api".to_string(),
+                "idem-submit".to_string(),
+            )
+            .await
+            .expect("signal submission should succeed");
+        engine
+            .resume_after_signal(
+                outcome
+                    .resume
+                    .expect("waiting run should produce resume context"),
+                mock_resolver,
+                |_id: AgentId, msg: String| async move { Ok((format!("Processed: {msg}"), 1, 1)) },
+            )
+            .await
+            .expect("signal resume should succeed");
 
         let record = load_durable_run(&engine, run_id);
         let signal_record = engine
             .workflow_stores
             .workflow_signal
-            .find_by_id(&signal.signal_id)
+            .find_by_id(&outcome.signal.signal_id)
             .expect("signal should load")
             .expect("signal should exist");
         let checkpoints = load_durable_checkpoints(&engine, run_id);
 
-        assert_eq!(record.status, DurableWorkflowRunStatus::Running);
+        assert_eq!(record.status, DurableWorkflowRunStatus::Completed);
         assert_eq!(record.waiting_kind, None);
         assert!(signal_record.consumed);
         assert!(checkpoints
             .iter()
             .any(|checkpoint| checkpoint.kind == DurableCheckpointKind::SignalReceived));
+        assert!(checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.kind == DurableCheckpointKind::SignalConsumed));
+        assert!(checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.kind == DurableCheckpointKind::RunResumedFromSignal));
     }
 
     #[tokio::test]

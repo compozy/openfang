@@ -240,6 +240,7 @@ pub fn validate_workflow_definition(
         );
     }
 
+    validate_duplicate_wait_signal_names(definition, &mut issues);
     validate_output_projection_contract(definition, &mut issues);
 
     issues
@@ -615,6 +616,33 @@ fn validate_step_definition(
 
     validate_step_uses(step, &step_path, registry, issues);
     validate_step_flow(step, &step_path, workflow, index, issues);
+}
+
+fn validate_duplicate_wait_signal_names(
+    workflow: &WorkflowV2Definition,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let mut seen = BTreeMap::<String, usize>::new();
+
+    for (index, step) in workflow.steps.iter().enumerate() {
+        let Some(StepUses::WaitSignal(uses)) = step.uses.as_ref() else {
+            continue;
+        };
+        if step.kind != StepKind::WaitSignal || uses.signal_name.trim().is_empty() {
+            continue;
+        }
+
+        if let Some(previous_index) = seen.insert(uses.signal_name.clone(), index) {
+            issues.push(ValidationIssue::warning(
+                "duplicate_wait_signal_name",
+                format!("steps[{index}].uses.signal_name"),
+                format!(
+                    "signal name '{}' is also used by wait_signal step '{}' at steps[{previous_index}]",
+                    uses.signal_name, workflow.steps[previous_index].id
+                ),
+            ));
+        }
+    }
 }
 
 fn validate_step_uses(
@@ -1472,6 +1500,80 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, "invalid_mode_for_kind");
         assert_eq!(issues[0].severity, ValidationSeverity::Error);
+    }
+
+    #[test]
+    fn wait_signal_requires_explicit_signal_name() {
+        let definition = definition_with_step(json!({
+            "id": "wait",
+            "name": "Wait",
+            "kind": "wait_signal",
+            "uses": { "signal_name": "" },
+            "flow": { "mode": "sequential" }
+        }));
+
+        let issues = validate_workflow_definition(&definition, &registry());
+        let issue = issues
+            .iter()
+            .find(|issue| issue.path == "steps[0].uses.signal_name")
+            .expect("missing signal name issue should exist");
+
+        assert_eq!(issue.code, "missing_required_field");
+        assert_eq!(issue.severity, ValidationSeverity::Error);
+    }
+
+    #[test]
+    fn duplicate_wait_signal_names_emit_warning() {
+        let definition = parse_definition(json!({
+            "id": "wait-duplicates",
+            "name": "Wait Duplicates",
+            "version": "1.0.0",
+            "description": "Duplicate wait signal names",
+            "input": { "kind": "any" },
+            "output": {
+                "kind": "object",
+                "required": ["result"],
+                "open": false,
+                "fields": {
+                    "result": { "kind": "any" }
+                }
+            },
+            "steps": [
+                {
+                    "id": "wait-one",
+                    "name": "Wait One",
+                    "kind": "wait_signal",
+                    "uses": { "signal_name": "approval" },
+                    "flow": { "mode": "sequential" }
+                },
+                {
+                    "id": "wait-two",
+                    "name": "Wait Two",
+                    "kind": "wait_signal",
+                    "uses": { "signal_name": "approval" },
+                    "flow": { "mode": "sequential" }
+                },
+                {
+                    "id": "after",
+                    "name": "After",
+                    "kind": "noop",
+                    "save_as": "result",
+                    "flow": { "mode": "sequential" }
+                }
+            ],
+            "outputs": {
+                "result": "{{ vars.result }}"
+            }
+        }));
+
+        let issues = validate_workflow_definition(&definition, &registry());
+        let issue = issues
+            .iter()
+            .find(|issue| issue.code == "duplicate_wait_signal_name")
+            .expect("duplicate wait signal warning should exist");
+
+        assert_eq!(issue.severity, ValidationSeverity::Warning);
+        assert_eq!(issue.path, "steps[1].uses.signal_name");
     }
 
     #[test]

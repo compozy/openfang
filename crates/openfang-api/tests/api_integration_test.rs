@@ -14,15 +14,18 @@ use openfang_api::ws;
 use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
 };
+use openfang_kernel::workflow_compiler::{compile_workflow_definition, WorkflowCompileRegistry};
 use openfang_kernel::OpenFangKernel;
-use openfang_memory::{WorkflowRunRecord, WorkflowRunStatus};
+use openfang_memory::{now_timestamp, WorkflowRunRecord, WorkflowRunStatus, WorkflowSignalRecord};
 use openfang_types::agent::AgentId;
 use openfang_types::config::{DefaultModelConfig, KernelConfig};
 use openfang_types::workflow::{
     FlowBlock, FlowMode, ResolvedRuntimeSettings, WorkflowIr, WorkflowIrStep, WorkflowIrStepKind,
+    WorkflowV2Definition,
 };
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::time::{sleep, Duration};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -141,6 +144,10 @@ async fn start_test_server_with_provider(
             "/api/v1/runs/{id}/checkpoints",
             axum::routing::get(routes::get_run_checkpoints_v1),
         )
+        .route(
+            "/api/v1/runs/{id}/signals",
+            axum::routing::get(routes::get_run_signals_v1).post(routes::post_run_signal_v1),
+        )
         .route("/api/shutdown", axum::routing::post(routes::shutdown))
         .layer(axum::middleware::from_fn(middleware::request_logging))
         .layer(TraceLayer::new_for_http())
@@ -226,6 +233,123 @@ async fn create_empty_workflow(
         .as_str()
         .expect("workflow id should be present")
         .to_string()
+}
+
+fn wait_signal_definition(workflow_id: WorkflowId) -> WorkflowV2Definition {
+    serde_json::from_value(serde_json::json!({
+        "id": workflow_id.to_string(),
+        "name": "wait-signal-api-test",
+        "version": "1.0.0",
+        "description": "Wait signal api test",
+        "input": { "kind": "any" },
+        "output": {
+            "kind": "object",
+            "required": ["result"],
+            "open": false,
+            "fields": {
+                "result": { "kind": "any" }
+            }
+        },
+        "steps": [
+            {
+                "id": "await-approval",
+                "name": "Await approval",
+                "kind": "wait_signal",
+                "uses": { "signal_name": "approval" },
+                "flow": { "mode": "sequential" }
+            },
+            {
+                "id": "after-approval",
+                "name": "After approval",
+                "kind": "noop",
+                "save_as": "result",
+                "flow": { "mode": "sequential" }
+            }
+        ],
+        "outputs": {
+            "result": "{{ vars.result }}"
+        }
+    }))
+    .expect("wait signal definition should deserialize")
+}
+
+async fn create_waiting_signal_run(server: &TestServer) -> String {
+    let workflow_id = WorkflowId::new();
+    let definition = wait_signal_definition(workflow_id);
+    let mut registry = WorkflowCompileRegistry::new();
+    registry.set_workflows(std::iter::once(definition.id.clone()));
+    let workflow_ir =
+        compile_workflow_definition(&definition, &registry).expect("workflow should compile");
+
+    server
+        .state
+        .kernel
+        .workflows
+        .register_workflow_v2_definition(definition.clone(), Vec::<String>::new())
+        .await
+        .expect("workflow v2 definition should register");
+    server
+        .state
+        .kernel
+        .workflows
+        .register(Workflow {
+            id: workflow_id,
+            name: definition.name.clone(),
+            description: definition.description.clone(),
+            steps: Vec::new(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .expect("workflow registration should succeed");
+
+    let run_id = server
+        .state
+        .kernel
+        .workflows
+        .create_run(workflow_id, "waiting input".to_string())
+        .await
+        .expect("workflow run should be created");
+    server
+        .state
+        .kernel
+        .workflows
+        .execute_run(
+            run_id,
+            workflow_ir,
+            |_agent| Some((AgentId::new(), "unused".to_string())),
+            |_agent_id: AgentId, message: String| async move {
+                Ok((format!("processed {message}"), 1, 1))
+            },
+        )
+        .await
+        .expect("workflow should park");
+
+    run_id.to_string()
+}
+
+async fn wait_for_run_status(
+    client: &reqwest::Client,
+    server: &TestServer,
+    run_id: &str,
+    expected_status: &str,
+) -> serde_json::Value {
+    for _ in 0..40 {
+        let response = client
+            .get(format!("{}/api/v1/runs/{run_id}", server.base_url))
+            .send()
+            .await
+            .expect("run detail request should succeed");
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("run detail response should deserialize");
+        if body["status"] == expected_status {
+            return body;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("run {run_id} did not reach status {expected_status}");
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +1016,10 @@ async fn test_v1_interrupted_run_is_visible_after_restart() {
     });
     let app = Router::new()
         .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))
+        .route(
+            "/api/v1/runs/{id}/signals",
+            axum::routing::get(routes::get_run_signals_v1).post(routes::post_run_signal_v1),
+        )
         .with_state(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -924,6 +1052,353 @@ async fn test_v1_interrupted_run_is_visible_after_restart() {
 
     assert_eq!(body["id"], run_id);
     assert_eq!(body["status"], "interrupted");
+}
+
+#[tokio::test]
+async fn post_run_signal_persists_and_affects_run_state() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+    let run_id = create_waiting_signal_run(&server).await;
+
+    let response = client
+        .post(format!("{}/api/v1/runs/{run_id}/signals", server.base_url))
+        .json(&serde_json::json!({
+            "name": "approval",
+            "payload": { "decision": "approved" },
+            "source": "api",
+            "idempotency_key": "idem-post-signal",
+        }))
+        .send()
+        .await
+        .expect("signal request should succeed");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .expect("signal response should deserialize");
+    let detail_response = client
+        .get(format!("{}/api/v1/runs/{run_id}", server.base_url))
+        .send()
+        .await
+        .expect("run detail request should succeed");
+    let detail_body: serde_json::Value = detail_response
+        .json()
+        .await
+        .expect("run detail response should deserialize");
+
+    assert_eq!(body["run_id"], run_id);
+    assert_eq!(body["name"], "approval");
+    assert_eq!(body["payload"]["decision"], "approved");
+    assert_eq!(body["source"], "api");
+    assert_eq!(body["consumed"], true);
+    assert!(body["consumed_at"].is_string());
+    assert!(detail_body["waiting_kind"].is_null());
+    assert_ne!(detail_body["status"], "waiting_signal");
+}
+
+#[tokio::test]
+async fn waiting_workflow_resumes_after_durable_signal_delivery() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+    let run_id = create_waiting_signal_run(&server).await;
+
+    let response = client
+        .post(format!("{}/api/v1/runs/{run_id}/signals", server.base_url))
+        .json(&serde_json::json!({
+            "name": "approval",
+            "payload": { "decision": "approved" },
+            "source": "api",
+            "idempotency_key": "idem-resume-complete",
+        }))
+        .send()
+        .await
+        .expect("signal request should succeed");
+
+    assert_eq!(response.status(), 200);
+    let run = wait_for_run_status(&client, &server, &run_id, "completed").await;
+
+    assert_eq!(run["waiting_kind"], serde_json::Value::Null);
+    assert_eq!(run["waiting_ref"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn duplicate_signal_idempotency_returns_existing_record() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+    let run_id = create_waiting_signal_run(&server).await;
+    let request_body = serde_json::json!({
+        "name": "approval",
+        "payload": { "decision": "approved" },
+        "source": "api",
+        "idempotency_key": "idem-duplicate-signal",
+    });
+
+    let first = client
+        .post(format!("{}/api/v1/runs/{run_id}/signals", server.base_url))
+        .json(&request_body)
+        .send()
+        .await
+        .expect("first signal request should succeed");
+    let second = client
+        .post(format!("{}/api/v1/runs/{run_id}/signals", server.base_url))
+        .json(&request_body)
+        .send()
+        .await
+        .expect("second signal request should succeed");
+
+    assert_eq!(first.status(), 200);
+    assert_eq!(second.status(), 200);
+    let first_body: serde_json::Value = first
+        .json()
+        .await
+        .expect("first signal response should deserialize");
+    let second_body: serde_json::Value = second
+        .json()
+        .await
+        .expect("second signal response should deserialize");
+    let list_response = client
+        .get(format!("{}/api/v1/runs/{run_id}/signals", server.base_url))
+        .send()
+        .await
+        .expect("signal list request should succeed");
+    let list_body: serde_json::Value = list_response
+        .json()
+        .await
+        .expect("signal list response should deserialize");
+
+    assert_eq!(first_body["id"], second_body["id"]);
+    assert_eq!(
+        list_body["items"]
+            .as_array()
+            .expect("signal list should be an array")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn restart_preserves_waiting_state_and_outstanding_signals() {
+    let tmp = tempfile::tempdir().expect("temp dir should be created");
+    let config = KernelConfig {
+        home_dir: tmp.path().to_path_buf(),
+        data_dir: tmp.path().join("data"),
+        default_model: DefaultModelConfig {
+            provider: "ollama".to_string(),
+            model: "test-model".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url: None,
+        },
+        ..KernelConfig::default()
+    };
+    let run_id = Uuid::new_v4().to_string();
+    let first_kernel = OpenFangKernel::boot_with_config(config.clone()).expect("first boot");
+    first_kernel
+        .workflow_stores
+        .workflow_run
+        .insert_run(&WorkflowRunRecord {
+            run_id: run_id.clone(),
+            workflow_id: Uuid::new_v4().to_string(),
+            workflow_version: "1.0.0".to_string(),
+            status: WorkflowRunStatus::WaitingSignal,
+            input_json: serde_json::json!({ "ticket": "T-42" }).to_string(),
+            vars_json: "{}".to_string(),
+            current_step_id: Some("await-approval".to_string()),
+            waiting_kind: Some("signal".to_string()),
+            waiting_ref: Some("approval".to_string()),
+            active_dispatch_id: None,
+            active_hitl_request_id: None,
+            labels_json: "[]".to_string(),
+            metadata_json: "{}".to_string(),
+            error_json: None,
+            started_at: "2026-03-23T12:00:00Z".to_string(),
+            updated_at: "2026-03-23T12:00:00Z".to_string(),
+            completed_at: None,
+        })
+        .expect("waiting workflow run should persist");
+    first_kernel
+        .workflow_stores
+        .workflow_signal
+        .insert(&WorkflowSignalRecord {
+            signal_id: "signal-restart".to_string(),
+            run_id: run_id.clone(),
+            name: "approval".to_string(),
+            payload_json: serde_json::json!({ "decision": "approved" }).to_string(),
+            source: "schedule".to_string(),
+            idempotency_key: "idem-restart".to_string(),
+            consumed: false,
+            created_at: now_timestamp(),
+            consumed_at: None,
+        })
+        .expect("outstanding signal should persist");
+    first_kernel.shutdown();
+
+    let kernel = Arc::new(OpenFangKernel::boot_with_config(config).expect("second boot"));
+    kernel.set_self_handle();
+    kernel.bootstrap_workflow_definitions().await;
+    let state = Arc::new(AppState {
+        kernel: Arc::clone(&kernel),
+        started_at: Instant::now(),
+        peer_registry: None,
+        bridge_manager: tokio::sync::Mutex::new(None),
+        channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        clawhub_cache: dashmap::DashMap::new(),
+        provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+    });
+    let app = Router::new()
+        .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))
+        .route(
+            "/api/v1/runs/{id}/signals",
+            axum::routing::get(routes::get_run_signals_v1),
+        )
+        .with_state(Arc::clone(&state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose local address");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("api should serve");
+    });
+
+    let server = TestServer {
+        base_url: format!("http://{}", address),
+        state,
+        _tmp: tmp,
+    };
+    let client = reqwest::Client::new();
+    let run_response = client
+        .get(format!("{}/api/v1/runs/{run_id}", server.base_url))
+        .send()
+        .await
+        .expect("run detail request should succeed");
+    let run_body: serde_json::Value = run_response
+        .json()
+        .await
+        .expect("run detail response should deserialize");
+    let signal_response = client
+        .get(format!("{}/api/v1/runs/{run_id}/signals", server.base_url))
+        .send()
+        .await
+        .expect("signal list request should succeed");
+    let signal_body: serde_json::Value = signal_response
+        .json()
+        .await
+        .expect("signal list response should deserialize");
+
+    assert_eq!(run_body["status"], "waiting_signal");
+    assert_eq!(run_body["waiting_ref"], "approval");
+    assert_eq!(signal_body["items"][0]["name"], "approval");
+    assert_eq!(signal_body["items"][0]["consumed"], false);
+}
+
+#[tokio::test]
+async fn get_run_signals_reads_from_compozy_db_not_memory() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+    let run_id = create_waiting_signal_run(&server).await;
+
+    server
+        .state
+        .kernel
+        .workflow_stores
+        .workflow_signal
+        .insert(&WorkflowSignalRecord {
+            signal_id: "signal-db-only".to_string(),
+            run_id: run_id.clone(),
+            name: "approval".to_string(),
+            payload_json: serde_json::json!({ "decision": "approved" }).to_string(),
+            source: "schedule".to_string(),
+            idempotency_key: "idem-db-only".to_string(),
+            consumed: false,
+            created_at: now_timestamp(),
+            consumed_at: None,
+        })
+        .expect("signal should persist");
+    server.state.kernel.workflows.clear_run_cache().await;
+
+    let response = client
+        .get(format!(
+            "{}/api/v1/runs/{run_id}/signals?consumed=false",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("signal list request should succeed");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .expect("signal list response should deserialize");
+
+    assert_eq!(body["items"][0]["id"], "signal-db-only");
+    assert_eq!(body["items"][0]["source"], "schedule");
+}
+
+#[tokio::test]
+async fn concurrent_signal_delivery_does_not_double_consume() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+    let run_id = create_waiting_signal_run(&server).await;
+
+    let first = client
+        .post(format!("{}/api/v1/runs/{run_id}/signals", server.base_url))
+        .json(&serde_json::json!({
+            "name": "approval",
+            "payload": { "decision": "approved" },
+            "source": "api",
+            "idempotency_key": "idem-concurrent-a",
+        }))
+        .send();
+    let second = client
+        .post(format!("{}/api/v1/runs/{run_id}/signals", server.base_url))
+        .json(&serde_json::json!({
+            "name": "approval",
+            "payload": { "decision": "approved-again" },
+            "source": "trigger",
+            "idempotency_key": "idem-concurrent-b",
+        }))
+        .send();
+
+    let (first_response, second_response) = tokio::join!(first, second);
+    assert_eq!(
+        first_response
+            .expect("first signal request should succeed")
+            .status(),
+        200
+    );
+    assert_eq!(
+        second_response
+            .expect("second signal request should succeed")
+            .status(),
+        200
+    );
+
+    let list_response = client
+        .get(format!("{}/api/v1/runs/{run_id}/signals", server.base_url))
+        .send()
+        .await
+        .expect("signal list request should succeed");
+    let list_body: serde_json::Value = list_response
+        .json()
+        .await
+        .expect("signal list response should deserialize");
+    let items = list_body["items"]
+        .as_array()
+        .expect("signal list should be an array");
+    let consumed = items.iter().filter(|item| item["consumed"] == true).count();
+    let unconsumed = items
+        .iter()
+        .filter(|item| item["consumed"] == false)
+        .count();
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(consumed, 1);
+    assert_eq!(unconsumed, 1);
 }
 
 #[tokio::test]
@@ -1280,6 +1755,10 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         .route(
             "/api/v1/runs/{id}/checkpoints",
             axum::routing::get(routes::get_run_checkpoints_v1),
+        )
+        .route(
+            "/api/v1/runs/{id}/signals",
+            axum::routing::get(routes::get_run_signals_v1).post(routes::post_run_signal_v1),
         )
         .route("/api/shutdown", axum::routing::post(routes::shutdown))
         .layer(axum::middleware::from_fn_with_state(
