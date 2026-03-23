@@ -8,6 +8,7 @@ pub mod approval;
 pub mod capability;
 pub mod comms;
 pub mod config;
+pub mod contract;
 pub mod error;
 pub mod event;
 pub mod manifest_signing;

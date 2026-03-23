@@ -4425,6 +4425,7 @@ dependencies = [
  "dirs 6.0.0",
  "ed25519-dalek",
  "hex",
+ "pretty_assertions",
  "rand 0.8.5",
  "rmp-serde",
  "serde",
