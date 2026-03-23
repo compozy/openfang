@@ -327,8 +327,8 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .create_run(wf.id, input.to_string())
             .await
         {
-            Some(id) => id,
-            None => return "Failed to create workflow run.".to_string(),
+            Ok(id) => id,
+            Err(error) => return format!("Failed to create workflow run: {error}"),
         };
 
         let kernel = self.kernel.clone();

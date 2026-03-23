@@ -15,6 +15,7 @@ pub mod semantic;
 pub mod session;
 pub mod structured;
 pub mod usage;
+pub mod workflow_store;
 
 mod substrate;
 pub use runtime_store::{
@@ -25,3 +26,10 @@ pub use runtime_store::{
     SCHEDULE_RUNTIME_CORE_MIGRATION_SQL,
 };
 pub use substrate::MemorySubstrate;
+pub use workflow_store::{
+    CheckpointKind, WorkflowCheckpointRecord, WorkflowCheckpointStore, WorkflowRunRecord,
+    WorkflowRunStatus, WorkflowRunStore, WorkflowSignalRecord, WorkflowSignalStore,
+    WorkflowStoreError, WorkflowStoreSet, WorkflowTransitionRequest,
+    WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
+    WORKFLOW_SIGNAL_MIGRATION_SQL,
+};

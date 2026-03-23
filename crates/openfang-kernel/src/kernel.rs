@@ -18,7 +18,9 @@ use crate::workflow::{
     WorkflowId, WorkflowRunId,
 };
 
-use openfang_memory::{AgentRuntimeRecord, AgentSessionRecord, MemorySubstrate, RuntimeStoreSet};
+use openfang_memory::{
+    AgentRuntimeRecord, AgentSessionRecord, MemorySubstrate, RuntimeStoreSet, WorkflowStoreSet,
+};
 use openfang_runtime::agent_loop::{
     run_agent_loop, run_agent_loop_streaming, strip_provider_prefix, AgentLoopResult,
 };
@@ -79,8 +81,8 @@ pub struct OpenFangKernel {
     pub memory: Arc<MemorySubstrate>,
     /// Typed runtime.db projection stores.
     pub runtime_stores: RuntimeStoreSet,
-    /// Compozy durable state database handle.
-    pub(crate) compozy_db: Arc<Mutex<Connection>>,
+    /// Typed compozy.db workflow stores.
+    pub workflow_stores: WorkflowStoreSet,
     /// Process supervisor.
     pub supervisor: Supervisor,
     /// Workflow engine.
@@ -547,6 +549,28 @@ fn initialize_runtime_stores(runtime_db: Arc<Mutex<Connection>>) -> RuntimeStore
     RuntimeStoreSet::new(runtime_db)
 }
 
+fn initialize_workflow_stores(compozy_db: Arc<Mutex<Connection>>) -> WorkflowStoreSet {
+    WorkflowStoreSet::new(compozy_db)
+}
+
+fn recover_inflight_workflow_runs(workflow_stores: &WorkflowStoreSet) -> KernelResult<()> {
+    let recovered = workflow_stores
+        .workflow_run
+        .recover_running_runs()
+        .map_err(|error| {
+            KernelError::BootFailed(format!("Workflow recovery scan failed: {error}"))
+        })?;
+
+    if recovered > 0 {
+        info!(
+            recovered_runs = recovered,
+            "Recovered running workflow rows and downgraded them to paused"
+        );
+    }
+
+    Ok(())
+}
+
 impl OpenFangKernel {
     /// Boot the kernel with configuration from the given path.
     pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
@@ -635,6 +659,8 @@ impl OpenFangKernel {
             config.memory.decay_rate,
         )?;
         let runtime_stores = initialize_runtime_stores(Arc::clone(&runtime_db));
+        let workflow_stores = initialize_workflow_stores(Arc::clone(&compozy_db));
+        recover_inflight_workflow_runs(&workflow_stores)?;
 
         // Initialize credential resolver (vault → dotenv → env var)
         let credential_resolver = {
@@ -1085,9 +1111,12 @@ impl OpenFangKernel {
             scheduler: AgentScheduler::new(),
             memory: memory.clone(),
             runtime_stores: runtime_stores.clone(),
-            compozy_db,
+            workflow_stores: workflow_stores.clone(),
             supervisor,
-            workflows: WorkflowEngine::with_definitions_dir(workflows_dir),
+            workflows: WorkflowEngine::with_definitions_dir_and_stores(
+                workflows_dir,
+                workflow_stores.clone(),
+            ),
             triggers: TriggerEngine::new(),
             background,
             audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
@@ -4010,9 +4039,7 @@ impl OpenFangKernel {
             .workflows
             .create_run(workflow_id, input)
             .await
-            .ok_or_else(|| {
-                KernelError::OpenFang(OpenFangError::Internal("Workflow not found".to_string()))
-            })?;
+            .map_err(KernelError::from)?;
 
         // Agent resolver: looks up by name or ID in the registry
         let resolver = |agent_ref: &StepAgent| -> Option<(AgentId, String)> {
@@ -4871,7 +4898,7 @@ impl OpenFangKernel {
 
     /// Return the readiness state for both kernel-owned SQLite databases.
     pub fn db_health(&self) -> crate::DatabaseHealth {
-        DatabaseManager::from_handles(self.memory.usage_conn(), Arc::clone(&self.compozy_db))
+        DatabaseManager::from_handles(self.memory.usage_conn(), self.workflow_stores.connection())
             .health()
     }
 
@@ -6886,13 +6913,14 @@ mod tests {
     }
 
     #[test]
-    fn boot_should_initialize_compozy_db_handle_as_non_null() {
+    fn boot_should_initialize_workflow_store_connection() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = boot_test_config(tmp.path());
 
         let kernel = OpenFangKernel::boot_with_config(config).expect("kernel should boot");
         let value = kernel
-            .compozy_db
+            .workflow_stores
+            .connection()
             .lock()
             .expect("compozy db lock")
             .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
@@ -7099,7 +7127,7 @@ mod tests {
         let compozy_rows = schema_migration_rows(&compozy_db);
 
         assert_eq!(runtime_rows.len(), 4);
-        assert_eq!(compozy_rows.len(), 1);
+        assert_eq!(compozy_rows.len(), 4);
         assert_eq!(runtime_rows[0].0, 1);
         assert_eq!(compozy_rows[0].0, 1);
         assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -7107,6 +7135,9 @@ mod tests {
         assert_eq!(runtime_rows[2].1, "0003_agent_sessions_and_messages");
         assert_eq!(runtime_rows[3].1, "0004_schedule_runtime_core");
         assert_eq!(compozy_rows[0].1, "schema_migrations_bootstrap");
+        assert_eq!(compozy_rows[1].1, "0002_workflow_run_core");
+        assert_eq!(compozy_rows[2].1, "0003_workflow_checkpoint");
+        assert_eq!(compozy_rows[3].1, "0004_workflow_signal");
 
         kernel.shutdown();
     }

@@ -165,10 +165,10 @@ memory_write = ["self.*"]
     let run_id = kernel
         .workflows
         .create_run(wf_id, "test input".to_string())
-        .await;
-    assert!(run_id.is_some());
+        .await
+        .expect("workflow run should be created");
 
-    let run = kernel.workflows.get_run(run_id.unwrap()).await.unwrap();
+    let run = kernel.workflows.get_run(run_id).await.unwrap();
     assert_eq!(run.input, "test input");
 
     kernel.shutdown();
@@ -225,11 +225,11 @@ memory_write = ["self.*"]
         .expect("workflow registration should succeed");
 
     // Can create run (agent resolution happens at execute time)
-    let run_id = kernel
+    let _run_id = kernel
         .workflows
         .create_run(wf_id, "hello".to_string())
-        .await;
-    assert!(run_id.is_some());
+        .await
+        .expect("workflow run should be created");
 
     kernel.shutdown();
 }

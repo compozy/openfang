@@ -5,7 +5,8 @@
 
 use openfang_memory::{
     AGENT_RUNTIME_CORE_MIGRATION_SQL, AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL,
-    SCHEDULE_RUNTIME_CORE_MIGRATION_SQL,
+    SCHEDULE_RUNTIME_CORE_MIGRATION_SQL, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
+    WORKFLOW_RUN_CORE_MIGRATION_SQL, WORKFLOW_SIGNAL_MIGRATION_SQL,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
@@ -133,11 +134,20 @@ const RUNTIME_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[
     ),
 ];
 
-const COMPOZY_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[MigrationStep::new(
-    1,
-    "schema_migrations_bootstrap",
-    SCHEMA_MIGRATION_BOOTSTRAP_SQL,
-)];
+const COMPOZY_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[
+    MigrationStep::new(
+        1,
+        "schema_migrations_bootstrap",
+        SCHEMA_MIGRATION_BOOTSTRAP_SQL,
+    ),
+    MigrationStep::new(2, "0002_workflow_run_core", WORKFLOW_RUN_CORE_MIGRATION_SQL),
+    MigrationStep::new(
+        3,
+        "0003_workflow_checkpoint",
+        WORKFLOW_CHECKPOINT_MIGRATION_SQL,
+    ),
+    MigrationStep::new(4, "0004_workflow_signal", WORKFLOW_SIGNAL_MIGRATION_SQL),
+];
 
 /// Returns the current `runtime.db` migration slice.
 pub(crate) const fn runtime_migration_steps() -> &'static [MigrationStep<'static>] {
@@ -301,9 +311,24 @@ mod tests {
         .is_some()
     }
 
+    fn table_columns(conn: &Connection, table_name: &str) -> Vec<String> {
+        let pragma = format!("PRAGMA table_info('{table_name}')");
+        let mut stmt = conn.prepare(&pragma).expect("prepare table info query");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table info rows");
+
+        rows.map(|row| row.expect("column row")).collect()
+    }
+
     fn apply_runtime_migrations(conn: &Connection) {
         run_migrations(conn, DatabaseIdentity::Runtime, runtime_migration_steps())
             .expect("runtime migrations should succeed");
+    }
+
+    fn apply_compozy_migrations(conn: &Connection) {
+        run_migrations(conn, DatabaseIdentity::Compozy, compozy_migration_steps())
+            .expect("compozy migrations should succeed");
     }
 
     #[test]
@@ -555,6 +580,97 @@ mod tests {
     }
 
     #[test]
+    fn compozy_db_migration_should_create_workflow_run_table() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_compozy_migrations(&conn);
+
+        assert!(table_exists(&conn, "workflow_run"));
+        assert_eq!(
+            table_columns(&conn, "workflow_run"),
+            vec![
+                "run_id".to_string(),
+                "workflow_id".to_string(),
+                "workflow_version".to_string(),
+                "status".to_string(),
+                "input_json".to_string(),
+                "vars_json".to_string(),
+                "current_step_id".to_string(),
+                "waiting_kind".to_string(),
+                "waiting_ref".to_string(),
+                "active_dispatch_id".to_string(),
+                "active_hitl_request_id".to_string(),
+                "labels_json".to_string(),
+                "metadata_json".to_string(),
+                "error_json".to_string(),
+                "started_at".to_string(),
+                "updated_at".to_string(),
+                "completed_at".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compozy_db_migration_should_create_workflow_checkpoint_table() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_compozy_migrations(&conn);
+
+        assert!(table_exists(&conn, "workflow_checkpoint"));
+        assert_eq!(
+            table_columns(&conn, "workflow_checkpoint"),
+            vec![
+                "checkpoint_id".to_string(),
+                "run_id".to_string(),
+                "step_id".to_string(),
+                "kind".to_string(),
+                "data_json".to_string(),
+                "created_at".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compozy_db_migration_should_create_workflow_signal_table() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_compozy_migrations(&conn);
+
+        assert!(table_exists(&conn, "workflow_signal"));
+        assert_eq!(
+            table_columns(&conn, "workflow_signal"),
+            vec![
+                "signal_id".to_string(),
+                "run_id".to_string(),
+                "name".to_string(),
+                "payload_json".to_string(),
+                "source".to_string(),
+                "consumed".to_string(),
+                "created_at".to_string(),
+                "consumed_at".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compozy_db_migration_should_create_all_required_indexes() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_compozy_migrations(&conn);
+
+        for index_name in [
+            "idx_workflow_run_workflow_id",
+            "idx_workflow_run_status",
+            "idx_workflow_run_updated_at",
+            "idx_workflow_checkpoint_run",
+            "idx_workflow_signal_run",
+            "idx_workflow_signal_run_consumed",
+            "idx_workflow_signal_run_name",
+        ] {
+            assert!(
+                index_exists(&conn, index_name),
+                "missing required compozy.db index: {index_name}"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_db_migration_should_not_include_compozy_domain_tables() {
         let runtime_sql = runtime_migration_steps()
             .iter()
@@ -597,6 +713,57 @@ mod tests {
             assert!(
                 !runtime_sql.contains(disallowed_column),
                 "runtime.db migrations unexpectedly reference definition field {disallowed_column}"
+            );
+        }
+    }
+
+    #[test]
+    fn compozy_db_migration_should_not_include_later_phase_tables_or_cross_database_sql() {
+        let compozy_sql = compozy_migration_steps()
+            .iter()
+            .map(|step| step.sql)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for disallowed_fragment in [
+            "CREATE TABLE agent_dispatch",
+            "CREATE TABLE IF NOT EXISTS agent_dispatch",
+            "CREATE TABLE hitl_request",
+            "CREATE TABLE IF NOT EXISTS hitl_request",
+            "CREATE TABLE task",
+            "CREATE TABLE IF NOT EXISTS task",
+            "CREATE TABLE subtask",
+            "CREATE TABLE IF NOT EXISTS subtask",
+            "ATTACH DATABASE",
+            "attach database",
+        ] {
+            assert!(
+                !compozy_sql.contains(disallowed_fragment),
+                "compozy.db migrations unexpectedly reference {disallowed_fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn compozy_db_migration_should_store_workflow_definition_references_only() {
+        let workflow_run_sql = compozy_migration_steps()
+            .iter()
+            .find(|step| step.name == "0002_workflow_run_core")
+            .expect("workflow_run migration should exist")
+            .sql;
+
+        assert!(workflow_run_sql.contains("workflow_id"));
+        assert!(workflow_run_sql.contains("workflow_version"));
+        for disallowed_column in [
+            "workflow_toml",
+            "workflow_json",
+            "step_definition",
+            "step_definitions",
+            "compiled_workflow",
+        ] {
+            assert!(
+                !workflow_run_sql.contains(disallowed_column),
+                "workflow_run migration unexpectedly embeds definition column {disallowed_column}"
             );
         }
     }

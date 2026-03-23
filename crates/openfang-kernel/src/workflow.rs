@@ -11,6 +11,10 @@
 //! Workflows are defined as Rust structs or loaded from JSON.
 
 use chrono::{DateTime, Utc};
+use openfang_memory::{
+    CheckpointKind as DurableCheckpointKind, WorkflowRunRecord,
+    WorkflowRunStatus as DurableWorkflowRunStatus, WorkflowStoreSet, WorkflowTransitionRequest,
+};
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use serde::{Deserialize, Serialize};
@@ -572,6 +576,8 @@ pub struct WorkflowEngine {
     definition_mutation_lock: Arc<Mutex<()>>,
     /// Readiness state for the workflow registry.
     readiness: Arc<AtomicU8>,
+    /// Durable workflow stores, if the kernel boot path provided them.
+    workflow_stores: Option<WorkflowStoreSet>,
 }
 
 impl WorkflowEngine {
@@ -584,6 +590,19 @@ impl WorkflowEngine {
 
     /// Create a new workflow engine with an explicit definitions directory.
     pub fn with_definitions_dir(workflows_dir: PathBuf) -> Self {
+        Self::build(workflows_dir, None)
+    }
+
+    /// Create a new workflow engine with an explicit definitions directory and
+    /// typed durable workflow stores.
+    pub fn with_definitions_dir_and_stores(
+        workflows_dir: PathBuf,
+        workflow_stores: WorkflowStoreSet,
+    ) -> Self {
+        Self::build(workflows_dir, Some(workflow_stores))
+    }
+
+    fn build(workflows_dir: PathBuf, workflow_stores: Option<WorkflowStoreSet>) -> Self {
         Self {
             workflows: Arc::new(RwLock::new(HashMap::new())),
             runs: Arc::new(RwLock::new(HashMap::new())),
@@ -592,6 +611,7 @@ impl WorkflowEngine {
             readiness: Arc::new(AtomicU8::new(
                 WorkflowRegistryReadiness::Bootstrapping as u8,
             )),
+            workflow_stores,
         }
     }
 
@@ -703,13 +723,169 @@ impl WorkflowEngine {
     ///
     /// The actual execution is driven externally by calling `execute_run()`
     /// with the kernel handle, since the workflow engine doesn't own the kernel.
+    async fn persist_run_creation(
+        &self,
+        workflow_id: WorkflowId,
+        run_id: WorkflowRunId,
+        input: &str,
+    ) -> OpenFangResult<()> {
+        let Some(workflow_stores) = self.workflow_stores.clone() else {
+            return Ok(());
+        };
+
+        let record = WorkflowRunRecord {
+            run_id: run_id.to_string(),
+            workflow_id: workflow_id.to_string(),
+            workflow_version: None,
+            status: DurableWorkflowRunStatus::Pending,
+            input_json: serde_json::to_string(input).map_err(|error| {
+                OpenFangError::Serialization(format!(
+                    "Failed to serialize workflow input for durable run state: {error}"
+                ))
+            })?,
+            vars_json: "{}".to_string(),
+            current_step_id: None,
+            waiting_kind: None,
+            waiting_ref: None,
+            active_dispatch_id: None,
+            active_hitl_request_id: None,
+            labels_json: "[]".to_string(),
+            metadata_json: "{}".to_string(),
+            error_json: None,
+            started_at: None,
+            updated_at: Utc::now().to_rfc3339(),
+            completed_at: None,
+        };
+
+        tokio::task::spawn_blocking(move || workflow_stores.workflow_run.create_run(&record))
+            .await
+            .map_err(|error| {
+                OpenFangError::Internal(format!("Workflow run persistence task failed: {error}"))
+            })?
+            .map_err(OpenFangError::from)
+    }
+
+    async fn persist_transition(
+        &self,
+        run_id: WorkflowRunId,
+        new_status: DurableWorkflowRunStatus,
+        step_id: Option<String>,
+        checkpoint_kind: DurableCheckpointKind,
+        checkpoint_data: serde_json::Value,
+        completed_at: Option<String>,
+    ) -> OpenFangResult<()> {
+        let Some(workflow_stores) = self.workflow_stores.clone() else {
+            return Ok(());
+        };
+
+        let run_id = run_id.to_string();
+        let transition = WorkflowTransitionRequest {
+            new_status,
+            step_id,
+            checkpoint_id: Uuid::new_v4().to_string(),
+            checkpoint_kind,
+            checkpoint_data,
+            updated_at: Utc::now().to_rfc3339(),
+            completed_at,
+        };
+
+        tokio::task::spawn_blocking(move || {
+            workflow_stores
+                .workflow_run
+                .transition(&run_id, &transition)
+        })
+        .await
+        .map_err(|error| {
+            OpenFangError::Internal(format!(
+                "Workflow transition persistence task failed: {error}"
+            ))
+        })?
+        .map_err(OpenFangError::from)
+    }
+
+    async fn mark_run_running(&self, run_id: WorkflowRunId) -> Result<(), String> {
+        self.persist_transition(
+            run_id,
+            DurableWorkflowRunStatus::Running,
+            None,
+            DurableCheckpointKind::RunStarted,
+            serde_json::json!({}),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let mut runs = self.runs.write().await;
+        let run = runs.get_mut(&run_id).ok_or("Workflow run not found")?;
+        run.state = WorkflowRunState::Running;
+        Ok(())
+    }
+
+    async fn mark_run_failed(
+        &self,
+        run_id: WorkflowRunId,
+        error_message: &str,
+    ) -> Result<(), String> {
+        let completed_at = Utc::now();
+        self.persist_transition(
+            run_id,
+            DurableWorkflowRunStatus::Failed,
+            None,
+            DurableCheckpointKind::RunFailed,
+            serde_json::json!({ "error": error_message }),
+            Some(completed_at.to_rfc3339()),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let mut runs = self.runs.write().await;
+        let run = runs.get_mut(&run_id).ok_or("Workflow run not found")?;
+        run.state = WorkflowRunState::Failed;
+        run.error = Some(error_message.to_string());
+        run.completed_at = Some(completed_at);
+        Ok(())
+    }
+
+    async fn mark_run_completed(
+        &self,
+        run_id: WorkflowRunId,
+        final_output: &str,
+    ) -> Result<(), String> {
+        let completed_at = Utc::now();
+        self.persist_transition(
+            run_id,
+            DurableWorkflowRunStatus::Completed,
+            None,
+            DurableCheckpointKind::RunCompleted,
+            serde_json::json!({ "output": final_output }),
+            Some(completed_at.to_rfc3339()),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let mut runs = self.runs.write().await;
+        let run = runs.get_mut(&run_id).ok_or("Workflow run not found")?;
+        run.state = WorkflowRunState::Completed;
+        run.output = Some(final_output.to_string());
+        run.completed_at = Some(completed_at);
+        Ok(())
+    }
+
     pub async fn create_run(
         &self,
         workflow_id: WorkflowId,
         input: String,
-    ) -> Option<WorkflowRunId> {
-        let workflow = self.workflows.read().await.get(&workflow_id)?.clone();
+    ) -> OpenFangResult<WorkflowRunId> {
+        let workflow = self
+            .workflows
+            .read()
+            .await
+            .get(&workflow_id)
+            .cloned()
+            .ok_or_else(|| OpenFangError::Internal("Workflow definition not found".to_string()))?;
         let run_id = WorkflowRunId::new();
+        self.persist_run_creation(workflow_id, run_id, &input)
+            .await?;
 
         let run = WorkflowRun {
             id: run_id,
@@ -750,7 +926,7 @@ impl WorkflowEngine {
             }
         }
 
-        Some(run_id)
+        Ok(run_id)
     }
 
     /// Get the current state of a workflow run.
@@ -916,9 +1092,8 @@ impl WorkflowEngine {
     {
         // Get the run and workflow
         let (workflow, input) = {
-            let mut runs = self.runs.write().await;
-            let run = runs.get_mut(&run_id).ok_or("Workflow run not found")?;
-            run.state = WorkflowRunState::Running;
+            let runs = self.runs.read().await;
+            let run = runs.get(&run_id).ok_or("Workflow run not found")?;
 
             let workflow = self
                 .workflows
@@ -930,6 +1105,8 @@ impl WorkflowEngine {
 
             (workflow, run.input.clone())
         };
+
+        self.mark_run_running(run_id).await?;
 
         info!(
             run_id = %run_id,
@@ -994,10 +1171,10 @@ impl WorkflowEngine {
                             info!(step = i + 1, name = %step.name, "Step skipped");
                         }
                         Err(e) => {
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
-                                r.state = WorkflowRunState::Failed;
-                                r.error = Some(e.clone());
-                                r.completed_at = Some(Utc::now());
+                            if let Err(persist_error) = self.mark_run_failed(run_id, &e).await {
+                                return Err(format!(
+                                    "{e}; additionally failed to persist workflow failure: {persist_error}"
+                                ));
                             }
                             return Err(e);
                         }
@@ -1072,10 +1249,12 @@ impl WorkflowEngine {
                                 let error_msg =
                                     format!("FanOut step '{}' failed: {}", step_name, e);
                                 warn!(%error_msg);
-                                if let Some(r) = self.runs.write().await.get_mut(&run_id) {
-                                    r.state = WorkflowRunState::Failed;
-                                    r.error = Some(error_msg.clone());
-                                    r.completed_at = Some(Utc::now());
+                                if let Err(persist_error) =
+                                    self.mark_run_failed(run_id, &error_msg).await
+                                {
+                                    return Err(format!(
+                                        "{error_msg}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
                                 }
                                 return Err(error_msg);
                             }
@@ -1085,10 +1264,12 @@ impl WorkflowEngine {
                                     step_name, fan_step.timeout_secs
                                 );
                                 warn!(%error_msg);
-                                if let Some(r) = self.runs.write().await.get_mut(&run_id) {
-                                    r.state = WorkflowRunState::Failed;
-                                    r.error = Some(error_msg.clone());
-                                    r.completed_at = Some(Utc::now());
+                                if let Err(persist_error) =
+                                    self.mark_run_failed(run_id, &error_msg).await
+                                {
+                                    return Err(format!(
+                                        "{error_msg}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
                                 }
                                 return Err(error_msg);
                             }
@@ -1164,10 +1345,10 @@ impl WorkflowEngine {
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
-                                r.state = WorkflowRunState::Failed;
-                                r.error = Some(e.clone());
-                                r.completed_at = Some(Utc::now());
+                            if let Err(persist_error) = self.mark_run_failed(run_id, &e).await {
+                                return Err(format!(
+                                    "{e}; additionally failed to persist workflow failure: {persist_error}"
+                                ));
                             }
                             return Err(e);
                         }
@@ -1237,10 +1418,10 @@ impl WorkflowEngine {
                             }
                             Ok(None) => break,
                             Err(e) => {
-                                if let Some(r) = self.runs.write().await.get_mut(&run_id) {
-                                    r.state = WorkflowRunState::Failed;
-                                    r.error = Some(e.clone());
-                                    r.completed_at = Some(Utc::now());
+                                if let Err(persist_error) = self.mark_run_failed(run_id, &e).await {
+                                    return Err(format!(
+                                        "{e}; additionally failed to persist workflow failure: {persist_error}"
+                                    ));
                                 }
                                 return Err(e);
                             }
@@ -1259,11 +1440,7 @@ impl WorkflowEngine {
 
         // Mark workflow as completed
         let final_output = current_input.clone();
-        if let Some(r) = self.runs.write().await.get_mut(&run_id) {
-            r.state = WorkflowRunState::Completed;
-            r.output = Some(final_output.clone());
-            r.completed_at = Some(Utc::now());
-        }
+        self.mark_run_completed(run_id, &final_output).await?;
 
         info!(run_id = %run_id, "Workflow completed successfully");
         Ok(final_output)
@@ -1560,10 +1737,12 @@ mod tests {
             .await
             .expect("workflow registration should succeed");
 
-        let run_id = engine.create_run(wf_id, "test input".to_string()).await;
-        assert!(run_id.is_some());
+        let run_id = engine
+            .create_run(wf_id, "test input".to_string())
+            .await
+            .expect("workflow run should be created");
 
-        let run = engine.get_run(run_id.unwrap()).await.unwrap();
+        let run = engine.get_run(run_id).await.unwrap();
         assert_eq!(run.input, "test input");
         assert!(matches!(run.state, WorkflowRunState::Pending));
     }
