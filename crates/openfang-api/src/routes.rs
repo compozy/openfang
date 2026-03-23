@@ -3291,21 +3291,18 @@ pub async fn delete_agent_kv_key(
 /// Returns only status and version to prevent information leakage.
 /// Use GET /api/health/detail for full diagnostics (requires auth).
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // Run the database check on a blocking thread so we never hold the
-    // std::sync::Mutex<Connection> on a tokio worker thread.  This prevents
-    // the health probe from starving the async runtime when the agent loop
-    // is holding the database lock for session saves.
-    let memory = state.kernel.memory.clone();
-    let db_ok = tokio::task::spawn_blocking(move || {
-        let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-        ]));
-        memory.structured_get(shared_id, "__health_check__").is_ok()
-    })
-    .await
-    .unwrap_or(false);
+    // Run the database checks on a blocking thread so we never hold the
+    // std::sync::Mutex<Connection> on a tokio worker thread.
+    let kernel = Arc::clone(&state.kernel);
+    let db_health = tokio::task::spawn_blocking(move || kernel.db_health())
+        .await
+        .unwrap_or_default();
 
-    let status = if db_ok { "ok" } else { "degraded" };
+    let status = if db_health.is_healthy() {
+        "ok"
+    } else {
+        "degraded"
+    };
 
     Json(serde_json::json!({
         "status": status,
@@ -3317,18 +3314,17 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let health = state.kernel.supervisor.health();
 
-    let memory = state.kernel.memory.clone();
-    let db_ok = tokio::task::spawn_blocking(move || {
-        let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-        ]));
-        memory.structured_get(shared_id, "__health_check__").is_ok()
-    })
-    .await
-    .unwrap_or(false);
+    let kernel = Arc::clone(&state.kernel);
+    let db_health = tokio::task::spawn_blocking(move || kernel.db_health())
+        .await
+        .unwrap_or_default();
 
     let config_warnings = state.kernel.config.validate();
-    let status = if db_ok { "ok" } else { "degraded" };
+    let status = if db_health.is_healthy() {
+        "ok"
+    } else {
+        "degraded"
+    };
 
     Json(serde_json::json!({
         "status": status,
@@ -3337,7 +3333,7 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
         "panic_count": health.panic_count,
         "restart_count": health.restart_count,
         "agent_count": state.kernel.registry.count(),
-        "database": if db_ok { "connected" } else { "error" },
+        "database": if db_health.is_healthy() { "connected" } else { "error" },
         "config_warnings": config_warnings,
     }))
 }

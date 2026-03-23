@@ -22,6 +22,7 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The unified memory substrate. Implements the `Memory` trait by delegating
 /// to specialized stores backed by a shared SQLite connection.
@@ -39,10 +40,28 @@ impl MemorySubstrate {
     /// Open or create a memory substrate at the given database path.
     pub fn open(db_path: &Path, decay_rate: f32) -> OpenFangResult<Self> {
         let conn = Connection::open(db_path).map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        run_migrations(&conn).map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Self::configure_connection(&conn)?;
         let shared = Arc::new(Mutex::new(conn));
+
+        Self::from_shared_connection(shared, decay_rate)
+    }
+
+    /// Build a memory substrate from an already-opened shared connection.
+    ///
+    /// This is used by the kernel boot sequence to open both SQLite files
+    /// before the runtime store layer is constructed.
+    pub fn from_shared_connection(
+        shared: Arc<Mutex<Connection>>,
+        decay_rate: f32,
+    ) -> OpenFangResult<Self> {
+        {
+            let conn = shared.lock().map_err(|error| {
+                OpenFangError::Memory(format!(
+                    "Failed to acquire runtime.db connection lock: {error}"
+                ))
+            })?;
+            run_migrations(&conn).map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        }
 
         Ok(Self {
             conn: Arc::clone(&shared),
@@ -59,18 +78,9 @@ impl MemorySubstrate {
     pub fn open_in_memory(decay_rate: f32) -> OpenFangResult<Self> {
         let conn =
             Connection::open_in_memory().map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        run_migrations(&conn).map_err(|e| OpenFangError::Memory(e.to_string()))?;
         let shared = Arc::new(Mutex::new(conn));
 
-        Ok(Self {
-            conn: Arc::clone(&shared),
-            structured: StructuredStore::new(Arc::clone(&shared)),
-            semantic: SemanticStore::new(Arc::clone(&shared)),
-            knowledge: KnowledgeStore::new(Arc::clone(&shared)),
-            sessions: SessionStore::new(Arc::clone(&shared)),
-            usage: UsageStore::new(Arc::clone(&shared)),
-            consolidation: ConsolidationEngine::new(shared, decay_rate),
-        })
+        Self::from_shared_connection(shared, decay_rate)
     }
 
     /// Get a reference to the usage store.
@@ -81,6 +91,14 @@ impl MemorySubstrate {
     /// Get the shared database connection (for constructing stores from outside).
     pub fn usage_conn(&self) -> Arc<Mutex<Connection>> {
         Arc::clone(&self.conn)
+    }
+
+    fn configure_connection(conn: &Connection) -> OpenFangResult<()> {
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        conn.busy_timeout(Duration::from_millis(5000))
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(())
     }
 
     /// Save an agent entry to persistent storage.

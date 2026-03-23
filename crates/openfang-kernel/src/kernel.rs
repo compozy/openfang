@@ -4,6 +4,7 @@ use crate::auth::AuthManager;
 use crate::background::{self, BackgroundExecutor};
 use crate::capabilities::CapabilityManager;
 use crate::config::load_config;
+use crate::db::DatabaseManager;
 use crate::error::{KernelError, KernelResult};
 use crate::event_bus::EventBus;
 use crate::metering::MeteringEngine;
@@ -36,8 +37,9 @@ use openfang_types::memory::Memory;
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tracing::{debug, info, warn};
 
 /// The main OpenFang kernel — coordinates all subsystems.
@@ -70,6 +72,8 @@ pub struct OpenFangKernel {
     pub scheduler: AgentScheduler,
     /// Memory substrate.
     pub memory: Arc<MemorySubstrate>,
+    /// Compozy durable state database handle.
+    pub(crate) compozy_db: Arc<Mutex<Connection>>,
     /// Process supervisor.
     pub supervisor: Supervisor,
     /// Workflow engine.
@@ -551,20 +555,25 @@ impl OpenFangKernel {
             warn!("Config: {}", w);
         }
 
-        config
-            .validate_persistence_paths()
-            .map_err(KernelError::BootFailed)?;
+        let runtime_db_path = config.persistence.resolve_runtime_db(&config.data_dir);
+        let compozy_db_path = config.persistence.resolve_compozy_db(&config.data_dir);
+
+        config.validate_persistence_paths().map_err(|error| {
+            DatabaseManager::map_validation_error(error, &runtime_db_path, &compozy_db_path)
+        })?;
 
         // Ensure data directory exists
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| KernelError::BootFailed(format!("Failed to create data dir: {e}")))?;
 
-        // Initialize memory substrate
-        let db_path = config.persistence.resolve_runtime_db(&config.data_dir);
-        let memory = Arc::new(
-            MemorySubstrate::open(&db_path, config.memory.decay_rate)
-                .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,
-        );
+        // Ensure both database parent directories exist before SQLite opens either file.
+        DatabaseManager::ensure_parent_directory(&runtime_db_path, "runtime.db")?;
+        DatabaseManager::ensure_parent_directory(&compozy_db_path, "compozy.db")?;
+
+        // Open both databases before constructing any dependent subsystem.
+        let (memory, database_manager) =
+            DatabaseManager::open(&runtime_db_path, config.memory.decay_rate, &compozy_db_path)?;
+        let compozy_db = database_manager.compozy_db();
 
         // Initialize credential resolver (vault → dotenv → env var)
         let credential_resolver = {
@@ -1006,6 +1015,7 @@ impl OpenFangKernel {
             event_bus: EventBus::new(),
             scheduler: AgentScheduler::new(),
             memory: memory.clone(),
+            compozy_db,
             supervisor,
             workflows: WorkflowEngine::new(),
             triggers: TriggerEngine::new(),
@@ -4581,6 +4591,12 @@ impl OpenFangKernel {
         );
     }
 
+    /// Return the readiness state for both kernel-owned SQLite databases.
+    pub fn db_health(&self) -> crate::DatabaseHealth {
+        DatabaseManager::from_handles(self.memory.usage_conn(), Arc::clone(&self.compozy_db))
+            .health()
+    }
+
     /// Resolve the LLM driver for an agent.
     ///
     /// Always creates a fresh driver using current environment variables so that
@@ -6471,7 +6487,146 @@ impl openfang_wire::peer::PeerHandle for OpenFangKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openfang_types::config::PersistenceConfig;
     use std::collections::HashMap;
+    use std::path::Path;
+
+    fn boot_test_config(root: &Path) -> KernelConfig {
+        KernelConfig {
+            home_dir: root.to_path_buf(),
+            data_dir: root.join("data"),
+            ..KernelConfig::default()
+        }
+    }
+
+    #[test]
+    fn boot_should_fail_clearly_when_runtime_db_path_is_unwritable() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let blocked_parent = tmp.path().join("blocked-runtime-parent");
+        std::fs::write(&blocked_parent, "not a directory").expect("blocked parent file");
+
+        let mut config = boot_test_config(tmp.path());
+        config.persistence = PersistenceConfig {
+            runtime_db: Some(blocked_parent.join("runtime.db")),
+            ..PersistenceConfig::default()
+        };
+
+        match OpenFangKernel::boot_with_config(config) {
+            Err(KernelError::BootFailed(message)) => {
+                assert!(message.contains("runtime.db"), "{message}");
+            }
+            Ok(_) => panic!("boot should fail"),
+            Err(other) => panic!("expected BootFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boot_should_fail_clearly_when_compozy_db_path_is_unwritable() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let blocked_parent = tmp.path().join("blocked-compozy-parent");
+        std::fs::write(&blocked_parent, "not a directory").expect("blocked parent file");
+
+        let mut config = boot_test_config(tmp.path());
+        config.persistence = PersistenceConfig {
+            compozy_db: Some(blocked_parent.join("compozy.db")),
+            ..PersistenceConfig::default()
+        };
+
+        match OpenFangKernel::boot_with_config(config) {
+            Err(KernelError::BootFailed(message)) => {
+                assert!(message.contains("compozy.db"), "{message}");
+            }
+            Ok(_) => panic!("boot should fail"),
+            Err(other) => panic!("expected BootFailed, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_should_open_runtime_db_before_compozy_db() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let compozy_parent = tmp.path().join("readonly-compozy");
+        std::fs::create_dir_all(&compozy_parent).expect("readonly dir");
+
+        let mut permissions = std::fs::metadata(&compozy_parent)
+            .expect("readonly metadata")
+            .permissions();
+        permissions.set_mode(0o555);
+        std::fs::set_permissions(&compozy_parent, permissions).expect("set readonly permissions");
+
+        let mut config = boot_test_config(tmp.path());
+        config.persistence = PersistenceConfig {
+            compozy_db: Some(compozy_parent.join("compozy.db")),
+            ..PersistenceConfig::default()
+        };
+        let runtime_db_path = config.persistence.resolve_runtime_db(&config.data_dir);
+
+        match OpenFangKernel::boot_with_config(config) {
+            Err(KernelError::BootFailed(message)) => {
+                assert!(runtime_db_path.exists(), "runtime.db should already exist");
+                assert!(message.contains("compozy.db"), "{message}");
+            }
+            Ok(_) => panic!("boot should fail"),
+            Err(other) => panic!("expected BootFailed, got {other:?}"),
+        }
+
+        let mut permissions = std::fs::metadata(&compozy_parent)
+            .expect("readonly metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&compozy_parent, permissions).expect("restore permissions");
+    }
+
+    #[test]
+    fn boot_should_initialize_compozy_db_handle_as_non_null() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel should boot");
+        let value = kernel
+            .compozy_db
+            .lock()
+            .expect("compozy db lock")
+            .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            .expect("compozy db query");
+
+        assert_eq!(value, 1);
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn db_health_should_return_healthy_after_successful_boot() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel should boot");
+        let health = kernel.db_health();
+
+        assert!(health.runtime_db);
+        assert!(health.compozy_db);
+        assert!(health.is_healthy());
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn boot_should_not_hide_partial_failure_as_degraded_success() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let blocked_parent = tmp.path().join("blocked-partial-parent");
+        std::fs::write(&blocked_parent, "not a directory").expect("blocked parent file");
+
+        let mut config = boot_test_config(tmp.path());
+        config.persistence = PersistenceConfig {
+            compozy_db: Some(blocked_parent.join("compozy.db")),
+            ..PersistenceConfig::default()
+        };
+
+        assert!(
+            OpenFangKernel::boot_with_config(config).is_err(),
+            "boot must fail instead of returning a degraded kernel"
+        );
+    }
 
     #[test]
     fn test_manifest_to_capabilities() {

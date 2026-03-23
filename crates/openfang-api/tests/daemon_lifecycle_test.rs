@@ -103,6 +103,26 @@ async fn test_full_daemon_lifecycle() {
     };
 
     let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let runtime_db = kernel
+        .config
+        .persistence
+        .resolve_runtime_db(&kernel.config.data_dir);
+    let compozy_db = kernel
+        .config
+        .persistence
+        .resolve_compozy_db(&kernel.config.data_dir);
+    assert!(
+        runtime_db.exists(),
+        "runtime.db should exist after daemon boot"
+    );
+    assert!(
+        compozy_db.exists(),
+        "compozy.db should exist after daemon boot"
+    );
+    assert!(
+        kernel.db_health().is_healthy(),
+        "daemon boot should leave both databases healthy"
+    );
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
 

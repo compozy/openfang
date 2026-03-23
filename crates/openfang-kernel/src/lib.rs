@@ -11,6 +11,7 @@ pub mod capabilities;
 pub mod config;
 pub mod config_reload;
 pub mod cron;
+mod db;
 pub mod error;
 pub mod event_bus;
 pub mod heartbeat;
@@ -25,5 +26,6 @@ pub mod whatsapp_gateway;
 pub mod wizard;
 pub mod workflow;
 
+pub use db::DatabaseHealth;
 pub use kernel::DeliveryTracker;
 pub use kernel::OpenFangKernel;

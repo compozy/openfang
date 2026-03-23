@@ -273,6 +273,68 @@ async fn test_config_endpoint_includes_resolved_persistence_paths() {
 }
 
 #[tokio::test]
+async fn test_fresh_boot_creates_both_database_files() {
+    let server = start_test_server().await;
+    let runtime_db = server
+        .state
+        .kernel
+        .config
+        .persistence
+        .resolve_runtime_db(&server.state.kernel.config.data_dir);
+    let compozy_db = server
+        .state
+        .kernel
+        .config
+        .persistence
+        .resolve_compozy_db(&server.state.kernel.config.data_dir);
+
+    assert!(runtime_db.exists(), "runtime.db should exist after boot");
+    assert!(compozy_db.exists(), "compozy.db should exist after boot");
+    assert!(
+        server.state.kernel.db_health().is_healthy(),
+        "dual-database boot should report healthy"
+    );
+}
+
+#[tokio::test]
+async fn test_second_boot_against_existing_dual_databases_succeeds() {
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+
+    let first_config = KernelConfig {
+        home_dir: tmp.path().to_path_buf(),
+        data_dir: tmp.path().join("data"),
+        default_model: DefaultModelConfig {
+            provider: "ollama".to_string(),
+            model: "test-model".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url: None,
+        },
+        ..KernelConfig::default()
+    };
+    let first_kernel = OpenFangKernel::boot_with_config(first_config).expect("first boot");
+    first_kernel.shutdown();
+
+    let second_config = KernelConfig {
+        home_dir: tmp.path().to_path_buf(),
+        data_dir: tmp.path().join("data"),
+        default_model: DefaultModelConfig {
+            provider: "ollama".to_string(),
+            model: "test-model".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url: None,
+        },
+        ..KernelConfig::default()
+    };
+    let second_kernel = OpenFangKernel::boot_with_config(second_config).expect("second boot");
+
+    assert!(
+        second_kernel.db_health().is_healthy(),
+        "second boot should preserve dual-database readiness"
+    );
+    second_kernel.shutdown();
+}
+
+#[tokio::test]
 async fn test_spawn_list_kill_agent() {
     let server = start_test_server().await;
     let client = reqwest::Client::new();
