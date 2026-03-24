@@ -148,6 +148,47 @@ pub async fn build_router(
             axum::routing::get(routes::get_agent_compiled),
         )
         .route(
+            "/api/v1/agents/{id}/runtime",
+            axum::routing::get(routes::get_agent_runtime),
+        )
+        .route(
+            "/api/v1/agents/{id}/runtime/start",
+            axum::routing::post(routes::start_agent_runtime),
+        )
+        .route(
+            "/api/v1/agents/{id}/runtime/stop",
+            axum::routing::post(routes::stop_agent_runtime),
+        )
+        .route(
+            "/api/v1/agents/{id}/runtime/restart",
+            axum::routing::post(routes::restart_agent_runtime),
+        )
+        .route(
+            "/api/v1/agents/{id}/runtime/mode",
+            axum::routing::put(routes::set_agent_runtime_mode),
+        )
+        .route(
+            "/api/v1/agents/{id}/sessions",
+            axum::routing::get(routes::list_agent_sessions_v1)
+                .post(routes::create_agent_session_v1),
+        )
+        .route(
+            "/api/v1/agents/{id}/sessions/{session_id}",
+            axum::routing::get(routes::get_agent_session_v1),
+        )
+        .route(
+            "/api/v1/agents/{id}/sessions/{session_id}/activate",
+            axum::routing::post(routes::activate_agent_session),
+        )
+        .route(
+            "/api/v1/agents/{id}/sessions/{session_id}/reset",
+            axum::routing::post(routes::reset_agent_session),
+        )
+        .route(
+            "/api/v1/agents/{id}/sessions/{session_id}/compact",
+            axum::routing::post(routes::compact_agent_session_v1),
+        )
+        .route(
             "/api/v1/agents",
             axum::routing::get(routes::list_agents).post(routes::create_agent),
         )

@@ -263,6 +263,93 @@ pub struct AgentCompiledResponse {
     pub compiled: AgentCompiledPayload,
 }
 
+/// Public runtime resource payload for one agent definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentRuntimeResponse {
+    pub agent_id: String,
+    pub loaded: bool,
+    pub state: openfang_types::agent::AgentState,
+    pub mode: openfang_types::agent::AgentMode,
+    pub healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_session_id: Option<String>,
+    pub active_sessions: u32,
+    pub active_dispatches: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_active_at: Option<String>,
+}
+
+/// Request payload for updating an agent runtime mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct RuntimeModeRequest {
+    pub mode: openfang_types::agent::AgentMode,
+}
+
+/// Session summary returned by `/api/v1/agents/{id}/sessions`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionListItem {
+    pub id: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub active: bool,
+    pub message_count: u32,
+    pub dispatch_count: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compacted_at: Option<String>,
+}
+
+/// Paginated session list payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionListResponse {
+    pub items: Vec<SessionListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// Full session detail payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionDetail {
+    pub id: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub active: bool,
+    pub message_count: u32,
+    pub dispatch_count: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compacted_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<serde_json::Value>>,
+}
+
+/// Request payload for creating a new agent session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateSessionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Canonical accepted response for operational actions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct AcceptedActionResponse {
+    pub accepted: bool,
+    pub resource_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
 /// Request to change an agent's operational mode.
 #[derive(Debug, Deserialize)]
 pub struct SetModeRequest {

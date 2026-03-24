@@ -22,11 +22,11 @@ use openfang_kernel::workflow_compiler::{
     validate_workflow_definition, WorkflowCompileError,
 };
 use openfang_kernel::OpenFangKernel;
-use openfang_memory::AgentRuntimeRecord;
+use openfang_memory::{AgentRuntimeRecord, AgentSessionRecord};
 use openfang_memory::{WorkflowRunListQuery, WorkflowRunStatus, WorkflowSignalRecord};
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
-use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest, AgentState};
+use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest, AgentState, SessionId};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -49,6 +49,20 @@ pub struct RunListQueryParams {
 pub struct RunSignalListQueryParams {
     #[serde(default)]
     pub consumed: Option<bool>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct AgentSessionDetailQuery {
+    #[serde(default)]
+    pub include_messages: Option<bool>,
+    #[serde(default)]
+    pub include_context: Option<bool>,
+}
+
+impl AgentSessionDetailQuery {
+    fn wants_messages(&self) -> bool {
+        self.include_messages.unwrap_or(false) || self.include_context.unwrap_or(false)
+    }
 }
 
 fn parse_run_status_param(
@@ -240,6 +254,21 @@ fn run_action_accepted_response(
             "resource_id": run_id,
             "run_id": run_id,
             "status": status.as_str(),
+        })),
+    )
+}
+
+fn agent_action_accepted_response(
+    resource_id: &str,
+    session_id: Option<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(AcceptedActionResponse {
+            accepted: true,
+            resource_id: resource_id.to_owned(),
+            status: "accepted".to_owned(),
+            session_id,
         })),
     )
 }
@@ -467,6 +496,251 @@ fn agent_compiled_payload(compiled: CompiledAgentDefinition) -> AgentCompiledPay
         agent_manifest: compiled.agent_manifest,
         provider_binding: compiled.provider_binding,
         product_metadata: compiled.product_metadata,
+    }
+}
+
+fn load_agent_definition_resource(
+    state: &AppState,
+    definition_id: &str,
+) -> Result<Option<AgentResponse>, (StatusCode, Json<serde_json::Value>)> {
+    agent_definition_store(state)
+        .load(definition_id)
+        .map_err(|error| {
+            agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "definition_load_failed",
+                "Failed to load agent definition",
+                Some(serde_json::json!([{
+                    "message": error,
+                }])),
+            )
+        })
+}
+
+fn find_runtime_agent_for_definition(
+    state: &AppState,
+    definition_id: &str,
+) -> Option<openfang_types::agent::AgentEntry> {
+    state
+        .kernel
+        .registry
+        .list()
+        .into_iter()
+        .filter(|entry| runtime_definition_id(entry) == Some(definition_id))
+        .max_by_key(|entry| entry.created_at)
+}
+
+fn stable_runtime_agent_id(definition_id: &str) -> AgentId {
+    AgentId::from_string(&format!("compozy-definition:{definition_id}"))
+}
+
+fn runtime_store_error(
+    code: &str,
+    message: &str,
+    error: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    agent_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        code,
+        message,
+        Some(serde_json::json!([{
+            "message": error.to_string(),
+        }])),
+    )
+}
+
+fn runtime_not_found_response() -> (StatusCode, Json<serde_json::Value>) {
+    agent_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Agent runtime not found",
+        None,
+    )
+}
+
+fn parse_session_id_path(
+    session_id: &str,
+) -> Result<SessionId, (StatusCode, Json<serde_json::Value>)> {
+    session_id
+        .parse::<uuid::Uuid>()
+        .map(SessionId)
+        .map_err(|_| {
+            agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Invalid session ID",
+                Some(serde_json::json!([{
+                    "path": "session_id",
+                    "value": session_id,
+                }])),
+            )
+        })
+}
+
+fn session_list_item(record: &AgentSessionRecord) -> SessionListItem {
+    let session_id = record.session_id.to_string();
+    SessionListItem {
+        id: session_id.clone(),
+        session_id,
+        label: record.label.clone(),
+        active: record.active,
+        message_count: record.message_count,
+        dispatch_count: record.dispatch_count,
+        created_at: record.created_at.clone(),
+        updated_at: record.updated_at.clone(),
+        compacted_at: record.compacted_at.clone(),
+    }
+}
+
+fn session_detail(
+    record: &AgentSessionRecord,
+    messages: Option<Vec<serde_json::Value>>,
+) -> SessionDetail {
+    let session_id = record.session_id.to_string();
+    SessionDetail {
+        id: session_id.clone(),
+        session_id,
+        label: record.label.clone(),
+        active: record.active,
+        message_count: record.message_count,
+        dispatch_count: record.dispatch_count,
+        created_at: record.created_at.clone(),
+        updated_at: record.updated_at.clone(),
+        compacted_at: record.compacted_at.clone(),
+        messages,
+    }
+}
+
+fn runtime_response(
+    definition_id: &str,
+    entry: Option<&openfang_types::agent::AgentEntry>,
+    record: Option<&AgentRuntimeRecord>,
+    active_sessions: u32,
+) -> AgentRuntimeResponse {
+    let loaded = record
+        .map(|runtime| runtime.loaded)
+        .unwrap_or(entry.is_some());
+    let state = record
+        .map(|runtime| runtime.state)
+        .or_else(|| entry.map(|runtime_entry| runtime_entry.state))
+        .unwrap_or(AgentState::Created);
+    let mode = record
+        .map(|runtime| runtime.mode)
+        .or_else(|| entry.map(|runtime_entry| runtime_entry.mode))
+        .unwrap_or_default();
+    let healthy = record.map(|runtime| runtime.healthy).unwrap_or_else(|| {
+        entry.is_some_and(|runtime_entry| {
+            !matches!(
+                runtime_entry.state,
+                AgentState::Crashed | AgentState::Terminated
+            )
+        })
+    });
+    let active_session_id = record
+        .and_then(|runtime| runtime.active_session_id.map(|value| value.to_string()))
+        .or_else(|| entry.map(|runtime_entry| runtime_entry.session_id.to_string()));
+    let active_dispatches = record.map(|runtime| runtime.active_dispatches).unwrap_or(0);
+    let last_active_at = record
+        .and_then(|runtime| runtime.last_active_at.clone())
+        .or_else(|| entry.map(|runtime_entry| runtime_entry.last_active.to_rfc3339()));
+
+    AgentRuntimeResponse {
+        agent_id: definition_id.to_owned(),
+        loaded,
+        state,
+        mode,
+        healthy,
+        active_session_id,
+        active_sessions,
+        active_dispatches,
+        last_active_at,
+    }
+}
+
+fn session_messages(
+    state: &AppState,
+    session_id: SessionId,
+) -> Result<Vec<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let messages = state
+        .kernel
+        .runtime_stores
+        .agent_message
+        .list_messages_for_session(session_id)
+        .map_err(|error| {
+            runtime_store_error(
+                "session_load_failed",
+                "Failed to load agent session messages",
+                error,
+            )
+        })?;
+
+    let mut payloads = Vec::with_capacity(messages.len());
+    for message in messages {
+        payloads.push(serde_json::json!({
+            "message_id": message.message_id,
+            "direction": message.direction,
+            "payload": serde_json::from_str::<serde_json::Value>(&message.payload_json).map_err(|error| {
+                agent_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session_load_failed",
+                    "Failed to decode stored agent session message",
+                    Some(serde_json::json!([{
+                        "message": error.to_string(),
+                        "session_id": session_id.to_string(),
+                    }])),
+                )
+            })?,
+            "status": message.status,
+            "created_at": message.created_at,
+            "completed_at": message.completed_at,
+        }));
+    }
+
+    Ok(payloads)
+}
+
+fn ensure_runtime_agent_present(
+    state: &AppState,
+    definition_id: &str,
+) -> Result<AgentId, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(entry) = find_runtime_agent_for_definition(state, definition_id) {
+        return Ok(entry.id);
+    }
+
+    let Some(resource) = load_agent_definition_resource(state, definition_id)? else {
+        return Err(runtime_not_found_response());
+    };
+
+    let store = agent_definition_store(state);
+    let context = agent_validation_context(state, &store)?;
+    let (_, compiled) = match prepare_agent_definition(resource.definition, &context) {
+        Ok(prepared) => prepared,
+        Err(AgentPreparationFailure::Validation(issues)) => {
+            return Err(agent_validation_error_response(&issues));
+        }
+        Err(AgentPreparationFailure::Compile(error)) => {
+            return Err(agent_compile_error_response(&error));
+        }
+    };
+
+    let stable_id = stable_runtime_agent_id(definition_id);
+    match state
+        .kernel
+        .spawn_agent_with_parent(compiled.agent_manifest, None, Some(stable_id))
+    {
+        Ok(agent_id) => Ok(agent_id),
+        Err(error) => find_runtime_agent_for_definition(state, definition_id)
+            .map(|entry| entry.id)
+            .ok_or_else(|| {
+                agent_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "runtime_start_failed",
+                    "Failed to start agent runtime",
+                    Some(serde_json::json!([{
+                        "message": error.to_string(),
+                    }])),
+                )
+            }),
     }
 }
 
@@ -957,6 +1231,681 @@ pub async fn get_agent_compiled(
             compiled: agent_compiled_payload(compiled),
         })),
     )
+}
+
+/// GET /api/v1/agents/{id}/runtime — Load runtime state for one agent definition.
+pub async fn get_agent_runtime(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let runtime_entry = find_runtime_agent_for_definition(&state, &id);
+    if runtime_entry.is_none() {
+        match load_agent_definition_resource(&state, &id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return runtime_not_found_response(),
+            Err(response) => return response,
+        }
+    }
+
+    let runtime_record = if let Some(entry) = runtime_entry.as_ref() {
+        match state
+            .kernel
+            .runtime_stores
+            .agent_runtime
+            .get_agent_runtime(entry.id)
+        {
+            Ok(record) => record,
+            Err(error) => {
+                return runtime_store_error(
+                    "runtime_status_failed",
+                    "Failed to load agent runtime status",
+                    error,
+                )
+            }
+        }
+    } else {
+        None
+    };
+
+    let active_sessions = if let Some(entry) = runtime_entry.as_ref() {
+        let count = match state
+            .kernel
+            .runtime_stores
+            .agent_session
+            .list_agent_sessions_for_agent(entry.id)
+        {
+            Ok(records) => records.len(),
+            Err(error) => {
+                return runtime_store_error(
+                    "runtime_status_failed",
+                    "Failed to load agent runtime status",
+                    error,
+                )
+            }
+        };
+        u32::try_from(count).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(runtime_response(
+            &id,
+            runtime_entry.as_ref(),
+            runtime_record.as_ref(),
+            active_sessions,
+        ))),
+    )
+}
+
+/// POST /api/v1/agents/{id}/runtime/start — Ensure the runtime is loaded and running.
+pub async fn start_agent_runtime(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let agent_id = match ensure_runtime_agent_present(&state, &id) {
+        Ok(agent_id) => agent_id,
+        Err(response) => return response,
+    };
+
+    if let Err(error) = state.kernel.set_agent_state(agent_id, AgentState::Running) {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime_start_failed",
+            "Failed to start agent runtime",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    agent_action_accepted_response(&id, None)
+}
+
+/// POST /api/v1/agents/{id}/runtime/stop — Suspend a loaded runtime.
+pub async fn stop_agent_runtime(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let Some(entry) = find_runtime_agent_for_definition(&state, &id) else {
+        return match load_agent_definition_resource(&state, &id) {
+            Ok(Some(_)) => agent_action_accepted_response(&id, None),
+            Ok(None) => runtime_not_found_response(),
+            Err(response) => response,
+        };
+    };
+
+    if let Err(error) = state.kernel.stop_agent_run(entry.id) {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime_stop_failed",
+            "Failed to stop agent runtime",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    if let Err(error) = state
+        .kernel
+        .set_agent_state(entry.id, AgentState::Suspended)
+    {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime_stop_failed",
+            "Failed to stop agent runtime",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    agent_action_accepted_response(&id, None)
+}
+
+/// POST /api/v1/agents/{id}/runtime/restart — Restart a runtime loop.
+pub async fn restart_agent_runtime(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let agent_id = match ensure_runtime_agent_present(&state, &id) {
+        Ok(agent_id) => agent_id,
+        Err(response) => return response,
+    };
+
+    if let Err(error) = state.kernel.stop_agent_run(agent_id) {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime_restart_failed",
+            "Failed to restart agent runtime",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    if let Err(error) = state.kernel.set_agent_state(agent_id, AgentState::Running) {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime_restart_failed",
+            "Failed to restart agent runtime",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    agent_action_accepted_response(&id, None)
+}
+
+/// PUT /api/v1/agents/{id}/runtime/mode — Update runtime mode without mutating the definition.
+pub async fn set_agent_runtime_mode(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<RuntimeModeRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return agent_json_rejection(rejection),
+    };
+
+    let agent_id = match ensure_runtime_agent_present(&state, &id) {
+        Ok(agent_id) => agent_id,
+        Err(response) => return response,
+    };
+
+    if let Err(error) = state.kernel.set_agent_mode(agent_id, request.mode) {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime_mode_failed",
+            "Failed to update agent runtime mode",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    agent_action_accepted_response(&id, None)
+}
+
+/// GET /api/v1/agents/{id}/sessions — List session projections for one runtime.
+pub async fn list_agent_sessions_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let Some(entry) = find_runtime_agent_for_definition(&state, &id) else {
+        return match load_agent_definition_resource(&state, &id) {
+            Ok(Some(_)) => (
+                StatusCode::OK,
+                Json(serde_json::json!(SessionListResponse {
+                    items: Vec::new(),
+                    next_cursor: None,
+                })),
+            ),
+            Ok(None) => runtime_not_found_response(),
+            Err(response) => response,
+        };
+    };
+
+    let records = match state
+        .kernel
+        .runtime_stores
+        .agent_session
+        .list_agent_sessions_for_agent(entry.id)
+    {
+        Ok(records) => records,
+        Err(error) => {
+            return runtime_store_error(
+                "session_list_failed",
+                "Failed to list agent sessions",
+                error,
+            )
+        }
+    };
+
+    let items = records.iter().map(session_list_item).collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(SessionListResponse {
+            items,
+            next_cursor: None,
+        })),
+    )
+}
+
+/// POST /api/v1/agents/{id}/sessions — Create a new session and activate it.
+pub async fn create_agent_session_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<CreateSessionRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return agent_json_rejection(rejection),
+    };
+
+    if let Some(label) = request.label.as_deref() {
+        if let Err(error) = openfang_types::agent::SessionLabel::new(label) {
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Invalid session label",
+                Some(serde_json::json!([{
+                    "path": "label",
+                    "message": error.to_string(),
+                }])),
+            );
+        }
+    }
+
+    let agent_id = match ensure_runtime_agent_present(&state, &id) {
+        Ok(agent_id) => agent_id,
+        Err(response) => return response,
+    };
+
+    let created = match state
+        .kernel
+        .create_agent_session(agent_id, request.label.as_deref())
+    {
+        Ok(created) => created,
+        Err(error) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_create_failed",
+                "Failed to create agent session",
+                Some(serde_json::json!([{
+                    "message": error.to_string(),
+                }])),
+            )
+        }
+    };
+
+    let Some(session_id_str) = created
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_create_failed",
+            "Failed to load the created agent session",
+            None,
+        );
+    };
+    let session_id = match parse_session_id_path(session_id_str) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+
+    let session_record = match state
+        .kernel
+        .runtime_stores
+        .agent_session
+        .get_agent_session(session_id)
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_create_failed",
+                "Failed to load the created agent session",
+                None,
+            )
+        }
+        Err(error) => {
+            return runtime_store_error(
+                "session_create_failed",
+                "Failed to load the created agent session",
+                error,
+            )
+        }
+    };
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!(session_detail(&session_record, None))),
+    )
+}
+
+/// GET /api/v1/agents/{id}/sessions/{session_id} — Load one session detail.
+pub async fn get_agent_session_v1(
+    State(state): State<Arc<AppState>>,
+    Path((id, session_id_path)): Path<(String, String)>,
+    Query(query): Query<AgentSessionDetailQuery>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let session_id = match parse_session_id_path(&session_id_path) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+
+    let runtime_entry = find_runtime_agent_for_definition(&state, &id);
+    if runtime_entry.is_none() {
+        match load_agent_definition_resource(&state, &id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return runtime_not_found_response(),
+            Err(response) => return response,
+        }
+    }
+
+    let session_record = match state
+        .kernel
+        .runtime_stores
+        .agent_session
+        .get_agent_session(session_id)
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return agent_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Agent session not found",
+                None,
+            )
+        }
+        Err(error) => {
+            return runtime_store_error(
+                "session_load_failed",
+                "Failed to load agent session",
+                error,
+            )
+        }
+    };
+
+    if runtime_entry
+        .as_ref()
+        .is_some_and(|entry| session_record.agent_id != entry.id)
+    {
+        return agent_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Agent session not found",
+            None,
+        );
+    }
+
+    let messages = if query.wants_messages() {
+        match session_messages(&state, session_id) {
+            Ok(messages) => Some(messages),
+            Err(response) => return response,
+        }
+    } else {
+        None
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(session_detail(&session_record, messages))),
+    )
+}
+
+/// POST /api/v1/agents/{id}/sessions/{session_id}/activate — Mark one session active.
+pub async fn activate_agent_session(
+    State(state): State<Arc<AppState>>,
+    Path((id, session_id_path)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let session_id = match parse_session_id_path(&session_id_path) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+    let agent_id = match ensure_runtime_agent_present(&state, &id) {
+        Ok(agent_id) => agent_id,
+        Err(response) => return response,
+    };
+
+    let session_record = match state
+        .kernel
+        .runtime_stores
+        .agent_session
+        .get_agent_session(session_id)
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return agent_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Agent session not found",
+                None,
+            )
+        }
+        Err(error) => {
+            return runtime_store_error(
+                "session_activate_failed",
+                "Failed to activate agent session",
+                error,
+            )
+        }
+    };
+
+    if session_record.agent_id != agent_id {
+        return agent_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Agent session not found",
+            None,
+        );
+    }
+
+    if let Err(error) = state.kernel.switch_agent_session(agent_id, session_id) {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_activate_failed",
+            "Failed to activate agent session",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    agent_action_accepted_response(&id, Some(session_id.to_string()))
+}
+
+/// POST /api/v1/agents/{id}/sessions/{session_id}/reset — Reset one session.
+pub async fn reset_agent_session(
+    State(state): State<Arc<AppState>>,
+    Path((id, session_id_path)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let session_id = match parse_session_id_path(&session_id_path) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+    let agent_id = match ensure_runtime_agent_present(&state, &id) {
+        Ok(agent_id) => agent_id,
+        Err(response) => return response,
+    };
+
+    let session_record = match state
+        .kernel
+        .runtime_stores
+        .agent_session
+        .get_agent_session(session_id)
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return agent_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Agent session not found",
+                None,
+            )
+        }
+        Err(error) => {
+            return runtime_store_error(
+                "session_reset_failed",
+                "Failed to reset agent session",
+                error,
+            )
+        }
+    };
+
+    if session_record.agent_id != agent_id {
+        return agent_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Agent session not found",
+            None,
+        );
+    }
+
+    if !session_record.active {
+        if let Err(error) = state.kernel.switch_agent_session(agent_id, session_id) {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_reset_failed",
+                "Failed to reset agent session",
+                Some(serde_json::json!([{
+                    "message": error.to_string(),
+                }])),
+            );
+        }
+    }
+
+    if let Err(error) = state.kernel.reset_session(agent_id) {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_reset_failed",
+            "Failed to reset agent session",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    let next_session_id = match state
+        .kernel
+        .runtime_stores
+        .agent_runtime
+        .get_agent_runtime(agent_id)
+    {
+        Ok(Some(record)) => record.active_session_id.map(|value| value.to_string()),
+        Ok(None) => None,
+        Err(error) => {
+            return runtime_store_error(
+                "session_reset_failed",
+                "Failed to load the reset agent session",
+                error,
+            )
+        }
+    };
+
+    agent_action_accepted_response(&id, next_session_id)
+}
+
+/// POST /api/v1/agents/{id}/sessions/{session_id}/compact — Compact one session.
+pub async fn compact_agent_session_v1(
+    State(state): State<Arc<AppState>>,
+    Path((id, session_id_path)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let session_id = match parse_session_id_path(&session_id_path) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+    let agent_id = match ensure_runtime_agent_present(&state, &id) {
+        Ok(agent_id) => agent_id,
+        Err(response) => return response,
+    };
+
+    let session_record = match state
+        .kernel
+        .runtime_stores
+        .agent_session
+        .get_agent_session(session_id)
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return agent_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Agent session not found",
+                None,
+            )
+        }
+        Err(error) => {
+            return runtime_store_error(
+                "session_compact_failed",
+                "Failed to compact agent session",
+                error,
+            )
+        }
+    };
+
+    if session_record.agent_id != agent_id {
+        return agent_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Agent session not found",
+            None,
+        );
+    }
+
+    if !session_record.active {
+        if let Err(error) = state.kernel.switch_agent_session(agent_id, session_id) {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_compact_failed",
+                "Failed to compact agent session",
+                Some(serde_json::json!([{
+                    "message": error.to_string(),
+                }])),
+            );
+        }
+    }
+
+    if let Err(error) = state.kernel.compact_agent_session(agent_id).await {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_compact_failed",
+            "Failed to compact agent session",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    agent_action_accepted_response(&id, Some(session_id.to_string()))
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -13176,10 +14125,13 @@ mod channel_config_tests {
 #[cfg(test)]
 mod agent_definition_route_tests {
     use super::*;
-    use axum::body::to_bytes;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
     use openfang_types::config::{DefaultModelConfig, KernelConfig};
     use serde_json::{json, Value};
     use tempfile::TempDir;
+    use tower::ServiceExt;
 
     struct RouteTestContext {
         state: Arc<AppState>,
@@ -13300,6 +14252,22 @@ mod agent_definition_route_tests {
     fn prd_writer_definition(id: &str, name: &str) -> AgentDefinition {
         serde_json::from_value(prd_writer_definition_value(id, name))
             .expect("fixture should deserialize")
+    }
+
+    async fn create_definition(context: &RouteTestContext, id: &str, name: &str) {
+        let (status, body) = json_response(
+            create_agent(
+                State(Arc::clone(&context.state)),
+                Ok(Json(CreateAgentRequest {
+                    definition: prd_writer_definition(id, name),
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["id"], json!(id));
     }
 
     #[tokio::test]
@@ -13446,5 +14414,168 @@ mod agent_definition_route_tests {
         assert_eq!(update_body["origin"]["kind"], json!("user"));
         assert!(update_body["forked_from"].is_null());
         assert!(update_body.get("agent_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_agent_runtime_should_return_runtime_resource_shape() {
+        let context = route_test_context().await;
+        create_definition(&context, "runtime-writer", "Runtime Writer").await;
+
+        let (status, body) = json_response(
+            get_agent_runtime(
+                State(Arc::clone(&context.state)),
+                Path("runtime-writer".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["agent_id"], json!("runtime-writer"));
+        assert_eq!(body["loaded"], json!(false));
+        assert_eq!(body["state"], json!("created"));
+        assert_eq!(body["mode"], json!("full"));
+        assert_eq!(body["healthy"], json!(false));
+        assert_eq!(body["active_sessions"], json!(0));
+        assert_eq!(body["active_dispatches"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn start_agent_runtime_should_return_accepted_action_response() {
+        let context = route_test_context().await;
+        create_definition(&context, "start-writer", "Start Writer").await;
+
+        let (status, body) = json_response(
+            start_agent_runtime(
+                State(Arc::clone(&context.state)),
+                Path("start-writer".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["accepted"], json!(true));
+        assert_eq!(body["resource_id"], json!("start-writer"));
+        assert_eq!(body["status"], json!("accepted"));
+    }
+
+    #[tokio::test]
+    async fn set_agent_runtime_mode_should_return_bad_request_for_unknown_mode() {
+        let context = route_test_context().await;
+        create_definition(&context, "mode-writer", "Mode Writer").await;
+
+        let router = Router::new()
+            .route(
+                "/api/v1/agents/{id}/runtime/mode",
+                axum::routing::put(set_agent_runtime_mode),
+            )
+            .with_state(Arc::clone(&context.state));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/agents/mode-writer/runtime/mode")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"unknown"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        let status = response.status();
+        let body = serde_json::from_slice::<Value>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should be readable"),
+        )
+        .expect("response should be JSON");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], json!("invalid_request"));
+        assert!(body["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn list_agent_sessions_v1_should_return_items_and_next_cursor_shape() {
+        let context = route_test_context().await;
+        create_definition(&context, "list-sessions", "List Sessions").await;
+
+        let _ = json_response(
+            start_agent_runtime(
+                State(Arc::clone(&context.state)),
+                Path("list-sessions".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        let (status, body) = json_response(
+            list_agent_sessions_v1(
+                State(Arc::clone(&context.state)),
+                Path("list-sessions".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["items"].is_array());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn create_agent_session_v1_should_return_session_detail_with_generated_session_id() {
+        let context = route_test_context().await;
+        create_definition(&context, "create-session", "Create Session").await;
+
+        let (status, body) = json_response(
+            create_agent_session_v1(
+                State(Arc::clone(&context.state)),
+                Path("create-session".to_string()),
+                Ok(Json(CreateSessionRequest {
+                    label: Some("Planning".to_string()),
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        let session_id = body["session_id"]
+            .as_str()
+            .expect("session_id should be present")
+            .to_string();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["id"], json!(session_id));
+        assert_eq!(body["label"], json!("Planning"));
+        assert_eq!(body["active"], json!(true));
+        assert_eq!(body["message_count"], json!(0));
+        assert_eq!(body["dispatch_count"], json!(0));
+        assert!(body["created_at"].is_string());
+        assert!(body["updated_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn get_agent_session_v1_should_return_not_found_for_unknown_session_id() {
+        let context = route_test_context().await;
+        create_definition(&context, "missing-session", "Missing Session").await;
+
+        let (status, body) = json_response(
+            get_agent_session_v1(
+                State(Arc::clone(&context.state)),
+                Path((
+                    "missing-session".to_string(),
+                    uuid::Uuid::new_v4().to_string(),
+                )),
+                Query(AgentSessionDetailQuery::default()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("not_found"));
+        assert_eq!(body["error"]["message"], json!("Agent session not found"));
     }
 }

@@ -5,7 +5,9 @@ use std::sync::Arc;
 use openfang_api::routes::AppState;
 use openfang_api::server::build_router;
 use openfang_kernel::OpenFangKernel;
+use openfang_types::agent::SessionId;
 use openfang_types::config::{DefaultModelConfig, KernelConfig};
+use openfang_types::message::{Message, MessageContent, Role};
 use serde_json::{json, Value};
 
 struct TestServer {
@@ -115,6 +117,111 @@ fn agent_definition_value(id: &str, name: &str) -> Value {
             "artifact_type": "prd"
         }
     })
+}
+
+async fn create_agent_definition(
+    client: &reqwest::Client,
+    server: &TestServer,
+    id: &str,
+    name: &str,
+) -> Value {
+    let response = client
+        .post(format!("{}/api/v1/agents", server.base_url))
+        .json(&agent_definition_value(id, name))
+        .send()
+        .await
+        .expect("create request should succeed");
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    response
+        .json()
+        .await
+        .expect("create response should be JSON")
+}
+
+async fn get_runtime(client: &reqwest::Client, server: &TestServer, definition_id: &str) -> Value {
+    let response = client
+        .get(format!(
+            "{}/api/v1/agents/{definition_id}/runtime",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("runtime request should succeed");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response
+        .json()
+        .await
+        .expect("runtime response should be JSON")
+}
+
+async fn list_sessions(
+    client: &reqwest::Client,
+    server: &TestServer,
+    definition_id: &str,
+) -> Value {
+    let response = client
+        .get(format!(
+            "{}/api/v1/agents/{definition_id}/sessions",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("sessions list request should succeed");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response
+        .json()
+        .await
+        .expect("sessions list response should be JSON")
+}
+
+fn runtime_agent_id(server: &TestServer, definition_id: &str) -> openfang_types::agent::AgentId {
+    server
+        .state
+        .kernel
+        .registry
+        .list()
+        .into_iter()
+        .find(|entry| {
+            entry
+                .manifest
+                .metadata
+                .get("compozy")
+                .and_then(|value| value.get("definition_id"))
+                .and_then(Value::as_str)
+                == Some(definition_id)
+        })
+        .map(|entry| entry.id)
+        .expect("runtime agent should exist")
+}
+
+fn seed_session_message(server: &TestServer, definition_id: &str, session_id: &str) {
+    let session_id = SessionId(
+        session_id
+            .parse::<uuid::Uuid>()
+            .expect("session_id should parse as UUID"),
+    );
+    let mut session = server
+        .state
+        .kernel
+        .memory
+        .get_session(session_id)
+        .expect("session load should succeed")
+        .expect("session should exist");
+    session.messages.push(Message {
+        role: Role::User,
+        content: MessageContent::Text("Reset this session".to_string()),
+    });
+    server
+        .state
+        .kernel
+        .memory
+        .save_session(&session)
+        .expect("session should save");
+    server
+        .state
+        .kernel
+        .refresh_agent_runtime_projection(runtime_agent_id(server, definition_id))
+        .expect("runtime projection should refresh");
 }
 
 #[tokio::test]
@@ -333,4 +440,206 @@ async fn v1_agents_post_should_reject_legacy_manifest_payload_with_error_envelop
     assert_eq!(body["error"]["code"], json!("invalid_request"));
     assert!(body["error"]["message"].is_string());
     assert!(body["error"]["details"].is_array());
+}
+
+#[tokio::test]
+async fn runtime_lifecycle_sequence_should_return_consistent_runtime_states() {
+    let server = start_agent_v2_test_server().await;
+    let client = reqwest::Client::new();
+    create_agent_definition(&client, &server, "runtime-sequence", "Runtime Sequence").await;
+
+    let start = client
+        .post(format!(
+            "{}/api/v1/agents/runtime-sequence/runtime/start",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("start request should succeed");
+    assert_eq!(start.status(), reqwest::StatusCode::OK);
+    let started: Value = start.json().await.expect("start response should be JSON");
+    assert_eq!(started["accepted"], json!(true));
+    assert_eq!(started["resource_id"], json!("runtime-sequence"));
+
+    let runtime_after_start = get_runtime(&client, &server, "runtime-sequence").await;
+    assert_eq!(runtime_after_start["loaded"], json!(true));
+    assert_eq!(runtime_after_start["state"], json!("running"));
+
+    let stop = client
+        .post(format!(
+            "{}/api/v1/agents/runtime-sequence/runtime/stop",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("stop request should succeed");
+    assert_eq!(stop.status(), reqwest::StatusCode::OK);
+    let stopped: Value = stop.json().await.expect("stop response should be JSON");
+    assert_eq!(stopped["accepted"], json!(true));
+    assert_eq!(stopped["resource_id"], json!("runtime-sequence"));
+
+    let runtime_after_stop = get_runtime(&client, &server, "runtime-sequence").await;
+    assert_eq!(runtime_after_stop["loaded"], json!(true));
+    assert_eq!(runtime_after_stop["state"], json!("suspended"));
+}
+
+#[tokio::test]
+async fn session_lifecycle_should_create_list_activate_and_reset_sessions() {
+    let server = start_agent_v2_test_server().await;
+    let client = reqwest::Client::new();
+    create_agent_definition(&client, &server, "session-flow", "Session Flow").await;
+
+    let start = client
+        .post(format!(
+            "{}/api/v1/agents/session-flow/runtime/start",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("start request should succeed");
+    assert_eq!(start.status(), reqwest::StatusCode::OK);
+
+    let initial_sessions = list_sessions(&client, &server, "session-flow").await;
+    let initial_session_id = initial_sessions["items"]
+        .as_array()
+        .expect("items should be an array")
+        .first()
+        .and_then(|item| item["session_id"].as_str())
+        .expect("default session should exist")
+        .to_string();
+
+    let create_session = client
+        .post(format!(
+            "{}/api/v1/agents/session-flow/sessions",
+            server.base_url
+        ))
+        .json(&json!({"label": "Review"}))
+        .send()
+        .await
+        .expect("create session request should succeed");
+    assert_eq!(create_session.status(), reqwest::StatusCode::CREATED);
+    let created_session: Value = create_session
+        .json()
+        .await
+        .expect("create session response should be JSON");
+    let created_session_id = created_session["session_id"]
+        .as_str()
+        .expect("created session should include session_id")
+        .to_string();
+
+    let after_create = list_sessions(&client, &server, "session-flow").await;
+    assert!(after_create["items"]
+        .as_array()
+        .expect("items should be an array")
+        .iter()
+        .any(|item| item["session_id"] == json!(created_session_id)));
+
+    let activate = client
+        .post(format!(
+            "{}/api/v1/agents/session-flow/sessions/{}/activate",
+            server.base_url, initial_session_id
+        ))
+        .send()
+        .await
+        .expect("activate session request should succeed");
+    assert_eq!(activate.status(), reqwest::StatusCode::OK);
+    let activated: Value = activate
+        .json()
+        .await
+        .expect("activate session response should be JSON");
+    assert_eq!(activated["accepted"], json!(true));
+    assert_eq!(activated["session_id"], json!(initial_session_id));
+
+    let after_activate = list_sessions(&client, &server, "session-flow").await;
+    let items = after_activate["items"]
+        .as_array()
+        .expect("items should be an array");
+    let initial_item = items
+        .iter()
+        .find(|item| item["session_id"] == json!(initial_session_id))
+        .expect("initial session should still exist");
+    let created_item = items
+        .iter()
+        .find(|item| item["session_id"] == json!(created_session_id))
+        .expect("created session should still exist");
+    assert_eq!(initial_item["active"], json!(true));
+    assert_eq!(created_item["active"], json!(false));
+
+    seed_session_message(&server, "session-flow", &initial_session_id);
+
+    let reset = client
+        .post(format!(
+            "{}/api/v1/agents/session-flow/sessions/{}/reset",
+            server.base_url, initial_session_id
+        ))
+        .send()
+        .await
+        .expect("reset session request should succeed");
+    assert_eq!(reset.status(), reqwest::StatusCode::OK);
+    let reset_body: Value = reset.json().await.expect("reset response should be JSON");
+    let reset_session_id = reset_body["session_id"]
+        .as_str()
+        .expect("reset response should include replacement session_id")
+        .to_string();
+
+    let session_detail = client
+        .get(format!(
+            "{}/api/v1/agents/session-flow/sessions/{}",
+            server.base_url, reset_session_id
+        ))
+        .send()
+        .await
+        .expect("session detail request should succeed");
+    assert_eq!(session_detail.status(), reqwest::StatusCode::OK);
+    let session_detail: Value = session_detail
+        .json()
+        .await
+        .expect("session detail response should be JSON");
+    assert_eq!(session_detail["session_id"], json!(reset_session_id));
+    assert_eq!(session_detail["message_count"], json!(0));
+
+    let final_sessions = list_sessions(&client, &server, "session-flow").await;
+    let final_items = final_sessions["items"]
+        .as_array()
+        .expect("items should be an array");
+    assert!(final_items
+        .iter()
+        .any(|item| item["session_id"] == json!(reset_session_id)));
+    assert!(!final_items
+        .iter()
+        .any(|item| item["session_id"] == json!(initial_session_id)));
+}
+
+#[tokio::test]
+async fn put_agent_should_not_change_runtime_state_observable_via_runtime_endpoint() {
+    let server = start_agent_v2_test_server().await;
+    let client = reqwest::Client::new();
+    create_agent_definition(&client, &server, "put-runtime", "Put Runtime").await;
+
+    let start = client
+        .post(format!(
+            "{}/api/v1/agents/put-runtime/runtime/start",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("start request should succeed");
+    assert_eq!(start.status(), reqwest::StatusCode::OK);
+
+    let runtime_before = get_runtime(&client, &server, "put-runtime").await;
+
+    let mut updated_definition = agent_definition_value("put-runtime", "Put Runtime Updated");
+    updated_definition["description"] = json!("Updated description");
+    let update = client
+        .put(format!("{}/api/v1/agents/put-runtime", server.base_url))
+        .json(&updated_definition)
+        .send()
+        .await
+        .expect("update request should succeed");
+    assert_eq!(update.status(), reqwest::StatusCode::OK);
+
+    let runtime_after = get_runtime(&client, &server, "put-runtime").await;
+    assert_eq!(runtime_after["state"], runtime_before["state"]);
+    assert_eq!(runtime_after["loaded"], runtime_before["loaded"]);
+    assert_eq!(runtime_after["mode"], runtime_before["mode"]);
 }
