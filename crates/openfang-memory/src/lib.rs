@@ -9,6 +9,7 @@
 
 pub mod consolidation;
 pub mod dispatch;
+pub mod hitl;
 pub mod knowledge;
 pub mod migration;
 pub mod runtime_store;
@@ -23,6 +24,10 @@ pub use dispatch::{
     DispatchKind, DispatchRecord, DispatchRepository, DispatchStatus, DispatchStore,
     DispatchStoreError, DispatchSummaryRecord, SqliteDispatchRepository,
     AGENT_DISPATCH_MIGRATION_SQL,
+};
+pub use hitl::{
+    HitlKind, HitlRecord, HitlRepository, HitlStatus, HitlStore, HitlStoreError, NewHitlRequest,
+    SqliteHitlRepository, HITL_REQUEST_MIGRATION_SQL,
 };
 pub use runtime_store::{
     AgentMessageRecord, AgentMessageStore, AgentRuntimeRecord, AgentRuntimeStore,

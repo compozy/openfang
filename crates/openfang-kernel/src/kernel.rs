@@ -7365,7 +7365,7 @@ mod tests {
         let compozy_rows = schema_migration_rows(&compozy_db);
 
         assert_eq!(runtime_rows.len(), 4);
-        assert_eq!(compozy_rows.len(), 8);
+        assert_eq!(compozy_rows.len(), 9);
         assert_eq!(runtime_rows[0].0, 1);
         assert_eq!(compozy_rows[0].0, 1);
         assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -7380,6 +7380,7 @@ mod tests {
         assert_eq!(compozy_rows[5].1, "0006_workflow_signal_waiting_state");
         assert_eq!(compozy_rows[6].1, "0007_workflow_run_control_plane");
         assert_eq!(compozy_rows[7].1, "0008_agent_dispatch");
+        assert_eq!(compozy_rows[8].1, "0009_hitl_request");
 
         kernel.shutdown();
     }

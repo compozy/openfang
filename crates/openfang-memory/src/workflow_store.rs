@@ -3,6 +3,7 @@
 use crate::dispatch::{
     list_dispatch_summaries_by_run, DispatchSummaryRecord, SqliteDispatchRepository,
 };
+use crate::hitl::SqliteHitlRepository;
 use chrono::Utc;
 use openfang_types::error::OpenFangError;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
@@ -45,6 +46,8 @@ pub struct WorkflowStoreSet {
     pub workflow_signal: WorkflowSignalRepository,
     /// Repository for durable agent dispatch state.
     pub dispatch: SqliteDispatchRepository,
+    /// Repository for durable HITL request state.
+    pub hitl: SqliteHitlRepository,
 }
 
 impl WorkflowStoreSet {
@@ -56,6 +59,7 @@ impl WorkflowStoreSet {
             workflow_run: WorkflowRunRepository::new(Arc::clone(&conn)),
             workflow_checkpoint: WorkflowCheckpointRepository::new(Arc::clone(&conn)),
             dispatch: SqliteDispatchRepository::new(Arc::clone(&conn)),
+            hitl: SqliteHitlRepository::new(Arc::clone(&conn)),
             workflow_signal: WorkflowSignalRepository::new(conn),
         }
     }

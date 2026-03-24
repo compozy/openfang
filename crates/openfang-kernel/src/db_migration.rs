@@ -5,10 +5,11 @@
 
 use openfang_memory::{
     AGENT_DISPATCH_MIGRATION_SQL, AGENT_RUNTIME_CORE_MIGRATION_SQL,
-    AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL, SCHEDULE_RUNTIME_CORE_MIGRATION_SQL,
-    WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
-    WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
-    WORKFLOW_SIGNAL_MIGRATION_SQL, WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
+    AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL, HITL_REQUEST_MIGRATION_SQL,
+    SCHEDULE_RUNTIME_CORE_MIGRATION_SQL, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
+    WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL, WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL,
+    WORKFLOW_RUN_CORE_MIGRATION_SQL, WORKFLOW_SIGNAL_MIGRATION_SQL,
+    WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
@@ -165,6 +166,7 @@ const COMPOZY_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[
         WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL,
     ),
     MigrationStep::new(8, "0008_agent_dispatch", AGENT_DISPATCH_MIGRATION_SQL),
+    MigrationStep::new(9, "0009_hitl_request", HITL_REQUEST_MIGRATION_SQL),
 ];
 
 /// Returns the current `runtime.db` migration slice.
@@ -700,6 +702,32 @@ mod tests {
     }
 
     #[test]
+    fn compozy_db_migration_should_add_hitl_table_cleanly() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_compozy_migrations(&conn);
+
+        assert!(table_exists(&conn, "hitl_request"));
+        assert_eq!(
+            table_columns(&conn, "hitl_request"),
+            vec![
+                "hitl_request_id".to_string(),
+                "run_id".to_string(),
+                "step_id".to_string(),
+                "dispatch_id".to_string(),
+                "kind".to_string(),
+                "status".to_string(),
+                "question".to_string(),
+                "context_json".to_string(),
+                "response_json".to_string(),
+                "sequence_no".to_string(),
+                "created_at".to_string(),
+                "answered_at".to_string(),
+                "timeout_at".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn compozy_db_migration_should_create_all_required_indexes() {
         let conn = Connection::open_in_memory().expect("in-memory db");
         apply_compozy_migrations(&conn);
@@ -716,6 +744,10 @@ mod tests {
             "idx_dispatch_run",
             "idx_dispatch_parent",
             "idx_dispatch_status",
+            "idx_hitl_run",
+            "idx_hitl_dispatch",
+            "idx_hitl_status",
+            "idx_hitl_run_step_sequence",
         ] {
             assert!(
                 index_exists(&conn, index_name),
@@ -780,8 +812,6 @@ mod tests {
             .join("\n");
 
         for disallowed_fragment in [
-            "CREATE TABLE hitl_request",
-            "CREATE TABLE IF NOT EXISTS hitl_request",
             "CREATE TABLE task",
             "CREATE TABLE IF NOT EXISTS task",
             "CREATE TABLE subtask",
@@ -797,17 +827,22 @@ mod tests {
     }
 
     #[test]
-    fn compozy_db_migration_should_be_idempotent() {
+    fn compozy_db_migration_should_be_idempotent_with_hitl_table() {
         let conn = Connection::open_in_memory().expect("in-memory db");
 
         apply_compozy_migrations(&conn);
         apply_compozy_migrations(&conn);
 
         assert!(table_exists(&conn, "agent_dispatch"));
+        assert!(table_exists(&conn, "hitl_request"));
         for index_name in [
             "idx_dispatch_run",
             "idx_dispatch_parent",
             "idx_dispatch_status",
+            "idx_hitl_run",
+            "idx_hitl_dispatch",
+            "idx_hitl_status",
+            "idx_hitl_run_step_sequence",
         ] {
             assert!(
                 index_exists(&conn, index_name),
@@ -820,7 +855,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("query schema_migration row count");
-        assert_eq!(migration_count, 8);
+        assert_eq!(migration_count, 9);
     }
 
     #[test]
