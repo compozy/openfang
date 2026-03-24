@@ -72,11 +72,11 @@ async fn start_test_server() -> TestServer {
         )
         .route(
             "/api/agents",
-            axum::routing::get(routes::list_agents).post(routes::spawn_agent),
+            axum::routing::get(routes::list_agents_legacy).post(routes::spawn_agent),
         )
         .route(
             "/api/agents/{id}",
-            axum::routing::get(routes::get_agent).delete(routes::kill_agent),
+            axum::routing::get(routes::get_agent_legacy).delete(routes::kill_agent),
         )
         .route(
             "/api/agents/{id}/session",

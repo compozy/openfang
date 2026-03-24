@@ -136,12 +136,34 @@ pub async fn build_router(
         .route("/api/status", axum::routing::get(routes::status))
         .route("/api/version", axum::routing::get(routes::version))
         .route(
+            "/api/v1/agents/validate",
+            axum::routing::post(routes::validate_agent_definition),
+        )
+        .route(
+            "/api/v1/agents/compile",
+            axum::routing::post(routes::compile_agent_definition),
+        )
+        .route(
+            "/api/v1/agents/{id}/compiled",
+            axum::routing::get(routes::get_agent_compiled),
+        )
+        .route(
+            "/api/v1/agents",
+            axum::routing::get(routes::list_agents).post(routes::create_agent),
+        )
+        .route(
+            "/api/v1/agents/{id}",
+            axum::routing::get(routes::get_agent)
+                .put(routes::update_agent)
+                .delete(routes::delete_agent),
+        )
+        .route(
             "/api/agents",
-            axum::routing::get(routes::list_agents).post(routes::spawn_agent),
+            axum::routing::get(routes::list_agents_legacy).post(routes::spawn_agent),
         )
         .route(
             "/api/agents/{id}",
-            axum::routing::get(routes::get_agent)
+            axum::routing::get(routes::get_agent_legacy)
                 .delete(routes::kill_agent)
                 .patch(routes::patch_agent),
         )
@@ -564,7 +586,7 @@ pub async fn build_router(
         // Agent update
         .route(
             "/api/agents/{id}/update",
-            axum::routing::put(routes::update_agent),
+            axum::routing::put(routes::update_agent_legacy),
         )
         // Security dashboard endpoint
         .route("/api/security", axum::routing::get(routes::security_status))

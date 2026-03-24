@@ -10,6 +10,7 @@ openfang-types = { workspace = true }
 openfang-kernel = { workspace = true }
 openfang-runtime = { workspace = true }
 openfang-memory = { workspace = true }
+openfang-agent-definition = { workspace = true }
 openfang-channels = { workspace = true }
 openfang-wire = { workspace = true }
 openfang-skills = { workspace = true }

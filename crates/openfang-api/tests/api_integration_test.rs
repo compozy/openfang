@@ -99,7 +99,7 @@ async fn start_test_server_with_provider(
         .route("/api/config", axum::routing::get(routes::get_config))
         .route(
             "/api/agents",
-            axum::routing::get(routes::list_agents).post(routes::spawn_agent),
+            axum::routing::get(routes::list_agents_legacy).post(routes::spawn_agent),
         )
         .route(
             "/api/agents/{id}/message",
@@ -2163,7 +2163,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         .route("/api/status", axum::routing::get(routes::status))
         .route(
             "/api/agents",
-            axum::routing::get(routes::list_agents).post(routes::spawn_agent),
+            axum::routing::get(routes::list_agents_legacy).post(routes::spawn_agent),
         )
         .route(
             "/api/agents/{id}/message",

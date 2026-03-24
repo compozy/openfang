@@ -1,11 +1,18 @@
 //! Route handlers for the OpenFang API.
 
+use crate::agent_definitions::AgentDefinitionStore;
 use crate::types::*;
 use axum::extract::{rejection::JsonRejection, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use dashmap::DashMap;
+use openfang_agent_definition::{
+    compile as compile_agent_ir, stage1_schema_validate, stage2_reference_validate,
+    stage3_semantic_validate, stage4_normalize, AgentDefinition, CompileError as AgentCompileError,
+    CompiledAgentDefinition, ValidationContext as AgentValidationContext,
+    ValidationIssue as AgentValidationIssue,
+};
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowRunId, WorkflowStep,
@@ -19,7 +26,7 @@ use openfang_memory::AgentRuntimeRecord;
 use openfang_memory::{WorkflowRunListQuery, WorkflowRunStatus, WorkflowSignalRecord};
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
-use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
+use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest, AgentState};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -261,6 +268,697 @@ pub struct AppState {
     pub provider_probe_cache: openfang_runtime::provider_health::ProbeCache,
 }
 
+fn agent_error_response(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    details: Option<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message.into(),
+                "details": details.unwrap_or_else(|| serde_json::json!([])),
+            }
+        })),
+    )
+}
+
+fn agent_json_rejection(rejection: JsonRejection) -> (StatusCode, Json<serde_json::Value>) {
+    match rejection {
+        JsonRejection::MissingJsonContentType(_) => agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Missing `Content-Type: application/json` header",
+            None,
+        ),
+        JsonRejection::JsonDataError(error) => agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Invalid JSON body: {error}"),
+            None,
+        ),
+        JsonRejection::JsonSyntaxError(error) => agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Invalid JSON body: {error}"),
+            None,
+        ),
+        JsonRejection::BytesRejection(error) => agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Failed to read request body: {error}"),
+            None,
+        ),
+        rejection => agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Invalid request body: {rejection}"),
+            None,
+        ),
+    }
+}
+
+fn agent_validation_error_response(
+    issues: &[AgentValidationIssue],
+) -> (StatusCode, Json<serde_json::Value>) {
+    let details = serde_json::to_value(issues).unwrap_or_else(|_| serde_json::json!([]));
+    agent_error_response(
+        StatusCode::BAD_REQUEST,
+        "validation_error",
+        "agent definition is invalid",
+        Some(details),
+    )
+}
+
+fn agent_compile_error_response(
+    error: &AgentCompileError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    agent_error_response(
+        StatusCode::BAD_REQUEST,
+        "validation_error",
+        "agent definition is invalid",
+        Some(serde_json::json!([{
+            "code": "compile_error",
+            "message": error.to_string(),
+        }])),
+    )
+}
+
+fn agent_definition_store(state: &AppState) -> AgentDefinitionStore {
+    AgentDefinitionStore::new(&state.kernel.config.home_dir)
+}
+
+fn agent_definition_id_is_safe(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn ensure_safe_agent_definition_id(id: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if agent_definition_id_is_safe(id) {
+        Ok(())
+    } else {
+        Err(agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Agent definition IDs may only contain ASCII letters, digits, `.`, `_`, or `-`",
+            Some(serde_json::json!([{
+                "path": "id",
+                "value": id,
+            }])),
+        ))
+    }
+}
+
+fn runtime_definition_id(entry: &openfang_types::agent::AgentEntry) -> Option<&str> {
+    entry
+        .manifest
+        .metadata
+        .get("compozy")
+        .and_then(|value| value.get("definition_id"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn agent_validation_context(
+    state: &AppState,
+    store: &AgentDefinitionStore,
+) -> Result<AgentValidationContext, (StatusCode, Json<serde_json::Value>)> {
+    let stored_definitions = store.list().map_err(|error| {
+        agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_load_failed",
+            "Failed to load agent definitions",
+            Some(serde_json::json!([{
+                "message": error,
+            }])),
+        )
+    })?;
+
+    let mut known_agents = BTreeSet::new();
+    for definition in stored_definitions {
+        known_agents.insert(definition.definition.id);
+        known_agents.insert(definition.definition.name);
+    }
+    for entry in state.kernel.registry.list() {
+        known_agents.insert(entry.id.to_string());
+        known_agents.insert(entry.name);
+    }
+
+    let known_skills = state
+        .kernel
+        .skill_registry
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .skill_names()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+
+    Ok(AgentValidationContext {
+        known_skills,
+        known_agents,
+        ..AgentValidationContext::default()
+    })
+}
+
+fn collect_agent_validation_issues(
+    definition: &AgentDefinition,
+    context: &AgentValidationContext,
+) -> Vec<AgentValidationIssue> {
+    let mut issues = stage1_schema_validate(definition);
+    issues.extend(stage2_reference_validate(definition, context));
+    issues.extend(stage3_semantic_validate(definition));
+    issues
+}
+
+fn agent_definition_is_valid(issues: &[AgentValidationIssue], strict: bool) -> bool {
+    if strict {
+        issues.is_empty()
+    } else {
+        !issues.iter().any(|issue| issue.severity.is_error())
+    }
+}
+
+enum AgentPreparationFailure {
+    Validation(Vec<AgentValidationIssue>),
+    Compile(AgentCompileError),
+}
+
+fn prepare_agent_definition(
+    definition: AgentDefinition,
+    context: &AgentValidationContext,
+) -> Result<(AgentDefinition, CompiledAgentDefinition), AgentPreparationFailure> {
+    let issues = collect_agent_validation_issues(&definition, context);
+    if issues.iter().any(|issue| issue.severity.is_error()) {
+        return Err(AgentPreparationFailure::Validation(issues));
+    }
+
+    let normalized = stage4_normalize(definition);
+    let compiled =
+        compile_agent_ir(normalized.clone()).map_err(AgentPreparationFailure::Compile)?;
+    Ok((normalized, compiled))
+}
+
+fn agent_compiled_payload(compiled: CompiledAgentDefinition) -> AgentCompiledPayload {
+    AgentCompiledPayload {
+        agent_manifest: compiled.agent_manifest,
+        provider_binding: compiled.provider_binding,
+        product_metadata: compiled.product_metadata,
+    }
+}
+
+fn agent_runtime_status_for_definition(
+    state: &AppState,
+    definition_id: &str,
+) -> Result<AgentRuntimeStatus, (StatusCode, Json<serde_json::Value>)> {
+    let matching_agents = state
+        .kernel
+        .registry
+        .list()
+        .into_iter()
+        .filter(|entry| runtime_definition_id(entry) == Some(definition_id))
+        .collect::<Vec<_>>();
+
+    if matching_agents.is_empty() {
+        return Ok(AgentRuntimeStatus {
+            loaded: false,
+            healthy: false,
+            active_sessions: 0,
+            active_dispatches: 0,
+        });
+    }
+
+    let runtime_records = state
+        .kernel
+        .runtime_stores
+        .agent_runtime
+        .list_agent_runtimes()
+        .map_err(|error| {
+            agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime_status_failed",
+                "Failed to load agent runtime status",
+                Some(serde_json::json!([{
+                    "message": error.to_string(),
+                }])),
+            )
+        })?
+        .into_iter()
+        .map(|record| (record.agent_id, record))
+        .collect::<HashMap<_, _>>();
+
+    let mut loaded = false;
+    let mut healthy = true;
+    let mut active_sessions = 0u32;
+    let mut active_dispatches = 0u32;
+
+    for entry in matching_agents {
+        let runtime = runtime_records.get(&entry.id);
+        loaded |= runtime
+            .map(|record| record.loaded)
+            .unwrap_or(matches!(entry.state, AgentState::Running));
+        healthy &= runtime.map(|record| record.healthy).unwrap_or(!matches!(
+            entry.state,
+            AgentState::Crashed | AgentState::Terminated
+        ));
+
+        let session_count = state
+            .kernel
+            .runtime_stores
+            .agent_session
+            .list_agent_sessions_for_agent(entry.id)
+            .map_err(|error| {
+                agent_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "runtime_status_failed",
+                    "Failed to load agent runtime status",
+                    Some(serde_json::json!([{
+                        "message": error.to_string(),
+                    }])),
+                )
+            })?
+            .len();
+        active_sessions =
+            active_sessions.saturating_add(u32::try_from(session_count).unwrap_or(u32::MAX));
+        active_dispatches = active_dispatches
+            .saturating_add(runtime.map(|record| record.active_dispatches).unwrap_or(0));
+    }
+
+    Ok(AgentRuntimeStatus {
+        loaded,
+        healthy,
+        active_sessions,
+        active_dispatches,
+    })
+}
+
+fn agent_list_item(resource: &AgentResponse, runtime_status: AgentRuntimeStatus) -> AgentListItem {
+    AgentListItem {
+        id: resource.definition.id.clone(),
+        name: resource.definition.name.clone(),
+        description: resource.definition.description.clone(),
+        enabled: resource.definition.enabled.unwrap_or(true),
+        group: resource.definition.group.clone(),
+        tags: resource.definition.tags.clone(),
+        provider: AgentProviderSummary {
+            driver: resource.definition.provider.driver.clone(),
+            model: resource.definition.provider.model.clone(),
+            profile: resource.definition.provider.profile.clone(),
+        },
+        origin: resource.origin.clone(),
+        forked_from: resource.forked_from.clone(),
+        runtime_status,
+        updated_at: resource.updated_at.clone(),
+    }
+}
+
+/// GET /api/v1/agents — List file-backed agent definitions.
+pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let store = agent_definition_store(&state);
+    let definitions = match store.list() {
+        Ok(definitions) => definitions,
+        Err(error) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "definition_load_failed",
+                "Failed to load agent definitions",
+                Some(serde_json::json!([{
+                    "message": error,
+                }])),
+            );
+        }
+    };
+
+    let mut items = Vec::with_capacity(definitions.len());
+    for definition in &definitions {
+        let runtime_status =
+            match agent_runtime_status_for_definition(&state, &definition.definition.id) {
+                Ok(runtime_status) => runtime_status,
+                Err(response) => return response,
+            };
+        items.push(agent_list_item(definition, runtime_status));
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(AgentListResponse {
+            items,
+            next_cursor: None,
+        })),
+    )
+}
+
+/// POST /api/v1/agents — Create and persist an agent definition.
+pub async fn create_agent(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<CreateAgentRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return agent_json_rejection(rejection),
+    };
+    let definition = request.definition;
+
+    if let Err(response) = ensure_safe_agent_definition_id(&definition.id) {
+        return response;
+    }
+
+    let store = agent_definition_store(&state);
+    match store.load(&definition.id) {
+        Ok(Some(_)) => {
+            return agent_error_response(
+                StatusCode::CONFLICT,
+                "already_exists",
+                "Agent definition already exists",
+                Some(serde_json::json!([{
+                    "path": "id",
+                    "value": definition.id,
+                }])),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "definition_load_failed",
+                "Failed to load agent definitions",
+                Some(serde_json::json!([{
+                    "message": error,
+                }])),
+            );
+        }
+    }
+
+    let context = match agent_validation_context(&state, &store) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let (normalized, _compiled) = match prepare_agent_definition(definition, &context) {
+        Ok(prepared) => prepared,
+        Err(AgentPreparationFailure::Validation(issues)) => {
+            return agent_validation_error_response(&issues);
+        }
+        Err(AgentPreparationFailure::Compile(error)) => {
+            return agent_compile_error_response(&error);
+        }
+    };
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let resource = AgentResponse {
+        definition: normalized,
+        origin: AgentOrigin::user(),
+        forked_from: None,
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+
+    if let Err(error) = store.persist(&resource) {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_persist_failed",
+            "Failed to persist agent definition",
+            Some(serde_json::json!([{
+                "message": error,
+            }])),
+        );
+    }
+
+    (StatusCode::CREATED, Json(serde_json::json!(resource)))
+}
+
+/// GET /api/v1/agents/{id} — Load one file-backed agent definition.
+pub async fn get_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let store = agent_definition_store(&state);
+    match store.load(&id) {
+        Ok(Some(definition)) => (StatusCode::OK, Json(serde_json::json!(definition))),
+        Ok(None) => agent_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Agent definition not found",
+            None,
+        ),
+        Err(error) => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_load_failed",
+            "Failed to load agent definition",
+            Some(serde_json::json!([{
+                "message": error,
+            }])),
+        ),
+    }
+}
+
+/// PUT /api/v1/agents/{id} — Replace one file-backed agent definition.
+pub async fn update_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<UpdateAgentRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return agent_json_rejection(rejection),
+    };
+    let definition = request.definition;
+
+    if definition.id != id {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Path ID and body ID must match",
+            Some(serde_json::json!([{
+                "path": "id",
+                "expected": id,
+                "actual": definition.id,
+            }])),
+        );
+    }
+
+    let store = agent_definition_store(&state);
+    let existing = match store.load(&id) {
+        Ok(Some(definition)) => definition,
+        Ok(None) => {
+            return agent_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Agent definition not found",
+                None,
+            );
+        }
+        Err(error) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "definition_load_failed",
+                "Failed to load agent definition",
+                Some(serde_json::json!([{
+                    "message": error,
+                }])),
+            );
+        }
+    };
+
+    let context = match agent_validation_context(&state, &store) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let (normalized, _compiled) = match prepare_agent_definition(definition, &context) {
+        Ok(prepared) => prepared,
+        Err(AgentPreparationFailure::Validation(issues)) => {
+            return agent_validation_error_response(&issues);
+        }
+        Err(AgentPreparationFailure::Compile(error)) => {
+            return agent_compile_error_response(&error);
+        }
+    };
+
+    let resource = AgentResponse {
+        definition: normalized,
+        origin: existing.origin,
+        forked_from: existing.forked_from,
+        created_at: existing.created_at,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    if let Err(error) = store.persist(&resource) {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_persist_failed",
+            "Failed to persist agent definition",
+            Some(serde_json::json!([{
+                "message": error,
+            }])),
+        );
+    }
+
+    (StatusCode::OK, Json(serde_json::json!(resource)))
+}
+
+/// DELETE /api/v1/agents/{id} — Delete one file-backed agent definition.
+pub async fn delete_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response.into_response();
+    }
+
+    let store = agent_definition_store(&state);
+    match store.delete(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => agent_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Agent definition not found",
+            None,
+        )
+        .into_response(),
+        Err(error) => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_delete_failed",
+            "Failed to delete agent definition",
+            Some(serde_json::json!([{
+                "message": error,
+            }])),
+        )
+        .into_response(),
+    }
+}
+
+/// POST /api/v1/agents/validate — Validate an agent definition.
+pub async fn validate_agent_definition(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<AgentValidateRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return agent_json_rejection(rejection),
+    };
+    let store = agent_definition_store(&state);
+    let context = match agent_validation_context(&state, &store) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+
+    let issues = collect_agent_validation_issues(&request.definition, &context);
+    let normalized = if issues.iter().any(|issue| issue.severity.is_error()) {
+        None
+    } else {
+        Some(stage4_normalize(request.definition))
+    };
+    let valid = agent_definition_is_valid(&issues, request.strict.unwrap_or(false));
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(AgentValidateResponse {
+            valid,
+            issues,
+            normalized,
+        })),
+    )
+}
+
+/// POST /api/v1/agents/compile — Validate and compile an agent definition.
+pub async fn compile_agent_definition(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<AgentCompileRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return agent_json_rejection(rejection),
+    };
+    let store = agent_definition_store(&state);
+    let context = match agent_validation_context(&state, &store) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let (normalized, compiled) = match prepare_agent_definition(request.definition, &context) {
+        Ok(prepared) => prepared,
+        Err(AgentPreparationFailure::Validation(issues)) => {
+            return agent_validation_error_response(&issues);
+        }
+        Err(AgentPreparationFailure::Compile(error)) => {
+            return agent_compile_error_response(&error);
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(AgentCompileResponse {
+            definition_id: normalized.id.clone(),
+            normalized,
+            compiled: agent_compiled_payload(compiled),
+        })),
+    )
+}
+
+/// GET /api/v1/agents/{id}/compiled — Compile one stored agent definition.
+pub async fn get_agent_compiled(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let store = agent_definition_store(&state);
+    let definition = match store.load(&id) {
+        Ok(Some(resource)) => resource.definition,
+        Ok(None) => {
+            return agent_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Agent definition not found",
+                None,
+            );
+        }
+        Err(error) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "definition_load_failed",
+                "Failed to load agent definition",
+                Some(serde_json::json!([{
+                    "message": error,
+                }])),
+            );
+        }
+    };
+    let context = match agent_validation_context(&state, &store) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let (normalized, compiled) = match prepare_agent_definition(definition, &context) {
+        Ok(prepared) => prepared,
+        Err(AgentPreparationFailure::Validation(issues)) => {
+            return agent_validation_error_response(&issues);
+        }
+        Err(AgentPreparationFailure::Compile(error)) => {
+            return agent_compile_error_response(&error);
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(AgentCompiledResponse {
+            definition_id: normalized.id.clone(),
+            normalized,
+            compiled: agent_compiled_payload(compiled),
+        })),
+    )
+}
+
 /// POST /api/agents — Spawn a new agent.
 pub async fn spawn_agent(
     State(state): State<Arc<AppState>>,
@@ -387,7 +1085,7 @@ pub async fn spawn_agent(
 }
 
 /// GET /api/agents — List all agents.
-pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list_agents_legacy(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Snapshot catalog once for enrichment
     let catalog = state.kernel.model_catalog.read().ok();
     let dm = &state.kernel.config.default_model;
@@ -2355,7 +3053,7 @@ pub async fn version() -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 /// GET /api/agents/:id — Get a single agent's detailed info.
-pub async fn get_agent(
+pub async fn get_agent_legacy(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
@@ -6721,10 +7419,10 @@ pub async fn update_trigger(
 // ---------------------------------------------------------------------------
 
 /// PUT /api/agents/:id — Update an agent (currently: re-set manifest fields).
-pub async fn update_agent(
+pub async fn update_agent_legacy(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<AgentUpdateRequest>,
+    Json(req): Json<LegacyAgentUpdateRequest>,
 ) -> impl IntoResponse {
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
@@ -12472,5 +13170,281 @@ mod channel_config_tests {
                 .unwrap()
                 .required
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_definition_route_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use openfang_types::config::{DefaultModelConfig, KernelConfig};
+    use serde_json::{json, Value};
+    use tempfile::TempDir;
+
+    struct RouteTestContext {
+        state: Arc<AppState>,
+        _tmp: TempDir,
+    }
+
+    impl Drop for RouteTestContext {
+        fn drop(&mut self) {
+            self.state.kernel.shutdown();
+        }
+    }
+
+    async fn route_test_context() -> RouteTestContext {
+        let tmp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = KernelConfig {
+            home_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().join("data"),
+            default_model: DefaultModelConfig {
+                provider: "claude_code".to_string(),
+                model: "sonnet".to_string(),
+                api_key_env: "ANTHROPIC_API_KEY".to_string(),
+                base_url: None,
+            },
+            ..KernelConfig::default()
+        };
+
+        let kernel =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel should boot"));
+        kernel.set_self_handle();
+        *kernel
+            .skill_registry
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) =
+            openfang_skills::registry::SkillRegistry::new(tmp.path().join("skills"));
+
+        let state = Arc::new(AppState {
+            kernel,
+            started_at: Instant::now(),
+            peer_registry: None,
+            bridge_manager: tokio::sync::Mutex::new(None),
+            channels_config: tokio::sync::RwLock::new(Default::default()),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            clawhub_cache: DashMap::new(),
+            provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        });
+
+        RouteTestContext { state, _tmp: tmp }
+    }
+
+    async fn json_response(response: impl IntoResponse) -> (StatusCode, Value) {
+        let response = response.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let json = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body should be valid JSON")
+        };
+        (status, json)
+    }
+
+    fn prd_writer_definition_value(id: &str, name: &str) -> Value {
+        json!({
+            "id": id,
+            "name": name,
+            "version": "1.0.0",
+            "description": "Writes and iterates on product requirement documents",
+            "enabled": true,
+            "group": "sdlc",
+            "tags": ["docs", "prd", "planning"],
+            "provider": {
+                "driver": "claude_code",
+                "model": "sonnet",
+                "profile": "default",
+                "defaults": {
+                    "reasoning_effort": "high",
+                    "max_tokens": 8000
+                },
+                "config": {
+                    "continue_conversation": true,
+                    "fork_session": false,
+                    "allowed_tools": ["Read", "Write", "Bash"],
+                    "disallowed_tools": [],
+                    "additional_directories": ["./docs"],
+                    "max_budget_usd": 5.0,
+                    "fallback_model": "sonnet"
+                }
+            },
+            "prompt": {
+                "system": "You are a senior product writer.",
+                "instructions": "Write clear, implementation-ready PRDs.",
+                "skills": ["writing", "prd"]
+            },
+            "capabilities": {
+                "tools": ["*"],
+                "primitives": ["issue.read", "artifact.*", "doc.*", "hitl.*"],
+                "delegation": ["call", "send"],
+                "workspace": "none",
+                "network": true
+            },
+            "runtime": {
+                "autonomous": true,
+                "memory_policy": "session",
+                "hitl": "explicit_only"
+            },
+            "input": {
+                "kind": "object"
+            },
+            "output": {
+                "kind": "artifact_ref",
+                "artifact_type": "prd"
+            }
+        })
+    }
+
+    fn prd_writer_definition(id: &str, name: &str) -> AgentDefinition {
+        serde_json::from_value(prd_writer_definition_value(id, name))
+            .expect("fixture should deserialize")
+    }
+
+    #[tokio::test]
+    async fn validate_agent_definition_should_return_normalized_response_for_valid_definition() {
+        let context = route_test_context().await;
+
+        let (status, body) = json_response(
+            validate_agent_definition(
+                State(Arc::clone(&context.state)),
+                Ok(Json(AgentValidateRequest {
+                    definition: prd_writer_definition("prd-writer", "PRD Writer"),
+                    strict: Some(true),
+                    context: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["valid"], json!(true));
+        assert_eq!(body["issues"], json!([]));
+        assert_eq!(body["normalized"]["id"], json!("prd-writer"));
+        assert_eq!(body["normalized"]["name"], json!("PRD Writer"));
+    }
+
+    #[tokio::test]
+    async fn validate_agent_definition_should_report_missing_driver() {
+        let context = route_test_context().await;
+        let mut definition = prd_writer_definition_value("broken-writer", "Broken Writer");
+        definition["provider"]["driver"] = Value::String(String::new());
+
+        let (status, body) = json_response(
+            validate_agent_definition(
+                State(Arc::clone(&context.state)),
+                Ok(Json(AgentValidateRequest {
+                    definition: serde_json::from_value(definition)
+                        .expect("fixture should deserialize"),
+                    strict: Some(false),
+                    context: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["valid"], json!(false));
+        assert!(body["issues"]
+            .as_array()
+            .expect("issues should be an array")
+            .iter()
+            .any(|issue| issue["path"] == json!("provider.driver")));
+    }
+
+    #[tokio::test]
+    async fn compile_agent_definition_should_return_all_compiled_layers() {
+        let context = route_test_context().await;
+
+        let (status, body) = json_response(
+            compile_agent_definition(
+                State(Arc::clone(&context.state)),
+                Ok(Json(AgentCompileRequest {
+                    definition: prd_writer_definition("compile-writer", "Compile Writer"),
+                    context: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["definition_id"], json!("compile-writer"));
+        assert!(body["compiled"]["agent_manifest"].is_object());
+        assert!(body["compiled"]["provider_binding"].is_object());
+        assert!(body["compiled"]["product_metadata"].is_object());
+    }
+
+    #[tokio::test]
+    async fn get_agent_compiled_should_return_not_found_for_unknown_definition() {
+        let context = route_test_context().await;
+
+        let (status, body) = json_response(
+            get_agent_compiled(
+                State(Arc::clone(&context.state)),
+                Path("missing-definition".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("not_found"));
+        assert_eq!(
+            body["error"]["message"],
+            json!("Agent definition not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_update_agent_should_return_full_resource_objects() {
+        let context = route_test_context().await;
+
+        let (create_status, create_body) = json_response(
+            create_agent(
+                State(Arc::clone(&context.state)),
+                Ok(Json(CreateAgentRequest {
+                    definition: prd_writer_definition("resource-writer", "Resource Writer"),
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(create_status, StatusCode::CREATED);
+        assert_eq!(create_body["id"], json!("resource-writer"));
+        assert_eq!(create_body["name"], json!("Resource Writer"));
+        assert_eq!(create_body["origin"]["kind"], json!("user"));
+        assert!(create_body["forked_from"].is_null());
+        assert!(create_body["created_at"].is_string());
+        assert!(create_body["updated_at"].is_string());
+        assert!(create_body.get("agent_id").is_none());
+
+        let mut updated = prd_writer_definition_value("resource-writer", "Updated Writer");
+        updated["description"] = json!("Updated description");
+
+        let (update_status, update_body) = json_response(
+            update_agent(
+                State(Arc::clone(&context.state)),
+                Path("resource-writer".to_string()),
+                Ok(Json(UpdateAgentRequest {
+                    definition: serde_json::from_value(updated)
+                        .expect("fixture should deserialize"),
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(update_status, StatusCode::OK);
+        assert_eq!(update_body["id"], json!("resource-writer"));
+        assert_eq!(update_body["name"], json!("Updated Writer"));
+        assert_eq!(update_body["description"], json!("Updated description"));
+        assert_eq!(update_body["origin"]["kind"], json!("user"));
+        assert!(update_body["forked_from"].is_null());
+        assert!(update_body.get("agent_id").is_none());
     }
 }

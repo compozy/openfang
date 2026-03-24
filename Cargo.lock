@@ -4135,6 +4135,7 @@ dependencies = [
  "governor",
  "hex",
  "hmac",
+ "openfang-agent-definition",
  "openfang-channels",
  "openfang-extensions",
  "openfang-hands",
