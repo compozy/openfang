@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/workflow/compile</domain>
@@ -54,12 +54,12 @@ updated to accept only `WorkflowIr`, never raw definition structs.
 
 ## Subtasks
 
-- [ ] 14.1 Implement the validate phase in `crates/openfang-kernel/src/workflow.rs` (or a new `crates/openfang-kernel/src/workflow_compiler.rs`): schema validation (required fields, known enums), reference validation (agents and primitives referenced by steps must exist in the definition registry), semantic validation (step kind + flow mode compatibility, loop termination requirements, conditional `when` field presence, `collect` placement rules).
-- [ ] 14.2 Implement the normalize phase: fill `defaults.timeout_secs` (default: 120) and `defaults.error_mode` (default: `fail`) into steps that do not override them; canonicalize `text` → `string` and `json` → `any` kind aliases in the `input`/`output` contract; produce `NormalizedWorkflow`.
-- [ ] 14.3 Implement the compile phase: walk the `NormalizedWorkflow`, resolve all `save_as` symbols, validate all `outputs` and `with` template references against the `vars` namespace and the `input` contract, and produce `WorkflowIr`. The `WorkflowIr` must carry all information needed by the runtime executor without re-parsing the definition.
-- [ ] 14.4 Define the `WorkflowIr` struct with: resolved step sequence with all defaults filled in, symbol table mapping `save_as` names to their originating step IDs, resolved `outputs` projection mapping output field names to their source expressions, validated `input` and `output` contract nodes, workflow-level defaults, and `workflow_id`/`workflow_version` for durable run records.
-- [ ] 14.5 Update the runtime executor (`WorkflowEngine::execute_run` or its successor) to accept `WorkflowIr` as its input rather than the raw `Workflow` struct. The old `Workflow` struct may be retained as a legacy internal representation during the migration but must not be the execution input.
-- [ ] 14.6 Write comprehensive unit tests for all compile error paths and symbol resolution.
+- [x] 14.1 Implement the validate phase in `crates/openfang-kernel/src/workflow.rs` (or a new `crates/openfang-kernel/src/workflow_compiler.rs`): schema validation (required fields, known enums), reference validation (agents and primitives referenced by steps must exist in the definition registry), semantic validation (step kind + flow mode compatibility, loop termination requirements, conditional `when` field presence, `collect` placement rules).
+- [x] 14.2 Implement the normalize phase: fill `defaults.timeout_secs` (default: 120) and `defaults.error_mode` (default: `fail`) into steps that do not override them; canonicalize `text` → `string` and `json` → `any` kind aliases in the `input`/`output` contract; produce `NormalizedWorkflow`.
+- [x] 14.3 Implement the compile phase: walk the `NormalizedWorkflow`, resolve all `save_as` symbols, validate all `outputs` and `with` template references against the `vars` namespace and the `input` contract, and produce `WorkflowIr`. The `WorkflowIr` must carry all information needed by the runtime executor without re-parsing the definition.
+- [x] 14.4 Define the `WorkflowIr` struct with: resolved step sequence with all defaults filled in, symbol table mapping `save_as` names to their originating step IDs, resolved `outputs` projection mapping output field names to their source expressions, validated `input` and `output` contract nodes, workflow-level defaults, and `workflow_id`/`workflow_version` for durable run records.
+- [x] 14.5 Update the runtime executor (`WorkflowEngine::execute_run` or its successor) to accept `WorkflowIr` as its input rather than the raw `Workflow` struct. The old `Workflow` struct may be retained as a legacy internal representation during the migration but must not be the execution input.
+- [x] 14.6 Write comprehensive unit tests for all compile error paths and symbol resolution.
 
 ## Implementation Details
 
@@ -138,31 +138,31 @@ the definitions. The executor only ever calls into the IR.
 
 ### Unit Tests (Required)
 
-- [ ] `step_kind_agent_validates_and_compiles`: a step with `kind: agent`, valid `uses.agent`, and `flow.mode: sequential` must compile without errors and produce an IR step with the correct target agent reference.
-- [ ] `step_kind_primitive_validates_known_primitive`: a step with `kind: primitive` and `uses.primitive: "issue.read"` must pass reference validation when the primitive is registered; must fail with `code: "unknown_primitive"` when it is not.
-- [ ] `step_kind_workflow_validates_nested_workflow_exists`: a step with `kind: workflow` and `uses.workflow: "nested-id"` must fail compilation with `code: "unknown_workflow"` when no workflow with that ID is registered.
-- [ ] `step_kind_wait_signal_rejects_non_sequential_mode`: a `wait_signal` step with `flow.mode: fan_out` must produce a `ValidationIssue` with `code: "invalid_mode_for_kind"` and `severity: error`.
-- [ ] `step_kind_collect_rejects_placement_before_fan_out`: a `collect` step that appears before any `fan_out` step must produce `code: "collect_without_fan_out"`.
-- [ ] `step_kind_loop_requires_until_and_max_iterations`: a loop step with `flow.max_iterations` missing must produce `code: "missing_required_field"` with `path: "steps[N].flow.max_iterations"`.
-- [ ] `save_as_introduces_symbol_to_vars_namespace`: after compiling a step with `save_as: "issue"`, the symbol `vars.issue` must be present in the compiled symbol table.
-- [ ] `outputs_with_dangling_reference_fails_compilation`: an `outputs` entry using `{{ vars.result }}` when no step has `save_as: "result"` must produce `code: "dangling_reference"` with `severity: error`.
-- [ ] `forward_reference_in_with_fails_compilation`: a step that uses `{{ vars.foo }}` in its `with` block before any step has `save_as: "foo"` must produce `code: "forward_reference"`.
-- [ ] `normalize_fills_default_timeout_and_error_mode`: a step without explicit `runtime.timeout_secs` must have it set to `120` (from `defaults`) in the normalized form.
-- [ ] `normalize_text_alias_becomes_string_kind`: an `input` contract with `kind: "text"` must normalize to `kind: "string"`.
-- [ ] `compile_produces_stable_ir_from_valid_definition`: a fully valid two-step sequential definition must produce a `WorkflowIr` that round-trips through `serde_json::to_string` and `serde_json::from_str` without loss.
+- [x] `step_kind_agent_validates_and_compiles`: a step with `kind: agent`, valid `uses.agent`, and `flow.mode: sequential` must compile without errors and produce an IR step with the correct target agent reference.
+- [x] `step_kind_primitive_validates_known_primitive`: a step with `kind: primitive` and `uses.primitive: "issue.read"` must pass reference validation when the primitive is registered; must fail with `code: "unknown_primitive"` when it is not.
+- [x] `step_kind_workflow_validates_nested_workflow_exists`: a step with `kind: workflow` and `uses.workflow: "nested-id"` must fail compilation with `code: "unknown_workflow"` when no workflow with that ID is registered.
+- [x] `step_kind_wait_signal_rejects_non_sequential_mode`: a `wait_signal` step with `flow.mode: fan_out` must produce a `ValidationIssue` with `code: "invalid_mode_for_kind"` and `severity: error`.
+- [x] `step_kind_collect_rejects_placement_before_fan_out`: a `collect` step that appears before any `fan_out` step must produce `code: "collect_without_fan_out"`.
+- [x] `step_kind_loop_requires_until_and_max_iterations`: a loop step with `flow.max_iterations` missing must produce `code: "missing_required_field"` with `path: "steps[N].flow.max_iterations"`.
+- [x] `save_as_introduces_symbol_to_vars_namespace`: after compiling a step with `save_as: "issue"`, the symbol `vars.issue` must be present in the compiled symbol table.
+- [x] `outputs_with_dangling_reference_fails_compilation`: an `outputs` entry using `{{ vars.result }}` when no step has `save_as: "result"` must produce `code: "dangling_reference"` with `severity: error`.
+- [x] `forward_reference_in_with_fails_compilation`: a step that uses `{{ vars.foo }}` in its `with` block before any step has `save_as: "foo"` must produce `code: "forward_reference"`.
+- [x] `normalize_fills_default_timeout_and_error_mode`: a step without explicit `runtime.timeout_secs` must have it set to `120` (from `defaults`) in the normalized form.
+- [x] `normalize_text_alias_becomes_string_kind`: an `input` contract with `kind: "text"` must normalize to `kind: "string"`.
+- [x] `compile_produces_stable_ir_from_valid_definition`: a fully valid two-step sequential definition must produce a `WorkflowIr` that round-trips through `serde_json::to_string` and `serde_json::from_str` without loss.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No step kind is silently ignored during compilation — all eight must produce distinct IR variants.
-- [ ] The pipeline must not accept a partially valid definition: if any `ValidationIssue` with `severity: error` is present, `compile` must return an error, not a partial IR.
-- [ ] The compile pipeline must not perform network calls, provider boots, or template execution — only structural symbol resolution.
-- [ ] The runtime executor must not accept the raw `WorkflowV2Definition` struct as its execution input — only `WorkflowIr` is valid after this task.
+- [x] No step kind is silently ignored during compilation — all eight must produce distinct IR variants.
+- [x] The pipeline must not accept a partially valid definition: if any `ValidationIssue` with `severity: error` is present, `compile` must return an error, not a partial IR.
+- [x] The compile pipeline must not perform network calls, provider boots, or template execution — only structural symbol resolution.
+- [x] The runtime executor must not accept the raw `WorkflowV2Definition` struct as its execution input — only `WorkflowIr` is valid after this task.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

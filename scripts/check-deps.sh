@@ -79,6 +79,22 @@ EXPECTED = {
         "openfang-memory",
         "openfang-skills",
     },
+    "openfang-provider-binding": {
+        "arky-claude-code",
+        "arky-codex",
+        "arky-config",
+        "arky-error",
+        "arky-protocol",
+        "arky-provider",
+        "openfang-runtime",
+        "openfang-types",
+    },
+    "openfang-agent-definition": {
+        "arky-claude-code",
+        "arky-config",
+        "openfang-provider-binding",
+        "openfang-types",
+    },
     "openfang-kernel": {
         "openfang-types",
         "openfang-memory",

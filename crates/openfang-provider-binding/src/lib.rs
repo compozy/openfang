@@ -4,6 +4,9 @@
 //! `agent_definition` documents and the Arky runtime registry.
 
 mod adapter;
+mod bridge;
+mod convert;
+mod instantiate;
 
 use std::collections::BTreeMap;
 
@@ -26,6 +29,15 @@ pub use crate::adapter::{
     binding_to_claude_code_config, binding_to_claude_compatible_config, binding_to_codex_config,
     build_provider_config, AdapterError, CompozyProviderConfig,
 };
+pub use crate::bridge::{binding_to_driver, ArkyDriverBridge, BridgeError};
+pub use crate::convert::{
+    agent_event_to_stream_event, arky_blocks_to_of, arky_message_to_of,
+    completion_request_to_provider, extract_tool_calls, finish_reason_from_payload,
+    finish_reason_to_stop_reason, flatten_tool_result_content, generate_response_to_completion,
+    of_message_to_arky, of_tool_to_arky, provider_error_to_llm, thinking_blocks,
+    usage_from_payload, usage_to_token_usage, ConvertError,
+};
+pub use crate::instantiate::{instantiate_provider, InstantiateError};
 
 /// Runtime-safe compiled provider binding derived from layered config input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

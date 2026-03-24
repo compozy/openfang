@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/workflow/api</domain>
@@ -49,12 +49,12 @@ prefix per ADR-032 (workflow API definition and operational surfaces).
 
 ## Subtasks
 
-- [ ] 15.1 Add request and response types to `crates/openfang-api/src/types.rs`: `WorkflowValidateRequest`, `WorkflowValidateResponse`, `WorkflowCompileRequest`, `WorkflowCompileResponse`, `WorkflowCompiledResponse`. All structs must match the API-SPEC.md payload shapes exactly.
-- [ ] 15.2 Implement `validate_workflow` route handler in `crates/openfang-api/src/routes.rs`: accepts a `WorkflowV2Definition` JSON body, calls the Task 14 validate phase, and returns the validation response.
-- [ ] 15.3 Implement `compile_workflow` route handler: accepts a `WorkflowV2Definition` JSON body, calls the full Task 14 pipeline, and returns the compile response with `WorkflowIr`.
-- [ ] 15.4 Implement `get_workflow_compiled` route handler for `GET /api/v1/workflows/{id}/compiled`: loads the stored definition, returns the cached compiled IR, or returns `404` for unknown IDs.
-- [ ] 15.5 Register all new routes in `crates/openfang-api/src/server.rs` under the `/api/v1/workflows` prefix.
-- [ ] 15.6 Write integration tests for all three endpoints.
+- [x] 15.1 Add request and response types to `crates/openfang-api/src/types.rs`: `WorkflowValidateRequest`, `WorkflowValidateResponse`, `WorkflowCompileRequest`, `WorkflowCompileResponse`, `WorkflowCompiledResponse`. All structs must match the API-SPEC.md payload shapes exactly.
+- [x] 15.2 Implement `validate_workflow` route handler in `crates/openfang-api/src/routes.rs`: accepts a `WorkflowV2Definition` JSON body, calls the Task 14 validate phase, and returns the validation response.
+- [x] 15.3 Implement `compile_workflow` route handler: accepts a `WorkflowV2Definition` JSON body, calls the full Task 14 pipeline, and returns the compile response with `WorkflowIr`.
+- [x] 15.4 Implement `get_workflow_compiled` route handler for `GET /api/v1/workflows/{id}/compiled`: loads the stored definition, returns the cached compiled IR, or returns `404` for unknown IDs.
+- [x] 15.5 Register all new routes in `crates/openfang-api/src/server.rs` under the `/api/v1/workflows` prefix.
+- [x] 15.6 Write integration tests for all three endpoints.
 
 ## Implementation Details
 
@@ -105,24 +105,24 @@ GET  /api/v1/workflows/{id}/compiled  -> get_workflow_compiled
 
 ### Integration Tests (Required)
 
-- [ ] `post_validate_returns_valid_true_for_correct_definition`: `POST /api/v1/workflows/validate` with a valid SDLC-like definition must return `{"valid": true, "issues": [], "normalized": {...}}`.
-- [ ] `post_validate_returns_issues_for_dangling_reference`: `POST /api/v1/workflows/validate` with an `outputs` dangling reference must return `{"valid": false, "issues": [{"severity": "error", "code": "dangling_reference", ...}]}`.
-- [ ] `post_compile_returns_workflow_ir`: `POST /api/v1/workflows/compile` with a valid definition must return `{"definition_id": "...", "normalized": {...}, "compiled": {"workflow_ir": {...}}}`.
-- [ ] `get_compiled_returns_cached_ir_for_registered_workflow`: after registering a workflow via `POST /api/v1/workflows`, `GET /api/v1/workflows/{id}/compiled` must return the pre-compiled IR without re-running the pipeline.
-- [ ] `get_compiled_returns_404_for_unknown_id`: `GET /api/v1/workflows/{unknown_id}/compiled` must return a `404` response with the standard error envelope.
-- [ ] `end_to_end_definition_to_ir_preserves_step_semantics`: a definition with all eight step kinds must produce an IR where each step's kind, uses, save_as, and flow mode are faithfully preserved.
+- [x] `post_validate_returns_valid_true_for_correct_definition`: `POST /api/v1/workflows/validate` with a valid SDLC-like definition must return `{"valid": true, "issues": [], "normalized": {...}}`.
+- [x] `post_validate_returns_issues_for_dangling_reference`: `POST /api/v1/workflows/validate` with an `outputs` dangling reference must return `{"valid": false, "issues": [{"severity": "error", "code": "dangling_reference", ...}]}`.
+- [x] `post_compile_returns_workflow_ir`: `POST /api/v1/workflows/compile` with a valid definition must return `{"definition_id": "...", "normalized": {...}, "compiled": {"workflow_ir": {...}}}`.
+- [x] `get_compiled_returns_cached_ir_for_registered_workflow`: after registering a workflow via `POST /api/v1/workflows`, `GET /api/v1/workflows/{id}/compiled` must return the pre-compiled IR without re-running the pipeline.
+- [x] `get_compiled_returns_404_for_unknown_id`: `GET /api/v1/workflows/{unknown_id}/compiled` must return a `404` response with the standard error envelope.
+- [x] `end_to_end_definition_to_ir_preserves_step_semantics`: a definition with all eight step kinds must produce an IR where each step's kind, uses, save_as, and flow mode are faithfully preserved.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] All error responses use the `{ error: { code, message, details } }` envelope — no unstructured plain-text error bodies.
-- [ ] The validate endpoint does not compile — it only validates and normalizes.
-- [ ] The compile endpoint returns an error (not a partial IR) when validation fails.
+- [x] All error responses use the `{ error: { code, message, details } }` envelope — no unstructured plain-text error bodies.
+- [x] The validate endpoint does not compile — it only validates and normalizes.
+- [x] The compile endpoint returns an error (not a partial IR) when validation fails.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

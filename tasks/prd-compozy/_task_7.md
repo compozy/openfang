@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/workflows/definitions</domain>
@@ -52,13 +52,13 @@ three mutation paths before any Phase 1 run-durability work begins.
 
 ## Subtasks
 
-- [ ] 7.1 Audit all three mutation paths (`create_workflow`, `update_workflow`, `delete_workflow` in `crates/openfang-api/src/routes.rs`) and map exactly where file and memory diverge.
-- [ ] 7.2 Fix `update_workflow`: persist the updated canonical definition file before calling `WorkflowEngine::update_workflow`, returning an error if the file write fails. File path must use the same naming convention as create.
-- [ ] 7.3 Fix `delete_workflow`: remove the definition file atomically alongside `WorkflowEngine::remove_workflow`. If the file does not exist, treat it as a warning rather than a hard error, but do not silently succeed if the in-memory entry was also missing.
-- [ ] 7.4 Harden `create_workflow`: replace the best-effort `tracing::warn!` file-write with a real error path. If disk persistence fails, roll back the in-memory registration and return a 500.
-- [ ] 7.5 Fix `load_workflows_from_dir` in `crates/openfang-kernel/src/kernel.rs`: confirm it loads exactly the files present on disk and does not re-register definitions that were deleted since the last boot. Add deduplication guard if the same `WorkflowId` is registered more than once.
-- [ ] 7.6 Introduce a `WorkflowDefinitionStore` abstraction (or equivalent internal helper) in `crates/openfang-kernel/src/workflow.rs` that encapsulates the file-path convention and the read/write/delete operations, so future callers cannot bypass disk persistence accidentally.
-- [ ] 7.7 Add restart-behavior integration tests that exercise create, update, and delete across a simulated restart by calling `load_workflows_from_dir` on a temp directory.
+- [x] 7.1 Audit all three mutation paths (`create_workflow`, `update_workflow`, `delete_workflow` in `crates/openfang-api/src/routes.rs`) and map exactly where file and memory diverge.
+- [x] 7.2 Fix `update_workflow`: persist the updated canonical definition file before calling `WorkflowEngine::update_workflow`, returning an error if the file write fails. File path must use the same naming convention as create.
+- [x] 7.3 Fix `delete_workflow`: remove the definition file atomically alongside `WorkflowEngine::remove_workflow`. If the file does not exist, treat it as a warning rather than a hard error, but do not silently succeed if the in-memory entry was also missing.
+- [x] 7.4 Harden `create_workflow`: replace the best-effort `tracing::warn!` file-write with a real error path. If disk persistence fails, roll back the in-memory registration and return a 500.
+- [x] 7.5 Fix `load_workflows_from_dir` in `crates/openfang-kernel/src/kernel.rs`: confirm it loads exactly the files present on disk and does not re-register definitions that were deleted since the last boot. Add deduplication guard if the same `WorkflowId` is registered more than once.
+- [x] 7.6 Introduce a `WorkflowDefinitionStore` abstraction (or equivalent internal helper) in `crates/openfang-kernel/src/workflow.rs` that encapsulates the file-path convention and the read/write/delete operations, so future callers cannot bypass disk persistence accidentally.
+- [x] 7.7 Add restart-behavior integration tests that exercise create, update, and delete across a simulated restart by calling `load_workflows_from_dir` on a temp directory.
 
 ## Implementation Details
 
@@ -115,31 +115,31 @@ The `WorkflowDefinitionStore` abstraction should handle:
 
 ### Unit Tests (Required)
 
-- [ ] `workflow_update_persists_canonical_definition`: call `update_workflow`, then read the file from disk, deserialize it, and assert the file content matches the updated definition — not the pre-update version.
-- [ ] `workflow_delete_removes_definition_file`: call `delete_workflow`, then assert the corresponding `.json` file no longer exists in the workflows directory.
-- [ ] `workflow_create_rolls_back_on_disk_failure`: simulate a disk write failure during `create_workflow` and assert the in-memory registry does not contain the new workflow after the error response.
-- [ ] `workflow_update_rolls_back_on_disk_failure`: simulate a disk write failure during `update_workflow` and assert the in-memory registry still holds the pre-update version.
-- [ ] `runtime_registry_and_file_store_stay_aligned`: after each of create, update, and delete, assert that the set of workflow IDs in memory equals the set of IDs from files present on disk.
+- [x] `workflow_update_persists_canonical_definition`: call `update_workflow`, then read the file from disk, deserialize it, and assert the file content matches the updated definition — not the pre-update version.
+- [x] `workflow_delete_removes_definition_file`: call `delete_workflow`, then assert the corresponding `.json` file no longer exists in the workflows directory.
+- [x] `workflow_create_rolls_back_on_disk_failure`: simulate a disk write failure during `create_workflow` and assert the in-memory registry does not contain the new workflow after the error response.
+- [x] `workflow_update_rolls_back_on_disk_failure`: simulate a disk write failure during `update_workflow` and assert the in-memory registry still holds the pre-update version.
+- [x] `runtime_registry_and_file_store_stay_aligned`: after each of create, update, and delete, assert that the set of workflow IDs in memory equals the set of IDs from files present on disk.
 
 ### Integration Tests (Required)
 
-- [ ] `create_then_restart_then_reload_returns_same_definition`: create a workflow via the route handler, simulate a restart by calling `load_workflows_from_dir` on the workflows directory, then assert the reloaded definition is identical to the one returned by the original create.
-- [ ] `update_then_restart_then_reload_reflects_updated_definition`: update a workflow, simulate a restart, then assert the reloaded definition reflects the update — not the pre-update version.
-- [ ] `delete_then_restart_does_not_resurrect_workflow`: delete a workflow, simulate a restart by calling `load_workflows_from_dir`, then assert the deleted workflow is not re-registered.
-- [ ] `concurrent_update_and_reload_is_coherent`: run an update and a `load_workflows_from_dir` concurrently and assert no mixed state is visible to readers.
+- [x] `create_then_restart_then_reload_returns_same_definition`: create a workflow via the route handler, simulate a restart by calling `load_workflows_from_dir` on the workflows directory, then assert the reloaded definition is identical to the one returned by the original create.
+- [x] `update_then_restart_then_reload_reflects_updated_definition`: update a workflow, simulate a restart, then assert the reloaded definition reflects the update — not the pre-update version.
+- [x] `delete_then_restart_does_not_resurrect_workflow`: delete a workflow, simulate a restart by calling `load_workflows_from_dir`, then assert the deleted workflow is not re-registered.
+- [x] `concurrent_update_and_reload_is_coherent`: run an update and a `load_workflows_from_dir` concurrently and assert no mixed state is visible to readers.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No code path calls `WorkflowEngine::register`, `WorkflowEngine::update_workflow`, or `WorkflowEngine::remove_workflow` without also performing the corresponding file operation.
-- [ ] No code path writes a workflow file without also updating the in-memory registry.
-- [ ] No database column or `compozy.db` table is introduced as a competing store of definition content — per ADR-037, the database stores runtime projections, not definition sources.
-- [ ] File write errors must surface as HTTP 500 responses, not as `tracing::warn!` with a silent success.
+- [x] No code path calls `WorkflowEngine::register`, `WorkflowEngine::update_workflow`, or `WorkflowEngine::remove_workflow` without also performing the corresponding file operation.
+- [x] No code path writes a workflow file without also updating the in-memory registry.
+- [x] No database column or `compozy.db` table is introduced as a competing store of definition content — per ADR-037, the database stores runtime projections, not definition sources.
+- [x] File write errors must surface as HTTP 500 responses, not as `tracing::warn!` with a silent success.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

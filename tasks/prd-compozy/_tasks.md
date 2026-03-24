@@ -1,0 +1,47 @@
+## markdown
+
+# PRD Task Index
+
+- [x] [_task_1.md](_task_1.md) — Task 1.0: Split Persistence Config For Dual Databases
+- [x] [_task_2.md](_task_2.md) — Task 2.0: Dual-Database Bootstrap In Kernel Startup
+- [x] [_task_3.md](_task_3.md) — Task 3.0: Reusable Migration Runner For Both Databases
+- [x] [_task_4.md](_task_4.md) — Task 4.0: Copy Arky Crates Into OpenFang Workspace
+- [x] [_task_5.md](_task_5.md) — Task 5.0: Shared Definition Contract Types
+- [x] [_task_6.md](_task_6.md) — Task 6.0: Initial runtime.db Schema And Stores
+- [x] [_task_7.md](_task_7.md) — Task 7.0: Workflow Definition Source-Of-Truth Consistency
+- [x] [_task_8.md](_task_8.md) — Task 8.0: Workflow Bootstrap And Readiness Semantics
+- [x] [_task_9.md](_task_9.md) — Task 9.0: Initial compozy.db Workflow Core Schema
+- [x] [_task_10.md](_task_10.md) — Task 10.0: Provider Layering For Workspace, Profiles, And Agent Config
+- [x] [_task_11.md](_task_11.md) — Task 11.0: ProviderBinding Compile Layer For Compozy Agents
+- [x] [_task_12.md](_task_12.md) — Task 12.0: Typed Provider Integration For Codex And Claude Code
+- [x] [_task_13.md](_task_13.md) — Task 13.0: Workflow v2 Definition Types
+- [x] [_task_14.md](_task_14.md) — Task 14.0: Workflow v2 Compile Pipeline
+- [x] [_task_15.md](_task_15.md) — Task 15.0: Workflow v2 API Endpoints
+- [x] [_task_16.md](_task_16.md) — Task 16.0: Durable Workflow Run Repository And Transition Writer
+- [x] [_task_17.md](_task_17.md) — Task 17.0: Workflow Signal Persistence And Waiting-State Integration
+- [x] [_task_18.md](_task_18.md) — Task 18.0: Agent Definition Validation And Compile Pipeline
+- [ ] [_task_19.md](_task_19.md) — Task 19.0: Restart Recovery And Durable Run Control Surfaces
+- [ ] [_task_20.md](_task_20.md) — Task 20.0: Agent Definition CRUD And Compile Routes
+- [ ] [_task_21.md](_task_21.md) — Task 21.0: Agent Runtime Operational Sub-Resources
+- [ ] [_task_22.md](_task_22.md) — Task 22.0: Agent Sessions Messages And SSE Streaming
+- [ ] [_task_23.md](_task_23.md) — Task 23.0: agent_dispatch Schema And Persistence Layer
+- [ ] [_task_24.md](_task_24.md) — Task 24.0: hitl_request Schema And Persistence Layer
+- [ ] [_task_25.md](_task_25.md) — Task 25.0: Workflow Definition CRUD Control-Plane Surfaces
+- [ ] [_task_26.md](_task_26.md) — Task 26.0: Schedule Control-Plane Surfaces
+- [ ] [_task_27.md](_task_27.md) — Task 27.0: Skills Listing Endpoint
+- [ ] [_task_28.md](_task_28.md) — Task 28.0: Task And Subtask Domain Schema And Repositories
+- [ ] [_task_29.md](_task_29.md) — Task 29.0: Dispatch Runtime Integration With Provider-Native Sessions
+- [ ] [_task_30.md](_task_30.md) — Task 30.0: HITL Single-Turn Live Pause And Resume
+- [ ] [_task_31.md](_task_31.md) — Task 31.0: HITL Post-Restart Reconstruction
+- [ ] [_task_32.md](_task_32.md) — Task 32.0: Task And Subtask Control-Plane Plus Replanning
+- [ ] [_task_33.md](_task_33.md) — Task 33.0: Dispatch And HITL Control-Plane Surfaces
+- [ ] [_task_34.md](_task_34.md) — Task 34.0: Looper Durable Schema And Runtime
+- [ ] [_task_35.md](_task_35.md) — Task 35.0: Trigger v2 Types And Definition CRUD
+- [ ] [_task_36.md](_task_36.md) — Task 36.0: Event Ingress Pipeline And Match Engine
+- [ ] [_task_37.md](_task_37.md) — Task 37.0: Artifact And Doc Versioning
+- [ ] [_task_38.md](_task_38.md) — Task 38.0: Artifact And Doc Standalone Read Endpoints
+- [ ] [_task_39.md](_task_39.md) — Task 39.0: Looper Control-Plane And SSE Surfaces
+- [ ] [_task_40.md](_task_40.md) — Task 40.0: Pack List Detail And CRUD Endpoints
+- [ ] [_task_41.md](_task_41.md) — Task 41.0: Pack System Install Upgrade And Bootstrap
+- [ ] [_task_42.md](_task_42.md) — Task 42.0: Retention Policies And Remaining SSE Endpoints
+- [ ] [_task_43.md](_task_43.md) — Task 43.0: E2E Integration Test And Restart Recovery Regression

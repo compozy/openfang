@@ -14,9 +14,15 @@ arky-config.workspace = true
 arky-error.workspace = true
 arky-protocol.workspace = true
 arky-provider.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+futures.workspace = true
+openfang-runtime = { version = "0.5.1", path = "../openfang-runtime" }
+openfang-types = { version = "0.5.1", path = "../openfang-types" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

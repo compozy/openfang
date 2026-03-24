@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/workflows/signals</domain>
@@ -76,40 +76,40 @@ are handled in Task 19.
 
 ## Subtasks
 
-- [ ] 17.1 Add `WorkflowSignalRepository` with insert, find-unconsumed, consume,
+- [x] 17.1 Add `WorkflowSignalRepository` with insert, find-unconsumed, consume,
       and list operations targeting `compozy.db`. Model the full `workflow_signal`
       table from DATABASE-SCHEMA.md (columns: `signal_id`, `run_id`, `name`,
       `payload_json`, `source`, `consumed`, `created_at`, `consumed_at`).
       Enforce unique constraint on `(run_id, idempotency_key)` for duplicate
       submission guard.
-- [ ] 17.2 Extend the `WorkflowRun` state machine to support `waiting_signal`
+- [x] 17.2 Extend the `WorkflowRun` state machine to support `waiting_signal`
       status. When the engine reaches a `wait_signal` step it must write
       `status = waiting_signal`, `waiting_kind = "signal"`, and
       `waiting_ref = <signal_name>` to `workflow_run` before suspending. Add
       `WorkflowRunStatus::WaitingSignal` to the status enum and update all
       match arms across the codebase.
-- [ ] 17.3 Implement transactional signal consumption. When a signal arrives for
+- [x] 17.3 Implement transactional signal consumption. When a signal arrives for
       a waiting run: atomically set `workflow_signal.consumed = true` and
       `consumed_at`, clear `workflow_run.waiting_kind` and `waiting_ref`, set
       `workflow_run.status` back to `running`, and insert a
       `run_resumed_from_signal` checkpoint into `workflow_checkpoint`. All four
       writes must succeed or all must be rolled back.
-- [ ] 17.4 Implement the eager-consume path. When a run's `wait_signal` step is
+- [x] 17.4 Implement the eager-consume path. When a run's `wait_signal` step is
       reached the engine must first query `WorkflowSignalRepository` for an
       existing unconsumed signal matching `(run_id, name)`. If one exists,
       consume it immediately (subtask 17.3 path) and advance the run without
       parking. If none exists, write the waiting state (subtask 17.2 path) and
       return control.
-- [ ] 17.5 Implement API route handlers for signal submission and listing. Wire
+- [x] 17.5 Implement API route handlers for signal submission and listing. Wire
       `POST /api/v1/runs/{id}/signals` and `GET /api/v1/runs/{id}/signals`
       through the repository layer. Both endpoints must read and write through
       `compozy.db` exclusively. Register the routes in `crates/openfang-api/src/server.rs`.
-- [ ] 17.6 Validate `wait_signal` steps at workflow compile time. The IR
+- [x] 17.6 Validate `wait_signal` steps at workflow compile time. The IR
       compiler must reject a `wait_signal` step that does not specify an
       explicit signal name, and must warn if the same signal name appears in
       two separate `wait_signal` steps in the same workflow without a branching
       structure that makes them mutually exclusive.
-- [ ] 17.7 Emit `signal_received` and `signal_consumed` checkpoints into
+- [x] 17.7 Emit `signal_received` and `signal_consumed` checkpoints into
       `workflow_checkpoint` for every signal lifecycle event. Checkpoint `kind`
       values must match the checkpoint shape from API-SPEC.md §9 (`{ "id",
   "run_id", "step_id", "kind", "data", "created_at" }`).
@@ -185,76 +185,76 @@ is treated as a first-class execution object even though it surfaces under
 
 ### Unit Tests (Required)
 
-- [ ] `signal_insert_persists_payload_and_source`: Insert a signal row and read
+- [x] `signal_insert_persists_payload_and_source`: Insert a signal row and read
       it back; assert `name`, `payload_json`, `source`, `consumed = false`,
       and `consumed_at = null` match exactly.
-- [ ] `signal_idempotency_key_prevents_duplicate`: Submit the same signal twice
+- [x] `signal_idempotency_key_prevents_duplicate`: Submit the same signal twice
       with the same `idempotency_key`; assert only one row exists in
       `workflow_signal` and the second call returns the existing row.
-- [ ] `waiting_run_transitions_status_to_waiting_signal`: Drive a run to a
+- [x] `waiting_run_transitions_status_to_waiting_signal`: Drive a run to a
       `wait_signal` step; assert `workflow_run.status = waiting_signal`,
       `waiting_kind = "signal"`, and `waiting_ref` equals the step's signal name.
-- [ ] `signal_consumption_is_transactional`: Simulate a crash mid-consumption
+- [x] `signal_consumption_is_transactional`: Simulate a crash mid-consumption
       (connection closed after marking consumed but before clearing
       `waiting_kind`); assert the database is not in a partially-consumed state
       after reconnect.
-- [ ] `consumed_flag_and_timestamp_update_atomically`: Consume a signal and
+- [x] `consumed_flag_and_timestamp_update_atomically`: Consume a signal and
       assert `consumed = true`, `consumed_at` is set, `workflow_run.waiting_kind`
       is cleared, and a `run_resumed_from_signal` checkpoint row exists.
-- [ ] `eager_consume_fires_when_signal_arrived_before_wait_step`: Insert an
+- [x] `eager_consume_fires_when_signal_arrived_before_wait_step`: Insert an
       unconsumed signal for a run before the run reaches its `wait_signal`
       step; assert the run advances immediately without parking.
-- [ ] `list_signals_returns_only_for_requested_run`: Insert signals for two
+- [x] `list_signals_returns_only_for_requested_run`: Insert signals for two
       different runs; assert listing signals for one run does not return the
       other run's signals.
-- [ ] `list_signals_consumed_filter_works`: Insert one consumed and one
+- [x] `list_signals_consumed_filter_works`: Insert one consumed and one
       unconsumed signal for the same run; assert `?consumed=true` returns only
       the consumed one and `?consumed=false` returns only the unconsumed one.
 
 ### Integration Tests (Required)
 
-- [ ] `post_run_signal_persists_and_affects_run_state`: Call
+- [x] `post_run_signal_persists_and_affects_run_state`: Call
       `POST /api/v1/runs/{id}/signals` for a run in `waiting_signal` status;
       assert the response carries the signal detail shape, the run transitions
       to `running`, and `GET /api/v1/runs/{id}` reflects the cleared
       `waiting_kind`.
-- [ ] `waiting_workflow_resumes_after_durable_signal_delivery`: Start a
+- [x] `waiting_workflow_resumes_after_durable_signal_delivery`: Start a
       workflow with a `wait_signal` step, park it, submit a matching signal via
       the API, and assert the run advances to the next step and eventually
       completes.
-- [ ] `restart_preserves_waiting_state_and_outstanding_signals`: Park a run at
+- [x] `restart_preserves_waiting_state_and_outstanding_signals`: Park a run at
       a `wait_signal` step; simulate a restart (drop in-memory state, reload
       from `compozy.db`); assert the run is still in `waiting_signal` status
       with correct `waiting_ref` and that the outstanding unconsumed signal is
       visible via `GET /api/v1/runs/{id}/signals`.
-- [ ] `get_run_signals_reads_from_compozy_db_not_memory`: Call
+- [x] `get_run_signals_reads_from_compozy_db_not_memory`: Call
       `GET /api/v1/runs/{id}/signals` immediately after a simulated in-memory
       cache flush; assert the response still returns the correct persisted
       signal rows.
-- [ ] `concurrent_signal_delivery_does_not_double_consume`: Submit two signals
+- [x] `concurrent_signal_delivery_does_not_double_consume`: Submit two signals
       with the same name to a waiting run concurrently; assert exactly one
       consumption occurs and the second signal remains unconsumed.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not process workflow signals only in memory — any signal that passes
+- [x] Do not process workflow signals only in memory — any signal that passes
       through the delivery path without a `workflow_signal` insert must fail
       the test with a missing-row assertion.
-- [ ] Do not bypass `workflow_run.waiting_kind` persistence when signal delivery
+- [x] Do not bypass `workflow_run.waiting_kind` persistence when signal delivery
       occurs — consuming a signal while `waiting_kind` is still set after
       commit is a test failure.
-- [ ] Do not overfit signal handling to one source — at least one test must use
+- [x] Do not overfit signal handling to one source — at least one test must use
       `source = "trigger"` and one must use `source = "schedule"` to confirm
       the source column is not hardcoded.
-- [ ] Do not allow a `wait_signal` step with no signal name to reach the
+- [x] Do not allow a `wait_signal` step with no signal name to reach the
       execution path — the compile-time validation test must assert an error is
       returned before any run is created.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

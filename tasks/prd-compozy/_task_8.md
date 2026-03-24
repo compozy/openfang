@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/workflows/bootstrap</domain>
@@ -59,13 +59,13 @@ sequence.
 
 ## Subtasks
 
-- [ ] 8.1 Audit the current `start_background_agents` method in `crates/openfang-kernel/src/kernel.rs` and map the exact position of the workflow autoload spawn relative to the API server start in `crates/openfang-api/src/server.rs`. Document the race window.
-- [ ] 8.2 Extract workflow definition loading from `start_background_agents` into a dedicated synchronous `bootstrap_workflow_definitions` method on `OpenFangKernel` that: (a) reads and validates all `.json` or `.toml` files from the configured workflows directory, (b) registers valid definitions, (c) logs each load result with path and outcome, and (d) returns a `BootstrapResult` summary (count loaded, count skipped, any errors).
-- [ ] 8.3 Wire `bootstrap_workflow_definitions` into the server startup sequence in `crates/openfang-api/src/server.rs` so it runs to completion before the Axum router begins serving requests. Ensure the startup sequence follows the pattern: `bootstrap_workflow_definitions` → `start_background_agents` (for non-workflow background tasks) → bind HTTP listener.
-- [ ] 8.4 Introduce a `WorkflowRegistryReadiness` state on `WorkflowEngine` (or an equivalent lightweight flag on `OpenFangKernel`) that transitions from `Bootstrapping` to `Ready` after `bootstrap_workflow_definitions` completes. The `GET /api/v1/workflows/{id}/runtime` handler must return `loaded: false` until this transition occurs.
-- [ ] 8.5 Handle broken definition files explicitly: a TOML/JSON parse failure must log the file path and error at `WARN` level and continue loading remaining files. A file I/O error on an existing readable directory entry must log at `ERROR` level. Neither case should silently produce an empty registry without surfacing the cause.
-- [ ] 8.6 Add restart-scenario tests that verify the workflow registry is fully populated before any API handler can serve a run-creation request.
-- [ ] 8.7 Remove the detached `tokio::spawn` workflow autoload block from `start_background_agents` once the synchronous bootstrap path is in place.
+- [x] 8.1 Audit the current `start_background_agents` method in `crates/openfang-kernel/src/kernel.rs` and map the exact position of the workflow autoload spawn relative to the API server start in `crates/openfang-api/src/server.rs`. Document the race window.
+- [x] 8.2 Extract workflow definition loading from `start_background_agents` into a dedicated synchronous `bootstrap_workflow_definitions` method on `OpenFangKernel` that: (a) reads and validates all `.json` or `.toml` files from the configured workflows directory, (b) registers valid definitions, (c) logs each load result with path and outcome, and (d) returns a `BootstrapResult` summary (count loaded, count skipped, any errors).
+- [x] 8.3 Wire `bootstrap_workflow_definitions` into the server startup sequence in `crates/openfang-api/src/server.rs` so it runs to completion before the Axum router begins serving requests. Ensure the startup sequence follows the pattern: `bootstrap_workflow_definitions` → `start_background_agents` (for non-workflow background tasks) → bind HTTP listener.
+- [x] 8.4 Introduce a `WorkflowRegistryReadiness` state on `WorkflowEngine` (or an equivalent lightweight flag on `OpenFangKernel`) that transitions from `Bootstrapping` to `Ready` after `bootstrap_workflow_definitions` completes. The `GET /api/v1/workflows/{id}/runtime` handler must return `loaded: false` until this transition occurs.
+- [x] 8.5 Handle broken definition files explicitly: a TOML/JSON parse failure must log the file path and error at `WARN` level and continue loading remaining files. A file I/O error on an existing readable directory entry must log at `ERROR` level. Neither case should silently produce an empty registry without surfacing the cause.
+- [x] 8.6 Add restart-scenario tests that verify the workflow registry is fully populated before any API handler can serve a run-creation request.
+- [x] 8.7 Remove the detached `tokio::spawn` workflow autoload block from `start_background_agents` once the synchronous bootstrap path is in place.
 
 ## Implementation Details
 
@@ -153,31 +153,31 @@ This matches the API-SPEC.md `runtime` resource shape:
 
 ### Unit Tests (Required)
 
-- [ ] `bootstrap_workflow_definitions_loads_all_valid_files`: populate a temp directory with N valid workflow `.json` files, call `bootstrap_workflow_definitions`, assert `BootstrapResult.loaded == N` and all workflow IDs are present in the registry.
-- [ ] `bootstrap_workflow_definitions_skips_invalid_files_with_warning`: populate a temp directory with one valid and one malformed file, call `bootstrap_workflow_definitions`, assert `loaded == 1`, `skipped == 1`, and `errors` contains the malformed file's path.
-- [ ] `bootstrap_workflow_definitions_tolerates_missing_directory`: call `bootstrap_workflow_definitions` with a non-existent directory path, assert it returns `loaded == 0` with no hard error.
-- [ ] `workflow_registry_readiness_starts_not_ready`: construct a fresh `WorkflowEngine`, assert `is_ready()` returns `false` before bootstrap runs.
-- [ ] `workflow_registry_readiness_set_after_bootstrap`: call `bootstrap_workflow_definitions`, assert `is_ready()` returns `true` immediately after.
-- [ ] `bootstrap_load_order_is_deterministic`: call `bootstrap_workflow_definitions` on a directory with multiple files, assert the load log entries appear in lexicographic filename order.
+- [x] `bootstrap_workflow_definitions_loads_all_valid_files`: populate a temp directory with N valid workflow `.json` files, call `bootstrap_workflow_definitions`, assert `BootstrapResult.loaded == N` and all workflow IDs are present in the registry.
+- [x] `bootstrap_workflow_definitions_skips_invalid_files_with_warning`: populate a temp directory with one valid and one malformed file, call `bootstrap_workflow_definitions`, assert `loaded == 1`, `skipped == 1`, and `errors` contains the malformed file's path.
+- [x] `bootstrap_workflow_definitions_tolerates_missing_directory`: call `bootstrap_workflow_definitions` with a non-existent directory path, assert it returns `loaded == 0` with no hard error.
+- [x] `workflow_registry_readiness_starts_not_ready`: construct a fresh `WorkflowEngine`, assert `is_ready()` returns `false` before bootstrap runs.
+- [x] `workflow_registry_readiness_set_after_bootstrap`: call `bootstrap_workflow_definitions`, assert `is_ready()` returns `true` immediately after.
+- [x] `bootstrap_load_order_is_deterministic`: call `bootstrap_workflow_definitions` on a directory with multiple files, assert the load log entries appear in lexicographic filename order.
 
 ### Integration Tests (Required)
 
-- [ ] `api_server_workflow_list_is_populated_before_first_request`: start the daemon with pre-existing workflow files, make the first `GET /api/workflows` request immediately after the server binds, assert the response contains the expected workflows (not an empty list).
-- [ ] `restart_with_existing_workflow_files_yields_stable_registry`: load definitions, simulate a restart via `bootstrap_workflow_definitions` on the same directory, assert the registry after restart matches the registry before restart.
-- [ ] `broken_workflow_files_surface_startup_behavior_consistently`: two successive restarts with the same broken file must produce the same `BootstrapResult` error set — no non-deterministic partial-load behavior.
+- [x] `api_server_workflow_list_is_populated_before_first_request`: start the daemon with pre-existing workflow files, make the first `GET /api/workflows` request immediately after the server binds, assert the response contains the expected workflows (not an empty list).
+- [x] `restart_with_existing_workflow_files_yields_stable_registry`: load definitions, simulate a restart via `bootstrap_workflow_definitions` on the same directory, assert the registry after restart matches the registry before restart.
+- [x] `broken_workflow_files_surface_startup_behavior_consistently`: two successive restarts with the same broken file must produce the same `BootstrapResult` error set — no non-deterministic partial-load behavior.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No detached `tokio::spawn` workflow loading remains in `start_background_agents` after this task.
-- [ ] No sleep-based readiness polling exists anywhere in the startup path or in tests.
-- [ ] The API server must not bind the HTTP listener before `bootstrap_workflow_definitions` returns — verify by checking server.rs startup ordering.
-- [ ] `WorkflowRegistryReadiness::Ready` must not be set before `bootstrap_workflow_definitions` completes its full loop, even in error paths.
+- [x] No detached `tokio::spawn` workflow loading remains in `start_background_agents` after this task.
+- [x] No sleep-based readiness polling exists anywhere in the startup path or in tests.
+- [x] The API server must not bind the HTTP listener before `bootstrap_workflow_definitions` returns — verify by checking server.rs startup ordering.
+- [x] `WorkflowRegistryReadiness::Ready` must not be set before `bootstrap_workflow_definitions` completes its full loop, even in error paths.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/types/contracts</domain>
@@ -48,13 +48,13 @@ can depend on without further schema inference.
 
 ## Subtasks
 
-- [ ] 5.1 Create `crates/openfang-types/src/contract.rs` with the `ContractKind` enum covering all structural and semantic kinds, the `ContractNode` struct with its kind-conditional fields, and the `ContractSchema` type alias or newtype wrapping the top-level contract node.
-- [ ] 5.2 Implement a `normalize` function (or method on `ContractNode`) that resolves alias kinds (`text`, `json`) into their canonical forms and sets structural defaults (`open = false` on objects, `nullable = false` when absent).
-- [ ] 5.3 Implement a `validate` function (or `ContractNode::validate`) that enforces structural rules: `fields` and `required` may only appear on `object` kind, `items` may only appear on `array` kind, `artifact_type` / `doc_type` appear only on the appropriate semantic kinds, and `required` field names must be keys present in `fields`.
-- [ ] 5.4 Add `ContractValidationError` to the crate's error type or as a standalone `thiserror`-derived enum, with variants covering each distinct validation failure mode (unknown-kind alias, misplaced field, missing required key reference, etc.).
-- [ ] 5.5 Register `pub mod contract;` in `crates/openfang-types/src/lib.rs` and ensure the module is re-exported at the crate root under a stable public path.
-- [ ] 5.6 Verify that the existing `crates/openfang-kernel/src/workflow.rs` workflow step types and `AgentManifest` in `crates/openfang-types/src/agent.rs` can reference the new `ContractNode` type for their `input`/`output` fields without circular dependency.
-- [ ] 5.7 Write all tests (see Tests section) in `crates/openfang-types/src/contract.rs` under a `#[cfg(test)]` block, using `pretty_assertions::assert_eq` throughout.
+- [x] 5.1 Create `crates/openfang-types/src/contract.rs` with the `ContractKind` enum covering all structural and semantic kinds, the `ContractNode` struct with its kind-conditional fields, and the `ContractSchema` type alias or newtype wrapping the top-level contract node.
+- [x] 5.2 Implement a `normalize` function (or method on `ContractNode`) that resolves alias kinds (`text`, `json`) into their canonical forms and sets structural defaults (`open = false` on objects, `nullable = false` when absent).
+- [x] 5.3 Implement a `validate` function (or `ContractNode::validate`) that enforces structural rules: `fields` and `required` may only appear on `object` kind, `items` may only appear on `array` kind, `artifact_type` / `doc_type` appear only on the appropriate semantic kinds, and `required` field names must be keys present in `fields`.
+- [x] 5.4 Add `ContractValidationError` to the crate's error type or as a standalone `thiserror`-derived enum, with variants covering each distinct validation failure mode (unknown-kind alias, misplaced field, missing required key reference, etc.).
+- [x] 5.5 Register `pub mod contract;` in `crates/openfang-types/src/lib.rs` and ensure the module is re-exported at the crate root under a stable public path.
+- [x] 5.6 Verify that the existing `crates/openfang-kernel/src/workflow.rs` workflow step types and `AgentManifest` in `crates/openfang-types/src/agent.rs` can reference the new `ContractNode` type for their `input`/`output` fields without circular dependency.
+- [x] 5.7 Write all tests (see Tests section) in `crates/openfang-types/src/contract.rs` under a `#[cfg(test)]` block, using `pretty_assertions::assert_eq` throughout.
 
 ## Implementation Details
 
@@ -126,38 +126,38 @@ failing on the first error.
 
 ### Unit Tests (Required)
 
-- [ ] Each of the seven structural kinds (`string`, `integer`, `number`, `boolean`, `object`, `array`, `any`) deserializes correctly from a JSON `{"kind": "..."}` node.
-- [ ] Each of the six semantic kinds (`artifact_ref`, `doc_ref`, `issue_ref`, `task_ref`, `task_list`, `run_ref`) deserializes correctly from a JSON `{"kind": "..."}` node.
-- [ ] Alias kind `"text"` normalizes to `ContractKind::String` after `normalize()` is called; the raw deserialized node must reflect the alias and the normalized node must reflect the canonical kind.
-- [ ] Alias kind `"json"` normalizes to `ContractKind::Any` after `normalize()`.
-- [ ] An `object` node with no explicit `open` field defaults to `open = false` after normalization.
-- [ ] A `ContractNode` with `kind = "string"` and a `fields` map present fails validation with a `ContractValidationIssue` indicating misplaced `fields`.
-- [ ] A `ContractNode` with `kind = "array"` and no `items` field passes validation (items is optional for array contracts).
-- [ ] A `ContractNode` with `kind = "object"`, `required: ["missing_key"]`, and a `fields` map that does not contain `"missing_key"` fails validation with a descriptive issue at the correct path.
-- [ ] An `artifact_ref` node with `artifact_type: Some("prd")` serializes to `{"kind":"artifact_ref","artifact_type":"prd"}` and round-trips correctly.
-- [ ] A nested `object` contract with two `fields` entries each containing their own `ContractNode` round-trips through JSON serialization without data loss.
+- [x] Each of the seven structural kinds (`string`, `integer`, `number`, `boolean`, `object`, `array`, `any`) deserializes correctly from a JSON `{"kind": "..."}` node.
+- [x] Each of the six semantic kinds (`artifact_ref`, `doc_ref`, `issue_ref`, `task_ref`, `task_list`, `run_ref`) deserializes correctly from a JSON `{"kind": "..."}` node.
+- [x] Alias kind `"text"` normalizes to `ContractKind::String` after `normalize()` is called; the raw deserialized node must reflect the alias and the normalized node must reflect the canonical kind.
+- [x] Alias kind `"json"` normalizes to `ContractKind::Any` after `normalize()`.
+- [x] An `object` node with no explicit `open` field defaults to `open = false` after normalization.
+- [x] A `ContractNode` with `kind = "string"` and a `fields` map present fails validation with a `ContractValidationIssue` indicating misplaced `fields`.
+- [x] A `ContractNode` with `kind = "array"` and no `items` field passes validation (items is optional for array contracts).
+- [x] A `ContractNode` with `kind = "object"`, `required: ["missing_key"]`, and a `fields` map that does not contain `"missing_key"` fails validation with a descriptive issue at the correct path.
+- [x] An `artifact_ref` node with `artifact_type: Some("prd")` serializes to `{"kind":"artifact_ref","artifact_type":"prd"}` and round-trips correctly.
+- [x] A nested `object` contract with two `fields` entries each containing their own `ContractNode` round-trips through JSON serialization without data loss.
 
 ### Integration Tests (Required)
 
-- [ ] A `ContractNode` representing the SDLC workflow input contract from `API-SPEC.md` (object with `issue_id: string`, `required: ["issue_id"]`, `open: false`) deserializes from JSON, validates with zero issues, and serializes back to identical JSON.
-- [ ] A `ContractNode` representing the PRD writer agent output contract from `API-SPEC.md` (`kind = "artifact_ref"`, `artifact_type = "prd"`) deserializes from JSON, validates with zero issues, and round-trips.
-- [ ] A deeply nested contract with `kind = "object"`, a field of `kind = "array"` whose `items` is `kind = "object"` validates successfully and normalizes all nested defaults.
-- [ ] `validate()` called on a contract node with two independent violations collects both issues in a single call (no early-exit).
-- [ ] A TOML-serialized contract (using `toml::to_string` and `toml::from_str`) round-trips to the same `ContractNode` value as the JSON round-trip.
+- [x] A `ContractNode` representing the SDLC workflow input contract from `API-SPEC.md` (object with `issue_id: string`, `required: ["issue_id"]`, `open: false`) deserializes from JSON, validates with zero issues, and serializes back to identical JSON.
+- [x] A `ContractNode` representing the PRD writer agent output contract from `API-SPEC.md` (`kind = "artifact_ref"`, `artifact_type = "prd"`) deserializes from JSON, validates with zero issues, and round-trips.
+- [x] A deeply nested contract with `kind = "object"`, a field of `kind = "array"` whose `items` is `kind = "object"` validates successfully and normalizes all nested defaults.
+- [x] `validate()` called on a contract node with two independent violations collects both issues in a single call (no early-exit).
+- [x] A TOML-serialized contract (using `toml::to_string` and `toml::from_str`) round-trips to the same `ContractNode` value as the JSON round-trip.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] The `contract` module must not define any duplicate kind types in agent-specific or workflow-specific modules — the single `ContractKind` enum in `contract.rs` is the only definition.
-- [ ] `ContractKind` must not have `Text` or `Json` variants — normalization of those aliases must happen at the parse or normalize layer, not by adding them to the enum.
-- [ ] The `validate` function must not make any external calls, must not boot providers, and must not depend on any tokio async runtime — it must be a pure synchronous function.
-- [ ] No `unwrap()` calls in production code paths; use `?` or `expect()` with a message.
-- [ ] `fields` must use a deterministic iteration order in tests — use `IndexMap` or sort before asserting.
+- [x] The `contract` module must not define any duplicate kind types in agent-specific or workflow-specific modules — the single `ContractKind` enum in `contract.rs` is the only definition.
+- [x] `ContractKind` must not have `Text` or `Json` variants — normalization of those aliases must happen at the parse or normalize layer, not by adding them to the enum.
+- [x] The `validate` function must not make any external calls, must not boot providers, and must not depend on any tokio async runtime — it must be a pure synchronous function.
+- [x] No `unwrap()` calls in production code paths; use `?` or `expect()` with a message.
+- [x] `fields` must use a deterministic iteration order in tests — use `IndexMap` or sort before asserting.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

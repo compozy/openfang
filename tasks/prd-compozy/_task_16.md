@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/workflows/runtime</domain>
@@ -58,14 +58,14 @@ durable product feature can build on a transient-only run model.
 
 ## Subtasks
 
-- [ ] 16.1 Write the `compozy.db` migration adding the `workflow_run`, `workflow_checkpoint`, and `workflow_signal` tables per `DATABASE-SCHEMA.md`. The migration must be idempotent and must use the existing migration infrastructure in `crates/openfang-memory/src/migration.rs` or the equivalent `compozy.db` migration path.
-- [ ] 16.2 Implement `WorkflowRunRepository` in a new file (e.g., `crates/openfang-memory/src/workflow_run.rs` or a new `crates/compozy-store/` crate): CRUD operations for `workflow_run` rows, checkpoint append, signal insert and consume, and a `list_non_terminal` query for restart recovery.
-- [ ] 16.3 Implement `WorkflowCheckpointRepository` with `append(run_id, step_id, kind, data)` and `list_for_run(run_id)` operations. Checkpoint kinds must cover the full lifecycle: `run_created`, `run_started`, `step_started`, `step_completed`, `step_failed`, `step_skipped`, `signal_received`, `run_completed`, `run_failed`, `run_cancelled`.
-- [ ] 16.4 Implement the `TransitionWriter` struct that wraps `WorkflowRunRepository` and `WorkflowCheckpointRepository` and exposes named transition methods: `record_run_created`, `record_run_started`, `record_step_started`, `record_step_completed`, `record_step_failed`, `record_run_completed`, `record_run_failed`, `record_run_cancelled`. Each method must write the checkpoint row first, then update the `workflow_run` row, and finally update the in-memory cache.
-- [ ] 16.5 Replace all direct `runs.write().await.get_mut(&run_id)` mutations in `WorkflowEngine::execute_run` and `WorkflowEngine::create_run` with `TransitionWriter` calls. No direct HashMap mutation of run state may remain after this subtask.
-- [ ] 16.6 Update `WorkflowEngine::create_run` to persist a `workflow_run` row via `WorkflowRunRepository` before inserting into the in-memory cache. If the database write fails, the in-memory insertion must not proceed and an error must be returned.
-- [ ] 16.7 Update `GET /api/v1/runs/{id}`, `GET /api/v1/runs`, and `GET /api/v1/workflows/{id}/runs` in `crates/openfang-api/src/routes.rs` to read from `WorkflowRunRepository` rather than `WorkflowEngine::list_runs` (which reads from the in-memory HashMap).
-- [ ] 16.8 Implement restart recovery: on daemon boot, after `bootstrap_workflow_definitions` (task 8) completes, call `WorkflowRunRepository::list_non_terminal` and populate the in-memory run cache from the database rows. Runs that were `running` at shutdown must be transitioned to a new `interrupted` status or reported via the API as `status: "interrupted"`.
+- [x] 16.1 Write the `compozy.db` migration adding the `workflow_run`, `workflow_checkpoint`, and `workflow_signal` tables per `DATABASE-SCHEMA.md`. The migration must be idempotent and must use the existing migration infrastructure in `crates/openfang-memory/src/migration.rs` or the equivalent `compozy.db` migration path.
+- [x] 16.2 Implement `WorkflowRunRepository` in a new file (e.g., `crates/openfang-memory/src/workflow_run.rs` or a new `crates/compozy-store/` crate): CRUD operations for `workflow_run` rows, checkpoint append, signal insert and consume, and a `list_non_terminal` query for restart recovery.
+- [x] 16.3 Implement `WorkflowCheckpointRepository` with `append(run_id, step_id, kind, data)` and `list_for_run(run_id)` operations. Checkpoint kinds must cover the full lifecycle: `run_created`, `run_started`, `step_started`, `step_completed`, `step_failed`, `step_skipped`, `signal_received`, `run_completed`, `run_failed`, `run_cancelled`.
+- [x] 16.4 Implement the `TransitionWriter` struct that wraps `WorkflowRunRepository` and `WorkflowCheckpointRepository` and exposes named transition methods: `record_run_created`, `record_run_started`, `record_step_started`, `record_step_completed`, `record_step_failed`, `record_run_completed`, `record_run_failed`, `record_run_cancelled`. Each method must write the checkpoint row first, then update the `workflow_run` row, and finally update the in-memory cache.
+- [x] 16.5 Replace all direct `runs.write().await.get_mut(&run_id)` mutations in `WorkflowEngine::execute_run` and `WorkflowEngine::create_run` with `TransitionWriter` calls. No direct HashMap mutation of run state may remain after this subtask.
+- [x] 16.6 Update `WorkflowEngine::create_run` to persist a `workflow_run` row via `WorkflowRunRepository` before inserting into the in-memory cache. If the database write fails, the in-memory insertion must not proceed and an error must be returned.
+- [x] 16.7 Update `GET /api/v1/runs/{id}`, `GET /api/v1/runs`, and `GET /api/v1/workflows/{id}/runs` in `crates/openfang-api/src/routes.rs` to read from `WorkflowRunRepository` rather than `WorkflowEngine::list_runs` (which reads from the in-memory HashMap).
+- [x] 16.8 Implement restart recovery: on daemon boot, after `bootstrap_workflow_definitions` (task 8) completes, call `WorkflowRunRepository::list_non_terminal` and populate the in-memory run cache from the database rows. Runs that were `running` at shutdown must be transitioned to a new `interrupted` status or reported via the API as `status: "interrupted"`.
 
 ## Implementation Details
 
@@ -240,37 +240,37 @@ The `GET /api/v1/runs/{id}/checkpoints` endpoint must return a list of
 
 ### Unit Tests (Required)
 
-- [ ] `run_creation_persists_workflow_run_row`: call `create_run`, then query `compozy.db` directly, assert a `workflow_run` row exists with `status = 'pending'` and correct `workflow_id`, `workflow_version`, and `input_json`.
-- [ ] `run_creation_appends_run_created_checkpoint`: after `create_run`, assert a `workflow_checkpoint` row exists with `kind = 'run_created'` and `data_json` containing `workflow_id` and `input`.
-- [ ] `transition_writer_step_completed_updates_run_and_appends_checkpoint`: call `record_step_completed` on the writer, assert the `workflow_run.current_step_id` is updated in the database and a `step_completed` checkpoint row is appended.
-- [ ] `transition_writer_rejects_invalid_status_transition`: attempt to call `record_run_completed` on a run in `pending` state (not `running`), assert a `TransitionError` is returned and no database mutation occurred.
-- [ ] `terminal_state_run_failed_persists_error_json`: force a step failure through `execute_run`, assert the `workflow_run` row has `status = 'failed'` and `error_json` contains the error message and the failing step ID.
-- [ ] `terminal_state_run_completed_sets_completed_at`: complete a run successfully, assert `workflow_run.status = 'completed'` and `completed_at` is set to a non-null RFC 3339 timestamp.
-- [ ] `signal_insert_persists_before_consumption`: submit a signal, assert a `workflow_signal` row exists with `consumed = 0`, then consume it, assert `consumed = 1` and `consumed_at` is set.
-- [ ] `signal_consumption_appends_signal_received_checkpoint`: when a `wait_signal` step consumes a signal, assert a `signal_received` checkpoint is appended to the run's checkpoint trail.
-- [ ] `list_non_terminal_returns_pending_and_running_runs`: insert one `completed` run, one `running` run, and one `pending` run, call `list_non_terminal`, assert only the `running` and `pending` runs are returned.
+- [x] `run_creation_persists_workflow_run_row`: call `create_run`, then query `compozy.db` directly, assert a `workflow_run` row exists with `status = 'pending'` and correct `workflow_id`, `workflow_version`, and `input_json`.
+- [x] `run_creation_appends_run_created_checkpoint`: after `create_run`, assert a `workflow_checkpoint` row exists with `kind = 'run_created'` and `data_json` containing `workflow_id` and `input`.
+- [x] `transition_writer_step_completed_updates_run_and_appends_checkpoint`: call `record_step_completed` on the writer, assert the `workflow_run.current_step_id` is updated in the database and a `step_completed` checkpoint row is appended.
+- [x] `transition_writer_rejects_invalid_status_transition`: attempt to call `record_run_completed` on a run in `pending` state (not `running`), assert a `TransitionError` is returned and no database mutation occurred.
+- [x] `terminal_state_run_failed_persists_error_json`: force a step failure through `execute_run`, assert the `workflow_run` row has `status = 'failed'` and `error_json` contains the error message and the failing step ID.
+- [x] `terminal_state_run_completed_sets_completed_at`: complete a run successfully, assert `workflow_run.status = 'completed'` and `completed_at` is set to a non-null RFC 3339 timestamp.
+- [x] `signal_insert_persists_before_consumption`: submit a signal, assert a `workflow_signal` row exists with `consumed = 0`, then consume it, assert `consumed = 1` and `consumed_at` is set.
+- [x] `signal_consumption_appends_signal_received_checkpoint`: when a `wait_signal` step consumes a signal, assert a `signal_received` checkpoint is appended to the run's checkpoint trail.
+- [x] `list_non_terminal_returns_pending_and_running_runs`: insert one `completed` run, one `running` run, and one `pending` run, call `list_non_terminal`, assert only the `running` and `pending` runs are returned.
 
 ### Integration Tests (Required)
 
-- [ ] `starting_workflow_creates_durable_run_record_immediately`: submit `POST /api/v1/workflows/{id}/runs`, assert the response contains a `run_id`, then query `GET /api/v1/runs/{run_id}` and assert `status` is not empty and the run row is present in `compozy.db`.
-- [ ] `run_list_after_execution_reflects_durable_state`: execute a workflow to completion, then call `GET /api/v1/workflows/{id}/runs`, assert the completed run appears in the list with the correct `status` even after the in-memory HashMap has been cleared.
-- [ ] `restart_retains_run_identity_and_transitions`: create a run, simulate a restart by reinitializing `WorkflowRunRepository` and calling `list_non_terminal`, assert the run is re-populated in the in-memory cache with its original `run_id` and `status`.
-- [ ] `checkpoint_list_reflects_full_run_lifecycle`: execute a two-step sequential workflow to completion, call `GET /api/v1/runs/{id}/checkpoints`, assert checkpoints include `run_created`, `run_started`, two `step_started`, two `step_completed`, and `run_completed` in that order.
-- [ ] `interrupted_run_is_visible_after_restart`: start a run, simulate a daemon restart without completing the run, call the restart recovery path, assert the run appears with `status: "interrupted"` in `GET /api/v1/runs/{id}`.
+- [x] `starting_workflow_creates_durable_run_record_immediately`: submit `POST /api/v1/workflows/{id}/runs`, assert the response contains a `run_id`, then query `GET /api/v1/runs/{run_id}` and assert `status` is not empty and the run row is present in `compozy.db`.
+- [x] `run_list_after_execution_reflects_durable_state`: execute a workflow to completion, then call `GET /api/v1/workflows/{id}/runs`, assert the completed run appears in the list with the correct `status` even after the in-memory HashMap has been cleared.
+- [x] `restart_retains_run_identity_and_transitions`: create a run, simulate a restart by reinitializing `WorkflowRunRepository` and calling `list_non_terminal`, assert the run is re-populated in the in-memory cache with its original `run_id` and `status`.
+- [x] `checkpoint_list_reflects_full_run_lifecycle`: execute a two-step sequential workflow to completion, call `GET /api/v1/runs/{id}/checkpoints`, assert checkpoints include `run_created`, `run_started`, two `step_started`, two `step_completed`, and `run_completed` in that order.
+- [x] `interrupted_run_is_visible_after_restart`: start a run, simulate a daemon restart without completing the run, call the restart recovery path, assert the run appears with `status: "interrupted"` in `GET /api/v1/runs/{id}`.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No `WorkflowRun` state exists only in the in-memory HashMap after any successful mutation — every mutation that changes `status`, `current_step_id`, `vars`, or `error` must also write to `compozy.db`.
-- [ ] No direct `runs.write().await.get_mut(&run_id)` mutation of `status` or `current_step_id` remains in `WorkflowEngine::execute_run` after the `TransitionWriter` is wired in.
-- [ ] The `MAX_RETAINED_RUNS` eviction cap must not apply to the database. Eviction from the in-memory cache is acceptable; eviction from `compozy.db` is not.
-- [ ] The `GET /api/v1/runs` and `GET /api/v1/runs/{id}` handlers must not call `WorkflowEngine::list_runs` or `WorkflowEngine::get_run` (which read from memory). They must call `WorkflowRunRepository` methods.
-- [ ] The `TransitionWriter` must enforce the checkpoint-before-run-update write order in all code paths — no shortcut writes that update the run row without a preceding checkpoint append.
+- [x] No `WorkflowRun` state exists only in the in-memory HashMap after any successful mutation — every mutation that changes `status`, `current_step_id`, `vars`, or `error` must also write to `compozy.db`.
+- [x] No direct `runs.write().await.get_mut(&run_id)` mutation of `status` or `current_step_id` remains in `WorkflowEngine::execute_run` after the `TransitionWriter` is wired in.
+- [x] The `MAX_RETAINED_RUNS` eviction cap must not apply to the database. Eviction from the in-memory cache is acceptable; eviction from `compozy.db` is not.
+- [x] The `GET /api/v1/runs` and `GET /api/v1/runs/{id}` handlers must not call `WorkflowEngine::list_runs` or `WorkflowEngine::get_run` (which read from memory). They must call `WorkflowRunRepository` methods.
+- [x] The `TransitionWriter` must enforce the checkpoint-before-run-update write order in all code paths — no shortcut writes that update the run row without a preceding checkpoint append.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

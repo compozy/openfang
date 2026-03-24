@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/workflows/schema</domain>
@@ -38,13 +38,13 @@ Create the initial `compozy.db` schema for durable workflow execution:
 
 ## Subtasks
 
-- [ ] 9.1 Write the three `compozy.db` migration SQL files (or inline SQL constants) per INITIAL-RUNTIME-MIGRATIONS.md section 5: `0002_workflow_run_core`, `0003_workflow_checkpoint`, `0004_workflow_signal`. Register them as `MigrationStep` entries in the `compozy.db` migration slice passed to the Task 3 runner in `boot_with_config()`. Confirm the `schema_migration` bootstrap from Task 3 is already step one in the slice.
-- [ ] 9.2 Define `WorkflowRunStore` wrapping `Arc<Mutex<Connection>>` for `compozy.db`. Implement: `create_run()`, `get_run()`, `list_runs()`, `update_run_status()`, `update_run_waiting_state()`. The `create_run()` and initial checkpoint write should be combined in a single transaction per INITIAL-RUNTIME-MIGRATIONS.md section 6 (Transition Writer).
-- [ ] 9.3 Define `WorkflowCheckpointStore`. Implement: `append_checkpoint()`, `list_checkpoints_for_run()`. The checkpoint `kind` field must support at minimum the nine checkpoint kinds specified in INITIAL-RUNTIME-MIGRATIONS.md section 5: `run_created`, `run_started`, `step_selected`, `waiting_signal`, `signal_received`, `run_paused`, `run_resumed`, `run_completed`, `run_failed`.
-- [ ] 9.4 Define `WorkflowSignalStore`. Implement: `insert_signal()`, `list_pending_signals_for_run()`, `mark_signal_consumed()`. A signal is pending when `consumed = 0`. Consuming a signal sets `consumed = 1` and `consumed_at = datetime('now')`.
-- [ ] 9.5 Replace the raw `compozy_db: Arc<Mutex<Connection>>` handle on `OpenFangKernel` (introduced by Task 2) with a `WorkflowStores` composite type or individual named store fields. The workflow engine at `crates/openfang-kernel/src/workflow.rs` must receive typed store access, not a raw connection.
-- [ ] 9.6 Implement the startup recovery scan: on boot, after migrations succeed, query `workflow_run WHERE status = 'running'` and downgrade each to `status = 'paused'`, writing a `run_recovered_needs_resume` checkpoint per INITIAL-RUNTIME-MIGRATIONS.md section 8. This scan runs once per boot before the workflow engine accepts new runs.
-- [ ] 9.7 Write migration tests for schema creation and all required indexes. Write store adapter tests for `workflow_run` lifecycle, checkpoint ordering, and signal consumption. Write a recovery scan test confirming `running` runs are downgraded to `paused` on a simulated restart.
+- [x] 9.1 Write the three `compozy.db` migration SQL files (or inline SQL constants) per INITIAL-RUNTIME-MIGRATIONS.md section 5: `0002_workflow_run_core`, `0003_workflow_checkpoint`, `0004_workflow_signal`. Register them as `MigrationStep` entries in the `compozy.db` migration slice passed to the Task 3 runner in `boot_with_config()`. Confirm the `schema_migration` bootstrap from Task 3 is already step one in the slice.
+- [x] 9.2 Define `WorkflowRunStore` wrapping `Arc<Mutex<Connection>>` for `compozy.db`. Implement: `create_run()`, `get_run()`, `list_runs()`, `update_run_status()`, `update_run_waiting_state()`. The `create_run()` and initial checkpoint write should be combined in a single transaction per INITIAL-RUNTIME-MIGRATIONS.md section 6 (Transition Writer).
+- [x] 9.3 Define `WorkflowCheckpointStore`. Implement: `append_checkpoint()`, `list_checkpoints_for_run()`. The checkpoint `kind` field must support at minimum the nine checkpoint kinds specified in INITIAL-RUNTIME-MIGRATIONS.md section 5: `run_created`, `run_started`, `step_selected`, `waiting_signal`, `signal_received`, `run_paused`, `run_resumed`, `run_completed`, `run_failed`.
+- [x] 9.4 Define `WorkflowSignalStore`. Implement: `insert_signal()`, `list_pending_signals_for_run()`, `mark_signal_consumed()`. A signal is pending when `consumed = 0`. Consuming a signal sets `consumed = 1` and `consumed_at = datetime('now')`.
+- [x] 9.5 Replace the raw `compozy_db: Arc<Mutex<Connection>>` handle on `OpenFangKernel` (introduced by Task 2) with a `WorkflowStores` composite type or individual named store fields. The workflow engine at `crates/openfang-kernel/src/workflow.rs` must receive typed store access, not a raw connection.
+- [x] 9.6 Implement the startup recovery scan: on boot, after migrations succeed, query `workflow_run WHERE status = 'running'` and downgrade each to `status = 'paused'`, writing a `run_recovered_needs_resume` checkpoint per INITIAL-RUNTIME-MIGRATIONS.md section 8. This scan runs once per boot before the workflow engine accepts new runs.
+- [x] 9.7 Write migration tests for schema creation and all required indexes. Write store adapter tests for `workflow_run` lifecycle, checkpoint ordering, and signal consumption. Write a recovery scan test confirming `running` runs are downgraded to `paused` on a simulated restart.
       </requirements>
 
 ## Implementation Details
@@ -240,38 +240,38 @@ newtype may be defined for compile-time safety, serializing to the strings above
 
 ### Unit Tests (Required)
 
-- [ ] `compozy_db_migration_should_create_workflow_run_table()` — run the `compozy.db` migration slice against an in-memory connection; query `sqlite_master` and confirm `workflow_run` exists with the expected columns.
-- [ ] `compozy_db_migration_should_create_workflow_checkpoint_table()` — same for `workflow_checkpoint`.
-- [ ] `compozy_db_migration_should_create_workflow_signal_table()` — same for `workflow_signal`.
-- [ ] `compozy_db_migration_should_create_all_required_indexes()` — query `sqlite_master WHERE type='index'` and confirm each required index name is present.
-- [ ] `workflow_run_store_should_create_run_and_write_run_created_checkpoint()` — call `create_run()`, query `workflow_run` and `workflow_checkpoint`; confirm one run row and one `run_created` checkpoint row exist, inserted in the same transaction.
-- [ ] `workflow_run_store_transition_should_write_run_and_checkpoint_atomically()` — call `transition()`, simulate a failure mid-transaction; confirm neither the status update nor the checkpoint row appears.
-- [ ] `workflow_signal_store_should_insert_and_consume_signals()` — insert two signals for the same run, consume one, confirm `consumed = 1` and `consumed_at IS NOT NULL` for the consumed signal and `consumed = 0` for the other.
-- [ ] `workflow_checkpoint_store_should_return_checkpoints_in_created_at_order()` — insert checkpoints out of chronological order by manipulating timestamps; confirm `list_checkpoints_for_run()` returns them ordered by `created_at` ascending.
-- [ ] `recovery_scan_should_downgrade_running_to_paused_and_write_checkpoint()` — seed a `workflow_run` row with `status = 'running'`, run the recovery scan, confirm `status = 'paused'` and a `run_recovered_needs_resume` checkpoint row exists.
-- [ ] `recovery_scan_should_not_modify_waiting_signal_runs()` — seed a run with `status = 'waiting_signal'`, run the recovery scan, confirm status is unchanged.
+- [x] `compozy_db_migration_should_create_workflow_run_table()` — run the `compozy.db` migration slice against an in-memory connection; query `sqlite_master` and confirm `workflow_run` exists with the expected columns.
+- [x] `compozy_db_migration_should_create_workflow_checkpoint_table()` — same for `workflow_checkpoint`.
+- [x] `compozy_db_migration_should_create_workflow_signal_table()` — same for `workflow_signal`.
+- [x] `compozy_db_migration_should_create_all_required_indexes()` — query `sqlite_master WHERE type='index'` and confirm each required index name is present.
+- [x] `workflow_run_store_should_create_run_and_write_run_created_checkpoint()` — call `create_run()`, query `workflow_run` and `workflow_checkpoint`; confirm one run row and one `run_created` checkpoint row exist, inserted in the same transaction.
+- [x] `workflow_run_store_transition_should_write_run_and_checkpoint_atomically()` — call `transition()`, simulate a failure mid-transaction; confirm neither the status update nor the checkpoint row appears.
+- [x] `workflow_signal_store_should_insert_and_consume_signals()` — insert two signals for the same run, consume one, confirm `consumed = 1` and `consumed_at IS NOT NULL` for the consumed signal and `consumed = 0` for the other.
+- [x] `workflow_checkpoint_store_should_return_checkpoints_in_created_at_order()` — insert checkpoints out of chronological order by manipulating timestamps; confirm `list_checkpoints_for_run()` returns them ordered by `created_at` ascending.
+- [x] `recovery_scan_should_downgrade_running_to_paused_and_write_checkpoint()` — seed a `workflow_run` row with `status = 'running'`, run the recovery scan, confirm `status = 'paused'` and a `run_recovered_needs_resume` checkpoint row exists.
+- [x] `recovery_scan_should_not_modify_waiting_signal_runs()` — seed a run with `status = 'waiting_signal'`, run the recovery scan, confirm status is unchanged.
 
 ### Integration Tests (Required)
 
-- [ ] `boot_should_create_compozy_db_with_all_phase_1_tables()` — after `boot_with_config()`, open `compozy.db` directly and confirm `workflow_run`, `workflow_checkpoint`, `workflow_signal` exist alongside `schema_migration`.
-- [ ] `boot_should_run_recovery_scan_before_workflow_engine_starts()` — seed a `running` run in `compozy.db`, reboot, confirm the run is `paused` before any new runs are accepted.
-- [ ] `workflow_run_should_survive_restart()` — create a `workflow_run` row, shut down (simulate by closing connections), reopen the database, confirm the row is present with the same `run_id` and fields.
-- [ ] `waiting_signal_run_should_survive_restart_and_remain_resumable()` — create a run in `waiting_signal` status with `waiting_kind` and `waiting_ref` populated, reboot, confirm the run is still `waiting_signal` with the same waiting state fields.
-- [ ] `compozy_db_and_runtime_db_should_coexist_after_both_boot()` — after full boot, confirm both `runtime.db` and `compozy.db` exist in `data_dir`, both have `schema_migration` tables, and their schemas do not overlap.
+- [x] `boot_should_create_compozy_db_with_all_phase_1_tables()` — after `boot_with_config()`, open `compozy.db` directly and confirm `workflow_run`, `workflow_checkpoint`, `workflow_signal` exist alongside `schema_migration`.
+- [x] `boot_should_run_recovery_scan_before_workflow_engine_starts()` — seed a `running` run in `compozy.db`, reboot, confirm the run is `paused` before any new runs are accepted.
+- [x] `workflow_run_should_survive_restart()` — create a `workflow_run` row, shut down (simulate by closing connections), reopen the database, confirm the row is present with the same `run_id` and fields.
+- [x] `waiting_signal_run_should_survive_restart_and_remain_resumable()` — create a run in `waiting_signal` status with `waiting_kind` and `waiting_ref` populated, reboot, confirm the run is still `waiting_signal` with the same waiting state fields.
+- [x] `compozy_db_and_runtime_db_should_coexist_after_both_boot()` — after full boot, confirm both `runtime.db` and `compozy.db` exist in `data_dir`, both have `schema_migration` tables, and their schemas do not overlap.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No Phase 2 tables (`agent_dispatch`, `hitl_request`) and no Phase 3 tables (`task`, `subtask`) may appear in the `compozy.db` migration slice for this task. Confirm by reviewing all SQL strings in the migration step definitions.
-- [ ] The `workflow_run` table must not contain definition fields (workflow TOML content, step definitions). Per ADR-037, these remain file-backed. Confirm by reviewing the migration SQL columns — `workflow_id` and `workflow_version` are references, not definition copies.
-- [ ] No migration step for `compozy.db` may reference a table from `runtime.db` via `ATTACH DATABASE` or any cross-database SQL syntax.
-- [ ] The recovery scan must not auto-resume `running` runs. Confirm by asserting that after the recovery scan, no run has `status = 'running'` — they must all be `paused` or in a terminal state.
-- [ ] Schema assumptions must not be hardcoded only in runtime code without corresponding migration SQL. If a store adapter references a column name, that column must appear in the migration SQL for the table.
+- [x] No Phase 2 tables (`agent_dispatch`, `hitl_request`) and no Phase 3 tables (`task`, `subtask`) may appear in the `compozy.db` migration slice for this task. Confirm by reviewing all SQL strings in the migration step definitions.
+- [x] The `workflow_run` table must not contain definition fields (workflow TOML content, step definitions). Per ADR-037, these remain file-backed. Confirm by reviewing the migration SQL columns — `workflow_id` and `workflow_version` are references, not definition copies.
+- [x] No migration step for `compozy.db` may reference a table from `runtime.db` via `ATTACH DATABASE` or any cross-database SQL syntax.
+- [x] The recovery scan must not auto-resume `running` runs. Confirm by asserting that after the recovery scan, no run has `status = 'running'` — they must all be `paused` or in a terminal state.
+- [x] Schema assumptions must not be hardcoded only in runtime code without corresponding migration SQL. If a store adapter references a column name, that column must appear in the migration SQL for the table.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/infra/bootstrap</domain>
@@ -38,13 +38,13 @@ before dependent subsystems are constructed.
 
 ## Subtasks
 
-- [ ] 2.1 Introduce a `DatabaseManager` or equivalent internal struct in `crates/openfang-kernel/src/` (e.g. `db.rs`) that holds both the `runtime.db` connection/pool and the `compozy.db` connection/pool, each wrapped in `Arc<Mutex<rusqlite::Connection>>` or a typed async pool. This struct is responsible for opening, configuring WAL mode, and setting `busy_timeout` for both databases, following the existing pattern in `crates/openfang-memory/src/substrate.rs` lines ~41-43.
-- [ ] 2.2 Refactor the `boot_with_config()` function in `crates/openfang-kernel/src/kernel.rs` to open both databases at lines ~554-567 before any other subsystem is constructed. The `runtime.db` path comes from `config.persistence.resolve_runtime_db(&config.data_dir)` (Task 1 output). The `compozy.db` path comes from `config.persistence.resolve_compozy_db(&config.data_dir)`.
-- [ ] 2.3 Add an explicit `compozy_db` handle to the `OpenFangKernel` struct. The initial handle is a bare `Arc<Mutex<rusqlite::Connection>>` or equivalent; it will be replaced by a typed store layer in Task 9. The existing `memory: Arc<MemorySubstrate>` continues to own `runtime.db` through Task 6.
-- [ ] 2.4 Ensure bootstrap failure at either database open produces a `KernelError::BootFailed` with an error message that identifies the database by name. The existing error handling pattern is at `crates/openfang-kernel/src/kernel.rs` line ~566: `.map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))`.
-- [ ] 2.5 Update the `data_dir` creation step (currently at line ~555 in `kernel.rs`) to also ensure parent directories for both database paths exist before attempting to open them, using `std::fs::create_dir_all` on the parent of each resolved path.
-- [ ] 2.6 Add a `db_health()` or equivalent method to `OpenFangKernel` that can report whether both databases are open and responsive (a simple `PRAGMA integrity_check` or `SELECT 1` is sufficient). This powers health checks and startup readiness reporting.
-- [ ] 2.7 Update kernel-level integration tests and the existing test server construction pattern in `crates/openfang-api/tests/` to confirm that `boot_with_config()` opens both databases and that the test teardown cleans up both temporary database files.
+- [x] 2.1 Introduce a `DatabaseManager` or equivalent internal struct in `crates/openfang-kernel/src/` (e.g. `db.rs`) that holds both the `runtime.db` connection/pool and the `compozy.db` connection/pool, each wrapped in `Arc<Mutex<rusqlite::Connection>>` or a typed async pool. This struct is responsible for opening, configuring WAL mode, and setting `busy_timeout` for both databases, following the existing pattern in `crates/openfang-memory/src/substrate.rs` lines ~41-43.
+- [x] 2.2 Refactor the `boot_with_config()` function in `crates/openfang-kernel/src/kernel.rs` to open both databases at lines ~554-567 before any other subsystem is constructed. The `runtime.db` path comes from `config.persistence.resolve_runtime_db(&config.data_dir)` (Task 1 output). The `compozy.db` path comes from `config.persistence.resolve_compozy_db(&config.data_dir)`.
+- [x] 2.3 Add an explicit `compozy_db` handle to the `OpenFangKernel` struct. The initial handle is a bare `Arc<Mutex<rusqlite::Connection>>` or equivalent; it will be replaced by a typed store layer in Task 9. The existing `memory: Arc<MemorySubstrate>` continues to own `runtime.db` through Task 6.
+- [x] 2.4 Ensure bootstrap failure at either database open produces a `KernelError::BootFailed` with an error message that identifies the database by name. The existing error handling pattern is at `crates/openfang-kernel/src/kernel.rs` line ~566: `.map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))`.
+- [x] 2.5 Update the `data_dir` creation step (currently at line ~555 in `kernel.rs`) to also ensure parent directories for both database paths exist before attempting to open them, using `std::fs::create_dir_all` on the parent of each resolved path.
+- [x] 2.6 Add a `db_health()` or equivalent method to `OpenFangKernel` that can report whether both databases are open and responsive (a simple `PRAGMA integrity_check` or `SELECT 1` is sufficient). This powers health checks and startup readiness reporting.
+- [x] 2.7 Update kernel-level integration tests and the existing test server construction pattern in `crates/openfang-api/tests/` to confirm that `boot_with_config()` opens both databases and that the test teardown cleans up both temporary database files.
       </requirements>
 
 ## Implementation Details
@@ -170,34 +170,34 @@ the migration runner and wires it here.
 
 ### Unit Tests (Required)
 
-- [ ] `boot_should_fail_clearly_when_runtime_db_path_is_unwritable()` — configure `runtime_db` to a path under a non-existent and non-creatable directory; confirm `boot_with_config()` returns `KernelError::BootFailed` containing `"runtime.db"` in the message.
-- [ ] `boot_should_fail_clearly_when_compozy_db_path_is_unwritable()` — same for `compozy_db`, confirm the error message contains `"compozy.db"`.
-- [ ] `boot_should_open_runtime_db_before_compozy_db()` — use a logging or instrumentation shim to verify open order; or verify that a failure on `compozy.db` does not prevent an already-opened `runtime.db` from being reported distinctly.
-- [ ] `boot_should_initialize_compozy_db_handle_as_non_null()` — after a successful boot, confirm `kernel.compozy_db` is a live connection by executing `SELECT 1` against it.
-- [ ] `db_health_should_return_healthy_after_successful_boot()` — confirm `kernel.db_health()` returns a healthy status for both databases.
-- [ ] `boot_should_not_hide_partial_failure_as_degraded_success()` — if `compozy.db` fails to open, `boot_with_config()` must return `Err`, not `Ok` with a degraded kernel.
+- [x] `boot_should_fail_clearly_when_runtime_db_path_is_unwritable()` — configure `runtime_db` to a path under a non-existent and non-creatable directory; confirm `boot_with_config()` returns `KernelError::BootFailed` containing `"runtime.db"` in the message.
+- [x] `boot_should_fail_clearly_when_compozy_db_path_is_unwritable()` — same for `compozy_db`, confirm the error message contains `"compozy.db"`.
+- [x] `boot_should_open_runtime_db_before_compozy_db()` — use a logging or instrumentation shim to verify open order; or verify that a failure on `compozy.db` does not prevent an already-opened `runtime.db` from being reported distinctly.
+- [x] `boot_should_initialize_compozy_db_handle_as_non_null()` — after a successful boot, confirm `kernel.compozy_db` is a live connection by executing `SELECT 1` against it.
+- [x] `db_health_should_return_healthy_after_successful_boot()` — confirm `kernel.db_health()` returns a healthy status for both databases.
+- [x] `boot_should_not_hide_partial_failure_as_degraded_success()` — if `compozy.db` fails to open, `boot_with_config()` must return `Err`, not `Ok` with a degraded kernel.
 
 ### Integration Tests (Required)
 
-- [ ] `start_test_server()` in `crates/openfang-api/tests/api_integration_test.rs` passes without modification — the new `compozy_db` field is transparent to test harnesses that use `..KernelConfig::default()`.
-- [ ] Daemon lifecycle tests in `crates/openfang-api/tests/daemon_lifecycle_test.rs` pass with both database files present in the test temp directory after boot.
-- [ ] A fresh boot with no pre-existing database files creates both `runtime.db` and `compozy.db` in `data_dir` — confirmed by asserting both files exist after `boot_with_config()` returns.
-- [ ] A second boot against an already-initialized `data_dir` succeeds without error — idempotent open behavior.
-- [ ] The health endpoint at `/api/health` returns a successful response after dual-database boot — confirms the API layer is not broken by the new kernel struct shape.
+- [x] `start_test_server()` in `crates/openfang-api/tests/api_integration_test.rs` passes without modification — the new `compozy_db` field is transparent to test harnesses that use `..KernelConfig::default()`.
+- [x] Daemon lifecycle tests in `crates/openfang-api/tests/daemon_lifecycle_test.rs` pass with both database files present in the test temp directory after boot.
+- [x] A fresh boot with no pre-existing database files creates both `runtime.db` and `compozy.db` in `data_dir` — confirmed by asserting both files exist after `boot_with_config()` returns.
+- [x] A second boot against an already-initialized `data_dir` succeeds without error — idempotent open behavior.
+- [x] The health endpoint at `/api/health` returns a successful response after dual-database boot — confirms the API layer is not broken by the new kernel struct shape.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No subsystem construction step (credential resolver, LLM driver, scheduler, workflow engine, etc.) may run before both database open calls complete in `boot_with_config()`. Verify by reading the function top-to-bottom after the change.
-- [ ] No global or thread-local static is introduced to avoid passing the `compozy_db` handle through the kernel struct. The handle must be a named field on `OpenFangKernel`.
-- [ ] Boot must not log a success message before both databases are confirmed open. The existing `info!("Booting OpenFang kernel...")` at line ~543 must not be the last boot log before a database failure.
-- [ ] No subsystem outside `openfang-kernel` may receive a raw `rusqlite::Connection` as a public parameter from this task.
-- [ ] The `memory: Arc<MemorySubstrate>` field must not be removed or renamed by this task — it remains the owner of `runtime.db` state until Task 6.
+- [x] No subsystem construction step (credential resolver, LLM driver, scheduler, workflow engine, etc.) may run before both database open calls complete in `boot_with_config()`. Verify by reading the function top-to-bottom after the change.
+- [x] No global or thread-local static is introduced to avoid passing the `compozy_db` handle through the kernel struct. The handle must be a named field on `OpenFangKernel`.
+- [x] Boot must not log a success message before both databases are confirmed open. The existing `info!("Booting OpenFang kernel...")` at line ~543 must not be the last boot log before a database failure.
+- [x] No subsystem outside `openfang-kernel` may receive a raw `rusqlite::Connection` as a public parameter from this task.
+- [x] The `memory: Arc<MemorySubstrate>` field must not be removed or renamed by this task — it remains the owner of `runtime.db` state until Task 6.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

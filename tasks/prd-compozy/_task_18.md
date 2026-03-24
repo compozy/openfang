@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>agents/compile</domain>
@@ -54,13 +54,13 @@ templates (ADR-041).
 
 ## Subtasks
 
-- [ ] 18.1 Define the `AgentDefinition` struct in a new module (e.g., `crates/openfang-types/src/agent_definition.rs` or a new `openfang-definitions` crate) with all top-level fields from ADR-029, the typed `ProviderBlock` struct, `ProviderDefaults`, `ProviderConfig` (as a driver-tagged enum or typed sub-struct), `PromptBlock`, `CapabilitiesBlock`, and `RuntimeBlock`.
-- [ ] 18.2 Define `ProviderBinding`, and `AgentProductMetadata` structs in the same module or an adjacent `compiled.rs`, ensuring `AgentManifest` from `openfang-types::agent` is reused as-is without modification.
-- [ ] 18.3 Implement `stage1_schema_validate(def: &AgentDefinition) -> Vec<ValidationIssue>` — checks required fields, known driver values, required provider fields, legal enum values for `delegation`, `workspace`, `memory_policy`, and `hitl`.
-- [ ] 18.4 Implement `stage2_reference_validate(def: &AgentDefinition, ctx: &ValidationContext) -> Vec<ValidationIssue>` — checks that named profiles exist in the context, that skill names are known if a skill registry is provided, and that any referenced primitive names are known. The `ValidationContext` must be constructible with empty registries so callers can skip reference checks they do not have data for.
-- [ ] 18.5 Implement `stage3_semantic_validate(def: &AgentDefinition) -> Vec<ValidationIssue>` — checks cross-field compatibility: `provider.profile` compatibility with the selected driver, `output.kind` compatibility with output-specific semantic metadata, bounded validation of `provider.request_extra` against the forbidden-key list, and validation of `input`/`output` using `openfang_types::contract::validate`.
-- [ ] 18.6 Implement `stage4_normalize(def: AgentDefinition) -> AgentDefinition` — fills defaults (`enabled = true` if absent, `nullable = false` on contract nodes, `open = false` on object contracts), canonicalizes contract aliases via `openfang_types::contract::normalize`, and produces a stable logical representation.
-- [ ] 18.7 Implement `compile(def: AgentDefinition) -> Result<CompiledAgentDefinition, CompileError>` — assumes the definition is already validated and normalized, maps it into `AgentManifest`, `ProviderBinding`, and `AgentProductMetadata`, and returns `Err` only for structural mapping failures (not for validation issues, which belong in the earlier stages).
+- [x] 18.1 Define the `AgentDefinition` struct in a new module (e.g., `crates/openfang-types/src/agent_definition.rs` or a new `openfang-definitions` crate) with all top-level fields from ADR-029, the typed `ProviderBlock` struct, `ProviderDefaults`, `ProviderConfig` (as a driver-tagged enum or typed sub-struct), `PromptBlock`, `CapabilitiesBlock`, and `RuntimeBlock`.
+- [x] 18.2 Define `ProviderBinding`, and `AgentProductMetadata` structs in the same module or an adjacent `compiled.rs`, ensuring `AgentManifest` from `openfang-types::agent` is reused as-is without modification.
+- [x] 18.3 Implement `stage1_schema_validate(def: &AgentDefinition) -> Vec<ValidationIssue>` — checks required fields, known driver values, required provider fields, legal enum values for `delegation`, `workspace`, `memory_policy`, and `hitl`.
+- [x] 18.4 Implement `stage2_reference_validate(def: &AgentDefinition, ctx: &ValidationContext) -> Vec<ValidationIssue>` — checks that named profiles exist in the context, that skill names are known if a skill registry is provided, and that any referenced primitive names are known. The `ValidationContext` must be constructible with empty registries so callers can skip reference checks they do not have data for.
+- [x] 18.5 Implement `stage3_semantic_validate(def: &AgentDefinition) -> Vec<ValidationIssue>` — checks cross-field compatibility: `provider.profile` compatibility with the selected driver, `output.kind` compatibility with output-specific semantic metadata, bounded validation of `provider.request_extra` against the forbidden-key list, and validation of `input`/`output` using `openfang_types::contract::validate`.
+- [x] 18.6 Implement `stage4_normalize(def: AgentDefinition) -> AgentDefinition` — fills defaults (`enabled = true` if absent, `nullable = false` on contract nodes, `open = false` on object contracts), canonicalizes contract aliases via `openfang_types::contract::normalize`, and produces a stable logical representation.
+- [x] 18.7 Implement `compile(def: AgentDefinition) -> Result<CompiledAgentDefinition, CompileError>` — assumes the definition is already validated and normalized, maps it into `AgentManifest`, `ProviderBinding`, and `AgentProductMetadata`, and returns `Err` only for structural mapping failures (not for validation issues, which belong in the earlier stages).
 
 ## Implementation Details
 
@@ -157,42 +157,42 @@ A new module — either `crates/openfang-types/src/agent_definition.rs` or a new
 
 ### Unit Tests (Required)
 
-- [ ] `stage1_schema_validate` returns zero issues for a minimal valid `AgentDefinition` with required fields populated (`id`, `name`, `provider.driver`, `provider.model`).
-- [ ] `stage1_schema_validate` returns an issue with `code = "missing_field"` and `path = "provider.driver"` when `driver` is absent.
-- [ ] `stage1_schema_validate` returns an issue with `code = "unknown_driver"` when `provider.driver` is set to an unrecognized string such as `"unknown_provider"`.
-- [ ] `stage1_schema_validate` returns an issue when `runtime.hitl` is set to an invalid enum value.
-- [ ] `stage2_reference_validate` returns an issue when `provider.profile` names a profile not present in `ValidationContext.known_profiles`.
-- [ ] `stage2_reference_validate` returns zero issues when `ValidationContext` has empty registries (no known profiles, no known skills), even if the definition references profiles and skills — unknown references are only flagged when the context has data to check against.
-- [ ] `stage3_semantic_validate` returns an issue when `provider.request_extra` contains a forbidden key such as `"api_key"` or `"env"`.
-- [ ] `stage3_semantic_validate` returns an issue when `output.kind = "artifact_ref"` is used without any `artifact_type` metadata (if the semantic rule requires it).
-- [ ] `stage3_semantic_validate` calls `openfang_types::contract::validate` on `input` and `output` and propagates any contract validation issues with path prefix `"input"` or `"output"`.
-- [ ] `stage4_normalize` fills `enabled = true` when the field is absent from the input definition.
-- [ ] `stage4_normalize` resolves `"text"` alias in `input.kind` to `ContractKind::String` via `openfang_types::contract::normalize`.
-- [ ] `compile` returns a `CompiledAgentDefinition` where `product_metadata.group` and `product_metadata.tags` match the source definition and are not present on `agent_manifest`.
-- [ ] `compile` maps `provider.driver` and `provider.model` onto `provider_binding.driver` and `provider_binding.model` without loss.
-- [ ] A full pipeline call (`stage1` -> `stage2` -> `stage3` -> `stage4` -> `compile`) on the PRD writer definition from `API-SPEC.md` section 3 produces zero issues and a non-empty `CompiledAgentDefinition`.
+- [x] `stage1_schema_validate` returns zero issues for a minimal valid `AgentDefinition` with required fields populated (`id`, `name`, `provider.driver`, `provider.model`).
+- [x] `stage1_schema_validate` returns an issue with `code = "missing_field"` and `path = "provider.driver"` when `driver` is absent.
+- [x] `stage1_schema_validate` returns an issue with `code = "unknown_driver"` when `provider.driver` is set to an unrecognized string such as `"unknown_provider"`.
+- [x] `stage1_schema_validate` returns an issue when `runtime.hitl` is set to an invalid enum value.
+- [x] `stage2_reference_validate` returns an issue when `provider.profile` names a profile not present in `ValidationContext.known_profiles`.
+- [x] `stage2_reference_validate` returns zero issues when `ValidationContext` has empty registries (no known profiles, no known skills), even if the definition references profiles and skills — unknown references are only flagged when the context has data to check against.
+- [x] `stage3_semantic_validate` returns an issue when `provider.request_extra` contains a forbidden key such as `"api_key"` or `"env"`.
+- [x] `stage3_semantic_validate` returns an issue when `output.kind = "artifact_ref"` is used without any `artifact_type` metadata (if the semantic rule requires it).
+- [x] `stage3_semantic_validate` calls `openfang_types::contract::validate` on `input` and `output` and propagates any contract validation issues with path prefix `"input"` or `"output"`.
+- [x] `stage4_normalize` fills `enabled = true` when the field is absent from the input definition.
+- [x] `stage4_normalize` resolves `"text"` alias in `input.kind` to `ContractKind::String` via `openfang_types::contract::normalize`.
+- [x] `compile` returns a `CompiledAgentDefinition` where `product_metadata.group` and `product_metadata.tags` match the source definition and are not present on `agent_manifest`.
+- [x] `compile` maps `provider.driver` and `provider.model` onto `provider_binding.driver` and `provider_binding.model` without loss.
+- [x] A full pipeline call (`stage1` -> `stage2` -> `stage3` -> `stage4` -> `compile`) on the PRD writer definition from `API-SPEC.md` section 3 produces zero issues and a non-empty `CompiledAgentDefinition`.
 
 ### Integration Tests (Required)
 
-- [ ] A well-formed `AgentDefinition` loaded from a TOML file (using `toml::from_str`) validates and compiles through the full pipeline without issues.
-- [ ] A definition with a malformed provider block (`driver` set to empty string) fails at stage 1 before reaching stage 3.
-- [ ] A definition whose `input` contract has a structural violation (e.g., `required` references a field not in `fields`) fails at stage 3 with a descriptive issue path.
-- [ ] A definition with multiple independent violations (missing `id`, unknown driver, forbidden `request_extra` key) produces all three issues in a single combined validation run across the stages.
-- [ ] `compile` called on an un-normalized definition (before `stage4_normalize`) produces a `CompileError` rather than silently producing a malformed output — or alternatively, `compile` internally normalizes first; either behavior must be documented and tested explicitly.
+- [x] A well-formed `AgentDefinition` loaded from a TOML file (using `toml::from_str`) validates and compiles through the full pipeline without issues.
+- [x] A definition with a malformed provider block (`driver` set to empty string) fails at stage 1 before reaching stage 3.
+- [x] A definition whose `input` contract has a structural violation (e.g., `required` references a field not in `fields`) fails at stage 3 with a descriptive issue path.
+- [x] A definition with multiple independent violations (missing `id`, unknown driver, forbidden `request_extra` key) produces all three issues in a single combined validation run across the stages.
+- [x] `compile` called on an un-normalized definition (before `stage4_normalize`) produces a `CompileError` rather than silently producing a malformed output — or alternatively, `compile` internally normalizes first; either behavior must be documented and tested explicitly.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No provider binary is executed, no tokio runtime is required, and no network socket is opened during any validation stage — verified by running the unit tests without any environment variables or network access.
-- [ ] `compile` must not accept a raw deserialized `AgentDefinition` that has not been through normalization without either normalizing internally or returning an error — no silent half-compiled manifests.
-- [ ] Product metadata fields (`version`, `enabled`, `group`, `tags`, `input`, `output`) must not appear on the compiled `AgentManifest` — verified by asserting the `AgentManifest` fields in compile output tests.
-- [ ] `ValidationIssue` must include both `code` and `path` fields — no free-form string-only error messages.
-- [ ] No `unwrap()` in production code paths across all four stages and `compile`.
+- [x] No provider binary is executed, no tokio runtime is required, and no network socket is opened during any validation stage — verified by running the unit tests without any environment variables or network access.
+- [x] `compile` must not accept a raw deserialized `AgentDefinition` that has not been through normalization without either normalizing internally or returning an error — no silent half-compiled manifests.
+- [x] Product metadata fields (`version`, `enabled`, `group`, `tags`, `input`, `output`) must not appear on the compiled `AgentManifest` — verified by asserting the `AgentManifest` fields in compile output tests.
+- [x] `ValidationIssue` must include both `code` and `path` fields — no free-form string-only error messages.
+- [x] No `unwrap()` in production code paths across all four stages and `compile`.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/infra/runtime-db</domain>
@@ -38,13 +38,13 @@ stores for agents and schedules.
 
 ## Subtasks
 
-- [ ] 6.1 Write the four `runtime.db` migration SQL files (or inline SQL constants) per INITIAL-RUNTIME-MIGRATIONS.md section 3: `0002_agent_runtime_core`, `0003_agent_sessions_and_messages`, `0004_schedule_runtime_core`. Register them as `MigrationStep` entries in the `runtime.db` migration slice that `boot_with_config()` passes to the Task 3 runner. Confirm the `schema_migration` bootstrap step from Task 3 is already the first step in the slice.
-- [ ] 6.2 Define the `AgentRuntimeStore` adapter in a new module (e.g. `crates/openfang-memory/src/agent_runtime.rs` or a new `crates/openfang-runtime-store/` crate) wrapping `Arc<Mutex<Connection>>` for `runtime.db`. Implement at minimum: `upsert_agent_runtime()`, `get_agent_runtime()`, `list_agent_runtimes()`, `remove_agent_runtime()`.
-- [ ] 6.3 Define the `AgentSessionStore` and `AgentMessageStore` adapters for the `agent_session` and `agent_message` tables in the same module. These replace or supplement the existing `SessionStore` in `crates/openfang-memory/src/session.rs` for the new schema. Confirm the existing `SessionStore` is not broken for the legacy schema path.
-- [ ] 6.4 Define the `ScheduleRuntimeStore` and `ScheduleExecutionStore` adapters for `schedule_runtime` and `schedule_execution`. The scheduler subsystem at `crates/openfang-kernel/src/scheduler.rs` currently holds schedule runtime state in memory; wire it to use `ScheduleRuntimeStore` for persistence.
-- [ ] 6.5 Add the new store handles to `OpenFangKernel` (alongside the existing `memory: Arc<MemorySubstrate>` and the new `compozy_db` handle from Task 2). The runtime stores are initialized in `boot_with_config()` after the `runtime.db` migrations succeed.
-- [ ] 6.6 Align the `/api/health` endpoint and any runtime state endpoints in `crates/openfang-api/src/routes.rs` to use the new `AgentRuntimeStore` for agent state reads, rather than the in-memory registry alone where applicable.
-- [ ] 6.7 Write migration tests (against in-memory `runtime.db`) confirming each table is created with the correct columns and indexes, and write store adapter tests confirming round-trip reads and writes for each new table.
+- [x] 6.1 Write the four `runtime.db` migration SQL files (or inline SQL constants) per INITIAL-RUNTIME-MIGRATIONS.md section 3: `0002_agent_runtime_core`, `0003_agent_sessions_and_messages`, `0004_schedule_runtime_core`. Register them as `MigrationStep` entries in the `runtime.db` migration slice that `boot_with_config()` passes to the Task 3 runner. Confirm the `schema_migration` bootstrap step from Task 3 is already the first step in the slice.
+- [x] 6.2 Define the `AgentRuntimeStore` adapter in a new module (e.g. `crates/openfang-memory/src/agent_runtime.rs` or a new `crates/openfang-runtime-store/` crate) wrapping `Arc<Mutex<Connection>>` for `runtime.db`. Implement at minimum: `upsert_agent_runtime()`, `get_agent_runtime()`, `list_agent_runtimes()`, `remove_agent_runtime()`.
+- [x] 6.3 Define the `AgentSessionStore` and `AgentMessageStore` adapters for the `agent_session` and `agent_message` tables in the same module. These replace or supplement the existing `SessionStore` in `crates/openfang-memory/src/session.rs` for the new schema. Confirm the existing `SessionStore` is not broken for the legacy schema path.
+- [x] 6.4 Define the `ScheduleRuntimeStore` and `ScheduleExecutionStore` adapters for `schedule_runtime` and `schedule_execution`. The scheduler subsystem at `crates/openfang-kernel/src/scheduler.rs` currently holds schedule runtime state in memory; wire it to use `ScheduleRuntimeStore` for persistence.
+- [x] 6.5 Add the new store handles to `OpenFangKernel` (alongside the existing `memory: Arc<MemorySubstrate>` and the new `compozy_db` handle from Task 2). The runtime stores are initialized in `boot_with_config()` after the `runtime.db` migrations succeed.
+- [x] 6.6 Align the `/api/health` endpoint and any runtime state endpoints in `crates/openfang-api/src/routes.rs` to use the new `AgentRuntimeStore` for agent state reads, rather than the in-memory registry alone where applicable.
+- [x] 6.7 Write migration tests (against in-memory `runtime.db`) confirming each table is created with the correct columns and indexes, and write store adapter tests confirming round-trip reads and writes for each new table.
       </requirements>
 
 ## Implementation Details
@@ -201,36 +201,36 @@ Follow the pattern in `crates/openfang-memory/src/structured.rs`:
 
 ### Unit Tests (Required)
 
-- [ ] `runtime_db_migration_should_create_agent_runtime_table()` — run the `runtime.db` migration slice against an in-memory connection; query `sqlite_master` and confirm `agent_runtime` exists.
-- [ ] `runtime_db_migration_should_create_agent_session_and_message_tables()` — same for `agent_session` and `agent_message`.
-- [ ] `runtime_db_migration_should_create_schedule_tables()` — same for `schedule_runtime` and `schedule_execution`.
-- [ ] `runtime_db_migration_should_create_required_indexes()` — query `sqlite_master WHERE type='index'` and confirm each required index name is present.
-- [ ] `agent_runtime_store_should_upsert_and_retrieve()` — insert an `agent_runtime` row via `AgentRuntimeStore::upsert_agent_runtime()`, retrieve it by `agent_id`, assert the fields match.
-- [ ] `agent_session_store_should_create_and_list_sessions()` — create two sessions for different agents; list by `agent_id` and confirm each returns only its own sessions.
-- [ ] `agent_message_store_should_record_direction_and_status()` — insert messages with different `direction` values (`inbound`, `outbound`); confirm they are stored and retrievable by `session_id`.
-- [ ] `schedule_runtime_store_should_update_last_run_and_next_run()` — upsert a `schedule_runtime` row, update `last_run` and `next_run`, retrieve and confirm the update persisted.
-- [ ] `schedule_execution_store_should_record_execution_receipt()` — insert a `schedule_execution` row; confirm it is retrievable by `schedule_id` ordered by `fired_at`.
+- [x] `runtime_db_migration_should_create_agent_runtime_table()` — run the `runtime.db` migration slice against an in-memory connection; query `sqlite_master` and confirm `agent_runtime` exists.
+- [x] `runtime_db_migration_should_create_agent_session_and_message_tables()` — same for `agent_session` and `agent_message`.
+- [x] `runtime_db_migration_should_create_schedule_tables()` — same for `schedule_runtime` and `schedule_execution`.
+- [x] `runtime_db_migration_should_create_required_indexes()` — query `sqlite_master WHERE type='index'` and confirm each required index name is present.
+- [x] `agent_runtime_store_should_upsert_and_retrieve()` — insert an `agent_runtime` row via `AgentRuntimeStore::upsert_agent_runtime()`, retrieve it by `agent_id`, assert the fields match.
+- [x] `agent_session_store_should_create_and_list_sessions()` — create two sessions for different agents; list by `agent_id` and confirm each returns only its own sessions.
+- [x] `agent_message_store_should_record_direction_and_status()` — insert messages with different `direction` values (`inbound`, `outbound`); confirm they are stored and retrievable by `session_id`.
+- [x] `schedule_runtime_store_should_update_last_run_and_next_run()` — upsert a `schedule_runtime` row, update `last_run` and `next_run`, retrieve and confirm the update persisted.
+- [x] `schedule_execution_store_should_record_execution_receipt()` — insert a `schedule_execution` row; confirm it is retrievable by `schedule_id` ordered by `fired_at`.
 
 ### Integration Tests (Required)
 
-- [ ] `boot_should_create_runtime_db_with_all_initial_tables()` — after `boot_with_config()`, open `runtime.db` directly and confirm all five new tables exist.
-- [ ] `agent_runtime_state_should_survive_restart()` — write an `agent_runtime` row via the store; re-boot against the same `data_dir`; confirm the row is still present.
-- [ ] `schedule_runtime_state_should_survive_restart()` — same for `schedule_runtime`.
-- [ ] `existing_boot_path_should_not_regress()` — the existing `MemorySubstrate` sessions and KV store must continue to work after the new `runtime.db` tables are added; confirmed by running the existing substrate tests.
+- [x] `boot_should_create_runtime_db_with_all_initial_tables()` — after `boot_with_config()`, open `runtime.db` directly and confirm all five new tables exist.
+- [x] `agent_runtime_state_should_survive_restart()` — write an `agent_runtime` row via the store; re-boot against the same `data_dir`; confirm the row is still present.
+- [x] `schedule_runtime_state_should_survive_restart()` — same for `schedule_runtime`.
+- [x] `existing_boot_path_should_not_regress()` — the existing `MemorySubstrate` sessions and KV store must continue to work after the new `runtime.db` tables are added; confirmed by running the existing substrate tests.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No `compozy.db` tables (`workflow_run`, `workflow_checkpoint`, `workflow_signal`, `task`, `subtask`, `looper_run`) may appear in the `runtime.db` migration slice. Confirm by reviewing the SQL strings.
-- [ ] The `agent_runtime` table must not contain definition fields (agent name, system prompt, model, skills list). These are file-backed per ADR-037. Confirm by reviewing the migration SQL columns.
-- [ ] The legacy `openfang-memory` `run_migrations()` call in `MemorySubstrate::open()` must not be removed or modified by this task. The old schema and the new schema coexist during the migration period.
-- [ ] No store adapter method may issue SQL that references a table from a different database (no `ATTACH DATABASE`, no cross-database references). Confirm by reviewing all SQL strings in the adapter implementations.
-- [ ] The scheduler's in-memory schedule state must remain functional if `ScheduleRuntimeStore` fails to write — the store should be best-effort for the first cut and must not crash the scheduler on a write error.
+- [x] No `compozy.db` tables (`workflow_run`, `workflow_checkpoint`, `workflow_signal`, `task`, `subtask`, `looper_run`) may appear in the `runtime.db` migration slice. Confirm by reviewing the SQL strings.
+- [x] The `agent_runtime` table must not contain definition fields (agent name, system prompt, model, skills list). These are file-backed per ADR-037. Confirm by reviewing the migration SQL columns.
+- [x] The legacy `openfang-memory` `run_migrations()` call in `MemorySubstrate::open()` must not be removed or modified by this task. The old schema and the new schema coexist during the migration period.
+- [x] No store adapter method may issue SQL that references a table from a different database (no `ATTACH DATABASE`, no cross-database references). Confirm by reviewing all SQL strings in the adapter implementations.
+- [x] The scheduler's in-memory schedule state must remain functional if `ScheduleRuntimeStore` fails to write — the store should be best-effort for the first cut and must not crash the scheduler on a write error.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

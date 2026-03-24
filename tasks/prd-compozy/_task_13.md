@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/workflow/types</domain>
@@ -58,11 +58,11 @@ the workflow API endpoints (Task 15).
 
 ## Subtasks
 
-- [ ] 13.1 Define `WorkflowV2Definition` in `crates/openfang-types/src/workflow.rs` (new file or extension) covering all top-level fields from ADR-024, plus the full `WorkflowV2Step` struct with `id`, `name`, `kind`, `uses`, `with`, `save_as`, `flow`, and `runtime` sub-fields.
-- [ ] 13.2 Define `StepKind` enum with variants `Agent`, `Primitive`, `Workflow`, `WaitSignal`, `StartLooper`, `EmitEvent`, `Collect`, `Noop`, and their associated `uses` payloads (`AgentUses { agent: String }`, `PrimitiveUses { primitive: String }`, `WorkflowUses { workflow: String }`, etc.).
-- [ ] 13.3 Define `FlowMode` enum with variants `Sequential`, `FanOut`, `Conditional { when: String }`, `Loop { until: String, max_iterations: u32 }`, and a `FlowBlock` wrapper struct that `WorkflowV2Step.flow` uses.
-- [ ] 13.4 Define `WorkflowDefaults` struct with `timeout_secs` and `error_mode` fields, and the `RuntimeBlock` struct for per-step runtime overrides.
-- [ ] 13.5 Write unit tests validating that all types serialize and deserialize correctly through `serde_json` round-trips.
+- [x] 13.1 Define `WorkflowV2Definition` in `crates/openfang-types/src/workflow.rs` (new file or extension) covering all top-level fields from ADR-024, plus the full `WorkflowV2Step` struct with `id`, `name`, `kind`, `uses`, `with`, `save_as`, `flow`, and `runtime` sub-fields.
+- [x] 13.2 Define `StepKind` enum with variants `Agent`, `Primitive`, `Workflow`, `WaitSignal`, `StartLooper`, `EmitEvent`, `Collect`, `Noop`, and their associated `uses` payloads (`AgentUses { agent: String }`, `PrimitiveUses { primitive: String }`, `WorkflowUses { workflow: String }`, etc.).
+- [x] 13.3 Define `FlowMode` enum with variants `Sequential`, `FanOut`, `Conditional { when: String }`, `Loop { until: String, max_iterations: u32 }`, and a `FlowBlock` wrapper struct that `WorkflowV2Step.flow` uses.
+- [x] 13.4 Define `WorkflowDefaults` struct with `timeout_secs` and `error_mode` fields, and the `RuntimeBlock` struct for per-step runtime overrides.
+- [x] 13.5 Write unit tests validating that all types serialize and deserialize correctly through `serde_json` round-trips.
 
 ## Implementation Details
 
@@ -121,19 +121,19 @@ The existing types in `crates/openfang-kernel/src/workflow.rs` to migrate from:
 
 ### Unit Tests (Required)
 
-- [ ] `workflow_v2_definition_round_trips_through_serde`: a fully populated `WorkflowV2Definition` must round-trip through `serde_json::to_string` and `serde_json::from_str` without loss.
-- [ ] `step_kind_agent_serializes_correctly`: a step with `kind: agent` and `uses.agent` must serialize to the expected JSON shape.
-- [ ] `step_kind_all_variants_deserialize`: all eight `StepKind` variants must deserialize from their canonical JSON representations.
-- [ ] `flow_mode_sequential_is_default`: a `FlowBlock` with no mode specified must default to `Sequential`.
-- [ ] `flow_mode_conditional_requires_when`: a `Conditional` flow mode must include a `when` field.
-- [ ] `flow_mode_loop_requires_until_and_max_iterations`: a `Loop` flow mode must include both `until` and `max_iterations` fields.
-- [ ] `workflow_defaults_apply_sensible_values`: a `WorkflowDefaults` with default construction must have `timeout_secs: 120` and `error_mode: fail`.
+- [x] `workflow_v2_definition_round_trips_through_serde`: a fully populated `WorkflowV2Definition` must round-trip through `serde_json::to_string` and `serde_json::from_str` without loss.
+- [x] `step_kind_agent_serializes_correctly`: a step with `kind: agent` and `uses.agent` must serialize to the expected JSON shape.
+- [x] `step_kind_all_variants_deserialize`: all eight `StepKind` variants must deserialize from their canonical JSON representations.
+- [x] `flow_mode_sequential_is_default`: a `FlowBlock` with no mode specified must default to `Sequential`.
+- [x] `flow_mode_conditional_requires_when`: a `Conditional` flow mode must include a `when` field.
+- [x] `flow_mode_loop_requires_until_and_max_iterations`: a `Loop` flow mode must include both `until` and `max_iterations` fields.
+- [x] `workflow_defaults_apply_sensible_values`: a `WorkflowDefaults` with default construction must have `timeout_secs: 120` and `error_mode: fail`.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/infra/migrations</domain>
@@ -38,13 +38,13 @@ for both `runtime.db` and `compozy.db`.
 
 ## Subtasks
 
-- [ ] 3.1 Audit `crates/openfang-memory/src/migration.rs` to extract the reusable patterns: the version-check-then-apply loop, the `column_exists()` safety check, and the `execute_batch()` style. Identify what must change: replace `PRAGMA user_version` with a `schema_migration` table, replace the hardcoded version ladder with an ordered slice of migration descriptors, and extract error handling into a proper `MigrationError` type.
-- [ ] 3.2 Define a `MigrationStep` type (or equivalent) in a new module — e.g. `crates/openfang-kernel/src/db_migration.rs` or a dedicated `crates/openfang-migrate-schema/` crate — that holds a version number, a human-readable name, and a SQL string or callable. The runner takes `&[MigrationStep]` (or equivalent ordered collection) and a `&Connection`.
-- [ ] 3.3 Implement the `schema_migration` bootstrap: before running any user-provided migration steps, the runner must ensure `CREATE TABLE IF NOT EXISTS schema_migration (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)` exists in the target database. This is the `0001_schema_migrations` step for both databases per INITIAL-RUNTIME-MIGRATIONS.md section 3.
-- [ ] 3.4 Implement the core migration loop: for each `MigrationStep`, check if its version is already in `schema_migration`; if not, execute its SQL inside a transaction, then insert a row into `schema_migration` with `applied_at = datetime('now')`. A failed SQL execution must roll back and surface `MigrationError`.
-- [ ] 3.5 Wire the migration runner into `boot_with_config()` in `crates/openfang-kernel/src/kernel.rs` immediately after both databases are opened (Task 2's output). Apply the `runtime.db` migration stream first, then the `compozy.db` stream. For this task, each stream may be empty or contain only the bootstrap `schema_migration` step — later tasks add the actual schema migrations.
-- [ ] 3.6 Define a `MigrationError` type (with `thiserror`) covering: `SchemaBootstrapFailed`, `AlreadyApplied` (for defensive use), `ExecutionFailed { version, name, source }`, `VersionQueryFailed`. Wire it into `KernelError::BootFailed` at the call site.
-- [ ] 3.7 Write unit tests for the migration runner against in-memory SQLite connections (`Connection::open_in_memory()`), covering: ordering, idempotency, failure propagation, and the `schema_migration` table bootstrap.
+- [x] 3.1 Audit `crates/openfang-memory/src/migration.rs` to extract the reusable patterns: the version-check-then-apply loop, the `column_exists()` safety check, and the `execute_batch()` style. Identify what must change: replace `PRAGMA user_version` with a `schema_migration` table, replace the hardcoded version ladder with an ordered slice of migration descriptors, and extract error handling into a proper `MigrationError` type.
+- [x] 3.2 Define a `MigrationStep` type (or equivalent) in a new module — e.g. `crates/openfang-kernel/src/db_migration.rs` or a dedicated `crates/openfang-migrate-schema/` crate — that holds a version number, a human-readable name, and a SQL string or callable. The runner takes `&[MigrationStep]` (or equivalent ordered collection) and a `&Connection`.
+- [x] 3.3 Implement the `schema_migration` bootstrap: before running any user-provided migration steps, the runner must ensure `CREATE TABLE IF NOT EXISTS schema_migration (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)` exists in the target database. This is the `0001_schema_migrations` step for both databases per INITIAL-RUNTIME-MIGRATIONS.md section 3.
+- [x] 3.4 Implement the core migration loop: for each `MigrationStep`, check if its version is already in `schema_migration`; if not, execute its SQL inside a transaction, then insert a row into `schema_migration` with `applied_at = datetime('now')`. A failed SQL execution must roll back and surface `MigrationError`.
+- [x] 3.5 Wire the migration runner into `boot_with_config()` in `crates/openfang-kernel/src/kernel.rs` immediately after both databases are opened (Task 2's output). Apply the `runtime.db` migration stream first, then the `compozy.db` stream. For this task, each stream may be empty or contain only the bootstrap `schema_migration` step — later tasks add the actual schema migrations.
+- [x] 3.6 Define a `MigrationError` type (with `thiserror`) covering: `SchemaBootstrapFailed`, `AlreadyApplied` (for defensive use), `ExecutionFailed { version, name, source }`, `VersionQueryFailed`. Wire it into `KernelError::BootFailed` at the call site.
+- [x] 3.7 Write unit tests for the migration runner against in-memory SQLite connections (`Connection::open_in_memory()`), covering: ordering, idempotency, failure propagation, and the `schema_migration` table bootstrap.
       </requirements>
 
 ## Implementation Details
@@ -189,37 +189,37 @@ as long as it receives an ordered slice of `MigrationStep` values.
 
 ### Unit Tests (Required)
 
-- [ ] `migration_runner_should_apply_steps_in_version_order()` — given steps with versions [3, 1, 2] passed out of order, the runner must apply them in ascending version order.
-- [ ] `migration_runner_should_skip_already_applied_steps()` — run the same set of steps twice; confirm no error on the second run and the `schema_migration` table has the same row count.
-- [ ] `migration_runner_should_record_name_and_applied_at_for_each_step()` — after a successful run, query `schema_migration` and confirm each applied step has a non-empty `name` and a valid `applied_at` timestamp.
-- [ ] `migration_runner_should_surface_failure_from_bad_sql()` — pass a step with invalid SQL; confirm the runner returns `MigrationError::ExecutionFailed` and does not insert a row into `schema_migration` for that step.
-- [ ] `migration_runner_should_roll_back_failed_step()` — after a failed step, confirm any partial DDL changes from that step are rolled back (use a table creation that partially succeeds then fails).
-- [ ] `schema_migration_bootstrap_should_be_idempotent()` — calling the runner on a database that already has `schema_migration` must not fail, even if the bootstrap step is included in the slice again.
-- [ ] `migration_runner_should_bootstrap_schema_migration_table_if_absent()` — run the runner on a completely empty in-memory database; confirm `schema_migration` is created and the first step's row is recorded.
-- [ ] `migration_error_should_carry_failing_version_and_name()` — confirm that `MigrationError::ExecutionFailed` exposes the `version` and `name` of the failing step.
+- [x] `migration_runner_should_apply_steps_in_version_order()` — given steps with versions [3, 1, 2] passed out of order, the runner must apply them in ascending version order.
+- [x] `migration_runner_should_skip_already_applied_steps()` — run the same set of steps twice; confirm no error on the second run and the `schema_migration` table has the same row count.
+- [x] `migration_runner_should_record_name_and_applied_at_for_each_step()` — after a successful run, query `schema_migration` and confirm each applied step has a non-empty `name` and a valid `applied_at` timestamp.
+- [x] `migration_runner_should_surface_failure_from_bad_sql()` — pass a step with invalid SQL; confirm the runner returns `MigrationError::ExecutionFailed` and does not insert a row into `schema_migration` for that step.
+- [x] `migration_runner_should_roll_back_failed_step()` — after a failed step, confirm any partial DDL changes from that step are rolled back (use a table creation that partially succeeds then fails).
+- [x] `schema_migration_bootstrap_should_be_idempotent()` — calling the runner on a database that already has `schema_migration` must not fail, even if the bootstrap step is included in the slice again.
+- [x] `migration_runner_should_bootstrap_schema_migration_table_if_absent()` — run the runner on a completely empty in-memory database; confirm `schema_migration` is created and the first step's row is recorded.
+- [x] `migration_error_should_carry_failing_version_and_name()` — confirm that `MigrationError::ExecutionFailed` exposes the `version` and `name` of the failing step.
 
 ### Integration Tests (Required)
 
-- [ ] `boot_should_apply_runtime_db_migrations_before_compozy_db()` — in `boot_with_config()`, instrument or inspect the order; confirm `schema_migration` exists in `runtime.db` before `compozy.db` migration begins.
-- [ ] `boot_should_create_schema_migration_in_both_databases()` — after a successful boot, open both database files and confirm `schema_migration` table exists in each with at least one row.
-- [ ] `boot_should_fail_clearly_when_runtime_db_migration_fails()` — inject a bad SQL step into the `runtime.db` stream; confirm `boot_with_config()` returns `KernelError::BootFailed` containing `"runtime.db"`.
-- [ ] `boot_should_fail_clearly_when_compozy_db_migration_fails()` — same for `compozy.db`.
-- [ ] `second_boot_against_migrated_databases_succeeds_without_error()` — run `boot_with_config()` twice against the same `data_dir`; second boot must succeed with no migration re-application errors.
-- [ ] `migration_status_is_queryable_after_boot()` — confirm that a query against `schema_migration` in each database returns the expected applied migration records after boot.
+- [x] `boot_should_apply_runtime_db_migrations_before_compozy_db()` — in `boot_with_config()`, instrument or inspect the order; confirm `schema_migration` exists in `runtime.db` before `compozy.db` migration begins.
+- [x] `boot_should_create_schema_migration_in_both_databases()` — after a successful boot, open both database files and confirm `schema_migration` table exists in each with at least one row.
+- [x] `boot_should_fail_clearly_when_runtime_db_migration_fails()` — inject a bad SQL step into the `runtime.db` stream; confirm `boot_with_config()` returns `KernelError::BootFailed` containing `"runtime.db"`.
+- [x] `boot_should_fail_clearly_when_compozy_db_migration_fails()` — same for `compozy.db`.
+- [x] `second_boot_against_migrated_databases_succeeds_without_error()` — run `boot_with_config()` twice against the same `data_dir`; second boot must succeed with no migration re-application errors.
+- [x] `migration_status_is_queryable_after_boot()` — confirm that a query against `schema_migration` in each database returns the expected applied migration records after boot.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] The runner must not be implemented as two separate, copy-pasted functions — one for `runtime.db` and one for `compozy.db`. Confirm there is a single runner function or struct parameterized by the migration slice.
-- [ ] The runner must not swallow a migration failure and return `Ok(())`. Any `rusqlite::Error` from executing a migration step must be propagated as `MigrationError::ExecutionFailed`.
-- [ ] The runner must not rely on `PRAGMA user_version` as its version store. Confirm there is no `pragma_update(None, "user_version", ...)` call in the new runner.
-- [ ] Boot must not continue with normal subsystem construction if either migration stream returns an error. Confirm that the `?` operator or equivalent is used to propagate `MigrationError` into `KernelError::BootFailed` at the boot call site.
-- [ ] The new runner must not modify or replace the existing `run_migrations()` call in `MemorySubstrate::open()`. That call remains until Task 6 unifies the schemas.
+- [x] The runner must not be implemented as two separate, copy-pasted functions — one for `runtime.db` and one for `compozy.db`. Confirm there is a single runner function or struct parameterized by the migration slice.
+- [x] The runner must not swallow a migration failure and return `Ok(())`. Any `rusqlite::Error` from executing a migration step must be propagated as `MigrationError::ExecutionFailed`.
+- [x] The runner must not rely on `PRAGMA user_version` as its version store. Confirm there is no `pragma_update(None, "user_version", ...)` call in the new runner.
+- [x] Boot must not continue with normal subsystem construction if either migration stream returns an error. Confirm that the `?` operator or equivalent is used to propagate `MigrationError` into `KernelError::BootFailed` at the boot call site.
+- [x] The new runner must not modify or replace the existing `run_migrations()` call in `MemorySubstrate::open()`. That call remains until Task 6 unifies the schemas.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>providers/arky/adapters</domain>
@@ -38,17 +38,17 @@ Codex and Claude Code.
 
 ## Subtasks
 
-- [ ] 12.1 Implement `binding_to_codex_config()` — a function that takes a `&ProviderBinding` and a `&ProviderConfig` (install layer) and returns `Result<CodexProviderConfig, AdapterError>`. Map fields from `ResolvedCodexBehaviorConfig` onto `CodexProviderConfig` sub-structs (`CodexSandboxConfig`, `CodexWorkspaceConfig`, `CodexCapabilityConfig`). Set installation-level fields from `ProviderConfig`: `binary` from `ProviderConfig::kind()` default or `ProviderConfig::binary()`, `env` from `ProviderConfig::env()`, timeouts from defaults. Preserve all typed fields — do not collapse them into `config_overrides`.
-- [ ] 12.2 Implement `binding_to_claude_code_config()` — a function that takes a `&ProviderBinding` and a `&ProviderConfig` (install layer) and returns `Result<ClaudeCodeProviderConfig, AdapterError>`. Map `ResolvedClaudeCodeBehaviorConfig` fields onto `ClaudeCodeProviderConfig`: `session` sub-struct from `ClaudeSessionConfig`, `filesystem` sub-struct from `ClaudeFilesystemConfig`, `allowed_tools`, `disallowed_tools`, `mcp_servers`, `max_budget_usd`, `fallback_model`, and `reasoning_effort` from `ProviderBinding.defaults`. Set install-level fields from `ProviderConfig`.
-- [ ] 12.3 Implement `binding_to_claude_compatible_config()` — a function that takes a `&ProviderBinding`, the `ClaudeCompatibleProviderKind` (derived from the driver string), and a `&ProviderConfig` and returns `Result<ClaudeProviderProfile, AdapterError>`. Use `ResolvedClaudeCompatibleBehaviorConfig`'s `base` to populate the shared `ClaudeCompatibleProviderConfig`, and use `selected_model`, `region`, `project_id` to populate wrapper-specific config structs (`BedrockProviderConfig`, `VertexProviderConfig`, etc.).
-- [ ] 12.4 Define `AdapterError` using `thiserror`. Required variants:
+- [x] 12.1 Implement `binding_to_codex_config()` — a function that takes a `&ProviderBinding` and a `&ProviderConfig` (install layer) and returns `Result<CodexProviderConfig, AdapterError>`. Map fields from `ResolvedCodexBehaviorConfig` onto `CodexProviderConfig` sub-structs (`CodexSandboxConfig`, `CodexWorkspaceConfig`, `CodexCapabilityConfig`). Set installation-level fields from `ProviderConfig`: `binary` from `ProviderConfig::kind()` default or `ProviderConfig::binary()`, `env` from `ProviderConfig::env()`, timeouts from defaults. Preserve all typed fields — do not collapse them into `config_overrides`.
+- [x] 12.2 Implement `binding_to_claude_code_config()` — a function that takes a `&ProviderBinding` and a `&ProviderConfig` (install layer) and returns `Result<ClaudeCodeProviderConfig, AdapterError>`. Map `ResolvedClaudeCodeBehaviorConfig` fields onto `ClaudeCodeProviderConfig`: `session` sub-struct from `ClaudeSessionConfig`, `filesystem` sub-struct from `ClaudeFilesystemConfig`, `allowed_tools`, `disallowed_tools`, `mcp_servers`, `max_budget_usd`, `fallback_model`, and `reasoning_effort` from `ProviderBinding.defaults`. Set install-level fields from `ProviderConfig`.
+- [x] 12.3 Implement `binding_to_claude_compatible_config()` — a function that takes a `&ProviderBinding`, the `ClaudeCompatibleProviderKind` (derived from the driver string), and a `&ProviderConfig` and returns `Result<ClaudeProviderProfile, AdapterError>`. Use `ResolvedClaudeCompatibleBehaviorConfig`'s `base` to populate the shared `ClaudeCompatibleProviderConfig`, and use `selected_model`, `region`, `project_id` to populate wrapper-specific config structs (`BedrockProviderConfig`, `VertexProviderConfig`, etc.).
+- [x] 12.4 Define `AdapterError` using `thiserror`. Required variants:
   - `UnsupportedDriver { driver: String }` — binding driver does not map to a known provider adapter
   - `MissingBehaviorConfig { driver: String }` — binding's `config` field is `None` but the adapter requires typed config
   - `ConfigTypeMismatch { expected: String, found: String }` — binding's `config` variant does not match the expected driver (e.g., `Codex` config for a `claude-code` driver)
   - `AdapterError` must implement `ClassifiedError` from `arky-error/src/lib.rs`.
-- [ ] 12.5 Create a dispatch function `build_provider_config()` that takes a `&ProviderBinding` and a `&ProviderConfig` and returns `Result<CompozyProviderConfig, AdapterError>`, where `CompozyProviderConfig` is an enum: `Codex(CodexProviderConfig)`, `ClaudeCode(ClaudeCodeProviderConfig)`, `ClaudeCompatible { kind: ClaudeCompatibleProviderKind, profile: ClaudeProviderProfile }`. This is the single public entry point for the adapter layer.
-- [ ] 12.6 Add adapter tests for provider-specific behavior and invalid config combinations (see Tests section). Confirm that `ClaudeCodeProviderConfig::cli_args()` produces expected flags when built from a `ProviderBinding` with known fields.
-- [ ] 12.7 Document the field mapping from `ResolvedCodexBehaviorConfig` to `CodexProviderConfig` and from `ResolvedClaudeCodeBehaviorConfig` to `ClaudeCodeProviderConfig` as inline `///` doc comments on the adapter functions, so the mapping is visible without reading two files.
+- [x] 12.5 Create a dispatch function `build_provider_config()` that takes a `&ProviderBinding` and a `&ProviderConfig` and returns `Result<CompozyProviderConfig, AdapterError>`, where `CompozyProviderConfig` is an enum: `Codex(CodexProviderConfig)`, `ClaudeCode(ClaudeCodeProviderConfig)`, `ClaudeCompatible { kind: ClaudeCompatibleProviderKind, profile: ClaudeProviderProfile }`. This is the single public entry point for the adapter layer.
+- [x] 12.6 Add adapter tests for provider-specific behavior and invalid config combinations (see Tests section). Confirm that `ClaudeCodeProviderConfig::cli_args()` produces expected flags when built from a `ProviderBinding` with known fields.
+- [x] 12.7 Document the field mapping from `ResolvedCodexBehaviorConfig` to `CodexProviderConfig` and from `ResolvedClaudeCodeBehaviorConfig` to `ClaudeCodeProviderConfig` as inline `///` doc comments on the adapter functions, so the mapping is visible without reading two files.
 
 ## Implementation Details
 
@@ -186,38 +186,38 @@ form (`"low"`, `"medium"`, `"high"`, `"max"`) before assigning.
 
 ### Unit Tests (Required)
 
-- [ ] `codex_binding_should_map_sandbox_mode_to_codex_provider_config` — a `ProviderBinding` with `ResolvedCodexBehaviorConfig { sandbox_mode: Some("workspace-write"), ... }` must produce a `CodexProviderConfig` with `sandbox.sandbox_mode = Some("workspace-write")`
-- [ ] `codex_binding_should_map_web_search_and_reasoning_summary` — verify `CodexCapabilityConfig.web_search` and `CodexProviderConfig.reasoning_summary` are set correctly
-- [ ] `claude_code_binding_should_map_session_and_filesystem_fields` — a `ProviderBinding` with `ResolvedClaudeCodeBehaviorConfig { session: { fork_session: true, ... }, filesystem: { additional_directories: [...], ... } }` must produce the correct `ClaudeCodeProviderConfig.session` and `.filesystem`
-- [ ] `claude_code_binding_should_map_allowed_and_disallowed_tools` — verify `allowed_tools` and `disallowed_tools` survive the mapping unchanged
-- [ ] `claude_code_binding_should_map_mcp_servers_and_budget` — verify `mcp_servers` and `max_budget_usd` are set correctly
-- [ ] `claude_code_cli_args_should_reflect_binding_fields` — call `ClaudeCodeProviderConfig::cli_args()` on the adapted config and assert that `--allowed-tools`, `--fork-session`, `--max-budget-usd`, and `--effort` flags appear when the corresponding binding fields are populated
-- [ ] `claude_compatible_bedrock_binding_should_set_region` — a `ResolvedClaudeCompatibleBehaviorConfig` with `region = Some("us-east-1")` must produce a `BedrockProviderConfig` with `.region = Some("us-east-1")`
-- [ ] `adapter_should_reject_codex_config_for_claude_code_driver` — a `ProviderBinding` with `driver = "claude-code"` but `config = ResolvedProviderBehaviorConfig::Codex(...)` must return `AdapterError::ConfigTypeMismatch`
-- [ ] `adapter_should_reject_binding_with_no_behavior_config_when_required` — if the adapter requires typed config but `ProviderBinding.config` is `None`, return `AdapterError::MissingBehaviorConfig`
-- [ ] `reasoning_effort_should_serialize_to_string_in_adapter` — `ReasoningEffort::High` from `ProviderBinding.defaults` must map to `reasoning_effort = Some("high")` in both `CodexProviderConfig` and `ClaudeCodeProviderConfig`
+- [x] `codex_binding_should_map_sandbox_mode_to_codex_provider_config` — a `ProviderBinding` with `ResolvedCodexBehaviorConfig { sandbox_mode: Some("workspace-write"), ... }` must produce a `CodexProviderConfig` with `sandbox.sandbox_mode = Some("workspace-write")`
+- [x] `codex_binding_should_map_web_search_and_reasoning_summary` — verify `CodexCapabilityConfig.web_search` and `CodexProviderConfig.reasoning_summary` are set correctly
+- [x] `claude_code_binding_should_map_session_and_filesystem_fields` — a `ProviderBinding` with `ResolvedClaudeCodeBehaviorConfig { session: { fork_session: true, ... }, filesystem: { additional_directories: [...], ... } }` must produce the correct `ClaudeCodeProviderConfig.session` and `.filesystem`
+- [x] `claude_code_binding_should_map_allowed_and_disallowed_tools` — verify `allowed_tools` and `disallowed_tools` survive the mapping unchanged
+- [x] `claude_code_binding_should_map_mcp_servers_and_budget` — verify `mcp_servers` and `max_budget_usd` are set correctly
+- [x] `claude_code_cli_args_should_reflect_binding_fields` — call `ClaudeCodeProviderConfig::cli_args()` on the adapted config and assert that `--allowed-tools`, `--fork-session`, `--max-budget-usd`, and `--effort` flags appear when the corresponding binding fields are populated
+- [x] `claude_compatible_bedrock_binding_should_set_region` — a `ResolvedClaudeCompatibleBehaviorConfig` with `region = Some("us-east-1")` must produce a `BedrockProviderConfig` with `.region = Some("us-east-1")`
+- [x] `adapter_should_reject_codex_config_for_claude_code_driver` — a `ProviderBinding` with `driver = "claude-code"` but `config = ResolvedProviderBehaviorConfig::Codex(...)` must return `AdapterError::ConfigTypeMismatch`
+- [x] `adapter_should_reject_binding_with_no_behavior_config_when_required` — if the adapter requires typed config but `ProviderBinding.config` is `None`, return `AdapterError::MissingBehaviorConfig`
+- [x] `reasoning_effort_should_serialize_to_string_in_adapter` — `ReasoningEffort::High` from `ProviderBinding.defaults` must map to `reasoning_effort = Some("high")` in both `CodexProviderConfig` and `ClaudeCodeProviderConfig`
 
 ### Integration Tests (Required)
 
-- [ ] An agent TOML with `provider.driver = "codex"`, `provider.model = "gpt-4o"`, and a `[provider.config.codex]` block including `include_plan_tool = true` and `web_search = true` must produce — after full compilation through task 10 and 11 — a `CodexProviderConfig` with those fields set correctly
-- [ ] An agent TOML with `provider.driver = "claude-code"` and `provider.config.claude_code.allowed_tools = ["read_file", "edit_file"]` must produce a `ClaudeCodeProviderConfig` with those tools in `allowed_tools`
-- [ ] An agent TOML with `provider.driver = "bedrock"` and `provider.config.claude_compatible.region = "eu-west-1"` must produce a `BedrockProviderConfig` with `.region = Some("eu-west-1")`
-- [ ] Provider-specific session settings (e.g., `fork_session = true` for Claude Code) must survive the full compile → adapt pipeline without being lost or overwritten with defaults
-- [ ] A `CompozyProviderConfig::Codex(config)` produced by `build_provider_config()` must be usable to construct a `CodexProvider` (via `CodexProvider::new(config)`) without panics or compile errors
+- [x] An agent TOML with `provider.driver = "codex"`, `provider.model = "gpt-4o"`, and a `[provider.config.codex]` block including `include_plan_tool = true` and `web_search = true` must produce — after full compilation through task 10 and 11 — a `CodexProviderConfig` with those fields set correctly
+- [x] An agent TOML with `provider.driver = "claude-code"` and `provider.config.claude_code.allowed_tools = ["read_file", "edit_file"]` must produce a `ClaudeCodeProviderConfig` with those tools in `allowed_tools`
+- [x] An agent TOML with `provider.driver = "bedrock"` and `provider.config.claude_compatible.region = "eu-west-1"` must produce a `BedrockProviderConfig` with `.region = Some("eu-west-1")`
+- [x] Provider-specific session settings (e.g., `fork_session = true` for Claude Code) must survive the full compile → adapt pipeline without being lost or overwritten with defaults
+- [x] A `CompozyProviderConfig::Codex(config)` produced by `build_provider_config()` must be usable to construct a `CodexProvider` (via `CodexProvider::new(config)`) without panics or compile errors
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not reduce provider-specific config to generic stringly-typed flags (e.g., do not store `{"sandbox_mode": "workspace-write"}` as an untyped `BTreeMap<String, Value>` when `CodexSandboxConfig.sandbox_mode: Option<String>` already exists)
-- [ ] Do not introduce one-off field mappings that bypass the typed config structs — every field in `ResolvedCodexBehaviorConfig` and `ResolvedClaudeCodeBehaviorConfig` must have an explicit named mapping in the adapter
-- [ ] Do not let provider wrappers silently ignore unsupported behavior fields — use `tracing::warn!()` for fields that cannot be applied to a specific wrapper kind
-- [ ] Do not use `println!()`, `dbg!()`, `log::warn!()`, or `eprintln!()` — use `tracing::warn!()` only (enforced by `.clippy.toml`)
-- [ ] Do not collapse `CodexBehaviorLayer` or `ClaudeCodeBehaviorLayer` config into the `config_overrides: BTreeMap<String, Value>` field on `CodexProviderConfig` — that field is for Codex RPC overrides and must not be repurposed
+- [x] Do not reduce provider-specific config to generic stringly-typed flags (e.g., do not store `{"sandbox_mode": "workspace-write"}` as an untyped `BTreeMap<String, Value>` when `CodexSandboxConfig.sandbox_mode: Option<String>` already exists)
+- [x] Do not introduce one-off field mappings that bypass the typed config structs — every field in `ResolvedCodexBehaviorConfig` and `ResolvedClaudeCodeBehaviorConfig` must have an explicit named mapping in the adapter
+- [x] Do not let provider wrappers silently ignore unsupported behavior fields — use `tracing::warn!()` for fields that cannot be applied to a specific wrapper kind
+- [x] Do not use `println!()`, `dbg!()`, `log::warn!()`, or `eprintln!()` — use `tracing::warn!()` only (enforced by `.clippy.toml`)
+- [x] Do not collapse `CodexBehaviorLayer` or `ClaudeCodeBehaviorLayer` config into the `config_overrides: BTreeMap<String, Value>` field on `CodexProviderConfig` — that field is for Codex RPC overrides and must not be repurposed
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

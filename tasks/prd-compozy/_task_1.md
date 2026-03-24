@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/infra/persistence</domain>
@@ -38,13 +38,13 @@ Split the current single SQLite persistence configuration into explicit
 
 ## Subtasks
 
-- [ ] 1.1 Audit all call sites that read `config.memory.sqlite_path` or construct the `openfang.db` path. Confirm the full list: `crates/openfang-kernel/src/kernel.rs` (boot sequence), `crates/openfang-cli/src/main.rs` (doctor check at line ~2287), `crates/openfang-api/src/routes.rs` (config status endpoint at line ~5155), and any integration test fixtures in `crates/openfang-api/tests/`.
-- [ ] 1.2 Define the `PersistenceConfig` struct in `crates/openfang-types/src/config.rs` with `runtime_db: Option<PathBuf>` and `compozy_db: Option<PathBuf>` fields, both `#[serde(default)]`. Add a `resolve_runtime_db(&self, data_dir: &Path) -> PathBuf` and `resolve_compozy_db(&self, data_dir: &Path) -> PathBuf` helper pair on `KernelConfig` or on `PersistenceConfig` itself.
-- [ ] 1.3 Add the `persistence: PersistenceConfig` field to `KernelConfig` in `crates/openfang-types/src/config.rs`. Update the `Default` impl to include `persistence: PersistenceConfig::default()`. Keep `memory: MemoryConfig` intact for the memory-substrate decay/embedding fields it still owns; only the `sqlite_path` subfield migrates out.
-- [ ] 1.4 Remove `sqlite_path` from `MemoryConfig` and update every consumer of that field. The kernel boot sequence in `crates/openfang-kernel/src/kernel.rs` must now read `config.persistence.resolve_runtime_db(&config.data_dir)` for the `MemorySubstrate` path (runtime.db owns the current substrate until Task 6 completes the proper split).
-- [ ] 1.5 Add config validation logic — either inside `KernelConfig::validate()` (which already exists and is called during boot) or as a dedicated `PersistenceConfig::validate()` method — that checks both resolved paths for viability and returns descriptive `String` warnings or errors per the existing validation pattern.
-- [ ] 1.6 Update the TOML config documentation comments in `config.rs` to describe the new `[persistence]` table and its two fields, including the default resolution rule.
-- [ ] 1.7 Write unit tests in `crates/openfang-types/src/config.rs` (or a sibling test module) covering: explicit path parsing, default resolution, and validation error messages for bad paths.
+- [x] 1.1 Audit all call sites that read `config.memory.sqlite_path` or construct the `openfang.db` path. Confirm the full list: `crates/openfang-kernel/src/kernel.rs` (boot sequence), `crates/openfang-cli/src/main.rs` (doctor check at line ~2287), `crates/openfang-api/src/routes.rs` (config status endpoint at line ~5155), and any integration test fixtures in `crates/openfang-api/tests/`.
+- [x] 1.2 Define the `PersistenceConfig` struct in `crates/openfang-types/src/config.rs` with `runtime_db: Option<PathBuf>` and `compozy_db: Option<PathBuf>` fields, both `#[serde(default)]`. Add a `resolve_runtime_db(&self, data_dir: &Path) -> PathBuf` and `resolve_compozy_db(&self, data_dir: &Path) -> PathBuf` helper pair on `KernelConfig` or on `PersistenceConfig` itself.
+- [x] 1.3 Add the `persistence: PersistenceConfig` field to `KernelConfig` in `crates/openfang-types/src/config.rs`. Update the `Default` impl to include `persistence: PersistenceConfig::default()`. Keep `memory: MemoryConfig` intact for the memory-substrate decay/embedding fields it still owns; only the `sqlite_path` subfield migrates out.
+- [x] 1.4 Remove `sqlite_path` from `MemoryConfig` and update every consumer of that field. The kernel boot sequence in `crates/openfang-kernel/src/kernel.rs` must now read `config.persistence.resolve_runtime_db(&config.data_dir)` for the `MemorySubstrate` path (runtime.db owns the current substrate until Task 6 completes the proper split).
+- [x] 1.5 Add config validation logic — either inside `KernelConfig::validate()` (which already exists and is called during boot) or as a dedicated `PersistenceConfig::validate()` method — that checks both resolved paths for viability and returns descriptive `String` warnings or errors per the existing validation pattern.
+- [x] 1.6 Update the TOML config documentation comments in `config.rs` to describe the new `[persistence]` table and its two fields, including the default resolution rule.
+- [x] 1.7 Write unit tests in `crates/openfang-types/src/config.rs` (or a sibling test module) covering: explicit path parsing, default resolution, and validation error messages for bad paths.
       </requirements>
 
 ## Implementation Details
@@ -153,36 +153,36 @@ The CLI doctor command checks the single DB at
 
 ### Unit Tests (Required)
 
-- [ ] `persistence_config_should_resolve_runtime_db_to_data_dir_default()` — when `runtime_db` is `None`, the resolved path equals `data_dir.join("runtime.db")`.
-- [ ] `persistence_config_should_resolve_compozy_db_to_data_dir_default()` — when `compozy_db` is `None`, the resolved path equals `data_dir.join("compozy.db")`.
-- [ ] `persistence_config_should_accept_explicit_runtime_db_path()` — when `runtime_db` is set, the resolution returns that exact path.
-- [ ] `persistence_config_should_accept_explicit_compozy_db_path()` — when `compozy_db` is set, the resolution returns that exact path.
-- [ ] `kernel_config_default_should_not_contain_openfang_db_anywhere()` — assert that serializing `KernelConfig::default()` to TOML does not contain the string `"openfang.db"`.
-- [ ] `memory_config_should_not_have_sqlite_path_field()` — compile-time proof: remove the field and confirm the struct still compiles without it.
-- [ ] `persistence_config_toml_round_trips_correctly()` — serialize a `PersistenceConfig` with explicit paths to TOML and deserialize it back; assert equality.
-- [ ] `persistence_config_validation_should_reject_path_with_missing_parent()` — confirm validation emits a non-empty warning or error for a path whose parent directory cannot be created (use a path under a non-existent root).
+- [x] `persistence_config_should_resolve_runtime_db_to_data_dir_default()` — when `runtime_db` is `None`, the resolved path equals `data_dir.join("runtime.db")`.
+- [x] `persistence_config_should_resolve_compozy_db_to_data_dir_default()` — when `compozy_db` is `None`, the resolved path equals `data_dir.join("compozy.db")`.
+- [x] `persistence_config_should_accept_explicit_runtime_db_path()` — when `runtime_db` is set, the resolution returns that exact path.
+- [x] `persistence_config_should_accept_explicit_compozy_db_path()` — when `compozy_db` is set, the resolution returns that exact path.
+- [x] `kernel_config_default_should_not_contain_openfang_db_anywhere()` — assert that serializing `KernelConfig::default()` to TOML does not contain the string `"openfang.db"`.
+- [x] `memory_config_should_not_have_sqlite_path_field()` — compile-time proof: remove the field and confirm the struct still compiles without it.
+- [x] `persistence_config_toml_round_trips_correctly()` — serialize a `PersistenceConfig` with explicit paths to TOML and deserialize it back; assert equality.
+- [x] `persistence_config_validation_should_reject_path_with_missing_parent()` — confirm validation emits a non-empty warning or error for a path whose parent directory cannot be created (use a path under a non-existent root).
 
 ### Integration Tests (Required)
 
-- [ ] Existing boot config fixtures in `crates/openfang-api/tests/api_integration_test.rs` continue to boot with `..KernelConfig::default()` without modification (confirms backward compatibility of the Default impl).
-- [ ] `start_test_server()` in `crates/openfang-api/tests/api_integration_test.rs` passes without changes — the new `persistence` field must be invisible to tests that use struct-update syntax.
-- [ ] A `KernelConfig` loaded from a TOML file that has no `[persistence]` section still boots — confirms graceful default resolution.
-- [ ] A `KernelConfig` loaded from a TOML file with an explicit `[persistence]` section that sets both paths uses those paths exactly.
-- [ ] The CLI doctor check in `crates/openfang-cli/src/main.rs` no longer hard-codes `openfang.db`; it reads from the resolved config paths.
+- [x] Existing boot config fixtures in `crates/openfang-api/tests/api_integration_test.rs` continue to boot with `..KernelConfig::default()` without modification (confirms backward compatibility of the Default impl).
+- [x] `start_test_server()` in `crates/openfang-api/tests/api_integration_test.rs` passes without changes — the new `persistence` field must be invisible to tests that use struct-update syntax.
+- [x] A `KernelConfig` loaded from a TOML file that has no `[persistence]` section still boots — confirms graceful default resolution.
+- [x] A `KernelConfig` loaded from a TOML file with an explicit `[persistence]` section that sets both paths uses those paths exactly.
+- [x] The CLI doctor check in `crates/openfang-cli/src/main.rs` no longer hard-codes `openfang.db`; it reads from the resolved config paths.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No code path may produce the string `"openfang.db"` as a database filename after this task. Search for the literal and confirm zero hits in non-test production code.
-- [ ] `memory.sqlite_path` must not survive as a live field in `MemoryConfig`. A grep for `sqlite_path` in the production source tree must return zero hits after this task.
-- [ ] Config changes must not silently reintroduce a single-DB assumption by having `PersistenceConfig` contain a single merged `path` field that is shared between databases.
-- [ ] No test-only config branch (e.g. `#[cfg(test)] let db_path = ":memory:"` injected into the production boot path) may be introduced by this task.
-- [ ] The new `PersistenceConfig` struct must not carry any fields that hint at a third database, a definitions database, or a combined merged path.
+- [x] No code path may produce the string `"openfang.db"` as a database filename after this task. Search for the literal and confirm zero hits in non-test production code.
+- [x] `memory.sqlite_path` must not survive as a live field in `MemoryConfig`. A grep for `sqlite_path` in the production source tree must return zero hits after this task.
+- [x] Config changes must not silently reintroduce a single-DB assumption by having `PersistenceConfig` contain a single merged `path` field that is shared between databases.
+- [x] No test-only config branch (e.g. `#[cfg(test)] let db_path = ":memory:"` injected into the production boot path) may be introduced by this task.
+- [x] The new `PersistenceConfig` struct must not carry any fields that hint at a third database, a definitions database, or a combined merged path.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

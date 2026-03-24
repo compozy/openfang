@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>providers/arky/config</domain>
@@ -38,13 +38,13 @@ installation/workspace config, named profiles, and per-agent config.
 
 ## Subtasks
 
-- [ ] 10.1 Audit the existing `arky-config/src/layered.rs` in the openfang workspace and map which types already cover the three-tier model. Identify gaps: `ResolvedAgentProviderConfig<TInstall>` uses a generic `TInstall` type parameter for the install layer — determine what concrete type `TInstall` should be for Compozy's workspace install layer (likely a projection of `ProviderConfig` from `loader.rs` minus credential fields).
-- [ ] 10.2 Extend `arky-config/src/loader.rs` to support named provider profiles under a new `[workspace.profiles]` table. The `ArkyConfig` struct currently holds `workspace`, `providers`, and `agents` — add a `profiles: BTreeMap<String, ProviderProfileConfig>` field and wire it through `ArkyConfigBuilder`, `PartialArkyConfig`, and `ConfigLoader::load()`. The `PartialProviderProfileConfig` struct in `layered.rs` is already the input shape.
-- [ ] 10.3 Add `ProviderProfileConfigBuilder` to the public API of `arky-config`. It must expose methods for `driver()`, `model()`, `defaults()` (accepting `ProviderRequestDefaults`), and `config()` (accepting `PartialProviderBehaviorConfig`). Wire it through `ArkyConfigBuilder::profile()`.
-- [ ] 10.4 Extend `validate_config()` in `arky-config/src/validate.rs` to validate profiles: each profile must have a non-empty `driver`, its `config` block must match the declared driver's expected namespace via `PartialProviderBehaviorConfig::finalize_for_driver()`, and `validate_defaults()` must be run on the profile's `defaults` block.
-- [ ] 10.5 Extend `validate_config()` to validate agent-level provider config: reject any agent whose `provider.config` namespace mismatches the resolved driver (after profile lookup). Confirm that the `finalize_for_driver()` logic in `PartialProviderBehaviorConfig` is called with the agent's effective driver string.
-- [ ] 10.6 Add a `resolve_agent_provider()` function (or method on `ArkyConfig`) that takes an agent name and returns a `ResolvedAgentProviderConfig<ProviderConfig>`: merge workspace install config, profile defaults, and agent overrides in the correct tier order, applying `ProviderBehaviorLayer::merge()` and `ProviderRequestDefaults::merge()` at each boundary.
-- [ ] 10.7 Write tests covering all precedence and boundary cases (see Tests section). Place them in `arky-config/src/layered.rs` and `arky-config/src/loader.rs` as inline `#[cfg(test)]` modules.
+- [x] 10.1 Audit the existing `arky-config/src/layered.rs` in the openfang workspace and map which types already cover the three-tier model. Identify gaps: `ResolvedAgentProviderConfig<TInstall>` uses a generic `TInstall` type parameter for the install layer — determine what concrete type `TInstall` should be for Compozy's workspace install layer (likely a projection of `ProviderConfig` from `loader.rs` minus credential fields).
+- [x] 10.2 Extend `arky-config/src/loader.rs` to support named provider profiles under a new `[workspace.profiles]` table. The `ArkyConfig` struct currently holds `workspace`, `providers`, and `agents` — add a `profiles: BTreeMap<String, ProviderProfileConfig>` field and wire it through `ArkyConfigBuilder`, `PartialArkyConfig`, and `ConfigLoader::load()`. The `PartialProviderProfileConfig` struct in `layered.rs` is already the input shape.
+- [x] 10.3 Add `ProviderProfileConfigBuilder` to the public API of `arky-config`. It must expose methods for `driver()`, `model()`, `defaults()` (accepting `ProviderRequestDefaults`), and `config()` (accepting `PartialProviderBehaviorConfig`). Wire it through `ArkyConfigBuilder::profile()`.
+- [x] 10.4 Extend `validate_config()` in `arky-config/src/validate.rs` to validate profiles: each profile must have a non-empty `driver`, its `config` block must match the declared driver's expected namespace via `PartialProviderBehaviorConfig::finalize_for_driver()`, and `validate_defaults()` must be run on the profile's `defaults` block.
+- [x] 10.5 Extend `validate_config()` to validate agent-level provider config: reject any agent whose `provider.config` namespace mismatches the resolved driver (after profile lookup). Confirm that the `finalize_for_driver()` logic in `PartialProviderBehaviorConfig` is called with the agent's effective driver string.
+- [x] 10.6 Add a `resolve_agent_provider()` function (or method on `ArkyConfig`) that takes an agent name and returns a `ResolvedAgentProviderConfig<ProviderConfig>`: merge workspace install config, profile defaults, and agent overrides in the correct tier order, applying `ProviderBehaviorLayer::merge()` and `ProviderRequestDefaults::merge()` at each boundary.
+- [x] 10.7 Write tests covering all precedence and boundary cases (see Tests section). Place them in `arky-config/src/layered.rs` and `arky-config/src/loader.rs` as inline `#[cfg(test)]` modules.
 
 ## Implementation Details
 
@@ -150,38 +150,38 @@ task 12. Specifically:
 
 ### Unit Tests (Required)
 
-- [ ] `provider_request_defaults_merge_should_prefer_overlay` — verify overlay `max_tokens` and `reasoning_effort` win over base values; missing overlay fields fall back to base
-- [ ] `codex_behavior_layer_merge_should_prefer_overlay_fields` — verify all eight fields of `CodexBehaviorLayer` merge correctly
-- [ ] `claude_code_behavior_layer_merge_should_prefer_overlay_fields` — verify all nine fields of `ClaudeCodeBehaviorLayer` merge correctly
-- [ ] `profile_driver_mismatch_should_produce_validation_issue` — a `[profiles.default]` block with `driver = "codex"` and a `claude_code` behavior namespace must fail validation with a clear `ValidationIssue`
-- [ ] `agent_driver_mismatch_should_produce_validation_issue` — an agent config with `driver = "claude-code"` and a `codex` behavior namespace must fail with a `ValidationIssue`
-- [ ] `forbidden_request_extra_key_should_produce_validation_issue` — each key in `FORBIDDEN_REQUEST_EXTRA_KEYS` (e.g., `"api_key"`, `"binary"`, `"env"`) placed in `request_extra` must produce a `ValidationIssue`
-- [ ] `request_extra_nesting_beyond_limit_should_produce_validation_issue` — a deeply nested (5+ levels) `request_extra` object must fail `validate_request_extra()`
-- [ ] `request_extra_entry_count_beyond_limit_should_produce_validation_issue` — more than 32 flattened entries in `request_extra` must fail
-- [ ] `resolve_agent_provider_should_merge_workspace_profile_agent_in_order` — workspace provider config sets binary path; profile sets model and a Codex behavior flag; agent overrides `max_tokens` — verify the resulting `ResolvedAgentProviderConfig` has all three values correctly merged
-- [ ] `profile_defaults_should_override_workspace_and_agent_overrides_profile` — verify the three-tier merge order is strictly workspace < profile < agent
+- [x] `provider_request_defaults_merge_should_prefer_overlay` — verify overlay `max_tokens` and `reasoning_effort` win over base values; missing overlay fields fall back to base
+- [x] `codex_behavior_layer_merge_should_prefer_overlay_fields` — verify all eight fields of `CodexBehaviorLayer` merge correctly
+- [x] `claude_code_behavior_layer_merge_should_prefer_overlay_fields` — verify all nine fields of `ClaudeCodeBehaviorLayer` merge correctly
+- [x] `profile_driver_mismatch_should_produce_validation_issue` — a `[profiles.default]` block with `driver = "codex"` and a `claude_code` behavior namespace must fail validation with a clear `ValidationIssue`
+- [x] `agent_driver_mismatch_should_produce_validation_issue` — an agent config with `driver = "claude-code"` and a `codex` behavior namespace must fail with a `ValidationIssue`
+- [x] `forbidden_request_extra_key_should_produce_validation_issue` — each key in `FORBIDDEN_REQUEST_EXTRA_KEYS` (e.g., `"api_key"`, `"binary"`, `"env"`) placed in `request_extra` must produce a `ValidationIssue`
+- [x] `request_extra_nesting_beyond_limit_should_produce_validation_issue` — a deeply nested (5+ levels) `request_extra` object must fail `validate_request_extra()`
+- [x] `request_extra_entry_count_beyond_limit_should_produce_validation_issue` — more than 32 flattened entries in `request_extra` must fail
+- [x] `resolve_agent_provider_should_merge_workspace_profile_agent_in_order` — workspace provider config sets binary path; profile sets model and a Codex behavior flag; agent overrides `max_tokens` — verify the resulting `ResolvedAgentProviderConfig` has all three values correctly merged
+- [x] `profile_defaults_should_override_workspace_and_agent_overrides_profile` — verify the three-tier merge order is strictly workspace < profile < agent
 
 ### Integration Tests (Required)
 
-- [ ] A TOML workspace config file with `[profiles.fast-research]` containing `driver = "codex"`, `model = "gpt-4o"`, and a `[config.codex]` block must parse and validate to a `ProviderProfileConfig` with the correct fields
-- [ ] A TOML workspace config with a `[profiles.safe-doc-writer]` block and an agent that references `profile = "safe-doc-writer"` must resolve to a `ResolvedAgentProviderConfig` carrying the profile's behavior layer merged with the agent's own config
-- [ ] A workspace config missing the profile named in an agent's `provider.profile` must fail validation with a clear error identifying the missing profile name
-- [ ] An agent config with `provider.request_extra = { api_key = "..." }` must fail `validate_config()` before compilation
-- [ ] Existing `ArkyConfig::from_path()` tests in `loader.rs` must continue passing without modification after the `profiles` field is added
+- [x] A TOML workspace config file with `[profiles.fast-research]` containing `driver = "codex"`, `model = "gpt-4o"`, and a `[config.codex]` block must parse and validate to a `ProviderProfileConfig` with the correct fields
+- [x] A TOML workspace config with a `[profiles.safe-doc-writer]` block and an agent that references `profile = "safe-doc-writer"` must resolve to a `ResolvedAgentProviderConfig` carrying the profile's behavior layer merged with the agent's own config
+- [x] A workspace config missing the profile named in an agent's `provider.profile` must fail validation with a clear error identifying the missing profile name
+- [x] An agent config with `provider.request_extra = { api_key = "..." }` must fail `validate_config()` before compilation
+- [x] Existing `ArkyConfig::from_path()` tests in `loader.rs` must continue passing without modification after the `profiles` field is added
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not let `request_extra` carry `binary`, `env`, `api_key`, `auth_token`, `client_name`, `client_version`, `startup_timeout`, `shared_app_server_key`, or any other key in `FORBIDDEN_REQUEST_EXTRA_KEYS`
-- [ ] Do not flatten typed provider blocks (`CodexBehaviorLayer`, `ClaudeCodeBehaviorLayer`) into generic top-level agent fields — they must remain namespaced under `provider.config`
-- [ ] Do not allow install-level secrets (`binary`, `env` maps, credential fields) to appear in `ProviderProfileConfig` or in agent-level provider config
-- [ ] Do not silently drop profile config when merging — a missing profile reference must be a validation error, not a silent no-op
-- [ ] Do not permit `provider.request_extra` to carry JSON that has more than `MAX_REQUEST_EXTRA_DEPTH` (4) levels of nesting or more than `MAX_REQUEST_EXTRA_ENTRIES` (32) total entries
+- [x] Do not let `request_extra` carry `binary`, `env`, `api_key`, `auth_token`, `client_name`, `client_version`, `startup_timeout`, `shared_app_server_key`, or any other key in `FORBIDDEN_REQUEST_EXTRA_KEYS`
+- [x] Do not flatten typed provider blocks (`CodexBehaviorLayer`, `ClaudeCodeBehaviorLayer`) into generic top-level agent fields — they must remain namespaced under `provider.config`
+- [x] Do not allow install-level secrets (`binary`, `env` maps, credential fields) to appear in `ProviderProfileConfig` or in agent-level provider config
+- [x] Do not silently drop profile config when merging — a missing profile reference must be a validation error, not a silent no-op
+- [x] Do not permit `provider.request_extra` to carry JSON that has more than `MAX_REQUEST_EXTRA_DEPTH` (4) levels of nesting or more than `MAX_REQUEST_EXTRA_ENTRIES` (32) total entries
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

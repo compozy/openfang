@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>providers/arky/integration</domain>
@@ -42,13 +42,13 @@ compile within the OpenFang workspace.
 
 ## Subtasks
 
-- [ ] 4.1 Audit the full transitive dependency graph of the six primary crates in `~/Dev/compozy/arky/crates/` to determine the complete set of Arky crates that must be copied (including `arky-hooks`, `arky-session`, `arky-tools`, `arky-mcp` if required). The `arky/CLAUDE.md` documents the dependency hierarchy bottom-up: `arky-error` and `arky-protocol` are leaf crates; `arky-tools`, `arky-hooks`, `arky-session`, `arky-provider` are foundation; `arky-mcp` is integration; `arky-codex` and `arky-claude-code` are providers.
-- [ ] 4.2 Copy all required crate directories from `~/Dev/compozy/arky/crates/` into `openfang/crates/`. Preserve internal module structure exactly. Update each crate's `Cargo.toml` to use `workspace = true` for shared fields (`version`, `edition`, `license`, `repository`, `rust-version`) and to reference sibling Arky crates via `workspace = true` rather than relative paths pointing outside the workspace.
-- [ ] 4.3 Register every copied crate in `openfang/Cargo.toml` under both `workspace.members` and `workspace.dependencies`. Add all third-party dependencies introduced by the Arky crates (e.g., `serde_norway`, `async-trait`, `tokio-util`, `pretty_assertions`, `tempfile`) to the workspace dependency table if not already present, resolving version conflicts with existing OpenFang entries.
-- [ ] 4.4 Adapt workspace-level lint configuration. The Arky workspace uses `deny(warnings)` with pedantic and nursery groups; OpenFang's `.clippy.toml` has additional disallowed macros and methods. Run `cargo clippy --workspace --all-targets -- -D warnings` and fix all new warnings introduced by the copied crates, without suppressing them with blanket `allow` attributes.
-- [ ] 4.5 Re-format all copied source files with `cargo +nightly-2026-03-15 fmt --all` to apply OpenFang's `max_width = 100` and vertical import layout from `.rustfmt.toml`. Arky uses `max_width = 90`, so expect lines to reflow.
-- [ ] 4.6 Verify that `openfang-runtime` and `openfang-kernel` still compile and their tests still pass after the workspace expansion. Pay special attention to the existing `drivers/claude_code.rs` and `drivers/mod.rs` in `crates/openfang-runtime/src/drivers/` — these already reference `claude-code` and `codex` providers via the legacy `LlmDriver` interface and must not collide with the new Arky `Provider` trait.
-- [ ] 4.7 Run `./scripts/check-deps.sh` to validate the internal crate dependency graph. Confirm that no circular dependencies exist between the copied Arky crates and the existing OpenFang crates.
+- [x] 4.1 Audit the full transitive dependency graph of the six primary crates in `~/Dev/compozy/arky/crates/` to determine the complete set of Arky crates that must be copied (including `arky-hooks`, `arky-session`, `arky-tools`, `arky-mcp` if required). The `arky/CLAUDE.md` documents the dependency hierarchy bottom-up: `arky-error` and `arky-protocol` are leaf crates; `arky-tools`, `arky-hooks`, `arky-session`, `arky-provider` are foundation; `arky-mcp` is integration; `arky-codex` and `arky-claude-code` are providers.
+- [x] 4.2 Copy all required crate directories from `~/Dev/compozy/arky/crates/` into `openfang/crates/`. Preserve internal module structure exactly. Update each crate's `Cargo.toml` to use `workspace = true` for shared fields (`version`, `edition`, `license`, `repository`, `rust-version`) and to reference sibling Arky crates via `workspace = true` rather than relative paths pointing outside the workspace.
+- [x] 4.3 Register every copied crate in `openfang/Cargo.toml` under both `workspace.members` and `workspace.dependencies`. Add all third-party dependencies introduced by the Arky crates (e.g., `serde_norway`, `async-trait`, `tokio-util`, `pretty_assertions`, `tempfile`) to the workspace dependency table if not already present, resolving version conflicts with existing OpenFang entries.
+- [x] 4.4 Adapt workspace-level lint configuration. The Arky workspace uses `deny(warnings)` with pedantic and nursery groups; OpenFang's `.clippy.toml` has additional disallowed macros and methods. Run `cargo clippy --workspace --all-targets -- -D warnings` and fix all new warnings introduced by the copied crates, without suppressing them with blanket `allow` attributes.
+- [x] 4.5 Re-format all copied source files with `cargo +nightly-2026-03-15 fmt --all` to apply OpenFang's `max_width = 100` and vertical import layout from `.rustfmt.toml`. Arky uses `max_width = 90`, so expect lines to reflow.
+- [x] 4.6 Verify that `openfang-runtime` and `openfang-kernel` still compile and their tests still pass after the workspace expansion. Pay special attention to the existing `drivers/claude_code.rs` and `drivers/mod.rs` in `crates/openfang-runtime/src/drivers/` — these already reference `claude-code` and `codex` providers via the legacy `LlmDriver` interface and must not collide with the new Arky `Provider` trait.
+- [x] 4.7 Run `./scripts/check-deps.sh` to validate the internal crate dependency graph. Confirm that no circular dependencies exist between the copied Arky crates and the existing OpenFang crates.
 
 ## Implementation Details
 
@@ -155,36 +155,36 @@ the workspace edition via `edition.workspace = true`.
 
 ### Unit Tests (Required)
 
-- [ ] `arky_error` — `classified_error_defaults_should_match_the_techspec` and `http_error_mapping_should_capture_http_projection` pass after copy
-- [ ] `arky_provider` — `provider_descriptor_should_preserve_construction_inputs`, `provider_registry_should_register_lookup_and_list_providers`, `infer_provider_id_should_map_known_model_prefixes` pass after copy
-- [ ] `arky_provider` — `generate_response_from_stream_should_use_terminal_message_event` and `generate_response_from_stream_should_reject_missing_terminal_message` pass
-- [ ] `arky_config` — `file_loading_should_parse_valid_toml`, `env_overrides_should_override_file_values`, `builder_should_override_environment_values` pass after copy
-- [ ] `arky_codex` — `config_should_round_trip_through_serde` and `config_registry_key_should_ignore_cwd_when_shared_key_is_set` pass
-- [ ] `arky_claude_code` — `config_should_serialize_key_runtime_fields_to_cli_args` and `validators_should_cover_model_prompt_and_session_warnings` pass
-- [ ] `arky_claude_code` — `supported_provider_kinds_should_round_trip` and `selected_model_should_prefer_provider_model_id` pass in `profile.rs` tests
-- [ ] No test in any copied crate is annotated with `#[ignore]` that was not already ignored in the upstream Arky source
+- [x] `arky_error` — `classified_error_defaults_should_match_the_techspec` and `http_error_mapping_should_capture_http_projection` pass after copy
+- [x] `arky_provider` — `provider_descriptor_should_preserve_construction_inputs`, `provider_registry_should_register_lookup_and_list_providers`, `infer_provider_id_should_map_known_model_prefixes` pass after copy
+- [x] `arky_provider` — `generate_response_from_stream_should_use_terminal_message_event` and `generate_response_from_stream_should_reject_missing_terminal_message` pass
+- [x] `arky_config` — `file_loading_should_parse_valid_toml`, `env_overrides_should_override_file_values`, `builder_should_override_environment_values` pass after copy
+- [x] `arky_codex` — `config_should_round_trip_through_serde` and `config_registry_key_should_ignore_cwd_when_shared_key_is_set` pass
+- [x] `arky_claude_code` — `config_should_serialize_key_runtime_fields_to_cli_args` and `validators_should_cover_model_prompt_and_session_warnings` pass
+- [x] `arky_claude_code` — `supported_provider_kinds_should_round_trip` and `selected_model_should_prefer_provider_model_id` pass in `profile.rs` tests
+- [x] No test in any copied crate is annotated with `#[ignore]` that was not already ignored in the upstream Arky source
 
 ### Integration Tests (Required)
 
-- [ ] `cargo build --workspace` succeeds with zero errors after adding all Arky crates to `workspace.members`
-- [ ] `cargo test --workspace` passes across all 23+ crates (13 original OpenFang + 10 Arky) with zero failures
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` produces zero warnings
-- [ ] The legacy `create_driver("claude-code", ...)` path in `openfang-runtime/src/drivers/mod.rs` still compiles and its existing tests pass unchanged
-- [ ] `cargo test -p openfang-kernel` and `cargo test -p openfang-types` pass with no regressions
+- [x] `cargo build --workspace` succeeds with zero errors after adding all Arky crates to `workspace.members`
+- [x] `cargo test --workspace` passes across all 23+ crates (13 original OpenFang + 10 Arky) with zero failures
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` produces zero warnings
+- [x] The legacy `create_driver("claude-code", ...)` path in `openfang-runtime/src/drivers/mod.rs` still compiles and its existing tests pass unchanged
+- [x] `cargo test -p openfang-kernel` and `cargo test -p openfang-types` pass with no regressions
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not introduce path dependencies that point outside the workspace (e.g., `arky-error = { path = "../../arky/crates/arky-error" }` is forbidden)
-- [ ] Do not silently disable Arky crate tests with `#[ignore]` or `cfg(test)` gating to make the build pass
-- [ ] Do not add `anyhow` as a dependency to non-WASM crates — OpenFang restricts `anyhow` to the WASM sandbox only (see key decisions in project memory)
-- [ ] Do not change the workspace `resolver = "2"` or `edition = "2021"` — all copied Arky crates inherit edition 2021 via `edition.workspace = true` and no downgrade is expected
-- [ ] Do not manually add version pins in individual `Cargo.toml` files for dependencies already in `[workspace.dependencies]` — use `dep.workspace = true`
+- [x] Do not introduce path dependencies that point outside the workspace (e.g., `arky-error = { path = "../../arky/crates/arky-error" }` is forbidden)
+- [x] Do not silently disable Arky crate tests with `#[ignore]` or `cfg(test)` gating to make the build pass
+- [x] Do not add `anyhow` as a dependency to non-WASM crates — OpenFang restricts `anyhow` to the WASM sandbox only (see key decisions in project memory)
+- [x] Do not change the workspace `resolver = "2"` or `edition = "2021"` — all copied Arky crates inherit edition 2021 via `edition.workspace = true` and no downgrade is expected
+- [x] Do not manually add version pins in individual `Cargo.toml` files for dependencies already in `[workspace.dependencies]` — use `dep.workspace = true`
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

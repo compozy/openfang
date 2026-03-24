@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>providers/arky/binding</domain>
@@ -38,8 +38,8 @@ data into a concrete `ProviderBinding` suitable for runtime use.
 
 ## Subtasks
 
-- [ ] 11.1 Decide the crate placement for `ProviderBinding`. The most natural location is a new `openfang-provider-binding` crate under `openfang/crates/`. It depends on `arky-config` (for `ResolvedAgentProviderConfig`, `ResolvedProviderBehaviorConfig`), `arky-provider` (for `ProviderId`, `ProviderRegistry`, `validate_capabilities`), and `arky-protocol` (for `ModelRef`, `ProviderSettings`). Add it to `openfang/Cargo.toml` workspace members. Alternatively, place it as a `provider_binding` module within `openfang-kernel` if it is tightly coupled there — document the decision.
-- [ ] 11.2 Define the `ProviderBinding` struct. Required fields:
+- [x] 11.1 Decide the crate placement for `ProviderBinding`. The most natural location is a new `openfang-provider-binding` crate under `openfang/crates/`. It depends on `arky-config` (for `ResolvedAgentProviderConfig`, `ResolvedProviderBehaviorConfig`), `arky-provider` (for `ProviderId`, `ProviderRegistry`, `validate_capabilities`), and `arky-protocol` (for `ModelRef`, `ProviderSettings`). Add it to `openfang/Cargo.toml` workspace members. Alternatively, place it as a `provider_binding` module within `openfang-kernel` if it is tightly coupled there — document the decision.
+- [x] 11.2 Define the `ProviderBinding` struct. Required fields:
   - `driver: String` — normalized driver string (e.g., `"claude-code"`, `"codex"`)
   - `provider_id: ProviderId` — from `arky-protocol`, keyed to `ProviderRegistry` lookup
   - `model: ModelRef` — from `arky-protocol`, carries `model_id` and optional `provider_model_id`
@@ -47,16 +47,16 @@ data into a concrete `ProviderBinding` suitable for runtime use.
   - `defaults: ProviderRequestDefaults` — from `arky-config/src/layered.rs`
   - `config: Option<ResolvedProviderBehaviorConfig>` — from `arky-config/src/layered.rs`
   - All fields must be `pub` and the struct must derive `Debug`, `Clone`, `PartialEq`, `Serialize`, `Deserialize`.
-- [ ] 11.3 Implement the `compile_provider_binding()` function (or a `ProviderBindingCompiler` struct with a `compile()` method) that takes a `ResolvedAgentProviderConfig<ProviderConfig>` and returns `Result<ProviderBinding, CompileError>`. The steps are: (1) normalize driver string via `normalize_driver()`; (2) construct `ProviderId::new(driver)`; (3) construct `ModelRef` from the resolved model string; (4) copy `defaults` and `config` from the resolved config; (5) validate the resolved `config` against the driver's known capabilities.
-- [ ] 11.4 Define `CompileError` using `thiserror`. Required variants:
+- [x] 11.3 Implement the `compile_provider_binding()` function (or a `ProviderBindingCompiler` struct with a `compile()` method) that takes a `ResolvedAgentProviderConfig<ProviderConfig>` and returns `Result<ProviderBinding, CompileError>`. The steps are: (1) normalize driver string via `normalize_driver()`; (2) construct `ProviderId::new(driver)`; (3) construct `ModelRef` from the resolved model string; (4) copy `defaults` and `config` from the resolved config; (5) validate the resolved `config` against the driver's known capabilities.
+- [x] 11.4 Define `CompileError` using `thiserror`. Required variants:
   - `UnknownDriver { driver: String }` — driver string does not map to a known `ProviderFamily`
   - `CapabilityMismatch { capability: String, driver: String, message: String }` — the resolved config requests a capability the driver cannot support
   - `MissingModel { driver: String }` — no model is available after profile and agent merge
   - `InvalidRequestExtra { field: String, message: String }` — re-surface validation issues from `validate_request_extra()` as a compile error
   - `CompileError` must implement `ClassifiedError` from `arky-error/src/lib.rs`.
-- [ ] 11.5 Add a driver capability validation step inside `compile_provider_binding()`. For each known driver, declare the expected `ProviderCapabilities` flags (e.g., `claude-code` supports `streaming`, `generate`, `tool_calls`, `mcp_passthrough`, `session_resume`; `codex` supports `streaming`, `generate`, `tool_calls`, `code_execution`). Use `ProviderCapabilities` from `arky-provider/src/descriptor.rs`. If the resolved config enables a feature the driver cannot support (e.g., `session_resume` for `codex`), emit a `CompileError::CapabilityMismatch`.
-- [ ] 11.6 Add a `resolve_provider_id()` helper that maps driver strings to `ProviderId` values using the same logic as `infer_provider_id()` in `arky-provider/src/registry.rs`. Codex maps to `ProviderId::new("codex")`; `claude-code` maps to `ProviderId::new("claude-code")`; Claude-compatible wrappers map to their canonical IDs from `CLAUDE_COMPATIBLE_PROVIDER_IDS` in `arky-claude-code/src/profile.rs`.
-- [ ] 11.7 Write tests for common and invalid `ProviderBinding` compile cases (see Tests section). Place them as `#[cfg(test)]` inline in the new crate or module.
+- [x] 11.5 Add a driver capability validation step inside `compile_provider_binding()`. For each known driver, declare the expected `ProviderCapabilities` flags (e.g., `claude-code` supports `streaming`, `generate`, `tool_calls`, `mcp_passthrough`, `session_resume`; `codex` supports `streaming`, `generate`, `tool_calls`, `code_execution`). Use `ProviderCapabilities` from `arky-provider/src/descriptor.rs`. If the resolved config enables a feature the driver cannot support (e.g., `session_resume` for `codex`), emit a `CompileError::CapabilityMismatch`.
+- [x] 11.6 Add a `resolve_provider_id()` helper that maps driver strings to `ProviderId` values using the same logic as `infer_provider_id()` in `arky-provider/src/registry.rs`. Codex maps to `ProviderId::new("codex")`; `claude-code` maps to `ProviderId::new("claude-code")`; Claude-compatible wrappers map to their canonical IDs from `CLAUDE_COMPATIBLE_PROVIDER_IDS` in `arky-claude-code/src/profile.rs`.
+- [x] 11.7 Write tests for common and invalid `ProviderBinding` compile cases (see Tests section). Place them as `#[cfg(test)]` inline in the new crate or module.
 
 ## Implementation Details
 
@@ -174,36 +174,36 @@ openfang-provider-binding
 
 ### Unit Tests (Required)
 
-- [ ] `provider_binding_should_capture_driver_model_profile_defaults_and_config` — verify all fields are correctly set after `compile_provider_binding()` from a fully populated `ResolvedAgentProviderConfig`
-- [ ] `provider_binding_should_normalize_claude_alias_to_claude_code` — driver string `"claude"` must produce `provider_id = ProviderId::new("claude-code")` in the binding
-- [ ] `provider_binding_should_reject_missing_model` — a `ResolvedAgentProviderConfig` with `model: None` must return `CompileError::MissingModel`
-- [ ] `provider_binding_should_reject_unknown_driver` — an unrecognized driver string (e.g., `"some-unknown-llm"`) must return `CompileError::UnknownDriver`
-- [ ] `provider_binding_should_enforce_capability_mismatch_for_session_resume_on_codex` — a Codex binding that tries to enable `session_resume` (if it is unsupported) must return `CompileError::CapabilityMismatch`
-- [ ] `provider_binding_should_reject_forbidden_request_extra_key` — a resolved config with `request_extra = { "api_key": "..." }` must return `CompileError::InvalidRequestExtra`
-- [ ] `provider_binding_should_serialize_and_deserialize_round_trip` — serialize a `ProviderBinding` to JSON and deserialize it back; assert equality
-- [ ] `compile_error_should_implement_classified_error` — verify `CompileError::UnknownDriver` has a stable `error_code()` and non-zero `http_status()`
+- [x] `provider_binding_should_capture_driver_model_profile_defaults_and_config` — verify all fields are correctly set after `compile_provider_binding()` from a fully populated `ResolvedAgentProviderConfig`
+- [x] `provider_binding_should_normalize_claude_alias_to_claude_code` — driver string `"claude"` must produce `provider_id = ProviderId::new("claude-code")` in the binding
+- [x] `provider_binding_should_reject_missing_model` — a `ResolvedAgentProviderConfig` with `model: None` must return `CompileError::MissingModel`
+- [x] `provider_binding_should_reject_unknown_driver` — an unrecognized driver string (e.g., `"some-unknown-llm"`) must return `CompileError::UnknownDriver`
+- [x] `provider_binding_should_enforce_capability_mismatch_for_session_resume_on_codex` — a Codex binding that tries to enable `session_resume` (if it is unsupported) must return `CompileError::CapabilityMismatch`
+- [x] `provider_binding_should_reject_forbidden_request_extra_key` — a resolved config with `request_extra = { "api_key": "..." }` must return `CompileError::InvalidRequestExtra`
+- [x] `provider_binding_should_serialize_and_deserialize_round_trip` — serialize a `ProviderBinding` to JSON and deserialize it back; assert equality
+- [x] `compile_error_should_implement_classified_error` — verify `CompileError::UnknownDriver` has a stable `error_code()` and non-zero `http_status()`
 
 ### Integration Tests (Required)
 
-- [ ] A fully specified `ResolvedAgentProviderConfig` for `claude-code` with `ClaudeCode` behavior config must compile to a `ProviderBinding` with `provider_id = "claude-code"` and a non-None `config`
-- [ ] A fully specified `ResolvedAgentProviderConfig` for `codex` with `Codex` behavior config must compile to a `ProviderBinding` with `provider_id = "codex"` and a non-None `config`
-- [ ] A `ProviderBinding` for `claude-code` must have its `provider_id` resolvable via `ProviderRegistry::get()` when a `ClaudeCodeProvider` is registered under `ProviderId::new("claude-code")`
-- [ ] Bindings with mismatched driver and config namespace (e.g., `driver = "codex"` but `config = ClaudeCode(...)`) must fail at compile time, not silently produce a corrupted binding
-- [ ] Compilation must not invoke `find_binary_on_path()`, network operations, or any I/O — confirm by running compile in an environment without the provider binary on PATH
+- [x] A fully specified `ResolvedAgentProviderConfig` for `claude-code` with `ClaudeCode` behavior config must compile to a `ProviderBinding` with `provider_id = "claude-code"` and a non-None `config`
+- [x] A fully specified `ResolvedAgentProviderConfig` for `codex` with `Codex` behavior config must compile to a `ProviderBinding` with `provider_id = "codex"` and a non-None `config`
+- [x] A `ProviderBinding` for `claude-code` must have its `provider_id` resolvable via `ProviderRegistry::get()` when a `ClaudeCodeProvider` is registered under `ProviderId::new("claude-code")`
+- [x] Bindings with mismatched driver and config namespace (e.g., `driver = "codex"` but `config = ClaudeCode(...)`) must fail at compile time, not silently produce a corrupted binding
+- [x] Compilation must not invoke `find_binary_on_path()`, network operations, or any I/O — confirm by running compile in an environment without the provider binary on PATH
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not store raw untyped `serde_json::Value` as the main runtime provider contract inside `ProviderBinding` — all config must be in typed fields
-- [ ] Do not include installation secrets (`env`, `binary`, `api_key`, `credentials`) in `ProviderBinding` — they remain in `ProviderConfig` (install layer)
-- [ ] Do not bypass `validate_capabilities()` where Arky already provides it — call it explicitly during compile
-- [ ] Do not allow `ProviderBinding` to be constructed directly without going through `compile_provider_binding()` — make the struct fields accessible but restrict construction via `pub(crate)` constructors or a builder pattern
-- [ ] Do not defer capability validation to runtime execution — it must be a compile-time `CompileError`
+- [x] Do not store raw untyped `serde_json::Value` as the main runtime provider contract inside `ProviderBinding` — all config must be in typed fields
+- [x] Do not include installation secrets (`env`, `binary`, `api_key`, `credentials`) in `ProviderBinding` — they remain in `ProviderConfig` (install layer)
+- [x] Do not bypass `validate_capabilities()` where Arky already provides it — call it explicitly during compile
+- [x] Do not allow `ProviderBinding` to be constructed directly without going through `compile_provider_binding()` — make the struct fields accessible but restrict construction via `pub(crate)` constructors or a builder pattern
+- [x] Do not defer capability validation to runtime execution — it must be a compile-time `CompileError`
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 
