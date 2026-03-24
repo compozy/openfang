@@ -13,6 +13,7 @@ use openfang_agent_definition::{
     CompiledAgentDefinition, ValidationContext as AgentValidationContext,
     ValidationIssue as AgentValidationIssue,
 };
+use openfang_kernel::metering::MeteringEngine;
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowRunId, WorkflowStep,
@@ -21,7 +22,7 @@ use openfang_kernel::workflow_compiler::{
     compile_workflow_definition, normalize_workflow_definition, validate_normalized_workflow,
     validate_workflow_definition, WorkflowCompileError,
 };
-use openfang_kernel::OpenFangKernel;
+use openfang_kernel::{AgentMessageDispatch, OpenFangKernel};
 use openfang_memory::{AgentRuntimeRecord, AgentSessionRecord};
 use openfang_memory::{WorkflowRunListQuery, WorkflowRunStatus, WorkflowSignalRecord};
 use openfang_runtime::kernel_handle::KernelHandle;
@@ -29,7 +30,7 @@ use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest, AgentState, SessionId};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct RunListQueryParams {
@@ -697,6 +698,259 @@ fn session_messages(
     }
 
     Ok(payloads)
+}
+
+fn agent_definition_not_found_response() -> (StatusCode, Json<serde_json::Value>) {
+    agent_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Agent definition not found",
+        None,
+    )
+}
+
+fn agent_session_not_found_response() -> (StatusCode, Json<serde_json::Value>) {
+    agent_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Agent session not found",
+        None,
+    )
+}
+
+fn runtime_not_started_response() -> (StatusCode, Json<serde_json::Value>) {
+    agent_error_response(
+        StatusCode::CONFLICT,
+        "runtime_not_started",
+        "Agent runtime is not started",
+        None,
+    )
+}
+
+fn resolve_message_text(
+    request: &MessageRequest,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    if request.input.items.is_empty() {
+        return Err(agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Message input must include at least one item",
+            Some(serde_json::json!([{
+                "path": "input.items",
+            }])),
+        ));
+    }
+
+    let mut parts = Vec::with_capacity(request.input.items.len());
+    for (index, item) in request.input.items.iter().enumerate() {
+        if item.item_type != "text" {
+            return Err(agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Only text input items are currently supported",
+                Some(serde_json::json!([{
+                    "path": format!("input.items[{index}].type"),
+                    "value": item.item_type,
+                }])),
+            ));
+        }
+
+        let Some(text) = item.text.as_deref() else {
+            return Err(agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Text input items must include a text field",
+                Some(serde_json::json!([{
+                    "path": format!("input.items[{index}].text"),
+                }])),
+            ));
+        };
+        if !text.trim().is_empty() {
+            parts.push(text.trim().to_owned());
+        }
+    }
+
+    if parts.is_empty() {
+        return Err(agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Message input must include non-empty text",
+            Some(serde_json::json!([{
+                "path": "input.items",
+            }])),
+        ));
+    }
+
+    Ok(parts.join("\n"))
+}
+
+fn new_message_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn load_session_record_for_agent(
+    state: &AppState,
+    agent_id: AgentId,
+    session_id: SessionId,
+) -> Result<AgentSessionRecord, (StatusCode, Json<serde_json::Value>)> {
+    let record = state
+        .kernel
+        .runtime_stores
+        .agent_session
+        .get_agent_session(session_id)
+        .map_err(|error| {
+            runtime_store_error("session_load_failed", "Failed to load agent session", error)
+        })?
+        .ok_or_else(agent_session_not_found_response)?;
+
+    if record.agent_id != agent_id {
+        return Err(agent_session_not_found_response());
+    }
+
+    Ok(record)
+}
+
+fn require_running_runtime_for_definition(
+    state: &AppState,
+    definition_id: &str,
+) -> Result<openfang_types::agent::AgentEntry, (StatusCode, Json<serde_json::Value>)> {
+    let Some(entry) = find_runtime_agent_for_definition(state, definition_id) else {
+        return match load_agent_definition_resource(state, definition_id)? {
+            Some(_) => Err(runtime_not_started_response()),
+            None => Err(agent_definition_not_found_response()),
+        };
+    };
+
+    let runtime_record = state
+        .kernel
+        .runtime_stores
+        .agent_runtime
+        .get_agent_runtime(entry.id)
+        .map_err(|error| {
+            runtime_store_error(
+                "runtime_status_failed",
+                "Failed to load agent runtime status",
+                error,
+            )
+        })?;
+
+    let loaded = runtime_record
+        .as_ref()
+        .map(|record| record.loaded)
+        .unwrap_or(true);
+    let runtime_state = runtime_record
+        .as_ref()
+        .map(|record| record.state)
+        .unwrap_or(entry.state);
+    if !loaded || runtime_state != AgentState::Running {
+        return Err(runtime_not_started_response());
+    }
+
+    Ok(entry)
+}
+
+fn compile_persisted_agent_definition(
+    state: &AppState,
+    definition_id: &str,
+) -> Result<(AgentResponse, CompiledAgentDefinition), (StatusCode, Json<serde_json::Value>)> {
+    let Some(resource) = load_agent_definition_resource(state, definition_id)? else {
+        return Err(agent_definition_not_found_response());
+    };
+    let store = agent_definition_store(state);
+    let context = agent_validation_context(state, &store)?;
+    let (_, compiled) = match prepare_agent_definition(resource.definition.clone(), &context) {
+        Ok(prepared) => prepared,
+        Err(AgentPreparationFailure::Validation(issues)) => {
+            return Err(agent_validation_error_response(&issues));
+        }
+        Err(AgentPreparationFailure::Compile(error)) => {
+            return Err(agent_compile_error_response(&error));
+        }
+    };
+
+    Ok((resource, compiled))
+}
+
+fn resolve_dry_run_tool_names(compiled: &CompiledAgentDefinition) -> Vec<String> {
+    let declared_tools = &compiled.agent_manifest.capabilities.tools;
+    let tools_unrestricted =
+        declared_tools.is_empty() || declared_tools.iter().any(|tool| tool == "*");
+
+    builtin_tool_definitions()
+        .into_iter()
+        .filter(|tool| tools_unrestricted || declared_tools.iter().any(|item| item == &tool.name))
+        .map(|tool| tool.name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn estimate_message_effects(
+    state: &AppState,
+    compiled: &CompiledAgentDefinition,
+    session_id: SessionId,
+    input_text: &str,
+) -> MessageDryRunEffects {
+    let mut messages = state
+        .kernel
+        .memory
+        .get_session(session_id)
+        .ok()
+        .flatten()
+        .map(|session| session.messages)
+        .unwrap_or_default();
+    messages.push(openfang_types::message::Message::user(input_text));
+
+    let estimated_tokens = openfang_runtime::compactor::estimate_token_count(
+        &messages,
+        Some(&compiled.agent_manifest.model.system_prompt),
+        None,
+    );
+    let estimated_tokens_u32 = u32::try_from(estimated_tokens).unwrap_or(u32::MAX);
+    let estimated_cost = MeteringEngine::estimate_cost_with_catalog(
+        &state
+            .kernel
+            .model_catalog
+            .read()
+            .unwrap_or_else(|error| error.into_inner()),
+        &compiled.agent_manifest.model.model,
+        u64::from(estimated_tokens_u32),
+        u64::from(estimated_tokens_u32 / 2),
+    );
+
+    MessageDryRunEffects {
+        message_submit: true,
+        estimated_tokens: estimated_tokens_u32,
+        estimated_cost,
+    }
+}
+
+fn stream_event_to_sse(
+    stream_event: &StreamEvent,
+) -> Result<axum::response::sse::Event, std::convert::Infallible> {
+    Ok(
+        axum::response::sse::Event::default()
+            .event(&stream_event.event)
+            .json_data(&stream_event.data)
+            .unwrap_or_else(|_| {
+                axum::response::sse::Event::default()
+                    .event("error")
+                    .data(
+                        "{\"error\":{\"code\":\"stream_encode_failed\",\"message\":\"Failed to encode SSE payload\",\"details\":[]}}",
+                    )
+            }),
+    )
+}
+
+fn single_sse_event_response(
+    _status: StatusCode,
+    stream_event: StreamEvent,
+) -> axum::response::Response {
+    use axum::response::sse::Sse;
+    use futures::stream;
+
+    let stream = stream::once(async move { stream_event_to_sse(&stream_event) });
+    Sse::new(stream).into_response()
 }
 
 fn ensure_runtime_agent_present(
@@ -1908,6 +2162,448 @@ pub async fn compact_agent_session_v1(
     agent_action_accepted_response(&id, Some(session_id.to_string()))
 }
 
+/// POST /api/v1/agents/{id}/messages — Submit a message using an explicit session context.
+pub async fn submit_agent_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<MessageRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return agent_json_rejection(rejection),
+    };
+    let input_text = match resolve_message_text(&request) {
+        Ok(text) => text,
+        Err(response) => return response,
+    };
+
+    const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+    if input_text.len() > MAX_MESSAGE_SIZE {
+        return agent_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request",
+            "Message too large (max 64KB)",
+            Some(serde_json::json!([{
+                "path": "input.items",
+            }])),
+        );
+    }
+
+    let session_id = match parse_session_id_path(&request.session_id) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+    let runtime_entry = match require_running_runtime_for_definition(&state, &id) {
+        Ok(entry) => entry,
+        Err(response) => return response,
+    };
+    let session_record = match load_session_record_for_agent(&state, runtime_entry.id, session_id) {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+    if let Err(error) = state.kernel.scheduler.check_quota(runtime_entry.id) {
+        return agent_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "quota_exceeded",
+            "Agent quota exceeded",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    let message_id = new_message_id();
+    let kernel = Arc::clone(&state.kernel);
+    let message = input_text;
+    let definition_id = id.clone();
+    tokio::spawn(async move {
+        let kernel_handle: Arc<dyn KernelHandle> = kernel.clone() as Arc<dyn KernelHandle>;
+        if let Err(error) = kernel
+            .send_message_with_handle_and_blocks_for_session(AgentMessageDispatch {
+                agent_id: runtime_entry.id,
+                session_id: Some(session_id),
+                message: &message,
+                kernel_handle: Some(kernel_handle),
+                content_blocks: None,
+                sender_id: None,
+                sender_name: None,
+            })
+            .await
+        {
+            tracing::warn!(
+                definition_id = %definition_id,
+                agent_id = %runtime_entry.id,
+                session_id = %session_id,
+                error = %error,
+                "Background agent message dispatch failed"
+            );
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!(MessageResponse {
+            accepted: true,
+            resource_id: id,
+            status: "accepted".to_owned(),
+            session_id: session_record.session_id.to_string(),
+            message_id,
+        })),
+    )
+}
+
+/// POST /api/v1/agents/{id}/messages/stream — Stream one agent turn via SSE.
+pub async fn stream_agent_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<MessageRequest>, JsonRejection>,
+) -> axum::response::Response {
+    use axum::response::sse::{KeepAlive, Sse};
+    use futures::stream;
+    use openfang_runtime::llm_driver::StreamEvent as LlmStreamEvent;
+
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return single_sse_event_response(
+            response.0,
+            StreamEvent {
+                event: "error".to_owned(),
+                data: serde_json::json!(response.1 .0),
+            },
+        );
+    }
+
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            let response = agent_json_rejection(rejection);
+            return single_sse_event_response(
+                response.0,
+                StreamEvent {
+                    event: "error".to_owned(),
+                    data: serde_json::json!(response.1 .0),
+                },
+            );
+        }
+    };
+    let input_text = match resolve_message_text(&request) {
+        Ok(text) => text,
+        Err(response) => {
+            return single_sse_event_response(
+                response.0,
+                StreamEvent {
+                    event: "error".to_owned(),
+                    data: serde_json::json!(response.1 .0),
+                },
+            );
+        }
+    };
+
+    const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+    if input_text.len() > MAX_MESSAGE_SIZE {
+        return single_sse_event_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StreamEvent {
+                event: "error".to_owned(),
+                data: serde_json::json!({
+                    "error": {
+                        "code": "invalid_request",
+                        "message": "Message too large (max 64KB)",
+                        "details": [{
+                            "path": "input.items",
+                        }],
+                    }
+                }),
+            },
+        );
+    }
+
+    let session_id = match parse_session_id_path(&request.session_id) {
+        Ok(session_id) => session_id,
+        Err(response) => {
+            return single_sse_event_response(
+                response.0,
+                StreamEvent {
+                    event: "error".to_owned(),
+                    data: serde_json::json!(response.1 .0),
+                },
+            );
+        }
+    };
+    let runtime_entry = match require_running_runtime_for_definition(&state, &id) {
+        Ok(entry) => entry,
+        Err(response) => {
+            return single_sse_event_response(
+                response.0,
+                StreamEvent {
+                    event: "error".to_owned(),
+                    data: serde_json::json!(response.1 .0),
+                },
+            );
+        }
+    };
+    let session_record = match load_session_record_for_agent(&state, runtime_entry.id, session_id) {
+        Ok(record) => record,
+        Err(response) => {
+            return single_sse_event_response(
+                response.0,
+                StreamEvent {
+                    event: "error".to_owned(),
+                    data: serde_json::json!(response.1 .0),
+                },
+            );
+        }
+    };
+    let message_id = new_message_id();
+
+    let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
+    let (mut kernel_rx, handle) =
+        match state
+            .kernel
+            .send_message_streaming_for_session(AgentMessageDispatch {
+                agent_id: runtime_entry.id,
+                session_id: Some(session_id),
+                message: &input_text,
+                kernel_handle: Some(kernel_handle),
+                content_blocks: None,
+                sender_id: None,
+                sender_name: None,
+            }) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return single_sse_event_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StreamEvent {
+                        event: "error".to_owned(),
+                        data: serde_json::json!({
+                            "error": {
+                                "code": "message_stream_failed",
+                                "message": "Failed to start agent message stream",
+                                "details": [{
+                                    "message": error.to_string(),
+                                }],
+                            }
+                        }),
+                    },
+                );
+            }
+        };
+
+    let (api_tx, api_rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+    let initial_keepalive = StreamEvent {
+        event: "keepalive".to_owned(),
+        data: serde_json::json!({
+            "session_id": session_record.session_id.to_string(),
+            "message_id": message_id,
+        }),
+    };
+    let _ = api_tx.try_send(initial_keepalive);
+
+    tokio::spawn(async move {
+        while let Some(event) = kernel_rx.recv().await {
+            let next_event = match event {
+                LlmStreamEvent::TextDelta { text } => Some(StreamEvent {
+                    event: "message.delta".to_owned(),
+                    data: serde_json::json!({
+                        "session_id": session_id.to_string(),
+                        "message_id": message_id,
+                        "delta": text,
+                    }),
+                }),
+                LlmStreamEvent::ToolUseEnd { id, name, input } => Some(StreamEvent {
+                    event: "tool.started".to_owned(),
+                    data: serde_json::json!({
+                        "session_id": session_id.to_string(),
+                        "message_id": message_id,
+                        "tool_id": id,
+                        "name": name,
+                        "input": input,
+                    }),
+                }),
+                LlmStreamEvent::ToolExecutionResult {
+                    name,
+                    result_preview,
+                    is_error,
+                } => Some(StreamEvent {
+                    event: "tool.completed".to_owned(),
+                    data: serde_json::json!({
+                        "session_id": session_id.to_string(),
+                        "message_id": message_id,
+                        "name": name,
+                        "result_preview": result_preview,
+                        "is_error": is_error,
+                    }),
+                }),
+                _ => None,
+            };
+
+            if let Some(next_event) = next_event {
+                if api_tx.send(next_event).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        let completion_event = match handle.await {
+            Ok(Ok(result)) => StreamEvent {
+                event: "message.completed".to_owned(),
+                data: serde_json::json!({
+                    "session_id": session_id.to_string(),
+                    "message_id": message_id,
+                    "content": crate::ws::strip_think_tags(&result.response),
+                    "usage": {
+                        "input_tokens": result.total_usage.input_tokens,
+                        "output_tokens": result.total_usage.output_tokens,
+                    },
+                }),
+            },
+            Ok(Err(error)) => StreamEvent {
+                event: "error".to_owned(),
+                data: serde_json::json!({
+                    "error": {
+                        "code": "message_stream_failed",
+                        "message": "Agent message stream failed",
+                        "details": [{
+                            "message": error.to_string(),
+                        }],
+                    }
+                }),
+            },
+            Err(error) => StreamEvent {
+                event: "error".to_owned(),
+                data: serde_json::json!({
+                    "error": {
+                        "code": "message_stream_failed",
+                        "message": "Agent message stream task failed",
+                        "details": [{
+                            "message": error.to_string(),
+                        }],
+                    }
+                }),
+            },
+        };
+        let _ = api_tx.send(completion_event).await;
+    });
+
+    let sse_stream = stream::unfold(api_rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|event| (stream_event_to_sse(&event), rx))
+    });
+
+    Sse::new(sse_stream)
+        .keep_alive(
+            KeepAlive::new().interval(Duration::from_secs(15)).event(
+                axum::response::sse::Event::default()
+                    .event("keepalive")
+                    .data("{}"),
+            ),
+        )
+        .into_response()
+}
+
+/// POST /api/v1/agents/{id}/messages/dry-run — Resolve one message request without dispatching.
+pub async fn dry_run_agent_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<MessageRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_agent_definition_id(&id) {
+        return response;
+    }
+
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return agent_json_rejection(rejection),
+    };
+    let input_text = match resolve_message_text(&request) {
+        Ok(text) => text,
+        Err(response) => return response,
+    };
+    let session_id = match parse_session_id_path(&request.session_id) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+
+    let (resource, compiled) = match compile_persisted_agent_definition(&state, &id) {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    let runtime_entry = find_runtime_agent_for_definition(&state, &id);
+    let session_record = match runtime_entry.as_ref() {
+        Some(entry) => load_session_record_for_agent(&state, entry.id, session_id),
+        None => match state
+            .kernel
+            .runtime_stores
+            .agent_session
+            .get_agent_session(session_id)
+        {
+            Ok(Some(record)) => {
+                if record.agent_id != stable_runtime_agent_id(&id) {
+                    Err(agent_session_not_found_response())
+                } else {
+                    Ok(record)
+                }
+            }
+            Ok(None) => Err(agent_session_not_found_response()),
+            Err(error) => Err(runtime_store_error(
+                "session_load_failed",
+                "Failed to load agent session",
+                error,
+            )),
+        },
+    };
+    let session_record = match session_record {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+
+    let tools = resolve_dry_run_tool_names(&compiled);
+    let effects = estimate_message_effects(&state, &compiled, session_id, &input_text);
+    let capabilities = serde_json::json!({
+        "network": resource.definition.capabilities.network,
+        "workspace": resource.definition.capabilities.workspace,
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(MessageDryRunResponse {
+            would_execute: true,
+            resolved: MessageDryRunResolved {
+                agent_id: resource.definition.id.clone(),
+                session_id: session_record.session_id.to_string(),
+                provider: MessageResolvedProvider {
+                    driver: resource.definition.provider.driver.clone(),
+                    model: resource.definition.provider.model.clone(),
+                },
+                model: resource.definition.provider.model.clone(),
+                tools,
+                session: MessageResolvedSession {
+                    id: session_record.session_id.to_string(),
+                    active: runtime_entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.session_id == session_record.session_id),
+                    message_count: session_record.message_count,
+                },
+            },
+            effects,
+            explanation: MessageDryRunExplanation {
+                skills: resource.definition.prompt.skills.clone(),
+                capabilities,
+                steps: vec![
+                    "Validated the persisted agent definition".to_owned(),
+                    "Compiled the definition into runtime metadata".to_owned(),
+                    "Resolved the requested session context".to_owned(),
+                    "Estimated the token and cost impact without dispatching".to_owned(),
+                ],
+            },
+        })),
+    )
+}
+
 /// POST /api/agents — Spawn a new agent.
 pub async fn spawn_agent(
     State(state): State<Arc<AppState>>,
@@ -2219,7 +2915,7 @@ pub fn inject_attachments_into_session(
 pub async fn send_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<MessageRequest>,
+    Json(req): Json<LegacyMessageRequest>,
 ) -> impl IntoResponse {
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
@@ -2295,7 +2991,7 @@ pub async fn send_message(
             };
             (
                 StatusCode::OK,
-                Json(serde_json::json!(MessageResponse {
+                Json(serde_json::json!(LegacyMessageResponse {
                     response,
                     input_tokens: result.total_usage.input_tokens,
                     output_tokens: result.total_usage.output_tokens,
@@ -4083,7 +4779,7 @@ pub async fn get_agent_legacy(
 pub async fn send_message_stream(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<MessageRequest>,
+    Json(req): Json<LegacyMessageRequest>,
 ) -> axum::response::Response {
     use axum::response::sse::{Event, Sse};
     use futures::stream;
@@ -14254,6 +14950,101 @@ mod agent_definition_route_tests {
             .expect("fixture should deserialize")
     }
 
+    fn codex_definition_value(id: &str, name: &str) -> Value {
+        json!({
+            "id": id,
+            "name": name,
+            "version": "1.0.0",
+            "description": "Executes simple prompts through Codex",
+            "enabled": true,
+            "group": "tests",
+            "tags": ["tests", "messages"],
+            "provider": {
+                "driver": "codex",
+                "model": "gpt-4.1",
+                "defaults": {
+                    "max_tokens": 512
+                },
+                "config": {
+                    "web_search": false
+                }
+            },
+            "prompt": {
+                "system": "You are a concise test assistant.",
+                "instructions": "Answer briefly and directly.",
+                "skills": ["testing"]
+            },
+            "capabilities": {
+                "tools": [],
+                "primitives": [],
+                "delegation": [],
+                "workspace": "none",
+                "network": true
+            },
+            "runtime": {
+                "autonomous": true,
+                "memory_policy": "session",
+                "hitl": "explicit_only"
+            },
+            "input": {
+                "kind": "object"
+            },
+            "output": {
+                "kind": "any"
+            }
+        })
+    }
+
+    fn codex_definition(id: &str, name: &str) -> AgentDefinition {
+        serde_json::from_value(codex_definition_value(id, name))
+            .expect("fixture should deserialize")
+    }
+
+    async fn create_codex_definition(context: &RouteTestContext, id: &str, name: &str) {
+        let (status, body) = json_response(
+            create_agent(
+                State(Arc::clone(&context.state)),
+                Ok(Json(CreateAgentRequest {
+                    definition: codex_definition(id, name),
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["id"], json!(id));
+    }
+
+    fn codex_live_available() -> bool {
+        std::env::var("OPENAI_API_KEY").is_ok()
+            || std::env::var("CODEX_HOME")
+                .map(std::path::PathBuf::from)
+                .ok()
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .map(|home| std::path::PathBuf::from(home).join(".codex"))
+                })
+                .map(|path| path.join("auth.json").is_file())
+                .unwrap_or(false)
+    }
+
+    fn message_request(session_id: &str, text: &str) -> MessageRequest {
+        MessageRequest {
+            session_id: session_id.to_owned(),
+            input: MessageInputPayload {
+                items: vec![MessageInputItem {
+                    item_type: "text".to_owned(),
+                    text: Some(text.to_owned()),
+                }],
+            },
+            metadata: Some(json!({
+                "source": "tests",
+            })),
+        }
+    }
+
     async fn create_definition(context: &RouteTestContext, id: &str, name: &str) {
         let (status, body) = json_response(
             create_agent(
@@ -14577,5 +15368,264 @@ mod agent_definition_route_tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], json!("not_found"));
         assert_eq!(body["error"]["message"], json!("Agent session not found"));
+    }
+
+    #[tokio::test]
+    async fn submit_agent_message_should_return_not_found_for_unknown_agent_id() {
+        let context = route_test_context().await;
+
+        let (status, body) = json_response(
+            submit_agent_message(
+                State(Arc::clone(&context.state)),
+                Path("unknown-agent".to_string()),
+                Ok(Json(message_request(
+                    &uuid::Uuid::new_v4().to_string(),
+                    "Hello",
+                ))),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("not_found"));
+        assert_eq!(
+            body["error"]["message"],
+            json!("Agent definition not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_agent_message_should_return_conflict_when_runtime_not_started() {
+        let context = route_test_context().await;
+        create_definition(&context, "message-runtime", "Message Runtime").await;
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let (status, body) = json_response(
+            submit_agent_message(
+                State(Arc::clone(&context.state)),
+                Path("message-runtime".to_string()),
+                Ok(Json(message_request(&session_id, "Hello"))),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], json!("runtime_not_started"));
+        assert_eq!(
+            body["error"]["message"],
+            json!("Agent runtime is not started")
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_agent_message_should_return_resolution_without_dispatch() {
+        let context = route_test_context().await;
+        create_definition(&context, "dry-run-writer", "Dry Run Writer").await;
+
+        let _ = json_response(
+            start_agent_runtime(
+                State(Arc::clone(&context.state)),
+                Path("dry-run-writer".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        let sessions = context
+            .state
+            .kernel
+            .runtime_stores
+            .agent_session
+            .list_agent_sessions_for_agent(stable_runtime_agent_id("dry-run-writer"))
+            .expect("session projections should load");
+        let session_id = sessions
+            .first()
+            .expect("runtime start should create a default session")
+            .session_id
+            .to_string();
+
+        let (status, body) = json_response(
+            dry_run_agent_message(
+                State(Arc::clone(&context.state)),
+                Path("dry-run-writer".to_string()),
+                Ok(Json(message_request(&session_id, "Create a short outline"))),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["would_execute"], json!(true));
+        assert_eq!(body["resolved"]["agent_id"], json!("dry-run-writer"));
+        assert_eq!(body["resolved"]["session_id"], json!(session_id));
+        assert_eq!(body["resolved"]["provider"]["driver"], json!("claude_code"));
+        assert_eq!(body["resolved"]["provider"]["model"], json!("sonnet"));
+        assert!(body["resolved"]["tools"].is_array());
+        assert_eq!(body["effects"]["message_submit"], json!(true));
+        assert!(body["effects"]["estimated_tokens"].is_u64());
+        assert!(body["effects"]["estimated_cost"].is_number());
+        assert!(body["explanation"]["steps"].is_array());
+    }
+
+    #[tokio::test]
+    async fn dry_run_agent_message_should_work_when_runtime_is_stopped() {
+        let context = route_test_context().await;
+        create_definition(&context, "dry-run-stopped", "Dry Run Stopped").await;
+
+        let _ = json_response(
+            start_agent_runtime(
+                State(Arc::clone(&context.state)),
+                Path("dry-run-stopped".to_string()),
+            )
+            .await,
+        )
+        .await;
+        let agent_entry = find_runtime_agent_for_definition(&context.state, "dry-run-stopped")
+            .expect("runtime should be present");
+        let session_id = agent_entry.session_id.to_string();
+
+        let _ = json_response(
+            stop_agent_runtime(
+                State(Arc::clone(&context.state)),
+                Path("dry-run-stopped".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        let (status, body) = json_response(
+            dry_run_agent_message(
+                State(Arc::clone(&context.state)),
+                Path("dry-run-stopped".to_string()),
+                Ok(Json(message_request(
+                    &session_id,
+                    "Summarize what would happen",
+                ))),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["would_execute"], json!(true));
+        assert_eq!(body["resolved"]["session"]["id"], json!(session_id));
+        assert_eq!(body["resolved"]["session"]["active"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn dry_run_agent_message_should_reject_session_from_another_agent() {
+        let context = route_test_context().await;
+        create_definition(&context, "dry-run-owner", "Dry Run Owner").await;
+        create_definition(&context, "dry-run-other", "Dry Run Other").await;
+
+        let _ = json_response(
+            start_agent_runtime(
+                State(Arc::clone(&context.state)),
+                Path("dry-run-owner".to_string()),
+            )
+            .await,
+        )
+        .await;
+        let owner_entry = find_runtime_agent_for_definition(&context.state, "dry-run-owner")
+            .expect("owner runtime should be present");
+        let foreign_session_id = owner_entry.session_id.to_string();
+
+        let (status, body) = json_response(
+            dry_run_agent_message(
+                State(Arc::clone(&context.state)),
+                Path("dry-run-other".to_string()),
+                Ok(Json(message_request(
+                    &foreign_session_id,
+                    "Attempt to inspect another agent session",
+                ))),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("not_found"));
+        assert_eq!(body["error"]["message"], json!("Agent session not found"));
+    }
+
+    #[tokio::test]
+    async fn submit_agent_message_should_return_accepted_response_for_valid_request() {
+        if !codex_live_available() {
+            eprintln!(
+                "Codex credentials not available, skipping live submit_agent_message unit test"
+            );
+            return;
+        }
+
+        let context = route_test_context().await;
+        create_codex_definition(&context, "submit-live", "Submit Live").await;
+
+        let _ = json_response(
+            start_agent_runtime(
+                State(Arc::clone(&context.state)),
+                Path("submit-live".to_string()),
+            )
+            .await,
+        )
+        .await;
+        let agent_entry = find_runtime_agent_for_definition(&context.state, "submit-live")
+            .expect("runtime should be present");
+        let session_id = agent_entry.session_id.to_string();
+
+        let (status, body) = json_response(
+            submit_agent_message(
+                State(Arc::clone(&context.state)),
+                Path("submit-live".to_string()),
+                Ok(Json(message_request(
+                    &session_id,
+                    "Say hello in exactly three words.",
+                ))),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["accepted"], json!(true));
+        assert_eq!(body["resource_id"], json!("submit-live"));
+        assert_eq!(body["session_id"], json!(session_id));
+        assert!(body["message_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn stream_agent_message_should_return_sse_error_event_for_unknown_agent_id() {
+        let context = route_test_context().await;
+
+        let response = stream_agent_message(
+            State(Arc::clone(&context.state)),
+            Path("unknown-agent".to_string()),
+            Ok(Json(message_request(
+                &uuid::Uuid::new_v4().to_string(),
+                "Hello from SSE",
+            ))),
+        )
+        .await;
+
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should be readable")
+                .to_vec(),
+        )
+        .expect("SSE response body should be valid UTF-8");
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.starts_with("text/event-stream"));
+        assert!(body.contains("event: error"));
+        assert!(body.contains("\"code\":\"not_found\""));
     }
 }

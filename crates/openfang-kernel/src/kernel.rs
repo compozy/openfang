@@ -67,6 +67,17 @@ impl LlmDriver for StubDriver {
     }
 }
 
+/// Message dispatch parameters for kernel execution entry points.
+pub struct AgentMessageDispatch<'a> {
+    pub agent_id: AgentId,
+    pub session_id: Option<SessionId>,
+    pub message: &'a str,
+    pub kernel_handle: Option<Arc<dyn KernelHandle>>,
+    pub content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+    pub sender_id: Option<String>,
+    pub sender_name: Option<String>,
+}
+
 pub struct OpenFangKernel {
     /// Kernel configuration.
     pub config: KernelConfig,
@@ -1840,6 +1851,33 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
+        self.send_message_with_handle_and_blocks_for_session(AgentMessageDispatch {
+            agent_id,
+            session_id: None,
+            message,
+            kernel_handle,
+            content_blocks,
+            sender_id,
+            sender_name,
+        })
+        .await
+    }
+
+    /// Send a message using an explicit session context without mutating the registry.
+    pub async fn send_message_with_handle_and_blocks_for_session(
+        &self,
+        request: AgentMessageDispatch<'_>,
+    ) -> KernelResult<AgentLoopResult> {
+        let AgentMessageDispatch {
+            agent_id,
+            session_id,
+            message,
+            kernel_handle,
+            content_blocks,
+            sender_id,
+            sender_name,
+        } = request;
+
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
         // succession (e.g. rapid voice messages via Telegram). Messages for different
@@ -1856,9 +1894,13 @@ impl OpenFangKernel {
             .check_quota(agent_id)
             .map_err(KernelError::OpenFang)?;
 
-        let entry = self.registry.get(agent_id).ok_or_else(|| {
+        let mut entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
+        if let Some(session_id) = session_id {
+            self.ensure_session_belongs_to_agent(agent_id, session_id)?;
+            entry.session_id = session_id;
+        }
 
         // Dispatch based on module type
         let result = if entry.manifest.module.starts_with("wasm:") {
@@ -1941,17 +1983,55 @@ impl OpenFangKernel {
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
     )> {
+        self.send_message_streaming_for_session(AgentMessageDispatch {
+            agent_id,
+            session_id: None,
+            message,
+            kernel_handle,
+            sender_id,
+            sender_name,
+            content_blocks,
+        })
+    }
+
+    /// Send a streaming message using an explicit session context without mutating the registry.
+    pub fn send_message_streaming_for_session(
+        self: &Arc<Self>,
+        request: AgentMessageDispatch<'_>,
+    ) -> KernelResult<(
+        tokio::sync::mpsc::Receiver<StreamEvent>,
+        tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
+    )> {
+        let AgentMessageDispatch {
+            agent_id,
+            session_id,
+            message,
+            kernel_handle,
+            sender_id,
+            sender_name,
+            content_blocks,
+        } = request;
+
         // Enforce quota before spawning the streaming task
         self.scheduler
             .check_quota(agent_id)
             .map_err(KernelError::OpenFang)?;
 
-        let entry = self.registry.get(agent_id).ok_or_else(|| {
+        let mut entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
+        if let Some(session_id) = session_id {
+            self.ensure_session_belongs_to_agent(agent_id, session_id)?;
+            entry.session_id = session_id;
+        }
 
         let is_wasm = entry.manifest.module.starts_with("wasm:");
         let is_python = entry.manifest.module.starts_with("python:");
+        let lock = self
+            .agent_msg_locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
 
         // Non-LLM modules: execute non-streaming and emit results as stream events
         if is_wasm || is_python {
@@ -1959,8 +2039,10 @@ impl OpenFangKernel {
             let kernel_clone = Arc::clone(self);
             let message_owned = message.to_string();
             let entry_clone = entry.clone();
+            let lock_clone = Arc::clone(&lock);
 
             let handle = tokio::spawn(async move {
+                let _guard = lock_clone.lock().await;
                 let result = if is_wasm {
                     kernel_clone
                         .execute_wasm_agent(&entry_clone, &message_owned, kernel_handle)
@@ -2070,6 +2152,8 @@ impl OpenFangKernel {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let mut manifest = entry.manifest.clone();
+        let dispatch_entry = entry.clone();
+        let lock_clone = Arc::clone(&lock);
 
         // Lazy backfill: create workspace for existing agents spawned before workspaces
         if manifest.workspace.is_none() {
@@ -2207,10 +2291,14 @@ impl OpenFangKernel {
         let kernel_clone = Arc::clone(self);
 
         let handle = tokio::spawn(async move {
+            let _guard = lock_clone.lock().await;
             // Auto-compact if the session is large before running the loop
             if needs_compact {
                 info!(agent_id = %agent_id, messages = session.messages.len(), "Auto-compacting session");
-                match kernel_clone.compact_agent_session(agent_id).await {
+                match kernel_clone
+                    .compact_agent_session_for_entry(&dispatch_entry)
+                    .await
+                {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
                         // Reload the session after compaction
@@ -2366,9 +2454,13 @@ impl OpenFangKernel {
                         let estimated = estimate_token_count(&session.messages, None, None);
                         if needs_compaction_by_tokens(estimated, &config) {
                             let kc = kernel_clone.clone();
+                            let entry_for_compaction = dispatch_entry.clone();
                             tokio::spawn(async move {
                                 info!(agent_id = %agent_id, estimated_tokens = estimated, "Post-loop compaction triggered");
-                                if let Err(e) = kc.compact_agent_session(agent_id).await {
+                                if let Err(e) = kc
+                                    .compact_agent_session_for_entry(&entry_for_compaction)
+                                    .await
+                                {
                                     warn!(agent_id = %agent_id, "Post-loop compaction failed: {e}");
                                 }
                             });
@@ -2589,7 +2681,7 @@ impl OpenFangKernel {
             };
             if by_messages || by_tokens || by_quota {
                 info!(agent_id = %agent_id, messages = session.messages.len(), estimated_tokens = estimated, "Pre-emptive compaction before LLM call");
-                match self.compact_agent_session(agent_id).await {
+                match self.compact_agent_session_for_entry(entry).await {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
                         if let Ok(Some(reloaded)) = self.memory.get_session(session.id) {
@@ -3105,6 +3197,28 @@ impl OpenFangKernel {
         Ok(())
     }
 
+    fn ensure_session_belongs_to_agent(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> KernelResult<()> {
+        let session = self
+            .memory
+            .get_session(session_id)
+            .map_err(KernelError::OpenFang)?
+            .ok_or_else(|| {
+                KernelError::OpenFang(OpenFangError::Internal("Session not found".to_string()))
+            })?;
+
+        if session.agent_id != agent_id {
+            return Err(KernelError::OpenFang(OpenFangError::Internal(
+                "Session belongs to a different agent".to_string(),
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Save a summary of the current session to agent memory before reset.
     fn save_session_summary(
         &self,
@@ -3414,13 +3528,10 @@ impl OpenFangKernel {
     ///
     /// Replaces the existing text-truncation compaction with an intelligent
     /// LLM-generated summary of older messages, keeping only recent messages.
-    pub async fn compact_agent_session(&self, agent_id: AgentId) -> KernelResult<String> {
+    async fn compact_agent_session_for_entry(&self, entry: &AgentEntry) -> KernelResult<String> {
         use openfang_runtime::compactor::{compact_session, needs_compaction, CompactionConfig};
 
-        let entry = self.registry.get(agent_id).ok_or_else(|| {
-            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
-        })?;
-
+        let agent_id = entry.id;
         let session = self
             .memory
             .get_session(entry.session_id)
@@ -3491,6 +3602,13 @@ impl OpenFangKernel {
         }
 
         Ok(msg)
+    }
+
+    pub async fn compact_agent_session(&self, agent_id: AgentId) -> KernelResult<String> {
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+        self.compact_agent_session_for_entry(&entry).await
     }
 
     /// Generate a context window usage report for an agent.

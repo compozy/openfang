@@ -119,6 +119,51 @@ fn agent_definition_value(id: &str, name: &str) -> Value {
     })
 }
 
+fn codex_agent_definition_value(id: &str, name: &str) -> Value {
+    json!({
+        "id": id,
+        "name": name,
+        "version": "1.0.0",
+        "description": "Executes simple prompts through Codex",
+        "enabled": true,
+        "group": "tests",
+        "tags": ["tests", "messages"],
+        "provider": {
+            "driver": "codex",
+            "model": "gpt-4.1",
+            "defaults": {
+                "max_tokens": 512
+            },
+            "config": {
+                "web_search": false
+            }
+        },
+        "prompt": {
+            "system": "You are a concise test assistant.",
+            "instructions": "Answer briefly and directly.",
+            "skills": ["testing"]
+        },
+        "capabilities": {
+            "tools": [],
+            "primitives": [],
+            "delegation": [],
+            "workspace": "none",
+            "network": true
+        },
+        "runtime": {
+            "autonomous": true,
+            "memory_policy": "session",
+            "hitl": "explicit_only"
+        },
+        "input": {
+            "kind": "object"
+        },
+        "output": {
+            "kind": "any"
+        }
+    })
+}
+
 async fn create_agent_definition(
     client: &reqwest::Client,
     server: &TestServer,
@@ -128,6 +173,25 @@ async fn create_agent_definition(
     let response = client
         .post(format!("{}/api/v1/agents", server.base_url))
         .json(&agent_definition_value(id, name))
+        .send()
+        .await
+        .expect("create request should succeed");
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    response
+        .json()
+        .await
+        .expect("create response should be JSON")
+}
+
+async fn create_codex_agent_definition(
+    client: &reqwest::Client,
+    server: &TestServer,
+    id: &str,
+    name: &str,
+) -> Value {
+    let response = client
+        .post(format!("{}/api/v1/agents", server.base_url))
+        .json(&codex_agent_definition_value(id, name))
         .send()
         .await
         .expect("create request should succeed");
@@ -192,6 +256,35 @@ fn runtime_agent_id(server: &TestServer, definition_id: &str) -> openfang_types:
         })
         .map(|entry| entry.id)
         .expect("runtime agent should exist")
+}
+
+fn codex_live_available() -> bool {
+    std::env::var("OPENAI_API_KEY").is_ok()
+        || std::env::var("CODEX_HOME")
+            .map(std::path::PathBuf::from)
+            .ok()
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|home| std::path::PathBuf::from(home).join(".codex"))
+            })
+            .map(|path| path.join("auth.json").is_file())
+            .unwrap_or(false)
+}
+
+fn message_request(session_id: &str, text: &str) -> Value {
+    json!({
+        "session_id": session_id,
+        "input": {
+            "items": [{
+                "type": "text",
+                "text": text
+            }]
+        },
+        "metadata": {
+            "source": "tests"
+        }
+    })
 }
 
 fn seed_session_message(server: &TestServer, definition_id: &str, session_id: &str) {
@@ -642,4 +735,257 @@ async fn put_agent_should_not_change_runtime_state_observable_via_runtime_endpoi
     assert_eq!(runtime_after["state"], runtime_before["state"]);
     assert_eq!(runtime_after["loaded"], runtime_before["loaded"]);
     assert_eq!(runtime_after["mode"], runtime_before["mode"]);
+}
+
+#[tokio::test]
+async fn message_stream_endpoint_should_return_sse_content_type_and_keepalive_event() {
+    if !codex_live_available() {
+        eprintln!("Codex credentials not available, skipping live SSE integration test");
+        return;
+    }
+
+    let server = start_agent_v2_test_server().await;
+    let client = reqwest::Client::new();
+    create_codex_agent_definition(&client, &server, "stream-keepalive", "Stream Keepalive").await;
+
+    let start = client
+        .post(format!(
+            "{}/api/v1/agents/stream-keepalive/runtime/start",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("start request should succeed");
+    assert_eq!(start.status(), reqwest::StatusCode::OK);
+
+    let session_id = get_runtime(&client, &server, "stream-keepalive")
+        .await
+        .get("active_session_id")
+        .and_then(Value::as_str)
+        .expect("runtime should expose active_session_id")
+        .to_string();
+
+    let response = client
+        .post(format!(
+            "{}/api/v1/agents/stream-keepalive/messages/stream",
+            server.base_url
+        ))
+        .json(&message_request(
+            &session_id,
+            "Say hello in exactly four words.",
+        ))
+        .send()
+        .await
+        .expect("stream request should succeed");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "expected SSE content type, got {content_type}"
+    );
+
+    let body = response
+        .text()
+        .await
+        .expect("stream body should be readable");
+    assert!(body.contains("event: keepalive"));
+    assert!(!body.contains("\"accepted\":true"));
+}
+
+#[tokio::test]
+async fn message_submit_should_return_message_id_and_increase_session_message_count() {
+    if !codex_live_available() {
+        eprintln!("Codex credentials not available, skipping live message submit test");
+        return;
+    }
+
+    let server = start_agent_v2_test_server().await;
+    let client = reqwest::Client::new();
+    create_codex_agent_definition(&client, &server, "message-flow", "Message Flow").await;
+
+    let start = client
+        .post(format!(
+            "{}/api/v1/agents/message-flow/runtime/start",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("start request should succeed");
+    assert_eq!(start.status(), reqwest::StatusCode::OK);
+
+    let runtime = get_runtime(&client, &server, "message-flow").await;
+    let session_id = runtime["active_session_id"]
+        .as_str()
+        .expect("runtime should expose active_session_id")
+        .to_string();
+
+    let before = client
+        .get(format!(
+            "{}/api/v1/agents/message-flow/sessions/{}",
+            server.base_url, session_id
+        ))
+        .send()
+        .await
+        .expect("session detail request should succeed");
+    assert_eq!(before.status(), reqwest::StatusCode::OK);
+    let before_body: Value = before.json().await.expect("session detail should be JSON");
+    let before_count = before_body["message_count"]
+        .as_u64()
+        .expect("message_count should be numeric");
+
+    let submit = client
+        .post(format!(
+            "{}/api/v1/agents/message-flow/messages",
+            server.base_url
+        ))
+        .json(&message_request(
+            &session_id,
+            "Reply with exactly two words.",
+        ))
+        .send()
+        .await
+        .expect("submit request should succeed");
+    assert_eq!(submit.status(), reqwest::StatusCode::ACCEPTED);
+    let submit_body: Value = submit.json().await.expect("submit response should be JSON");
+    assert_eq!(submit_body["accepted"], json!(true));
+    assert_eq!(submit_body["session_id"], json!(session_id));
+    assert!(submit_body["message_id"].is_string());
+
+    let mut after_count = before_count;
+    for _ in 0..40 {
+        let after = client
+            .get(format!(
+                "{}/api/v1/agents/message-flow/sessions/{}",
+                server.base_url, session_id
+            ))
+            .send()
+            .await
+            .expect("session detail request should succeed");
+        assert_eq!(after.status(), reqwest::StatusCode::OK);
+        let after_body: Value = after.json().await.expect("session detail should be JSON");
+        after_count = after_body["message_count"]
+            .as_u64()
+            .expect("message_count should be numeric");
+        if after_count > before_count {
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    assert!(
+        after_count > before_count,
+        "message count should increase after submit"
+    );
+}
+
+#[tokio::test]
+async fn message_stream_should_emit_delta_and_completed_events_for_live_dispatch() {
+    if !codex_live_available() {
+        eprintln!("Codex credentials not available, skipping live message stream test");
+        return;
+    }
+
+    let server = start_agent_v2_test_server().await;
+    let client = reqwest::Client::new();
+    create_codex_agent_definition(&client, &server, "message-stream", "Message Stream").await;
+
+    let start = client
+        .post(format!(
+            "{}/api/v1/agents/message-stream/runtime/start",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("start request should succeed");
+    assert_eq!(start.status(), reqwest::StatusCode::OK);
+
+    let runtime = get_runtime(&client, &server, "message-stream").await;
+    let session_id = runtime["active_session_id"]
+        .as_str()
+        .expect("runtime should expose active_session_id")
+        .to_string();
+
+    let response = client
+        .post(format!(
+            "{}/api/v1/agents/message-stream/messages/stream",
+            server.base_url
+        ))
+        .json(&message_request(
+            &session_id,
+            "Say hello in exactly three words.",
+        ))
+        .send()
+        .await
+        .expect("stream request should succeed");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let body = response
+        .text()
+        .await
+        .expect("stream body should be readable");
+    assert!(body.contains("event: keepalive"));
+    assert!(body.contains("event: message.delta"));
+    assert!(body.contains("event: message.completed"));
+}
+
+#[tokio::test]
+async fn dry_run_should_return_provider_and_model_without_dispatching() {
+    let server = start_agent_v2_test_server().await;
+    let client = reqwest::Client::new();
+    create_agent_definition(&client, &server, "dry-run-live", "Dry Run Live").await;
+
+    let start = client
+        .post(format!(
+            "{}/api/v1/agents/dry-run-live/runtime/start",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("start request should succeed");
+    assert_eq!(start.status(), reqwest::StatusCode::OK);
+
+    let runtime = get_runtime(&client, &server, "dry-run-live").await;
+    let session_id = runtime["active_session_id"]
+        .as_str()
+        .expect("runtime should expose active_session_id")
+        .to_string();
+
+    let stop = client
+        .post(format!(
+            "{}/api/v1/agents/dry-run-live/runtime/stop",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("stop request should succeed");
+    assert_eq!(stop.status(), reqwest::StatusCode::OK);
+
+    let response = client
+        .post(format!(
+            "{}/api/v1/agents/dry-run-live/messages/dry-run",
+            server.base_url
+        ))
+        .json(&message_request(
+            &session_id,
+            "Describe the dry-run resolution.",
+        ))
+        .send()
+        .await
+        .expect("dry-run request should succeed");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response
+        .json()
+        .await
+        .expect("dry-run response should be JSON");
+    assert_eq!(body["would_execute"], json!(true));
+    assert_eq!(body["resolved"]["provider"]["driver"], json!("claude_code"));
+    assert_eq!(body["resolved"]["provider"]["model"], json!("sonnet"));
+    assert_eq!(body["resolved"]["session_id"], json!(session_id));
+    assert_eq!(body["effects"]["message_submit"], json!(true));
 }

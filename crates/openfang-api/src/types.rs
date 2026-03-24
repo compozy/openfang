@@ -43,9 +43,9 @@ pub struct AttachmentRef {
     pub content_type: String,
 }
 
-/// Request to send a message to an agent.
+/// Legacy request to send a message to an agent.
 #[derive(Debug, Deserialize)]
-pub struct MessageRequest {
+pub struct LegacyMessageRequest {
     pub message: String,
     /// Optional file attachments (uploaded via /upload endpoint).
     #[serde(default)]
@@ -58,15 +58,118 @@ pub struct MessageRequest {
     pub sender_name: Option<String>,
 }
 
-/// Response from sending a message.
+/// Legacy response from sending a message.
 #[derive(Debug, Serialize)]
-pub struct MessageResponse {
+pub struct LegacyMessageResponse {
     pub response: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub iterations: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+}
+
+/// Structured message input payload for v1 agent messaging.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct MessageInputPayload {
+    pub items: Vec<MessageInputItem>,
+}
+
+/// One structured item inside a v1 message input payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct MessageInputItem {
+    #[serde(rename = "type")]
+    pub item_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// V1 request to submit or stream an agent message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct MessageRequest {
+    pub session_id: String,
+    pub input: MessageInputPayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// V1 accepted response after submitting an agent message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct MessageResponse {
+    pub accepted: bool,
+    pub resource_id: String,
+    pub status: String,
+    pub session_id: String,
+    pub message_id: String,
+}
+
+/// Provider resolution details returned by agent message dry-run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct MessageResolvedProvider {
+    pub driver: String,
+    pub model: String,
+}
+
+/// Session summary returned by agent message dry-run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct MessageResolvedSession {
+    pub id: String,
+    pub active: bool,
+    pub message_count: u32,
+}
+
+/// Resolved execution plan returned by agent message dry-run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct MessageDryRunResolved {
+    pub agent_id: String,
+    pub session_id: String,
+    pub provider: MessageResolvedProvider,
+    pub model: String,
+    pub tools: Vec<String>,
+    pub session: MessageResolvedSession,
+}
+
+/// Estimated effects returned by agent message dry-run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct MessageDryRunEffects {
+    pub message_submit: bool,
+    pub estimated_tokens: u32,
+    pub estimated_cost: f64,
+}
+
+/// Explanation payload returned by agent message dry-run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct MessageDryRunExplanation {
+    pub skills: Vec<String>,
+    pub capabilities: serde_json::Value,
+    pub steps: Vec<String>,
+}
+
+/// V1 dry-run response for an agent message request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct MessageDryRunResponse {
+    pub would_execute: bool,
+    pub resolved: MessageDryRunResolved,
+    pub effects: MessageDryRunEffects,
+    pub explanation: MessageDryRunExplanation,
+}
+
+/// Canonical stream event payload emitted by v1 agent message SSE endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct StreamEvent {
+    pub event: String,
+    pub data: serde_json::Value,
 }
 
 /// Request to install a skill from the marketplace.

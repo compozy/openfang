@@ -189,6 +189,18 @@ pub async fn build_router(
             axum::routing::post(routes::compact_agent_session_v1),
         )
         .route(
+            "/api/v1/agents/{id}/messages",
+            axum::routing::post(routes::submit_agent_message),
+        )
+        .route(
+            "/api/v1/agents/{id}/messages/stream",
+            axum::routing::post(routes::stream_agent_message),
+        )
+        .route(
+            "/api/v1/agents/{id}/messages/dry-run",
+            axum::routing::post(routes::dry_run_agent_message),
+        )
+        .route(
             "/api/v1/agents",
             axum::routing::get(routes::list_agents).post(routes::create_agent),
         )

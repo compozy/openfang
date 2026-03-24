@@ -29,5 +29,6 @@ pub mod workflow;
 pub mod workflow_compiler;
 
 pub use db::DatabaseHealth;
+pub use kernel::AgentMessageDispatch;
 pub use kernel::DeliveryTracker;
 pub use kernel::OpenFangKernel;
