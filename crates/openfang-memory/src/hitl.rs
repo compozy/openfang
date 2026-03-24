@@ -421,7 +421,10 @@ fn lock_conn(conn: &Arc<Mutex<Connection>>) -> Result<MutexGuard<'_, Connection>
         .map_err(|error| HitlStoreError::ConnectionLock(error.to_string()))
 }
 
-fn insert_hitl_request(conn: &Connection, record: &HitlRecord) -> Result<(), HitlStoreError> {
+pub(crate) fn insert_hitl_request(
+    conn: &Connection,
+    record: &HitlRecord,
+) -> Result<(), HitlStoreError> {
     conn.execute(
         "INSERT INTO hitl_request (
             hitl_request_id,
@@ -457,7 +460,7 @@ fn insert_hitl_request(conn: &Connection, record: &HitlRecord) -> Result<(), Hit
     Ok(())
 }
 
-fn load_hitl_request(
+pub(crate) fn load_hitl_request(
     conn: &Connection,
     hitl_request_id: &str,
 ) -> Result<Option<HitlRecord>, HitlStoreError> {
@@ -485,7 +488,7 @@ fn load_hitl_request(
     .map_err(Into::into)
 }
 
-fn load_required_hitl_request(
+pub(crate) fn load_required_hitl_request(
     conn: &Connection,
     hitl_request_id: &str,
 ) -> Result<HitlRecord, HitlStoreError> {
@@ -549,7 +552,7 @@ fn list_hitl_requests_by_dispatch(
     collect_rows(rows)
 }
 
-fn next_sequence_no(
+pub(crate) fn next_sequence_no(
     conn: &Connection,
     run_id: &str,
     step_id: &str,
@@ -579,7 +582,10 @@ fn next_sequence_no(
     i64_to_u32(next_value)
 }
 
-fn ensure_pending_transition(current: &HitlRecord, next: HitlStatus) -> Result<(), HitlStoreError> {
+pub(crate) fn ensure_pending_transition(
+    current: &HitlRecord,
+    next: HitlStatus,
+) -> Result<(), HitlStoreError> {
     if current.status != HitlStatus::Pending {
         return Err(HitlStoreError::InvalidStatusTransition {
             hitl_request_id: current.hitl_request_id.clone(),

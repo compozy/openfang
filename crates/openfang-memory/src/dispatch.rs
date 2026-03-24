@@ -605,7 +605,7 @@ fn insert_dispatch(conn: &Connection, record: &DispatchRecord) -> Result<(), Dis
     Ok(())
 }
 
-fn load_dispatch(
+pub(crate) fn load_dispatch(
     conn: &Connection,
     dispatch_id: &str,
 ) -> Result<Option<DispatchRecord>, DispatchStoreError> {
@@ -638,7 +638,7 @@ fn load_dispatch(
     .map_err(Into::into)
 }
 
-fn load_required_dispatch(
+pub(crate) fn load_required_dispatch(
     conn: &Connection,
     dispatch_id: &str,
 ) -> Result<DispatchRecord, DispatchStoreError> {
@@ -725,7 +725,7 @@ pub(crate) fn list_dispatch_summaries_by_run(
     collect_rows(rows)
 }
 
-fn update_dispatch_row(
+pub(crate) fn update_dispatch_row(
     conn: &Connection,
     current: &DispatchRecord,
     next: &DispatchRecord,
@@ -762,7 +762,7 @@ fn update_dispatch_row(
     .map_err(Into::into)
 }
 
-fn resolve_update_conflict(
+pub(crate) fn resolve_update_conflict(
     conn: &Connection,
     dispatch_id: &str,
     expected: DispatchStatus,

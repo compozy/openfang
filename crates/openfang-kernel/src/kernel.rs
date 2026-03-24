@@ -15,7 +15,7 @@ use crate::supervisor::Supervisor;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{
     Workflow, WorkflowAgentDispatchOutcome, WorkflowAgentDispatchRequest, WorkflowBootstrapResult,
-    WorkflowDefinitionStore, WorkflowEngine, WorkflowId, WorkflowRunId,
+    WorkflowDefinitionStore, WorkflowEngine, WorkflowHitlSignal, WorkflowId, WorkflowRunId,
 };
 
 use arky_session::{NewSession, SessionStore, SqliteSessionStore};
@@ -52,6 +52,7 @@ use openfang_types::workflow::WorkflowIr;
 use async_trait::async_trait;
 use rusqlite::Connection;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -103,6 +104,16 @@ struct LoadedDefinitionRuntime {
 struct StoredAgentDefinitionFile {
     #[serde(flatten)]
     definition: AgentDefinition,
+}
+
+enum WorkflowDispatchCallState {
+    Completed(AgentLoopResult),
+    HitlRequested {
+        signal: WorkflowHitlSignal,
+        turn_usage: openfang_types::message::TokenUsage,
+        turn_iterations: u32,
+        provider_resume_token: Option<String>,
+    },
 }
 
 pub struct OpenFangKernel {
@@ -4462,6 +4473,32 @@ impl OpenFangKernel {
             .map_err(|error| format!("Failed to persist running dispatch '{dispatch_id}': {error}"))
     }
 
+    async fn ensure_dispatch_running(
+        &self,
+        dispatch_id: &str,
+        provider_driver: &str,
+        session_id: &str,
+        provider_resume_token: Option<String>,
+    ) -> Result<openfang_memory::DispatchRecord, String> {
+        let current = self.load_dispatch_record(dispatch_id).await?;
+        match current.status {
+            DispatchStatus::Pending | DispatchStatus::WaitingHitl => {
+                self.mark_dispatch_running(
+                    dispatch_id,
+                    provider_driver,
+                    session_id,
+                    provider_resume_token,
+                )
+                .await
+            }
+            DispatchStatus::Running => Ok(current),
+            other => Err(format!(
+                "Dispatch '{}' is not resumable from status '{}'",
+                dispatch_id, other
+            )),
+        }
+    }
+
     async fn complete_dispatch(
         &self,
         dispatch_id: &str,
@@ -4554,15 +4591,75 @@ impl OpenFangKernel {
             .map_err(|error| format!("Failed to complete spawn dispatch '{dispatch_id}': {error}"))
     }
 
-    fn dispatch_result_json(result: &AgentLoopResult) -> serde_json::Value {
+    fn aggregate_dispatch_result_json(
+        response: &str,
+        usage: openfang_types::message::TokenUsage,
+        iterations: u32,
+        silent: bool,
+    ) -> serde_json::Value {
         serde_json::json!({
-            "response": result.response,
+            "response": response,
             "usage": {
-                "input_tokens": result.total_usage.input_tokens,
-                "output_tokens": result.total_usage.output_tokens,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
             },
-            "iterations": result.iterations,
-            "silent": result.silent,
+            "iterations": iterations,
+            "silent": silent,
+        })
+    }
+
+    async fn finalize_completed_workflow_dispatch_call(
+        &self,
+        dispatch_id: &str,
+        result: &AgentLoopResult,
+    ) -> Result<(), String> {
+        let provider_resume_token = result
+            .provider_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.provider_resume_token.clone());
+        self.complete_dispatch(
+            dispatch_id,
+            Self::aggregate_dispatch_result_json(
+                &result.response,
+                result.total_usage,
+                result.iterations,
+                result.silent,
+            ),
+            provider_resume_token,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    fn parse_hitl_signal(response_text: &str) -> Option<WorkflowHitlSignal> {
+        #[derive(Deserialize)]
+        struct HitlEnvelope {
+            #[serde(default)]
+            kind: Option<String>,
+            question: String,
+            #[serde(default)]
+            context: JsonValue,
+        }
+
+        #[derive(Deserialize)]
+        struct WrappedEnvelope {
+            #[serde(rename = "$compozy_hitl")]
+            hitl: HitlEnvelope,
+        }
+
+        let wrapped = serde_json::from_str::<WrappedEnvelope>(response_text).ok()?;
+        let kind = wrapped
+            .hitl
+            .kind
+            .as_deref()
+            .unwrap_or("clarification")
+            .parse::<openfang_memory::HitlKind>()
+            .ok()?;
+
+        Some(WorkflowHitlSignal {
+            kind,
+            question: wrapped.hitl.question,
+            context: wrapped.hitl.context,
         })
     }
 
@@ -4585,25 +4682,73 @@ impl OpenFangKernel {
         request: &WorkflowAgentDispatchRequest,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
     ) -> Result<AgentLoopResult, String> {
-        self.run_legacy_workflow_dispatch_call_inner(request, kernel_handle, None)
-            .await
+        match self
+            .run_legacy_workflow_dispatch_call_state_inner(request, kernel_handle, None)
+            .await?
+        {
+            WorkflowDispatchCallState::Completed(result) => {
+                self.finalize_completed_workflow_dispatch_call(&request.dispatch_id, &result)
+                    .await?;
+                Ok(result)
+            }
+            WorkflowDispatchCallState::HitlRequested { .. } => {
+                Err("workflow dispatch paused for HITL".to_string())
+            }
+        }
     }
 
+    #[cfg(test)]
     async fn run_legacy_workflow_dispatch_call_inner(
         &self,
         request: &WorkflowAgentDispatchRequest,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         driver_override: Option<Arc<dyn LlmDriver>>,
     ) -> Result<AgentLoopResult, String> {
+        match self
+            .run_legacy_workflow_dispatch_call_state_inner(request, kernel_handle, driver_override)
+            .await?
+        {
+            WorkflowDispatchCallState::Completed(result) => {
+                self.finalize_completed_workflow_dispatch_call(&request.dispatch_id, &result)
+                    .await?;
+                Ok(result)
+            }
+            WorkflowDispatchCallState::HitlRequested { .. } => {
+                Err("workflow dispatch paused for HITL".to_string())
+            }
+        }
+    }
+
+    async fn run_legacy_workflow_dispatch_call_state_inner(
+        &self,
+        request: &WorkflowAgentDispatchRequest,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        driver_override: Option<Arc<dyn LlmDriver>>,
+    ) -> Result<WorkflowDispatchCallState, String> {
         let entry = self
             .registry
             .get(request.agent_id)
             .ok_or_else(|| format!("Agent '{}' is no longer registered", request.agent_id))?;
-        self.mark_dispatch_running(
+        let current_dispatch = self.load_dispatch_record(&request.dispatch_id).await?;
+        let dispatch_session_id = current_dispatch
+            .session_id
+            .as_deref()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| entry.session_id.to_string());
+        let parsed_session_id = SessionId(uuid::Uuid::parse_str(&dispatch_session_id).map_err(
+            |error| {
+                format!(
+                    "Stored session id '{}' for dispatch '{}' is invalid: {error}",
+                    dispatch_session_id, request.dispatch_id
+                )
+            },
+        )?);
+
+        self.ensure_dispatch_running(
             &request.dispatch_id,
             &entry.manifest.model.provider,
-            &entry.session_id.to_string(),
-            None,
+            dispatch_session_id.as_str(),
+            current_dispatch.provider_resume_token.clone(),
         )
         .await?;
 
@@ -4623,29 +4768,34 @@ impl OpenFangKernel {
                 .await
                 .map_err(|error| error.to_string()),
             None => self
-                .send_message_with_handle(
-                    request.agent_id,
-                    &request.prompt,
+                .send_message_with_handle_and_blocks_for_session(AgentMessageDispatch {
+                    agent_id: request.agent_id,
+                    session_id: Some(parsed_session_id),
+                    message: &request.prompt,
                     kernel_handle,
-                    None,
-                    None,
-                )
+                    content_blocks: None,
+                    sender_id: None,
+                    sender_name: None,
+                })
                 .await
                 .map_err(|error| error.to_string()),
         };
 
         match dispatch_result {
             Ok(result) => {
-                self.complete_dispatch(
-                    &request.dispatch_id,
-                    Self::dispatch_result_json(&result),
-                    result
-                        .provider_metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.provider_resume_token.clone()),
-                )
-                .await?;
-                Ok(result)
+                let provider_resume_token = result
+                    .provider_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.provider_resume_token.clone());
+                if let Some(signal) = Self::parse_hitl_signal(&result.response) {
+                    return Ok(WorkflowDispatchCallState::HitlRequested {
+                        signal,
+                        turn_usage: result.total_usage,
+                        turn_iterations: result.iterations,
+                        provider_resume_token,
+                    });
+                }
+                Ok(WorkflowDispatchCallState::Completed(result))
             }
             Err(error) => {
                 let error_message = error.to_string();
@@ -4662,10 +4812,22 @@ impl OpenFangKernel {
         request: &WorkflowAgentDispatchRequest,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
     ) -> Result<AgentLoopResult, String> {
-        self.run_arky_workflow_dispatch_call_inner(request, kernel_handle, None, None, None)
-            .await
+        match self
+            .run_arky_workflow_dispatch_call_state_inner(request, kernel_handle, None, None, None)
+            .await?
+        {
+            WorkflowDispatchCallState::Completed(result) => {
+                self.finalize_completed_workflow_dispatch_call(&request.dispatch_id, &result)
+                    .await?;
+                Ok(result)
+            }
+            WorkflowDispatchCallState::HitlRequested { .. } => {
+                Err("workflow dispatch paused for HITL".to_string())
+            }
+        }
     }
 
+    #[cfg(test)]
     async fn run_arky_workflow_dispatch_call_inner(
         &self,
         request: &WorkflowAgentDispatchRequest,
@@ -4674,6 +4836,35 @@ impl OpenFangKernel {
         session_store_override: Option<Arc<dyn SessionStore>>,
         driver_override: Option<Arc<dyn LlmDriver>>,
     ) -> Result<AgentLoopResult, String> {
+        match self
+            .run_arky_workflow_dispatch_call_state_inner(
+                request,
+                kernel_handle,
+                runtime_override,
+                session_store_override,
+                driver_override,
+            )
+            .await?
+        {
+            WorkflowDispatchCallState::Completed(result) => {
+                self.finalize_completed_workflow_dispatch_call(&request.dispatch_id, &result)
+                    .await?;
+                Ok(result)
+            }
+            WorkflowDispatchCallState::HitlRequested { .. } => {
+                Err("workflow dispatch paused for HITL".to_string())
+            }
+        }
+    }
+
+    async fn run_arky_workflow_dispatch_call_state_inner(
+        &self,
+        request: &WorkflowAgentDispatchRequest,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        runtime_override: Option<LoadedDefinitionRuntime>,
+        session_store_override: Option<Arc<dyn SessionStore>>,
+        driver_override: Option<Arc<dyn LlmDriver>>,
+    ) -> Result<WorkflowDispatchCallState, String> {
         let entry = self
             .registry
             .get(request.agent_id)
@@ -4695,30 +4886,35 @@ impl OpenFangKernel {
         } else {
             self.open_arky_session_store().await?
         };
-        let session_id = session_store
-            .create(NewSession {
-                model_id: Some(runtime.compiled.provider_binding.model.model_id.clone()),
-                labels: BTreeMap::from([
-                    ("dispatch_id".to_string(), request.dispatch_id.clone()),
-                    ("run_id".to_string(), request.run_id.to_string()),
-                    ("step_id".to_string(), request.step_id.clone()),
-                ]),
-                ..NewSession::default()
-            })
-            .await
-            .map_err(|error| {
-                format!(
-                    "Failed to create Arky session for dispatch '{}': {error}",
-                    request.dispatch_id
-                )
-            })?;
-        let session_id_text = session_id.to_string();
+        let current_dispatch = self.load_dispatch_record(&request.dispatch_id).await?;
+        let session_id_text = if let Some(session_id) = current_dispatch.session_id.as_ref() {
+            session_id.clone()
+        } else {
+            session_store
+                .create(NewSession {
+                    model_id: Some(runtime.compiled.provider_binding.model.model_id.clone()),
+                    labels: BTreeMap::from([
+                        ("dispatch_id".to_string(), request.dispatch_id.clone()),
+                        ("run_id".to_string(), request.run_id.to_string()),
+                        ("step_id".to_string(), request.step_id.clone()),
+                    ]),
+                    ..NewSession::default()
+                })
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Failed to create Arky session for dispatch '{}': {error}",
+                        request.dispatch_id
+                    )
+                })?
+                .to_string()
+        };
 
-        self.mark_dispatch_running(
+        self.ensure_dispatch_running(
             &request.dispatch_id,
             &runtime.compiled.provider_binding.driver,
-            &session_id_text,
-            None,
+            session_id_text.as_str(),
+            current_dispatch.provider_resume_token.clone(),
         )
         .await?;
 
@@ -4742,6 +4938,7 @@ impl OpenFangKernel {
             "compozy_dispatch_session".to_string(),
             serde_json::json!({
                 "session_id": session_id_text,
+                "provider_resume_token": current_dispatch.provider_resume_token,
             }),
         );
 
@@ -4764,13 +4961,15 @@ impl OpenFangKernel {
                     .provider_metadata
                     .as_ref()
                     .and_then(|metadata| metadata.provider_resume_token.clone());
-                self.complete_dispatch(
-                    &request.dispatch_id,
-                    Self::dispatch_result_json(&result),
-                    provider_resume_token,
-                )
-                .await?;
-                Ok(result)
+                if let Some(signal) = Self::parse_hitl_signal(&result.response) {
+                    return Ok(WorkflowDispatchCallState::HitlRequested {
+                        signal,
+                        turn_usage: result.total_usage,
+                        turn_iterations: result.iterations,
+                        provider_resume_token,
+                    });
+                }
+                Ok(WorkflowDispatchCallState::Completed(result))
             }
             Err(error) => {
                 let error_message = error.to_string();
@@ -4870,19 +5069,89 @@ impl OpenFangKernel {
             return Ok(WorkflowAgentDispatchOutcome::SendAccepted);
         }
 
-        let result = if uses_arky_runtime {
-            self.run_arky_workflow_dispatch_call(&request, kernel_handle)
-                .await?
-        } else {
-            self.run_legacy_workflow_dispatch_call(&request, kernel_handle)
-                .await?
-        };
+        let mut request = request;
+        let mut total_usage = openfang_types::message::TokenUsage::default();
+        let mut total_iterations = 0u32;
 
-        Ok(WorkflowAgentDispatchOutcome::CallCompleted {
-            output: result.response,
-            input_tokens: result.total_usage.input_tokens,
-            output_tokens: result.total_usage.output_tokens,
-        })
+        loop {
+            let call_state = if uses_arky_runtime {
+                self.run_arky_workflow_dispatch_call_state_inner(
+                    &request,
+                    kernel_handle.clone(),
+                    None,
+                    None,
+                    None,
+                )
+                .await?
+            } else {
+                self.run_legacy_workflow_dispatch_call_state_inner(
+                    &request,
+                    kernel_handle.clone(),
+                    None,
+                )
+                .await?
+            };
+
+            match call_state {
+                WorkflowDispatchCallState::Completed(result) => {
+                    total_usage.input_tokens += result.total_usage.input_tokens;
+                    total_usage.output_tokens += result.total_usage.output_tokens;
+                    total_iterations += result.iterations;
+
+                    self.complete_dispatch(
+                        &request.dispatch_id,
+                        Self::aggregate_dispatch_result_json(
+                            &result.response,
+                            total_usage,
+                            total_iterations,
+                            result.silent,
+                        ),
+                        result
+                            .provider_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.provider_resume_token.clone()),
+                    )
+                    .await?;
+
+                    return Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                        output: result.response,
+                        input_tokens: total_usage.input_tokens,
+                        output_tokens: total_usage.output_tokens,
+                    });
+                }
+                WorkflowDispatchCallState::HitlRequested {
+                    signal,
+                    turn_usage,
+                    turn_iterations,
+                    provider_resume_token,
+                } => {
+                    total_usage.input_tokens += turn_usage.input_tokens;
+                    total_usage.output_tokens += turn_usage.output_tokens;
+                    total_iterations += turn_iterations;
+
+                    let (hitl_record, receiver) = self
+                        .workflows
+                        .request_hitl_pause(
+                            request.run_id,
+                            &request.step_id,
+                            &request.dispatch_id,
+                            signal,
+                            provider_resume_token,
+                        )
+                        .await?;
+                    let answer = self
+                        .workflows
+                        .wait_for_hitl_answer(&hitl_record.hitl_request_id, receiver)
+                        .await?;
+
+                    request.prompt = answer.continuation_message();
+                    request.continuation = Some(crate::workflow::WorkflowAgentContinuation {
+                        hitl_request_id: hitl_record.hitl_request_id,
+                        answer,
+                    });
+                }
+            }
+        }
     }
 
     pub async fn execute_compiled_workflow_run(
@@ -7992,6 +8261,7 @@ mod tests {
             prompt: "hello dispatch".to_string(),
             dispatch_id: uuid::Uuid::new_v4().to_string(),
             kind: openfang_memory::DispatchKind::Call,
+            continuation: None,
         }
     }
 

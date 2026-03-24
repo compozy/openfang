@@ -1,9 +1,13 @@
 //! Typed `compozy.db` repositories for durable workflow runtime state.
 
 use crate::dispatch::{
-    list_dispatch_summaries_by_run, DispatchSummaryRecord, SqliteDispatchRepository,
+    list_dispatch_summaries_by_run, resolve_update_conflict as resolve_dispatch_update_conflict,
+    update_dispatch_row, DispatchRecord, DispatchSummaryRecord, SqliteDispatchRepository,
 };
-use crate::hitl::SqliteHitlRepository;
+use crate::hitl::{
+    ensure_pending_transition, insert_hitl_request, load_required_hitl_request, next_sequence_no,
+    HitlRecord, HitlStatus, NewHitlRequest, SqliteHitlRepository,
+};
 use crate::task::{SubtaskRepository, TaskRepository};
 use chrono::Utc;
 use openfang_types::error::OpenFangError;
@@ -85,6 +89,12 @@ pub struct SubmittedSignalResume<'a> {
     pub consumed_at: &'a str,
 }
 
+pub struct HitlAnswerTransition<'a> {
+    pub hitl_request_id: &'a str,
+    pub response_json: &'a serde_json::Value,
+    pub answered_at: &'a chrono::DateTime<Utc>,
+}
+
 /// Typed failures from the workflow repository layer.
 #[derive(Debug, Error)]
 pub enum WorkflowStoreError {
@@ -100,6 +110,9 @@ pub enum WorkflowStoreError {
     /// Dispatch repository returned a typed durable dispatch error.
     #[error(transparent)]
     Dispatch(#[from] crate::dispatch::DispatchStoreError),
+    /// HITL repository returned a typed durable HITL error.
+    #[error(transparent)]
+    Hitl(#[from] crate::hitl::HitlStoreError),
     /// The requested workflow run does not exist.
     #[error("workflow run '{run_id}' was not found")]
     RunNotFound { run_id: String },
@@ -248,6 +261,8 @@ pub enum CheckpointKind {
     StepSelected,
     /// The run is durably waiting on a signal.
     WaitingSignal,
+    /// The run requested a human-in-the-loop clarification.
+    HitlRequested,
     /// The run was paused by an explicit control-plane action.
     RunPaused,
     /// The run was resumed by an explicit control-plane action.
@@ -275,6 +290,7 @@ impl CheckpointKind {
             Self::RunInterrupted => "run_interrupted",
             Self::StepSelected => "step_selected",
             Self::WaitingSignal => "waiting_signal",
+            Self::HitlRequested => "hitl_requested",
             Self::RunPaused => "run_paused",
             Self::RunResumed => "run_resumed",
             Self::RunRecoveredNeedsResume => "run_recovered_needs_resume",
@@ -298,6 +314,7 @@ impl CheckpointKind {
             "run_interrupted" => Ok(Self::RunInterrupted),
             "step_selected" => Ok(Self::StepSelected),
             "waiting_signal" => Ok(Self::WaitingSignal),
+            "hitl_requested" => Ok(Self::HitlRequested),
             "run_paused" => Ok(Self::RunPaused),
             "run_resumed" => Ok(Self::RunResumed),
             "run_recovered_needs_resume" => Ok(Self::RunRecoveredNeedsResume),
@@ -737,6 +754,193 @@ impl WorkflowRunRepository {
 
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Create a pending HITL request, park the dispatch, and update the run in
+    /// one SQLite transaction.
+    pub fn persist_hitl_pause(
+        &self,
+        current_run: &WorkflowRunRecord,
+        next_run: &WorkflowRunRecord,
+        current_dispatch: &DispatchRecord,
+        next_dispatch: &DispatchRecord,
+        request: &NewHitlRequest,
+        checkpoint: &WorkflowCheckpointRecord,
+    ) -> Result<HitlRecord, WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        let transaction = conn.unchecked_transaction()?;
+
+        let hitl_record = HitlRecord {
+            hitl_request_id: request.hitl_request_id.clone(),
+            run_id: request.run_id.clone(),
+            step_id: request.step_id.clone(),
+            dispatch_id: request.dispatch_id.clone(),
+            kind: request.kind,
+            status: HitlStatus::Pending,
+            question: request.question.clone(),
+            context_json: request.context_json.clone(),
+            response_json: None,
+            sequence_no: next_sequence_no(
+                &transaction,
+                &request.run_id,
+                &request.step_id,
+                request.dispatch_id.as_deref(),
+            )?,
+            created_at: request.created_at,
+            answered_at: None,
+            timeout_at: request.timeout_at,
+        };
+
+        insert_hitl_request(&transaction, &hitl_record)?;
+        insert_checkpoint(&transaction, checkpoint)?;
+
+        let dispatch_rows = update_dispatch_row(&transaction, current_dispatch, next_dispatch)?;
+        if dispatch_rows == 0 {
+            return Err(resolve_dispatch_update_conflict(
+                &transaction,
+                &current_dispatch.dispatch_id,
+                current_dispatch.status,
+            )
+            .into());
+        }
+
+        let run_rows =
+            update_workflow_run_record(&transaction, next_run, Some(current_run.status))?;
+        if run_rows == 0 {
+            return Err(resolve_update_conflict(
+                &transaction,
+                &current_run.run_id,
+                Some(current_run.status),
+            ));
+        }
+
+        transaction.commit()?;
+        Ok(hitl_record)
+    }
+
+    /// Answer a pending HITL request, resume the dispatch, and clear the run's
+    /// active HITL marker inside one SQLite transaction.
+    pub fn persist_hitl_answer_and_resume(
+        &self,
+        current_run: &WorkflowRunRecord,
+        next_run: &WorkflowRunRecord,
+        current_dispatch: &DispatchRecord,
+        next_dispatch: &DispatchRecord,
+        answer: HitlAnswerTransition<'_>,
+    ) -> Result<HitlRecord, WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        let transaction = conn.unchecked_transaction()?;
+        let current_hitl = load_required_hitl_request(&transaction, answer.hitl_request_id)?;
+        ensure_pending_transition(&current_hitl, HitlStatus::Answered)?;
+
+        let answered_timestamp = answer.answered_at.to_owned();
+        let answered_at = answered_timestamp.to_rfc3339();
+        let hitl_rows = transaction.execute(
+            "UPDATE hitl_request
+             SET status = ?1,
+                 response_json = ?2,
+                 answered_at = ?3
+             WHERE hitl_request_id = ?4",
+            params![
+                HitlStatus::Answered.as_str(),
+                serde_json::to_string(answer.response_json)?,
+                answered_at.as_str(),
+                answer.hitl_request_id,
+            ],
+        )?;
+        if hitl_rows == 0 {
+            return Err(WorkflowStoreError::Hitl(
+                crate::hitl::HitlStoreError::HitlRequestNotFound {
+                    hitl_request_id: answer.hitl_request_id.to_string(),
+                },
+            ));
+        }
+
+        let dispatch_rows = update_dispatch_row(&transaction, current_dispatch, next_dispatch)?;
+        if dispatch_rows == 0 {
+            return Err(resolve_dispatch_update_conflict(
+                &transaction,
+                &current_dispatch.dispatch_id,
+                current_dispatch.status,
+            )
+            .into());
+        }
+
+        let run_rows =
+            update_workflow_run_record(&transaction, next_run, Some(current_run.status))?;
+        if run_rows == 0 {
+            return Err(resolve_update_conflict(
+                &transaction,
+                &current_run.run_id,
+                Some(current_run.status),
+            ));
+        }
+
+        transaction.commit()?;
+
+        Ok(HitlRecord {
+            status: HitlStatus::Answered,
+            response_json: Some(answer.response_json.clone()),
+            answered_at: Some(answered_timestamp),
+            ..current_hitl
+        })
+    }
+
+    /// Cancel a pending HITL request, fail its dispatch, and clear the run's
+    /// active HITL marker inside one SQLite transaction.
+    pub fn persist_hitl_cancel(
+        &self,
+        current_run: &WorkflowRunRecord,
+        next_run: &WorkflowRunRecord,
+        current_dispatch: &DispatchRecord,
+        next_dispatch: &DispatchRecord,
+        hitl_request_id: &str,
+    ) -> Result<HitlRecord, WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        let transaction = conn.unchecked_transaction()?;
+        let current_hitl = load_required_hitl_request(&transaction, hitl_request_id)?;
+        ensure_pending_transition(&current_hitl, HitlStatus::Cancelled)?;
+
+        let hitl_rows = transaction.execute(
+            "UPDATE hitl_request
+             SET status = ?1
+             WHERE hitl_request_id = ?2",
+            params![HitlStatus::Cancelled.as_str(), hitl_request_id],
+        )?;
+        if hitl_rows == 0 {
+            return Err(WorkflowStoreError::Hitl(
+                crate::hitl::HitlStoreError::HitlRequestNotFound {
+                    hitl_request_id: hitl_request_id.to_string(),
+                },
+            ));
+        }
+
+        let dispatch_rows = update_dispatch_row(&transaction, current_dispatch, next_dispatch)?;
+        if dispatch_rows == 0 {
+            return Err(resolve_dispatch_update_conflict(
+                &transaction,
+                &current_dispatch.dispatch_id,
+                current_dispatch.status,
+            )
+            .into());
+        }
+
+        let run_rows =
+            update_workflow_run_record(&transaction, next_run, Some(current_run.status))?;
+        if run_rows == 0 {
+            return Err(resolve_update_conflict(
+                &transaction,
+                &current_run.run_id,
+                Some(current_run.status),
+            ));
+        }
+
+        transaction.commit()?;
+
+        Ok(HitlRecord {
+            status: HitlStatus::Cancelled,
+            ..current_hitl
+        })
     }
 }
 
