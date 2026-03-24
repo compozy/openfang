@@ -2,6 +2,7 @@
 
 use crate::types::AgentResponse;
 use openfang_agent_definition::stage4_normalize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -18,10 +19,6 @@ impl AgentDefinitionStore {
 
     fn definition_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.toml"))
-    }
-
-    fn temp_path(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.toml.tmp"))
     }
 
     fn deserialize_definition(content: &str, path: &Path) -> Result<AgentResponse, String> {
@@ -100,22 +97,36 @@ impl AgentDefinitionStore {
             )
         })?;
         let path = self.definition_path(&definition.definition.id);
-        let tmp_path = self.temp_path(&definition.definition.id);
+        let mut temp_file = tempfile::Builder::new()
+            .prefix(&definition.definition.id)
+            .suffix(".toml.tmp")
+            .tempfile_in(&self.dir)
+            .map_err(|error| {
+                format!(
+                    "Failed to create temporary agent definition near '{}': {error}",
+                    path.display()
+                )
+            })?;
 
-        std::fs::write(&tmp_path, payload.as_bytes()).map_err(|error| {
+        temp_file.write_all(payload.as_bytes()).map_err(|error| {
             format!(
                 "Failed to write temporary agent definition '{}': {error}",
-                tmp_path.display()
+                path.display()
+            )
+        })?;
+        temp_file.flush().map_err(|error| {
+            format!(
+                "Failed to flush temporary agent definition '{}': {error}",
+                path.display()
             )
         })?;
 
-        if let Err(error) = std::fs::rename(&tmp_path, &path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(format!(
+        temp_file.persist(&path).map_err(|error| {
+            format!(
                 "Failed to replace agent definition '{}': {error}",
                 path.display()
-            ));
-        }
+            )
+        })?;
 
         let persisted = std::fs::read_to_string(&path).map_err(|error| {
             format!(

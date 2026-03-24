@@ -2,6 +2,7 @@
 
 use crate::agent_definitions::AgentDefinitionStore;
 use crate::types::*;
+use crate::workflow_definitions::{canonicalize_workflow_definition, WorkflowDefinitionStore};
 use axum::extract::{rejection::JsonRejection, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -20,7 +21,7 @@ use openfang_kernel::workflow::{
 };
 use openfang_kernel::workflow_compiler::{
     compile_workflow_definition, normalize_workflow_definition, validate_normalized_workflow,
-    validate_workflow_definition, WorkflowCompileError,
+    validate_workflow_value, WorkflowCompileError,
 };
 use openfang_kernel::{AgentMessageDispatch, OpenFangKernel};
 use openfang_memory::{AgentRuntimeRecord, AgentSessionRecord};
@@ -28,9 +29,12 @@ use openfang_memory::{WorkflowRunListQuery, WorkflowRunStatus, WorkflowSignalRec
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest, AgentState, SessionId};
+use openfang_types::workflow::{WorkflowIr, WorkflowIrStepKind};
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct RunListQueryParams {
@@ -58,6 +62,48 @@ pub struct AgentSessionDetailQuery {
     pub include_messages: Option<bool>,
     #[serde(default)]
     pub include_context: Option<bool>,
+}
+
+const DEFAULT_PAGE_LIMIT: usize = 50;
+const MAX_PAGE_LIMIT: usize = 200;
+static WORKFLOW_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct WorkflowListQueryParams {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub sort: Option<String>,
+    #[serde(default)]
+    pub order: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default, rename = "q")]
+    pub search: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct WorkflowRunsListQueryParams {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub sort: Option<String>,
+    #[serde(default)]
+    pub order: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowRunPageQuery {
+    limit: usize,
+    offset: usize,
+    sort: String,
+    order: Ordering,
 }
 
 impl AgentSessionDetailQuery {
@@ -3405,7 +3451,7 @@ fn workflow_v2_error_response(
             "error": {
                 "code": code,
                 "message": message.into(),
-                "details": details.unwrap_or(serde_json::Value::Null),
+                "details": details.unwrap_or_else(|| serde_json::json!([])),
             }
         })),
     )
@@ -3457,13 +3503,28 @@ fn workflow_v2_compile_error_response(
     )
 }
 
-fn workflow_v2_available_agent_refs(state: &AppState) -> BTreeSet<String> {
+async fn workflow_v2_available_agent_refs(
+    state: &AppState,
+) -> Result<BTreeSet<String>, (StatusCode, Json<serde_json::Value>)> {
+    let stored_definitions = agent_definition_store(state).list().map_err(|error| {
+        workflow_store_load_error_response(
+            "definition_load_failed",
+            "Failed to load agent definitions",
+            error,
+        )
+    })?;
+
     let mut agents = BTreeSet::new();
+    for definition in stored_definitions {
+        agents.insert(definition.definition.id);
+        agents.insert(definition.definition.name);
+    }
     for entry in state.kernel.registry.list() {
         agents.insert(entry.id.to_string());
         agents.insert(entry.name);
     }
-    agents
+
+    Ok(agents)
 }
 
 fn workflow_v2_is_valid(
@@ -3475,6 +3536,774 @@ fn workflow_v2_is_valid(
     } else {
         !issues.iter().any(|issue| issue.severity.is_error())
     }
+}
+
+fn workflow_definition_store(state: &AppState) -> WorkflowDefinitionStore {
+    WorkflowDefinitionStore::new(&state.kernel.config.home_dir)
+}
+
+fn workflow_definition_id_is_safe(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn ensure_safe_workflow_definition_id(
+    id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if workflow_definition_id_is_safe(id) {
+        return Ok(());
+    }
+
+    Err(workflow_v2_error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        "Workflow definition IDs may only contain ASCII letters, digits, `.`, `_`, or `-`",
+        Some(serde_json::json!([{
+            "path": "id",
+            "value": id,
+        }])),
+    ))
+}
+
+fn workflow_definition_not_found_response() -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Workflow definition not found",
+        None,
+    )
+}
+
+fn workflow_pack_conflict_response(id: &str) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::CONFLICT,
+        "managed_definition_conflict",
+        "Managed pack workflow definitions must be forked before modification",
+        Some(serde_json::json!([{
+            "path": "id",
+            "value": id,
+            "action": "fork",
+        }])),
+    )
+}
+
+fn workflow_store_load_error_response(
+    code: &str,
+    message: &str,
+    error: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        code,
+        message,
+        Some(serde_json::json!([{
+            "message": error.into(),
+        }])),
+    )
+}
+
+fn workflow_run_summary(record: &openfang_memory::WorkflowRunRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": record.run_id,
+        "status": record.status.as_str(),
+        "current_step_id": record.current_step_id,
+        "started_at": record.started_at,
+        "updated_at": record.updated_at,
+    })
+}
+
+fn load_workflow_definition_resource(
+    state: &AppState,
+    definition_id: &str,
+) -> Result<Option<WorkflowResponse>, (StatusCode, Json<serde_json::Value>)> {
+    workflow_definition_store(state)
+        .load(definition_id)
+        .map_err(|error| {
+            workflow_store_load_error_response(
+                "definition_load_failed",
+                "Failed to load workflow definition",
+                error,
+            )
+        })
+}
+
+fn load_all_workflow_definition_resources(
+    state: &AppState,
+) -> Result<Vec<WorkflowResponse>, (StatusCode, Json<serde_json::Value>)> {
+    workflow_definition_store(state).list().map_err(|error| {
+        workflow_store_load_error_response(
+            "definition_load_failed",
+            "Failed to load workflow definitions",
+            error,
+        )
+    })
+}
+
+async fn workflow_compile_registry(
+    state: &AppState,
+    additional_workflows: impl IntoIterator<Item = String>,
+) -> Result<
+    openfang_kernel::workflow_compiler::WorkflowCompileRegistry,
+    (StatusCode, Json<serde_json::Value>),
+> {
+    let resources = load_all_workflow_definition_resources(state)?;
+    let workflow_ids = resources
+        .into_iter()
+        .map(|resource| resource.definition.id)
+        .chain(additional_workflows);
+    let agent_refs = workflow_v2_available_agent_refs(state).await?;
+    Ok(state
+        .kernel
+        .workflows
+        .build_compile_registry(agent_refs, workflow_ids)
+        .await)
+}
+
+async fn compile_workflow_resource(
+    state: &AppState,
+    resource: &WorkflowResponse,
+) -> Result<WorkflowIr, (StatusCode, Json<serde_json::Value>)> {
+    let registry =
+        workflow_compile_registry(state, std::iter::once(resource.definition.id.clone())).await?;
+    compile_workflow_definition(&resource.definition, &registry)
+        .map_err(|error| workflow_v2_compile_error_response(&error))
+}
+
+fn workflow_runtime_counts(
+    runs: &[openfang_memory::WorkflowRunRecord],
+) -> (usize, usize, Option<String>) {
+    let mut active_runs = 0usize;
+    let mut waiting_runs = 0usize;
+    let mut last_run_at = None;
+
+    for run in runs {
+        match run.status {
+            WorkflowRunStatus::Running => active_runs += 1,
+            WorkflowRunStatus::Pending
+            | WorkflowRunStatus::WaitingSignal
+            | WorkflowRunStatus::WaitingHitl => waiting_runs += 1,
+            WorkflowRunStatus::Paused
+            | WorkflowRunStatus::Completed
+            | WorkflowRunStatus::Failed
+            | WorkflowRunStatus::Cancelled => {}
+        }
+
+        if last_run_at
+            .as_ref()
+            .map(|current: &String| run.started_at > *current)
+            .unwrap_or(true)
+        {
+            last_run_at = Some(run.started_at.clone());
+        }
+    }
+
+    (active_runs, waiting_runs, last_run_at)
+}
+
+fn parse_pagination_limit(
+    limit: Option<usize>,
+) -> Result<usize, (StatusCode, Json<serde_json::Value>)> {
+    match limit.unwrap_or(DEFAULT_PAGE_LIMIT) {
+        0 => Err(workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "`limit` must be greater than zero",
+            Some(serde_json::json!([{
+                "path": "limit",
+            }])),
+        )),
+        value => Ok(value.min(MAX_PAGE_LIMIT)),
+    }
+}
+
+fn parse_cursor_offset(
+    cursor: Option<&str>,
+) -> Result<usize, (StatusCode, Json<serde_json::Value>)> {
+    cursor
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map(|value| value.unwrap_or(0))
+        .map_err(|_| {
+            workflow_v2_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "`cursor` must be an unsigned integer offset",
+                Some(serde_json::json!([{
+                    "path": "cursor",
+                    "value": cursor,
+                }])),
+            )
+        })
+}
+
+fn parse_sort_order(
+    order: Option<&str>,
+) -> Result<Ordering, (StatusCode, Json<serde_json::Value>)> {
+    match order.unwrap_or("asc") {
+        "asc" => Ok(Ordering::Less),
+        "desc" => Ok(Ordering::Greater),
+        value => Err(workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "`order` must be either `asc` or `desc`",
+            Some(serde_json::json!([{
+                "path": "order",
+                "value": value,
+            }])),
+        )),
+    }
+}
+
+fn reverse_if_desc(ordering: Ordering, order: Ordering) -> Ordering {
+    match order {
+        Ordering::Less => ordering,
+        Ordering::Greater => ordering.reverse(),
+        Ordering::Equal => ordering,
+    }
+}
+
+fn workflow_dry_run_initial_dispatches(workflow_ir: &WorkflowIr) -> usize {
+    workflow_ir
+        .steps
+        .first()
+        .map(|step| {
+            usize::from(matches!(
+                step.kind,
+                WorkflowIrStepKind::Agent { .. }
+                    | WorkflowIrStepKind::Primitive { .. }
+                    | WorkflowIrStepKind::Workflow { .. }
+                    | WorkflowIrStepKind::StartLooper { .. }
+                    | WorkflowIrStepKind::EmitEvent { .. }
+            ))
+        })
+        .unwrap_or(0)
+}
+
+fn workflow_run_list_query(
+    id: &str,
+    params: &WorkflowRunsListQueryParams,
+) -> Result<WorkflowRunPageQuery, (StatusCode, Json<serde_json::Value>)> {
+    let limit = parse_pagination_limit(params.limit)?;
+    let offset = parse_cursor_offset(params.cursor.as_deref())?;
+    let sort = params
+        .sort
+        .clone()
+        .unwrap_or_else(|| "updated_at".to_string());
+    if !matches!(sort.as_str(), "id" | "status" | "started_at" | "updated_at") {
+        return Err(workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Unsupported workflow run sort field",
+            Some(serde_json::json!([{
+                "path": "sort",
+                "value": sort,
+                "workflow_id": id,
+            }])),
+        ));
+    }
+    let order = parse_sort_order(params.order.as_deref())?;
+    Ok(WorkflowRunPageQuery {
+        limit,
+        offset,
+        sort,
+        order,
+    })
+}
+
+fn sort_workflow_run_records(
+    runs: &mut [openfang_memory::WorkflowRunRecord],
+    sort: &str,
+    order: Ordering,
+) {
+    runs.sort_by(|left, right| {
+        let ordering = match sort {
+            "id" => left.run_id.cmp(&right.run_id),
+            "status" => left.status.as_str().cmp(right.status.as_str()),
+            "started_at" => left.started_at.cmp(&right.started_at),
+            "updated_at" => left.updated_at.cmp(&right.updated_at),
+            _ => left.updated_at.cmp(&right.updated_at),
+        };
+        reverse_if_desc(ordering, order).then_with(|| left.run_id.cmp(&right.run_id))
+    });
+}
+
+/// GET /api/v1/workflows — List file-backed workflow definitions.
+pub async fn list_workflow_definitions_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<WorkflowListQueryParams>,
+) -> impl IntoResponse {
+    let limit = match parse_pagination_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
+    let offset = match parse_cursor_offset(params.cursor.as_deref()) {
+        Ok(offset) => offset,
+        Err(response) => return response,
+    };
+    let sort = params.sort.unwrap_or_else(|| "id".to_string());
+    if !matches!(sort.as_str(), "id" | "name" | "updated_at") {
+        return workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Unsupported workflow sort field",
+            Some(serde_json::json!([{
+                "path": "sort",
+                "value": sort,
+            }])),
+        );
+    }
+    let order = match parse_sort_order(params.order.as_deref()) {
+        Ok(order) => order,
+        Err(response) => return response,
+    };
+
+    let definitions = match load_all_workflow_definition_resources(&state) {
+        Ok(definitions) => definitions,
+        Err(response) => return response,
+    };
+    let runs = match state
+        .kernel
+        .workflow_stores
+        .workflow_run
+        .list_non_terminal()
+    {
+        Ok(runs) => runs,
+        Err(error) => {
+            return workflow_store_load_error_response(
+                "runtime_status_failed",
+                "Failed to load workflow runtime status",
+                error.to_string(),
+            )
+        }
+    };
+
+    let mut runtime_by_workflow = HashMap::<String, (usize, usize)>::new();
+    for run in runs {
+        let entry = runtime_by_workflow
+            .entry(run.workflow_id.clone())
+            .or_insert((0usize, 0usize));
+        match run.status {
+            WorkflowRunStatus::Running => entry.0 += 1,
+            WorkflowRunStatus::Pending
+            | WorkflowRunStatus::WaitingSignal
+            | WorkflowRunStatus::WaitingHitl => entry.1 += 1,
+            WorkflowRunStatus::Paused
+            | WorkflowRunStatus::Completed
+            | WorkflowRunStatus::Failed
+            | WorkflowRunStatus::Cancelled => {}
+        }
+    }
+
+    let search = params.search.map(|value| value.to_lowercase());
+    let tag = params.tag.map(|value| value.to_lowercase());
+    let mut items = definitions
+        .into_iter()
+        .filter(|resource| {
+            params
+                .enabled
+                .map(|enabled| resource.definition.enabled == enabled)
+                .unwrap_or(true)
+        })
+        .filter(|resource| {
+            tag.as_ref().is_none_or(|expected| {
+                resource
+                    .definition
+                    .tags
+                    .iter()
+                    .any(|candidate| candidate.to_lowercase() == *expected)
+            })
+        })
+        .filter(|resource| {
+            search.as_ref().is_none_or(|needle| {
+                resource.definition.id.to_lowercase().contains(needle)
+                    || resource.definition.name.to_lowercase().contains(needle)
+                    || resource
+                        .definition
+                        .description
+                        .to_lowercase()
+                        .contains(needle)
+                    || resource
+                        .definition
+                        .tags
+                        .iter()
+                        .any(|tag| tag.to_lowercase().contains(needle))
+            })
+        })
+        .map(|resource| {
+            let (active_runs, waiting_runs) = runtime_by_workflow
+                .get(&resource.definition.id)
+                .copied()
+                .unwrap_or((0, 0));
+            WorkflowListItem {
+                id: resource.definition.id.clone(),
+                name: resource.definition.name.clone(),
+                description: resource.definition.description.clone(),
+                enabled: resource.definition.enabled,
+                tags: resource.definition.tags.clone(),
+                steps: resource.definition.steps.len(),
+                origin: resource.origin.clone(),
+                runtime_status: WorkflowListRuntimeStatus {
+                    loaded: true,
+                    active_runs,
+                    waiting_runs,
+                },
+                updated_at: resource.updated_at,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    items.sort_by(|left, right| {
+        let ordering = match sort.as_str() {
+            "name" => left.name.cmp(&right.name),
+            "updated_at" => left.updated_at.cmp(&right.updated_at),
+            _ => left.id.cmp(&right.id),
+        };
+        reverse_if_desc(ordering, order).then_with(|| left.id.cmp(&right.id))
+    });
+
+    let next_cursor = if offset + limit < items.len() {
+        Some((offset + limit).to_string())
+    } else {
+        None
+    };
+    let items = items
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(WorkflowListResponse {
+            items,
+            next_cursor
+        })),
+    )
+}
+
+/// POST /api/v1/workflows — Create and persist a workflow definition.
+pub async fn create_workflow_definition_v1(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(body) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let _write_guard = WORKFLOW_DEFINITION_WRITE_LOCK.lock().await;
+    let requested_id = body
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_default();
+    if !requested_id.is_empty() {
+        if let Err(response) = ensure_safe_workflow_definition_id(&requested_id) {
+            return response;
+        }
+    }
+
+    let registry = match workflow_compile_registry(
+        &state,
+        std::iter::once(requested_id.clone()).filter(|id| !id.is_empty()),
+    )
+    .await
+    {
+        Ok(registry) => registry,
+        Err(response) => return response,
+    };
+    let definition = match validate_workflow_value(&body, &registry) {
+        Ok(definition) => definition,
+        Err(error) => return workflow_v2_compile_error_response(&error),
+    };
+    if let Err(response) = ensure_safe_workflow_definition_id(&definition.id) {
+        return response;
+    }
+
+    let store = workflow_definition_store(&state);
+    match store.load(&definition.id) {
+        Ok(Some(existing)) if existing.origin.kind == WorkflowOriginKind::Pack => {
+            return workflow_pack_conflict_response(&definition.id)
+        }
+        Ok(Some(_)) => {
+            return workflow_v2_error_response(
+                StatusCode::CONFLICT,
+                "already_exists",
+                "Workflow definition already exists",
+                Some(serde_json::json!([{
+                    "path": "id",
+                    "value": definition.id,
+                }])),
+            )
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return workflow_store_load_error_response(
+                "definition_load_failed",
+                "Failed to load workflow definition",
+                error,
+            )
+        }
+    }
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let resource = WorkflowResponse {
+        definition: canonicalize_workflow_definition(definition),
+        origin: WorkflowOrigin::user(),
+        forked_from: None,
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+    let compiled = match compile_workflow_resource(&state, &resource).await {
+        Ok(compiled) => compiled,
+        Err(response) => return response,
+    };
+
+    if let Err(error) = store.persist(&resource) {
+        return workflow_store_load_error_response(
+            "definition_persist_failed",
+            "Failed to persist workflow definition",
+            error,
+        );
+    }
+    state
+        .kernel
+        .workflows
+        .upsert_workflow_v2_definition(resource.definition.clone(), compiled)
+        .await;
+
+    (StatusCode::CREATED, Json(serde_json::json!(resource)))
+}
+
+/// GET /api/v1/workflows/{id} — Load one persisted workflow definition.
+pub async fn get_workflow_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_workflow_definition_id(&id) {
+        return response;
+    }
+
+    match load_workflow_definition_resource(&state, &id) {
+        Ok(Some(resource)) => (StatusCode::OK, Json(serde_json::json!(resource))),
+        Ok(None) => workflow_definition_not_found_response(),
+        Err(response) => response,
+    }
+}
+
+/// PUT /api/v1/workflows/{id} — Replace one persisted workflow definition.
+pub async fn update_workflow_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_workflow_definition_id(&id) {
+        return response;
+    }
+
+    let Json(body) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let _write_guard = WORKFLOW_DEFINITION_WRITE_LOCK.lock().await;
+    let registry = match workflow_compile_registry(&state, std::iter::once(id.clone())).await {
+        Ok(registry) => registry,
+        Err(response) => return response,
+    };
+    let definition = match validate_workflow_value(&body, &registry) {
+        Ok(definition) => definition,
+        Err(error) => return workflow_v2_compile_error_response(&error),
+    };
+
+    if definition.id != id {
+        return workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Path ID and body ID must match",
+            Some(serde_json::json!([{
+                "path": "id",
+                "expected": id,
+                "actual": definition.id,
+            }])),
+        );
+    }
+
+    let store = workflow_definition_store(&state);
+    let existing = match store.load(&id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return workflow_definition_not_found_response(),
+        Err(error) => {
+            return workflow_store_load_error_response(
+                "definition_load_failed",
+                "Failed to load workflow definition",
+                error,
+            )
+        }
+    };
+    if existing.origin.kind == WorkflowOriginKind::Pack {
+        return workflow_pack_conflict_response(&id);
+    }
+
+    let resource = WorkflowResponse {
+        definition: canonicalize_workflow_definition(definition),
+        origin: existing.origin,
+        forked_from: existing.forked_from,
+        created_at: existing.created_at,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let compiled = match compile_workflow_resource(&state, &resource).await {
+        Ok(compiled) => compiled,
+        Err(response) => return response,
+    };
+
+    if let Err(error) = store.persist(&resource) {
+        return workflow_store_load_error_response(
+            "definition_persist_failed",
+            "Failed to persist workflow definition",
+            error,
+        );
+    }
+    state
+        .kernel
+        .workflows
+        .upsert_workflow_v2_definition(resource.definition.clone(), compiled)
+        .await;
+
+    (StatusCode::OK, Json(serde_json::json!(resource)))
+}
+
+/// DELETE /api/v1/workflows/{id} — Delete one persisted workflow definition.
+pub async fn delete_workflow_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_workflow_definition_id(&id) {
+        return response.into_response();
+    }
+    let _write_guard = WORKFLOW_DEFINITION_WRITE_LOCK.lock().await;
+
+    let store = workflow_definition_store(&state);
+    let existing = match store.load(&id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return workflow_definition_not_found_response().into_response(),
+        Err(error) => {
+            return workflow_store_load_error_response(
+                "definition_load_failed",
+                "Failed to load workflow definition",
+                error,
+            )
+            .into_response()
+        }
+    };
+    if existing.origin.kind == WorkflowOriginKind::Pack {
+        return workflow_pack_conflict_response(&id).into_response();
+    }
+
+    match store.delete(&id) {
+        Ok(true) => {}
+        Ok(false) => return workflow_definition_not_found_response().into_response(),
+        Err(error) => {
+            return workflow_store_load_error_response(
+                "definition_delete_failed",
+                "Failed to delete workflow definition",
+                error,
+            )
+            .into_response()
+        }
+    }
+    state
+        .kernel
+        .workflows
+        .remove_workflow_v2_definition(&id)
+        .await;
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// POST /api/v1/workflows/{id}/fork — Shadow a managed pack workflow with a user-owned copy.
+pub async fn fork_workflow_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<WorkflowForkRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_workflow_definition_id(&id) {
+        return response;
+    }
+
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let _write_guard = WORKFLOW_DEFINITION_WRITE_LOCK.lock().await;
+    if request.mode != "shadow" {
+        return workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Workflow forks currently support only `shadow` mode",
+            Some(serde_json::json!([{
+                "path": "mode",
+                "value": request.mode,
+            }])),
+        );
+    }
+
+    let store = workflow_definition_store(&state);
+    let existing = match store.load(&id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return workflow_definition_not_found_response(),
+        Err(error) => {
+            return workflow_store_load_error_response(
+                "definition_load_failed",
+                "Failed to load workflow definition",
+                error,
+            )
+        }
+    };
+    if existing.origin.kind != WorkflowOriginKind::Pack {
+        return workflow_v2_error_response(
+            StatusCode::CONFLICT,
+            "invalid_fork_source",
+            "Only managed pack workflow definitions can be forked",
+            Some(serde_json::json!([{
+                "workflow_id": id,
+            }])),
+        );
+    }
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let resource = WorkflowResponse {
+        definition: existing.definition.clone(),
+        origin: WorkflowOrigin::user(),
+        forked_from: Some(WorkflowForkedFrom {
+            kind: existing.origin.kind,
+            pack_id: existing.origin.pack_id.clone(),
+            pack_version: existing.origin.pack_version.clone(),
+            resource_type: "workflow".to_string(),
+            resource_id: id.clone(),
+        }),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+    let compiled = match compile_workflow_resource(&state, &resource).await {
+        Ok(compiled) => compiled,
+        Err(response) => return response,
+    };
+
+    if let Err(error) = store.persist(&resource) {
+        return workflow_store_load_error_response(
+            "definition_persist_failed",
+            "Failed to persist workflow definition",
+            error,
+        );
+    }
+    state
+        .kernel
+        .workflows
+        .upsert_workflow_v2_definition(resource.definition.clone(), compiled)
+        .await;
+
+    (StatusCode::OK, Json(serde_json::json!(resource)))
 }
 
 fn workflow_from_request(
@@ -3599,26 +4428,28 @@ pub async fn validate_workflow(
         context: _context,
     } = request;
     let strict = strict.unwrap_or(false);
-    let registry = state
-        .kernel
-        .workflows
-        .build_compile_registry(
-            workflow_v2_available_agent_refs(&state),
-            std::iter::once(definition.id.clone()),
-        )
-        .await;
+    let additional_workflow = definition
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let registry = match workflow_compile_registry(&state, additional_workflow.into_iter()).await {
+        Ok(registry) => registry,
+        Err(response) => return response,
+    };
 
-    let mut issues = validate_workflow_definition(&definition, &registry);
-    let mut normalized = None;
-
-    if !issues.iter().any(|issue| issue.severity.is_error()) {
-        let candidate = normalize_workflow_definition(&definition);
-        issues.extend(validate_normalized_workflow(&candidate));
-
-        if !issues.iter().any(|issue| issue.severity.is_error()) {
-            normalized = Some(candidate);
+    let (issues, normalized) = match validate_workflow_value(&definition, &registry) {
+        Ok(definition) => {
+            let candidate = normalize_workflow_definition(&definition);
+            let issues = validate_normalized_workflow(&candidate);
+            let normalized = if issues.iter().any(|issue| issue.severity.is_error()) {
+                None
+            } else {
+                Some(candidate)
+            };
+            (issues, normalized)
         }
-    }
+        Err(error) => (error.issues().to_vec(), None),
+    };
 
     let valid = workflow_v2_is_valid(&issues, strict);
 
@@ -3646,102 +4477,104 @@ pub async fn compile_workflow(
         definition,
         context: _context,
     } = request;
-    let registry = state
-        .kernel
-        .workflows
-        .build_compile_registry(
-            workflow_v2_available_agent_refs(&state),
-            std::iter::once(definition.id.clone()),
-        )
-        .await;
+    let additional_workflow = definition
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let registry = match workflow_compile_registry(&state, additional_workflow.into_iter()).await {
+        Ok(registry) => registry,
+        Err(response) => return response,
+    };
+    let definition = match validate_workflow_value(&definition, &registry) {
+        Ok(definition) => definition,
+        Err(error) => return workflow_v2_compile_error_response(&error),
+    };
 
     match compile_workflow_definition(&definition, &registry) {
-        Ok(workflow_ir) => {
-            let definition_id = definition.id.clone();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!(WorkflowCompileResponse {
-                    definition_id,
-                    normalized: normalize_workflow_definition(&definition),
-                    compiled: WorkflowCompiledPayload { workflow_ir },
-                })),
-            )
-        }
+        Ok(workflow_ir) => (
+            StatusCode::OK,
+            Json(serde_json::json!(WorkflowCompileResponse {
+                definition_id: definition.id.clone(),
+                normalized: normalize_workflow_definition(&definition),
+                compiled: WorkflowCompiledPayload { workflow_ir },
+            })),
+        ),
         Err(error) => workflow_v2_compile_error_response(&error),
     }
 }
 
-/// GET /api/v1/workflows/{id}/compiled — Return the cached compiled IR.
+/// GET /api/v1/workflows/{id}/compiled — Return the compiled IR for one persisted
+/// workflow definition.
 pub async fn get_workflow_compiled(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.kernel.workflows.get_compiled_workflow(&id).await {
-        Some(workflow_ir) => {
-            let definition_id = workflow_ir.workflow_id.clone();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!(WorkflowCompiledResponse {
-                    definition_id,
-                    compiled: WorkflowCompiledPayload { workflow_ir },
-                })),
-            )
-        }
-        None => workflow_v2_error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "Workflow not found",
-            None,
+    if let Err(response) = ensure_safe_workflow_definition_id(&id) {
+        return response;
+    }
+
+    let resource = match load_workflow_definition_resource(&state, &id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return workflow_definition_not_found_response(),
+        Err(response) => return response,
+    };
+    match compile_workflow_resource(&state, &resource).await {
+        Ok(workflow_ir) => (
+            StatusCode::OK,
+            Json(serde_json::json!(WorkflowCompiledResponse {
+                definition_id: resource.definition.id.clone(),
+                normalized: normalize_workflow_definition(&resource.definition),
+                compiled: WorkflowCompiledPayload { workflow_ir },
+            })),
         ),
+        Err(response) => response,
     }
 }
 
 /// GET /api/v1/workflows/:id/runtime — Get workflow runtime status.
-pub async fn get_workflow_runtime(
+pub async fn get_workflow_runtime_v1(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let workflow_id = WorkflowId(match id.parse() {
-        Ok(u) => u,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid workflow ID"})),
-            );
+    if let Err(response) = ensure_safe_workflow_definition_id(&id) {
+        return response;
+    }
+
+    match load_workflow_definition_resource(&state, &id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return workflow_definition_not_found_response(),
+        Err(response) => return response,
+    }
+
+    let runs = match state
+        .kernel
+        .workflow_stores
+        .workflow_run
+        .list_for_workflow(&id)
+    {
+        Ok(runs) => runs,
+        Err(error) => {
+            return workflow_store_load_error_response(
+                "runtime_status_failed",
+                "Failed to load workflow runtime status",
+                error.to_string(),
+            )
         }
-    });
+    };
+    let (active_runs, waiting_runs, last_run_at) = workflow_runtime_counts(&runs);
+    let loaded = true;
 
-    if !state.kernel.workflows.is_ready() {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "workflow_id": workflow_id.to_string(),
-                "loaded": false,
-                "healthy": false,
-                "active_runs": 0,
-                "waiting_runs": 0,
-                "last_run_at": serde_json::Value::Null,
-            })),
-        );
-    }
-
-    match state.kernel.workflows.runtime_status(workflow_id).await {
-        Some(runtime) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "workflow_id": runtime.workflow_id.to_string(),
-                "loaded": runtime.loaded,
-                "healthy": runtime.healthy,
-                "active_runs": runtime.active_runs,
-                "waiting_runs": runtime.waiting_runs,
-                "last_run_at": runtime.last_run_at.map(|value| value.to_rfc3339()),
-            })),
-        ),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Workflow not found"})),
-        ),
-    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(WorkflowRuntimeResponse {
+            workflow_id: id,
+            loaded,
+            healthy: true,
+            active_runs,
+            waiting_runs,
+            last_run_at,
+        })),
+    )
 }
 
 /// POST /api/workflows/:id/run — Execute a workflow.
@@ -3786,67 +4619,112 @@ pub async fn run_workflow(
 pub async fn start_workflow_run_v1(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<serde_json::Value>,
+    payload: Result<Json<WorkflowRunRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    let workflow_id = WorkflowId(match id.parse() {
-        Ok(value) => value,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "invalid_workflow_id",
-                        "message": "Invalid workflow ID",
-                        "details": [],
-                    }
-                })),
-            );
-        }
-    });
+    if let Err(response) = ensure_safe_workflow_definition_id(&id) {
+        return response;
+    }
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let resource = match load_workflow_definition_resource(&state, &id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return workflow_definition_not_found_response(),
+        Err(response) => return response,
+    };
+    let workflow_ir = match compile_workflow_resource(&state, &resource).await {
+        Ok(workflow_ir) => workflow_ir,
+        Err(response) => return response,
+    };
 
-    let input = serde_json::to_string(req.get("input").unwrap_or(&serde_json::Value::Null))
-        .unwrap_or_else(|_| "null".to_string());
-    let labels = req
-        .get("labels")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let metadata = req
-        .get("metadata")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
+    let input = match serde_json::to_string(&req.input) {
+        Ok(input) => input,
+        Err(error) => {
+            return workflow_v2_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Workflow input must be valid JSON",
+                Some(serde_json::json!([{
+                    "path": "input",
+                    "message": error.to_string(),
+                }])),
+            )
+        }
+    };
 
     match state
         .kernel
-        .run_workflow_with_context(workflow_id, input, labels, metadata)
+        .workflows
+        .create_run_from_compiled_workflow(
+            workflow_ir.workflow_id.clone(),
+            resource.definition.name.clone(),
+            workflow_ir.workflow_version.clone(),
+            input,
+            req.labels,
+            req.metadata,
+        )
         .await
     {
-        Ok((run_id, _output)) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({
-                "accepted": true,
-                "resource_id": id,
-                "status": "accepted",
-                "run_id": run_id.to_string(),
-            })),
-        ),
+        Ok(run_id) => {
+            let workflow_ir_for_task = workflow_ir.clone();
+            let kernel = Arc::clone(&state.kernel);
+            let definition_id = id.clone();
+            tokio::spawn(async move {
+                let resolver = |agent_ref: &str| -> Option<(AgentId, String)> {
+                    if let Ok(agent_id) = agent_ref.parse::<AgentId>() {
+                        let entry = kernel.registry.get(agent_id)?;
+                        return Some((agent_id, entry.name.clone()));
+                    }
+
+                    let entry = kernel.registry.find_by_name(agent_ref)?;
+                    Some((entry.id, entry.name.clone()))
+                };
+                let send_message = |agent_id: AgentId, message: String| {
+                    let kernel = Arc::clone(&kernel);
+                    async move {
+                        kernel
+                            .send_message(agent_id, &message)
+                            .await
+                            .map(|response| {
+                                (
+                                    response.response,
+                                    response.total_usage.input_tokens,
+                                    response.total_usage.output_tokens,
+                                )
+                            })
+                            .map_err(|error| format!("{error}"))
+                    }
+                };
+
+                if let Err(error) = kernel
+                    .workflows
+                    .execute_run(run_id, workflow_ir_for_task, resolver, send_message)
+                    .await
+                {
+                    tracing::warn!(workflow_id = %definition_id, run_id = %run_id, "Workflow execution failed: {error}");
+                }
+            });
+
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "accepted": true,
+                    "resource_id": id,
+                    "status": "accepted",
+                    "run_id": run_id.to_string(),
+                })),
+            )
+        }
         Err(error) => {
             tracing::warn!("Workflow run failed for {id}: {error}");
-            (
+            workflow_v2_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "workflow_execution_failed",
-                        "message": "Workflow execution failed",
-                        "details": [],
-                    }
-                })),
+                "workflow_execution_failed",
+                "Workflow execution failed",
+                Some(serde_json::json!([{
+                    "message": error.to_string(),
+                }])),
             )
         }
     }
@@ -3881,34 +4759,106 @@ pub async fn list_workflow_runs(
 pub async fn list_workflow_runs_v1(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(params): Query<WorkflowRunsListQueryParams>,
 ) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_workflow_definition_id(&id) {
+        return response;
+    }
+    match load_workflow_definition_resource(&state, &id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return workflow_definition_not_found_response(),
+        Err(response) => return response,
+    }
+
+    let query = match workflow_run_list_query(&id, &params) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+
     match state
         .kernel
         .workflow_stores
         .workflow_run
         .list_for_workflow(&id)
     {
-        Ok(runs) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "items": runs.iter().map(run_record_to_summary).collect::<Vec<_>>(),
-                "next_cursor": serde_json::Value::Null,
-            })),
-        ),
-        Err(error) => {
-            tracing::warn!("Failed to list durable workflow runs for {id}: {error}");
+        Ok(mut runs) => {
+            sort_workflow_run_records(&mut runs, &query.sort, query.order);
+            let next_cursor = if query.offset + query.limit < runs.len() {
+                Some((query.offset + query.limit).to_string())
+            } else {
+                None
+            };
+            let items = runs
+                .into_iter()
+                .skip(query.offset)
+                .take(query.limit)
+                .map(|run| workflow_run_summary(&run))
+                .collect::<Vec<_>>();
+
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::OK,
                 Json(serde_json::json!({
-                    "error": {
-                        "code": "run_list_failed",
-                        "message": "Failed to list workflow runs",
-                        "details": [],
-                    }
+                    "items": items,
+                    "next_cursor": next_cursor,
                 })),
             )
         }
+        Err(error) => {
+            tracing::warn!("Failed to list durable workflow runs for {id}: {error}");
+            workflow_v2_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "run_list_failed",
+                "Failed to list workflow runs",
+                Some(serde_json::json!([{
+                    "message": error.to_string(),
+                }])),
+            )
+        }
     }
+}
+
+/// POST /api/v1/workflows/{id}/runs/dry-run — Simulate workflow run creation without executing it.
+pub async fn dry_run_workflow_run_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<WorkflowRunRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_workflow_definition_id(&id) {
+        return response;
+    }
+    let Json(_request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let resource = match load_workflow_definition_resource(&state, &id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return workflow_definition_not_found_response(),
+        Err(response) => return response,
+    };
+    let workflow_ir = match compile_workflow_resource(&state, &resource).await {
+        Ok(workflow_ir) => workflow_ir,
+        Err(response) => return response,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "would_execute": true,
+            "resolved": {
+                "workflow_id": workflow_ir.workflow_id,
+                "workflow_version": workflow_ir.workflow_version,
+                "initial_step_id": workflow_ir.steps.first().map(|step| step.id.clone()),
+            },
+            "effects": {
+                "run_create": true,
+                "initial_dispatches": workflow_dry_run_initial_dispatches(&workflow_ir),
+            },
+            "explanation": {
+                "input_contract": resource.definition.input,
+                "output_contract": resource.definition.output,
+            }
+        })),
+    )
 }
 
 /// GET /api/v1/runs — List durable runs.

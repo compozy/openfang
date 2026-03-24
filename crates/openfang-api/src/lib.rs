@@ -15,4 +15,5 @@ pub mod stream_chunker;
 pub mod stream_dedup;
 pub mod types;
 pub mod webchat;
+mod workflow_definitions;
 pub mod ws;

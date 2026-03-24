@@ -138,6 +138,11 @@ async fn start_test_server_with_provider(
             axum::routing::get(routes::list_workflow_runs),
         )
         .route(
+            "/api/v1/workflows",
+            axum::routing::get(routes::list_workflow_definitions_v1)
+                .post(routes::create_workflow_definition_v1),
+        )
+        .route(
             "/api/v1/workflows/{id}/runs",
             axum::routing::get(routes::list_workflow_runs_v1).post(routes::start_workflow_run_v1),
         )
@@ -233,11 +238,40 @@ async fn create_empty_workflow(
     name: &str,
 ) -> String {
     let response = client
-        .post(format!("{}/api/workflows", server.base_url))
+        .post(format!("{}/api/v1/workflows", server.base_url))
         .json(&serde_json::json!({
+            "id": name,
             "name": name,
+            "version": "1.0.0",
             "description": "Durable workflow integration test",
-            "steps": [],
+            "enabled": true,
+            "tags": ["durable"],
+            "input": {
+                "kind": "object",
+                "required": ["issue_id"],
+                "open": false,
+                "fields": {
+                    "issue_id": { "kind": "string" }
+                }
+            },
+            "output": {
+                "kind": "object",
+                "required": ["result"],
+                "open": false,
+                "fields": {
+                    "result": { "kind": "string" }
+                }
+            },
+            "steps": [{
+                "id": "noop-step",
+                "name": "Noop Step",
+                "kind": "noop",
+                "save_as": "result",
+                "flow": { "mode": "sequential" }
+            }],
+            "outputs": {
+                "result": "{{ vars.result }}"
+            }
         }))
         .send()
         .await
@@ -248,7 +282,7 @@ async fn create_empty_workflow(
         .json()
         .await
         .expect("workflow creation response should deserialize");
-    body["workflow_id"]
+    body["id"]
         .as_str()
         .expect("workflow id should be present")
         .to_string()
@@ -700,39 +734,65 @@ async fn test_workflow_crud() {
 
     // Create workflow
     let resp = client
-        .post(format!("{}/api/workflows", server.base_url))
+        .post(format!("{}/api/v1/workflows", server.base_url))
         .json(&serde_json::json!({
+            "id": "test-workflow",
             "name": "test-workflow",
+            "version": "1.0.0",
             "description": "Integration test workflow",
-            "steps": [
-                {
-                    "name": "step1",
-                    "agent_name": agent_name,
-                    "prompt": "Echo: {{input}}",
-                    "mode": "sequential",
-                    "timeout_secs": 30
+            "enabled": true,
+            "tags": ["integration"],
+            "input": {
+                "kind": "object",
+                "required": ["message"],
+                "open": false,
+                "fields": {
+                    "message": { "kind": "string" }
                 }
-            ]
+            },
+            "output": {
+                "kind": "object",
+                "required": ["result"],
+                "open": false,
+                "fields": {
+                    "result": { "kind": "string" }
+                }
+            },
+            "steps": [{
+                "id": "agent-step",
+                "name": "step1",
+                "kind": "agent",
+                "uses": { "agent": agent_name },
+                "with": {
+                    "message": "Echo: {{ input.message }}"
+                },
+                "save_as": "result",
+                "flow": { "mode": "sequential" }
+            }],
+            "outputs": {
+                "result": "{{ vars.result }}"
+            }
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
     let body: serde_json::Value = resp.json().await.unwrap();
-    let workflow_id = body["workflow_id"].as_str().unwrap().to_string();
+    let workflow_id = body["id"].as_str().unwrap().to_string();
     assert!(!workflow_id.is_empty());
 
     // List workflows
     let resp = client
-        .get(format!("{}/api/workflows", server.base_url))
+        .get(format!("{}/api/v1/workflows", server.base_url))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let workflows: Vec<serde_json::Value> = resp.json().await.unwrap();
-    assert_eq!(workflows.len(), 1);
-    assert_eq!(workflows[0]["name"], "test-workflow");
-    assert_eq!(workflows[0]["steps"], 1);
+    let workflows: serde_json::Value = resp.json().await.unwrap();
+    let items = workflows["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], "test-workflow");
+    assert_eq!(items[0]["steps"], 1);
 }
 
 #[tokio::test]

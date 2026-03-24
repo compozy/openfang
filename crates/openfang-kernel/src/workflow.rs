@@ -185,7 +185,7 @@ pub struct WorkflowRun {
     /// Run instance ID.
     pub id: WorkflowRunId,
     /// The workflow being run.
-    pub workflow_id: WorkflowId,
+    pub workflow_id: String,
     /// Compiled workflow version for this run.
     pub workflow_version: String,
     /// Workflow name (copied for quick access).
@@ -622,12 +622,6 @@ enum TransitionError {
         #[source]
         source: chrono::ParseError,
     },
-    #[error("failed to parse stored workflow identifier '{value}': {source}")]
-    InvalidWorkflowId {
-        value: String,
-        #[source]
-        source: uuid::Error,
-    },
     #[error("failed to parse stored workflow run identifier '{value}': {source}")]
     InvalidRunId {
         value: String,
@@ -776,6 +770,7 @@ struct TransitionWriter {
     workflow_stores: WorkflowStoreSet,
     runs: Arc<RwLock<HashMap<WorkflowRunId, WorkflowRun>>>,
     workflows: Arc<RwLock<HashMap<WorkflowId, Workflow>>>,
+    workflow_v2_definitions: Arc<RwLock<BTreeMap<String, WorkflowV2Definition>>>,
 }
 
 impl TransitionWriter {
@@ -783,11 +778,13 @@ impl TransitionWriter {
         workflow_stores: WorkflowStoreSet,
         runs: Arc<RwLock<HashMap<WorkflowRunId, WorkflowRun>>>,
         workflows: Arc<RwLock<HashMap<WorkflowId, Workflow>>>,
+        workflow_v2_definitions: Arc<RwLock<BTreeMap<String, WorkflowV2Definition>>>,
     ) -> Self {
         Self {
             workflow_stores,
             runs,
             workflows,
+            workflow_v2_definitions,
         }
     }
 
@@ -831,12 +828,6 @@ impl TransitionWriter {
                 source,
             }
         })?);
-        let workflow_id = WorkflowId(Uuid::parse_str(&record.workflow_id).map_err(|source| {
-            TransitionError::InvalidWorkflowId {
-                value: record.workflow_id.clone(),
-                source,
-            }
-        })?);
         let started_at = parse_rfc3339_utc(&record.started_at)?;
         let updated_at = parse_rfc3339_utc(&record.updated_at)?;
         let completed_at = match record.completed_at.as_deref() {
@@ -851,19 +842,30 @@ impl TransitionWriter {
         let seed_output = seed_run.as_ref().and_then(|run| run.output.clone());
         let workflow_name = if let Some(run) = seed_run.as_ref() {
             run.workflow_name.clone()
+        } else if let Some(definition) = self
+            .workflow_v2_definitions
+            .read()
+            .await
+            .get(&record.workflow_id)
+        {
+            definition.name.clone()
         } else {
-            self.workflows
-                .read()
-                .await
-                .get(&workflow_id)
-                .map(|workflow| workflow.name.clone())
+            Uuid::parse_str(&record.workflow_id)
+                .ok()
+                .and_then(|workflow_id| {
+                    self.workflows
+                        .try_read()
+                        .ok()
+                        .and_then(|workflows| workflows.get(&WorkflowId(workflow_id)).cloned())
+                })
+                .map(|workflow| workflow.name)
                 .unwrap_or_else(|| record.workflow_id.clone())
         };
 
         let mut runs = self.runs.write().await;
         let entry = runs.entry(run_id).or_insert_with(|| WorkflowRun {
             id: run_id,
-            workflow_id,
+            workflow_id: record.workflow_id.clone(),
             workflow_version: record.workflow_version.clone(),
             workflow_name,
             input: seed_input.unwrap_or_else(|| cache_input_from_json(&record.input_json)),
@@ -884,7 +886,7 @@ impl TransitionWriter {
             completed_at,
         });
 
-        entry.workflow_id = workflow_id;
+        entry.workflow_id = record.workflow_id.clone();
         entry.workflow_version = record.workflow_version.clone();
         entry.vars_json = record.vars_json.clone();
         entry.current_step_id = record.current_step_id.clone();
@@ -1607,13 +1609,22 @@ impl WorkflowEngine {
         definition: WorkflowV2Definition,
         available_agents: impl IntoIterator<Item = String>,
     ) -> Result<(), WorkflowCompileError> {
-        let _mutation_guard = self.definition_mutation_lock.lock().await;
         let registry = self
             .build_compile_registry(available_agents, std::iter::once(definition.id.clone()))
             .await;
-
         let compiled = compile_workflow_definition(&definition, &registry)?;
+        self.upsert_workflow_v2_definition(definition, compiled)
+            .await;
+        Ok(())
+    }
 
+    /// Upsert a Workflow v2 definition and its compiled IR atomically.
+    pub async fn upsert_workflow_v2_definition(
+        &self,
+        definition: WorkflowV2Definition,
+        compiled: WorkflowIr,
+    ) {
+        let _mutation_guard = self.definition_mutation_lock.lock().await;
         self.workflow_v2_definitions
             .write()
             .await
@@ -1622,6 +1633,57 @@ impl WorkflowEngine {
             .write()
             .await
             .insert(compiled.workflow_id.clone(), compiled);
+    }
+
+    /// Remove one Workflow v2 definition and its compiled cache entry.
+    pub async fn remove_workflow_v2_definition(&self, workflow_id: &str) {
+        let _mutation_guard = self.definition_mutation_lock.lock().await;
+        self.workflow_v2_definitions
+            .write()
+            .await
+            .remove(workflow_id);
+        self.compiled_workflows.write().await.remove(workflow_id);
+    }
+
+    /// Replace the full Workflow v2 definition set and compiled cache in one
+    /// operation.
+    pub async fn replace_workflow_v2_definitions<I>(
+        &self,
+        definitions: I,
+        available_agents: impl IntoIterator<Item = String>,
+    ) -> Result<(), WorkflowCompileError>
+    where
+        I: IntoIterator<Item = WorkflowV2Definition>,
+    {
+        let _mutation_guard = self.definition_mutation_lock.lock().await;
+        let definitions = definitions.into_iter().collect::<Vec<_>>();
+        let available_agents = available_agents.into_iter().collect::<Vec<_>>();
+
+        let mut registry = WorkflowCompileRegistry::new();
+        registry.set_agents(available_agents);
+        registry.set_primitives(
+            self.known_primitives
+                .read()
+                .await
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        );
+        registry.set_workflows(definitions.iter().map(|definition| definition.id.clone()));
+
+        let mut compiled = BTreeMap::new();
+        for definition in &definitions {
+            let workflow_ir = compile_workflow_definition(definition, &registry)?;
+            compiled.insert(workflow_ir.workflow_id.clone(), workflow_ir);
+        }
+
+        let definitions = definitions
+            .into_iter()
+            .map(|definition| (definition.id.clone(), definition))
+            .collect::<BTreeMap<_, _>>();
+
+        *self.workflow_v2_definitions.write().await = definitions;
+        *self.compiled_workflows.write().await = compiled;
 
         Ok(())
     }
@@ -1744,6 +1806,7 @@ impl WorkflowEngine {
             self.workflow_stores.clone(),
             Arc::clone(&self.runs),
             Arc::clone(&self.workflows),
+            Arc::clone(&self.workflow_v2_definitions),
         )
     }
 
@@ -1819,12 +1882,34 @@ impl WorkflowEngine {
             .get(&workflow_id)
             .cloned()
             .ok_or_else(|| OpenFangError::Internal("Workflow definition not found".to_string()))?;
+        self.create_run_from_compiled_workflow(
+            workflow_id.to_string(),
+            workflow.name,
+            workflow_version,
+            input,
+            labels,
+            metadata,
+        )
+        .await
+    }
+
+    /// Create a durable run directly from compiled workflow metadata without
+    /// requiring a legacy UUID-backed definition.
+    pub async fn create_run_from_compiled_workflow(
+        &self,
+        workflow_id: String,
+        workflow_name: String,
+        workflow_version: impl Into<String>,
+        input: String,
+        labels: Vec<String>,
+        metadata: JsonValue,
+    ) -> OpenFangResult<WorkflowRunId> {
         let run_id = WorkflowRunId::new();
         let timestamp = now_timestamp();
         let workflow_version = workflow_version.into();
         let run_record = WorkflowRunRecord {
             run_id: run_id.to_string(),
-            workflow_id: workflow_id.to_string(),
+            workflow_id: workflow_id.clone(),
             workflow_version: workflow_version.clone(),
             status: DurableWorkflowRunStatus::Pending,
             input_json: normalize_workflow_input_json(&input)?,
@@ -1854,7 +1939,7 @@ impl WorkflowEngine {
             id: run_id,
             workflow_id,
             workflow_version,
-            workflow_name: workflow.name,
+            workflow_name,
             input,
             vars_json: "{}".to_string(),
             current_step_id: None,
@@ -2102,7 +2187,10 @@ impl WorkflowEngine {
         let mut waiting_runs = 0usize;
         let mut last_run_at = None;
 
-        for run in runs.values().filter(|run| run.workflow_id == workflow.id) {
+        for run in runs
+            .values()
+            .filter(|run| run.workflow_id == workflow.id.to_string())
+        {
             match run.state {
                 WorkflowRunState::Running => active_runs += 1,
                 WorkflowRunState::Pending
@@ -3445,10 +3533,10 @@ impl WorkflowEngine {
         let (input, run_workflow_id) = {
             let runs = self.runs.read().await;
             let run = runs.get(&run_id).ok_or("Workflow run not found")?;
-            (run.input.clone(), run.workflow_id)
+            (run.input.clone(), run.workflow_id.clone())
         };
 
-        if run_workflow_id.to_string() != workflow.workflow_id {
+        if run_workflow_id != workflow.workflow_id {
             let error = format!(
                 "Workflow IR '{}' does not match run workflow '{}'",
                 workflow.workflow_id, run_workflow_id

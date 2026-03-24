@@ -381,28 +381,17 @@ pub async fn build_router(
             "/api/schedules/{id}/run",
             axum::routing::post(routes::run_schedule),
         )
-        // Workflow endpoints
+        // Workflow v1 control-plane endpoints
         .route(
-            "/api/workflows",
-            axum::routing::get(routes::list_workflows).post(routes::create_workflow),
+            "/api/v1/workflows",
+            axum::routing::get(routes::list_workflow_definitions_v1)
+                .post(routes::create_workflow_definition_v1),
         )
         .route(
-            "/api/workflows/{id}",
-            axum::routing::get(routes::get_workflow)
-                .put(routes::update_workflow)
-                .delete(routes::delete_workflow),
-        )
-        .route(
-            "/api/workflows/{id}/runtime",
-            axum::routing::get(routes::get_workflow_runtime),
-        )
-        .route(
-            "/api/workflows/{id}/run",
-            axum::routing::post(routes::run_workflow),
-        )
-        .route(
-            "/api/workflows/{id}/runs",
-            axum::routing::get(routes::list_workflow_runs),
+            "/api/v1/workflows/{id}",
+            axum::routing::get(routes::get_workflow_definition_v1)
+                .put(routes::update_workflow_definition_v1)
+                .delete(routes::delete_workflow_definition_v1),
         )
         .route(
             "/api/v1/workflows/validate",
@@ -417,12 +406,20 @@ pub async fn build_router(
             axum::routing::get(routes::get_workflow_compiled),
         )
         .route(
+            "/api/v1/workflows/{id}/fork",
+            axum::routing::post(routes::fork_workflow_definition_v1),
+        )
+        .route(
             "/api/v1/workflows/{id}/runs",
             axum::routing::get(routes::list_workflow_runs_v1).post(routes::start_workflow_run_v1),
         )
         .route(
+            "/api/v1/workflows/{id}/runs/dry-run",
+            axum::routing::post(routes::dry_run_workflow_run_v1),
+        )
+        .route(
             "/api/v1/workflows/{id}/runtime",
-            axum::routing::get(routes::get_workflow_runtime),
+            axum::routing::get(routes::get_workflow_runtime_v1),
         )
         .route("/api/v1/runs", axum::routing::get(routes::list_runs_v1))
         .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))

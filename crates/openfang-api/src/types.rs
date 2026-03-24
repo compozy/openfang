@@ -250,6 +250,13 @@ pub struct AgentForkedFrom {
     pub resource_id: String,
 }
 
+/// Workflow definition origin uses the same payload shape as agent origins.
+pub type WorkflowOriginKind = AgentOriginKind;
+/// Workflow definition origin uses the same payload shape as agent origins.
+pub type WorkflowOrigin = AgentOrigin;
+/// Workflow fork provenance uses the same payload shape as agent provenance.
+pub type WorkflowForkedFrom = AgentForkedFrom;
+
 /// Agent provider summary used in list responses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -307,6 +314,87 @@ pub struct AgentListItem {
 pub struct AgentListResponse {
     pub items: Vec<AgentListItem>,
     pub next_cursor: Option<String>,
+}
+
+/// Aggregated workflow runtime status attached to list items.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkflowListRuntimeStatus {
+    pub loaded: bool,
+    pub active_runs: usize,
+    pub waiting_runs: usize,
+}
+
+/// Full public workflow resource response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkflowResponse {
+    #[serde(flatten)]
+    pub definition: WorkflowV2Definition,
+    pub origin: WorkflowOrigin,
+    pub forked_from: Option<WorkflowForkedFrom>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Workflow list item returned by `/api/v1/workflows`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkflowListItem {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub steps: usize,
+    pub origin: WorkflowOrigin,
+    pub runtime_status: WorkflowListRuntimeStatus,
+    pub updated_at: String,
+}
+
+/// Paginated workflow definition list response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkflowListResponse {
+    pub items: Vec<WorkflowListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// Full workflow runtime resource.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkflowRuntimeResponse {
+    pub workflow_id: String,
+    pub loaded: bool,
+    pub healthy: bool,
+    pub active_runs: usize,
+    pub waiting_runs: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<String>,
+}
+
+/// Request payload for workflow forking.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkflowForkRequest {
+    pub mode: String,
+}
+
+/// Request payload for workflow run creation and dry-run simulation.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkflowRunRequest {
+    #[serde(default)]
+    pub input: serde_json::Value,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default = "default_workflow_run_metadata")]
+    pub metadata: serde_json::Value,
+}
+
+fn default_workflow_run_metadata() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 /// Request payload for agent-definition validation.
@@ -486,7 +574,7 @@ pub struct ClawHubInstallRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowValidateRequest {
     /// Workflow definition to validate.
-    pub definition: WorkflowV2Definition,
+    pub definition: serde_json::Value,
     /// Whether warnings should also mark the definition as invalid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
@@ -511,7 +599,7 @@ pub struct WorkflowValidateResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowCompileRequest {
     /// Workflow definition to compile.
-    pub definition: WorkflowV2Definition,
+    pub definition: serde_json::Value,
     /// Optional control-plane compilation context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<serde_json::Value>,
@@ -540,6 +628,8 @@ pub struct WorkflowCompileResponse {
 pub struct WorkflowCompiledResponse {
     /// Stable workflow definition identifier.
     pub definition_id: String,
+    /// Normalized workflow definition used during compilation.
+    pub normalized: NormalizedWorkflow,
     /// Cached compiled workflow IR payload.
     pub compiled: WorkflowCompiledPayload,
 }
