@@ -148,6 +148,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 5,
                 },
+                metadata: None,
             })
         }
     }
@@ -161,6 +162,7 @@ mod tests {
             temperature: 0.0,
             system: None,
             thinking: None,
+            session: None,
         }
     }
 

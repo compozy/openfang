@@ -20,7 +20,6 @@ use openfang_memory::{
     now_timestamp, DispatchKind, DispatchRecord, DispatchRepository, DispatchStatus,
     WorkflowRunRecord, WorkflowRunStatus, WorkflowSignalRecord,
 };
-use openfang_types::agent::AgentId;
 use openfang_types::config::{DefaultModelConfig, KernelConfig};
 use openfang_types::workflow::{
     FlowBlock, FlowMode, ResolvedRuntimeSettings, WorkflowIr, WorkflowIrStep, WorkflowIrStepKind,
@@ -365,15 +364,7 @@ async fn create_waiting_signal_run(server: &TestServer) -> String {
     server
         .state
         .kernel
-        .workflows
-        .execute_run(
-            run_id,
-            workflow_ir,
-            |_agent| Some((AgentId::new(), "unused".to_string())),
-            |_agent_id: AgentId, message: String| async move {
-                Ok((format!("processed {message}"), 1, 1))
-            },
-        )
+        .execute_compiled_workflow_run(run_id, workflow_ir)
         .await
         .expect("workflow should park");
 
@@ -980,9 +971,7 @@ async fn test_v1_run_checkpoints_reflect_full_lifecycle() {
             WorkflowIrStep {
                 id: "analyze".to_string(),
                 name: "analyze".to_string(),
-                kind: WorkflowIrStepKind::Agent {
-                    agent: "alpha".to_string(),
-                },
+                kind: WorkflowIrStepKind::Noop,
                 flow: FlowBlock {
                     mode: FlowMode::Sequential,
                 },
@@ -993,9 +982,7 @@ async fn test_v1_run_checkpoints_reflect_full_lifecycle() {
             WorkflowIrStep {
                 id: "summarize".to_string(),
                 name: "summarize".to_string(),
-                kind: WorkflowIrStepKind::Agent {
-                    agent: "beta".to_string(),
-                },
+                kind: WorkflowIrStepKind::Noop,
                 flow: FlowBlock {
                     mode: FlowMode::Sequential,
                 },
@@ -1014,15 +1001,7 @@ async fn test_v1_run_checkpoints_reflect_full_lifecycle() {
     server
         .state
         .kernel
-        .workflows
-        .execute_run(
-            run_id,
-            workflow_ir,
-            |agent| Some((AgentId::new(), agent.to_string())),
-            |_agent_id: AgentId, message: String| async move {
-                Ok((format!("processed {message}"), 1, 1))
-            },
-        )
+        .execute_compiled_workflow_run(run_id, workflow_ir)
         .await
         .expect("workflow execution should succeed");
 
@@ -1076,7 +1055,9 @@ async fn test_v1_recovered_run_is_paused_after_restart() {
         ..KernelConfig::default()
     };
     let run_id = Uuid::new_v4().to_string();
-    let first_kernel = OpenFangKernel::boot_with_config(config.clone()).expect("first boot");
+    let first_kernel =
+        Arc::new(OpenFangKernel::boot_with_config(config.clone()).expect("first boot"));
+    first_kernel.set_self_handle();
     first_kernel
         .workflow_stores
         .workflow_run
@@ -1175,7 +1156,9 @@ async fn get_run_list_reflects_recovered_state() {
         },
         ..KernelConfig::default()
     };
-    let first_kernel = OpenFangKernel::boot_with_config(config.clone()).expect("first boot");
+    let first_kernel =
+        Arc::new(OpenFangKernel::boot_with_config(config.clone()).expect("first boot"));
+    first_kernel.set_self_handle();
     let paused_candidates = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
     for run_id in &paused_candidates {
         first_kernel
@@ -1523,7 +1506,9 @@ async fn restart_preserves_waiting_state_and_outstanding_signals() {
         ..KernelConfig::default()
     };
     let run_id = Uuid::new_v4().to_string();
-    let first_kernel = OpenFangKernel::boot_with_config(config.clone()).expect("first boot");
+    let first_kernel =
+        Arc::new(OpenFangKernel::boot_with_config(config.clone()).expect("first boot"));
+    first_kernel.set_self_handle();
     first_kernel
         .workflow_stores
         .workflow_run
@@ -1721,7 +1706,9 @@ async fn waiting_signal_run_still_accepts_signal_after_restart() {
         },
         ..KernelConfig::default()
     };
-    let first_kernel = OpenFangKernel::boot_with_config(config.clone()).expect("first boot");
+    let first_kernel =
+        Arc::new(OpenFangKernel::boot_with_config(config.clone()).expect("first boot"));
+    first_kernel.set_self_handle();
     let workflow_id = WorkflowId::new();
     let definition = wait_signal_definition(workflow_id);
     let mut registry = WorkflowCompileRegistry::new();
@@ -1752,15 +1739,7 @@ async fn waiting_signal_run_still_accepts_signal_after_restart() {
         .await
         .expect("workflow run should be created");
     first_kernel
-        .workflows
-        .execute_run(
-            run_id,
-            workflow_ir,
-            |_agent| Some((AgentId::new(), "unused".to_string())),
-            |_agent_id: AgentId, message: String| async move {
-                Ok((format!("processed {message}"), 1, 1))
-            },
-        )
+        .execute_compiled_workflow_run(run_id, workflow_ir)
         .await
         .expect("workflow should park");
     first_kernel.shutdown();

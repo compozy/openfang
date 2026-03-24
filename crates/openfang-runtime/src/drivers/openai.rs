@@ -734,6 +734,7 @@ impl LlmDriver for OpenAIDriver {
                 stop_reason,
                 tool_calls,
                 usage,
+                metadata: None,
             });
         }
 
@@ -1364,6 +1365,7 @@ impl LlmDriver for OpenAIDriver {
                 stop_reason,
                 tool_calls,
                 usage,
+                metadata: None,
             });
         }
 
@@ -1542,6 +1544,7 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
                     input_tokens: 0,
                     output_tokens: 0,
                 },
+                metadata: None,
             });
         }
         return None;
@@ -1555,6 +1558,7 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
             input_tokens: 0,
             output_tokens: 0,
         },
+        metadata: None,
     })
 }
 

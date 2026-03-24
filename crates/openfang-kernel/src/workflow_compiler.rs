@@ -612,6 +612,14 @@ fn validate_step_definition(
                 "`retry` with `max_retries = 0` behaves like `fail`",
             ));
         }
+
+        if runtime.dispatch.is_some() && step.kind != StepKind::Agent {
+            issues.push(ValidationIssue::error(
+                "invalid_dispatch_target",
+                format!("{step_path}.runtime.dispatch"),
+                "`runtime.dispatch` is only supported on `agent` steps",
+            ));
+        }
     }
 
     validate_step_uses(step, &step_path, registry, issues);

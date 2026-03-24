@@ -439,6 +439,7 @@ pub fn spawn_daemon_stream(
             cost_usd: None,
             silent: false,
             directives: Default::default(),
+            provider_metadata: None,
         })));
     });
 }
@@ -475,6 +476,7 @@ fn daemon_fallback(
             cost_usd: body["cost_usd"].as_f64(),
             silent: false,
             directives: Default::default(),
+            provider_metadata: None,
         })
     } else {
         Err(body["error"]

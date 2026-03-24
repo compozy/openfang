@@ -15,7 +15,8 @@ use crate::workflow_compiler::{
 };
 use chrono::{DateTime, Utc};
 use openfang_memory::{
-    now_timestamp, CheckpointKind as DurableCheckpointKind, SubmittedSignalResume,
+    now_timestamp, CheckpointKind as DurableCheckpointKind, DispatchKind as DurableDispatchKind,
+    DispatchRecord, DispatchRepository, DispatchStatus, SubmittedSignalResume,
     WorkflowCheckpointRecord, WorkflowRunRecord, WorkflowRunStatus as DurableWorkflowRunStatus,
     WorkflowStoreError, WorkflowStoreSet, AGENT_DISPATCH_MIGRATION_SQL,
     WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
@@ -25,15 +26,17 @@ use openfang_memory::{
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::workflow::{
-    CompiledTemplate, ErrorMode as WorkflowV2ErrorMode, FlowBlock, FlowMode as WorkflowV2FlowMode,
-    ResolvedRuntimeSettings, TemplateNamespace, TemplateReference, TemplateSegment, WorkflowIr,
-    WorkflowIrStep, WorkflowIrStepKind, WorkflowV2Definition,
+    CompiledTemplate, DispatchMode as WorkflowDispatchMode, ErrorMode as WorkflowV2ErrorMode,
+    FlowBlock, FlowMode as WorkflowV2FlowMode, ResolvedRuntimeSettings, TemplateNamespace,
+    TemplateReference, TemplateSegment, WorkflowIr, WorkflowIrStep, WorkflowIrStepKind,
+    WorkflowV2Definition,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, RwLock};
@@ -765,6 +768,53 @@ enum ExecutionOutcome {
     Parked(String),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowAgentDispatchRequest {
+    pub run_id: WorkflowRunId,
+    pub step_id: String,
+    pub target_agent: String,
+    pub agent_id: AgentId,
+    pub agent_name: String,
+    pub prompt: String,
+    pub dispatch_id: String,
+    pub kind: DurableDispatchKind,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum WorkflowAgentDispatchOutcome {
+    CallCompleted {
+        output: String,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    SendAccepted,
+    Spawned {
+        spawned_agent_id: String,
+    },
+}
+
+pub(crate) type WorkflowDispatchFuture =
+    Pin<Box<dyn std::future::Future<Output = Result<WorkflowAgentDispatchOutcome, String>> + Send>>;
+pub(crate) type WorkflowAgentResolver =
+    dyn Fn(&str) -> Result<(AgentId, String), String> + Send + Sync;
+pub(crate) type WorkflowDispatchAgent =
+    dyn Fn(WorkflowAgentDispatchRequest) -> WorkflowDispatchFuture + Send + Sync;
+
+#[derive(Debug, Clone)]
+struct WorkflowDispatchHandle {
+    record: DispatchRecord,
+    target_agent: String,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowAgentStepOutcome {
+    agent_id: AgentId,
+    agent_name: String,
+    output: String,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
 #[derive(Clone)]
 struct TransitionWriter {
     workflow_stores: WorkflowStoreSet,
@@ -948,6 +998,7 @@ impl TransitionWriter {
         next.current_step_id = initial_step_id.map(ToOwned::to_owned);
         next.waiting_kind = None;
         next.waiting_ref = None;
+        next.active_dispatch_id = None;
         next.updated_at = now_timestamp();
 
         let checkpoint = WorkflowCheckpointRecord {
@@ -970,6 +1021,7 @@ impl TransitionWriter {
         &self,
         run_id: WorkflowRunId,
         step: &WorkflowIrStep,
+        active_dispatch_id: Option<&str>,
     ) -> Result<(), TransitionError> {
         let current = self.load_run(run_id).await?;
         if current.status != DurableWorkflowRunStatus::Running {
@@ -982,6 +1034,7 @@ impl TransitionWriter {
 
         let mut next = current.clone();
         next.current_step_id = Some(step.id.clone());
+        next.active_dispatch_id = active_dispatch_id.map(ToOwned::to_owned);
         next.updated_at = now_timestamp();
 
         let mut payload = serde_json::Map::new();
@@ -1071,6 +1124,7 @@ impl TransitionWriter {
 
         let mut next = current.clone();
         next.current_step_id = Some(step_id.to_string());
+        next.active_dispatch_id = None;
         next.vars_json = vars_json;
         next.error_json = None;
         next.updated_at = now_timestamp();
@@ -1111,6 +1165,7 @@ impl TransitionWriter {
 
         let mut next = current.clone();
         next.current_step_id = Some(step_id.to_string());
+        next.active_dispatch_id = None;
         next.error_json = Some(
             serde_json::json!({
                 "message": error,
@@ -1156,6 +1211,7 @@ impl TransitionWriter {
 
         let mut next = current.clone();
         next.current_step_id = Some(step_id.to_string());
+        next.active_dispatch_id = None;
         next.updated_at = now_timestamp();
 
         let checkpoint = WorkflowCheckpointRecord {
@@ -1196,6 +1252,7 @@ impl TransitionWriter {
         next.current_step_id = Some(step_id.to_string());
         next.waiting_kind = Some("signal".to_string());
         next.waiting_ref = Some(signal_name.to_string());
+        next.active_dispatch_id = None;
         next.updated_at = now_timestamp();
 
         let checkpoint = WorkflowCheckpointRecord {
@@ -1240,6 +1297,7 @@ impl TransitionWriter {
         next.current_step_id = next_step_id.map(ToOwned::to_owned);
         next.waiting_kind = None;
         next.waiting_ref = None;
+        next.active_dispatch_id = None;
         next.updated_at = now_timestamp();
 
         let consumed_checkpoint = WorkflowCheckpointRecord {
@@ -1307,6 +1365,7 @@ impl TransitionWriter {
         next.completed_at = Some(next.updated_at.clone());
         next.waiting_kind = None;
         next.waiting_ref = None;
+        next.active_dispatch_id = None;
         next.error_json = None;
 
         let checkpoint = WorkflowCheckpointRecord {
@@ -1359,6 +1418,7 @@ impl TransitionWriter {
         next.completed_at = Some(next.updated_at.clone());
         next.waiting_kind = None;
         next.waiting_ref = None;
+        next.active_dispatch_id = None;
 
         let checkpoint = WorkflowCheckpointRecord {
             checkpoint_id: Uuid::new_v4().to_string(),
@@ -1399,6 +1459,7 @@ impl TransitionWriter {
         next.updated_at = now_timestamp();
         next.waiting_kind = None;
         next.waiting_ref = None;
+        next.active_dispatch_id = None;
 
         let checkpoint = WorkflowCheckpointRecord {
             checkpoint_id: Uuid::new_v4().to_string(),
@@ -1433,6 +1494,7 @@ impl TransitionWriter {
         next.updated_at = now_timestamp();
         next.waiting_kind = None;
         next.waiting_ref = None;
+        next.active_dispatch_id = None;
 
         let checkpoint = WorkflowCheckpointRecord {
             checkpoint_id: Uuid::new_v4().to_string(),
@@ -1468,6 +1530,7 @@ impl TransitionWriter {
         next.completed_at = Some(next.updated_at.clone());
         next.waiting_kind = None;
         next.waiting_ref = None;
+        next.active_dispatch_id = None;
 
         let checkpoint = WorkflowCheckpointRecord {
             checkpoint_id: Uuid::new_v4().to_string(),
@@ -2105,9 +2168,10 @@ impl WorkflowEngine {
         &self,
         run_id: WorkflowRunId,
         step: &WorkflowIrStep,
+        active_dispatch_id: Option<&str>,
     ) -> Result<(), String> {
         self.transition_writer()
-            .record_step_started(run_id, step)
+            .record_step_started(run_id, step, active_dispatch_id)
             .await
             .map_err(transition_error_to_string)
     }
@@ -2285,6 +2349,7 @@ impl WorkflowEngine {
                 runtime: ResolvedRuntimeSettings {
                     timeout_secs: step.timeout_secs,
                     error_mode: Self::map_legacy_error_mode(&step.error_mode),
+                    dispatch: WorkflowDispatchMode::Call,
                 },
                 with,
                 save_as: step.output_var.clone(),
@@ -2468,57 +2533,244 @@ impl WorkflowEngine {
         }
     }
 
-    async fn execute_step_with_error_mode<F, Fut>(
+    fn durable_dispatch_kind(mode: WorkflowDispatchMode) -> DurableDispatchKind {
+        match mode {
+            WorkflowDispatchMode::Call => DurableDispatchKind::Call,
+            WorkflowDispatchMode::Send => DurableDispatchKind::Send,
+            WorkflowDispatchMode::Spawn => DurableDispatchKind::Spawn,
+        }
+    }
+
+    fn dispatch_input_json(prompt: &str) -> JsonValue {
+        serde_json::from_str(prompt).unwrap_or_else(|_| JsonValue::String(prompt.to_string()))
+    }
+
+    async fn create_pending_dispatch(
+        &self,
+        run_id: WorkflowRunId,
         step: &WorkflowIrStep,
-        agent_id: AgentId,
-        prompt: String,
-        send_message: &F,
-    ) -> Result<Option<(String, u64, u64)>, String>
-    where
-        F: Fn(AgentId, String) -> Fut,
-        Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
-    {
+        target_agent: &str,
+        prompt: &str,
+    ) -> Result<WorkflowDispatchHandle, String> {
+        let timestamp = now_timestamp();
+        let dispatch_id = Uuid::new_v4().to_string();
+        let record = DispatchRecord {
+            dispatch_id,
+            run_id: run_id.to_string(),
+            step_id: Some(step.id.clone()),
+            kind: Self::durable_dispatch_kind(step.runtime.dispatch),
+            target_agent: target_agent.to_string(),
+            status: DispatchStatus::Pending,
+            input_json: Self::dispatch_input_json(prompt),
+            result_json: None,
+            error_json: None,
+            attempt: 1,
+            parent_dispatch_id: None,
+            spawned_agent_id: None,
+            provider_driver: None,
+            session_id: None,
+            provider_resume_token: None,
+            started_at: timestamp.clone(),
+            updated_at: timestamp,
+            completed_at: None,
+        };
+        self.workflow_stores
+            .dispatch
+            .create(&record)
+            .await
+            .map_err(|error| format!("Failed to create dispatch record: {error}"))?;
+
+        Ok(WorkflowDispatchHandle {
+            record,
+            target_agent: target_agent.to_string(),
+        })
+    }
+
+    async fn fail_dispatch(
+        &self,
+        dispatch_id: &str,
+        error: &str,
+    ) -> Result<DispatchRecord, String> {
+        let current = self
+            .workflow_stores
+            .dispatch
+            .find_by_id(dispatch_id)
+            .await
+            .map_err(|store_error| {
+                format!(
+                    "Failed to reload dispatch '{dispatch_id}' for failure update: {store_error}"
+                )
+            })?
+            .ok_or_else(|| format!("Dispatch '{dispatch_id}' disappeared before failure update"))?;
+        if current.status == DispatchStatus::Failed {
+            return Ok(current);
+        }
+        let error_json = serde_json::json!({
+            "message": error,
+        });
+        self.workflow_stores
+            .dispatch
+            .mark_failed(&current, &error_json, &now_timestamp())
+            .await
+            .map_err(|store_error| {
+                format!("Failed to persist dispatch failure for '{dispatch_id}': {store_error}")
+            })
+    }
+
+    async fn prepare_dispatch_retry(&self, dispatch_id: &str) -> Result<(), String> {
+        let current = self
+            .workflow_stores
+            .dispatch
+            .find_by_id(dispatch_id)
+            .await
+            .map_err(|store_error| {
+                format!("Failed to reload dispatch '{dispatch_id}' for retry reset: {store_error}")
+            })?
+            .ok_or_else(|| format!("Dispatch '{dispatch_id}' disappeared before retry reset"))?;
+        if current.status != DispatchStatus::Failed {
+            return Err(format!(
+                "Dispatch '{dispatch_id}' is not ready for retry reset from status '{}'",
+                current.status
+            ));
+        }
+
+        let mut next = current.clone();
+        next.status = DispatchStatus::Pending;
+        next.attempt += 1;
+        next.error_json = None;
+        next.result_json = None;
+        next.provider_driver = None;
+        next.session_id = None;
+        next.provider_resume_token = None;
+        next.updated_at = now_timestamp();
+        next.completed_at = None;
+        self.workflow_stores
+            .dispatch
+            .update_status(&current, &next)
+            .await
+            .map(|_| ())
+            .map_err(|store_error| {
+                format!("Failed to prepare dispatch '{dispatch_id}' for retry: {store_error}")
+            })
+    }
+
+    async fn execute_agent_step_with_error_mode(
+        &self,
+        step: &WorkflowIrStep,
+        request: WorkflowAgentDispatchRequest,
+        dispatch_agent: &WorkflowDispatchAgent,
+    ) -> Result<Option<WorkflowAgentStepOutcome>, String> {
         let timeout_dur = std::time::Duration::from_secs(step.runtime.timeout_secs);
+        let skipped_output = match step.runtime.dispatch {
+            WorkflowDispatchMode::Call => None,
+            WorkflowDispatchMode::Send => Some(WorkflowAgentStepOutcome {
+                agent_id: request.agent_id,
+                agent_name: request.agent_name.clone(),
+                output: request.dispatch_id.clone(),
+                input_tokens: 0,
+                output_tokens: 0,
+            }),
+            WorkflowDispatchMode::Spawn => None,
+        };
+
+        let map_outcome =
+            |outcome: WorkflowAgentDispatchOutcome| -> Result<WorkflowAgentStepOutcome, String> {
+                match outcome {
+                    WorkflowAgentDispatchOutcome::CallCompleted {
+                        output,
+                        input_tokens,
+                        output_tokens,
+                    } => Ok(WorkflowAgentStepOutcome {
+                        agent_id: request.agent_id,
+                        agent_name: request.agent_name.clone(),
+                        output,
+                        input_tokens,
+                        output_tokens,
+                    }),
+                    WorkflowAgentDispatchOutcome::SendAccepted => Ok(WorkflowAgentStepOutcome {
+                        agent_id: request.agent_id,
+                        agent_name: request.agent_name.clone(),
+                        output: request.dispatch_id.clone(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    }),
+                    WorkflowAgentDispatchOutcome::Spawned { spawned_agent_id } => {
+                        Ok(WorkflowAgentStepOutcome {
+                            agent_id: request.agent_id,
+                            agent_name: request.agent_name.clone(),
+                            output: spawned_agent_id,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        })
+                    }
+                }
+            };
 
         match &step.runtime.error_mode {
             WorkflowV2ErrorMode::Fail => {
-                let result = tokio::time::timeout(timeout_dur, send_message(agent_id, prompt))
-                    .await
-                    .map_err(|_| {
-                        format!(
-                            "Step '{}' timed out after {}s",
-                            step.name, step.runtime.timeout_secs
-                        )
-                    })?
-                    .map_err(|error| format!("Step '{}' failed: {error}", step.name))?;
-                Ok(Some(result))
-            }
-            WorkflowV2ErrorMode::Skip => {
-                match tokio::time::timeout(timeout_dur, send_message(agent_id, prompt)).await {
-                    Ok(Ok(result)) => Ok(Some(result)),
+                let result = match tokio::time::timeout(
+                    timeout_dur,
+                    dispatch_agent(request.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => result,
                     Ok(Err(error)) => {
-                        warn!("Step '{}' failed (skipping): {error}", step.name);
-                        Ok(None)
+                        let error = format!("Step '{}' failed: {error}", step.name);
+                        let _ = self.fail_dispatch(&request.dispatch_id, &error).await;
+                        return Err(error);
                     }
                     Err(_) => {
+                        let error = format!(
+                            "Step '{}' timed out after {}s",
+                            step.name, step.runtime.timeout_secs
+                        );
+                        let _ = self.fail_dispatch(&request.dispatch_id, &error).await;
+                        return Err(error);
+                    }
+                };
+                Ok(Some(map_outcome(result)?))
+            }
+            WorkflowV2ErrorMode::Skip => {
+                match tokio::time::timeout(timeout_dur, dispatch_agent(request.clone())).await {
+                    Ok(Ok(result)) => Ok(Some(map_outcome(result)?)),
+                    Ok(Err(error)) => {
+                        let durable_error = format!("Step '{}' failed: {error}", step.name);
+                        let _ = self
+                            .fail_dispatch(&request.dispatch_id, &durable_error)
+                            .await;
+                        warn!("Step '{}' failed (skipping): {error}", step.name);
+                        Ok(skipped_output)
+                    }
+                    Err(_) => {
+                        let durable_error = format!(
+                            "Step '{}' timed out after {}s",
+                            step.name, step.runtime.timeout_secs
+                        );
+                        let _ = self
+                            .fail_dispatch(&request.dispatch_id, &durable_error)
+                            .await;
                         warn!(
                             "Step '{}' timed out (skipping) after {}s",
                             step.name, step.runtime.timeout_secs
                         );
-                        Ok(None)
+                        Ok(skipped_output)
                     }
                 }
             }
             WorkflowV2ErrorMode::Retry { max_retries } => {
                 let mut last_error = String::new();
                 for attempt in 0..=*max_retries {
-                    match tokio::time::timeout(timeout_dur, send_message(agent_id, prompt.clone()))
-                        .await
-                    {
-                        Ok(Ok(result)) => return Ok(Some(result)),
+                    match tokio::time::timeout(timeout_dur, dispatch_agent(request.clone())).await {
+                        Ok(Ok(result)) => return Ok(Some(map_outcome(result)?)),
                         Ok(Err(error)) => {
+                            let durable_error = format!("Step '{}' failed: {error}", step.name);
+                            let _ = self
+                                .fail_dispatch(&request.dispatch_id, &durable_error)
+                                .await;
                             last_error = error.to_string();
                             if attempt < *max_retries {
+                                self.prepare_dispatch_retry(&request.dispatch_id).await?;
                                 warn!(
                                     "Step '{}' attempt {} failed: {error}, retrying",
                                     step.name,
@@ -2527,8 +2779,16 @@ impl WorkflowEngine {
                             }
                         }
                         Err(_) => {
+                            let durable_error = format!(
+                                "Step '{}' timed out after {}s",
+                                step.name, step.runtime.timeout_secs
+                            );
+                            let _ = self
+                                .fail_dispatch(&request.dispatch_id, &durable_error)
+                                .await;
                             last_error = format!("timed out after {}s", step.runtime.timeout_secs);
                             if attempt < *max_retries {
+                                self.prepare_dispatch_retry(&request.dispatch_id).await?;
                                 warn!(
                                     "Step '{}' attempt {} timed out, retrying",
                                     step.name,
@@ -2545,6 +2805,48 @@ impl WorkflowEngine {
                 ))
             }
         }
+    }
+
+    async fn dispatch_agent_step(
+        &self,
+        run_id: WorkflowRunId,
+        step: &WorkflowIrStep,
+        current_input: &str,
+        variables: &HashMap<String, String>,
+        agent_resolver: &WorkflowAgentResolver,
+        dispatch_agent: &WorkflowDispatchAgent,
+    ) -> Result<Option<WorkflowAgentStepOutcome>, String> {
+        let target_agent = Self::agent_target(step)?;
+        let prompt = Self::render_step_payload(step, current_input, variables);
+        let dispatch = self
+            .create_pending_dispatch(run_id, step, target_agent, &prompt)
+            .await?;
+        self.record_step_started_transition(run_id, step, Some(&dispatch.record.dispatch_id))
+            .await?;
+
+        let (agent_id, agent_name) = match agent_resolver(target_agent) {
+            Ok(agent) => agent,
+            Err(error) => {
+                let _ = self
+                    .fail_dispatch(&dispatch.record.dispatch_id, &error)
+                    .await;
+                return Err(error);
+            }
+        };
+
+        let request = WorkflowAgentDispatchRequest {
+            run_id,
+            step_id: step.id.clone(),
+            target_agent: dispatch.target_agent,
+            agent_id,
+            agent_name,
+            prompt,
+            dispatch_id: dispatch.record.dispatch_id,
+            kind: dispatch.record.kind,
+        };
+
+        self.execute_agent_step_with_error_mode(step, request, dispatch_agent)
+            .await
     }
 
     async fn workflow_ir_for_record(
@@ -2828,16 +3130,12 @@ impl WorkflowEngine {
         }
     }
 
-    pub(crate) async fn resume_after_signal<F, Fut>(
+    pub(crate) async fn resume_after_signal_with_dispatch(
         &self,
         resume: SignalResumeContext,
-        agent_resolver: impl Fn(&str) -> Option<(AgentId, String)>,
-        send_message: F,
-    ) -> Result<(), String>
-    where
-        F: Fn(AgentId, String) -> Fut,
-        Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
-    {
+        agent_resolver: &WorkflowAgentResolver,
+        dispatch_agent: &WorkflowDispatchAgent,
+    ) -> Result<(), String> {
         let _ = self
             .execute_steps(
                 ExecutionContext {
@@ -2849,22 +3147,58 @@ impl WorkflowEngine {
                     start_run: false,
                 },
                 agent_resolver,
-                send_message,
+                dispatch_agent,
             )
             .await?;
         Ok(())
     }
 
-    async fn execute_steps<F, Fut>(
+    #[cfg(test)]
+    pub(crate) async fn resume_after_signal<S, SFut>(
+        &self,
+        resume: SignalResumeContext,
+        agent_resolver: impl Fn(&str) -> Option<(AgentId, String)> + Send + Sync + 'static,
+        send_message: S,
+    ) -> Result<(), String>
+    where
+        S: Fn(AgentId, String) -> SFut + Send + Sync + 'static,
+        SFut: std::future::Future<Output = Result<(String, u64, u64), String>> + Send + 'static,
+    {
+        let resolver = move |agent: &str| {
+            agent_resolver(agent).ok_or_else(|| format!("Agent not found: {agent}"))
+        };
+        let send_message = Arc::new(send_message);
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let send_message = Arc::clone(&send_message);
+            Box::pin(async move {
+                match request.kind {
+                    DurableDispatchKind::Call => {
+                        let (output, input_tokens, output_tokens) =
+                            send_message(request.agent_id, request.prompt).await?;
+                        Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                            output,
+                            input_tokens,
+                            output_tokens,
+                        })
+                    }
+                    DurableDispatchKind::Send => Ok(WorkflowAgentDispatchOutcome::SendAccepted),
+                    DurableDispatchKind::Spawn => Ok(WorkflowAgentDispatchOutcome::Spawned {
+                        spawned_agent_id: request.agent_id.to_string(),
+                    }),
+                }
+            }) as WorkflowDispatchFuture
+        };
+
+        self.resume_after_signal_with_dispatch(resume, &resolver, &dispatch_agent)
+            .await
+    }
+
+    async fn execute_steps(
         &self,
         execution: ExecutionContext,
-        agent_resolver: impl Fn(&str) -> Option<(AgentId, String)>,
-        send_message: F,
-    ) -> Result<ExecutionOutcome, String>
-    where
-        F: Fn(AgentId, String) -> Fut,
-        Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
-    {
+        agent_resolver: &WorkflowAgentResolver,
+        dispatch_agent: &WorkflowDispatchAgent,
+    ) -> Result<ExecutionOutcome, String> {
         let ExecutionContext {
             run_id,
             workflow,
@@ -2873,7 +3207,6 @@ impl WorkflowEngine {
             mut variables,
             start_run,
         } = execution;
-        let send_message = &send_message;
         let vars_json = |variables: &HashMap<String, String>| {
             serde_json::to_string(variables).unwrap_or_else(|_| "{}".to_string())
         };
@@ -2908,7 +3241,8 @@ impl WorkflowEngine {
             match &step.flow.mode {
                 WorkflowV2FlowMode::Sequential => match &step.kind {
                     WorkflowIrStepKind::Collect => {
-                        self.record_step_started_transition(run_id, step).await?;
+                        self.record_step_started_transition(run_id, step, None)
+                            .await?;
                         current_input = all_outputs.join("\n\n---\n\n");
                         all_outputs.clear();
                         all_outputs.push(current_input.clone());
@@ -2925,7 +3259,8 @@ impl WorkflowEngine {
                         .await?;
                     }
                     WorkflowIrStepKind::Noop => {
-                        self.record_step_started_transition(run_id, step).await?;
+                        self.record_step_started_transition(run_id, step, None)
+                            .await?;
                         all_outputs.push(current_input.clone());
                         if let Some(symbol) = step.save_as.as_ref() {
                             variables.insert(symbol.clone(), current_input.clone());
@@ -2940,7 +3275,8 @@ impl WorkflowEngine {
                         .await?;
                     }
                     WorkflowIrStepKind::WaitSignal { signal_name } => {
-                        self.record_step_started_transition(run_id, step).await?;
+                        self.record_step_started_transition(run_id, step, None)
+                            .await?;
                         let repository = self.workflow_stores.workflow_signal.clone();
                         let run_id_text = run_id.to_string();
                         let signal_name_text = signal_name.clone();
@@ -2981,71 +3317,39 @@ impl WorkflowEngine {
                         return Ok(ExecutionOutcome::Parked(current_input));
                     }
                     _ => {
-                        self.record_step_started_transition(run_id, step).await?;
-                        let agent = match Self::agent_target(step) {
-                            Ok(agent) => agent,
-                            Err(error) => {
-                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
-                                    .await?;
-                                if let Err(persist_error) = self
-                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
-                                    .await
-                                {
-                                    return Err(format!(
-                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
-                                    ));
-                                }
-                                return Err(error);
-                            }
-                        };
-                        let (agent_id, agent_name) = match agent_resolver(agent) {
-                            Some(agent) => agent,
-                            None => {
-                                let error = format!("Agent not found for step '{}'", step.name);
-                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
-                                    .await?;
-                                if let Err(persist_error) = self
-                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
-                                    .await
-                                {
-                                    return Err(format!(
-                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
-                                    ));
-                                }
-                                return Err(error);
-                            }
-                        };
-                        let prompt = Self::render_step_payload(step, &current_input, &variables);
                         let start = std::time::Instant::now();
-                        let result = Self::execute_step_with_error_mode(
-                            step,
-                            agent_id,
-                            prompt,
-                            send_message,
-                        )
-                        .await;
+                        let result = self
+                            .dispatch_agent_step(
+                                run_id,
+                                step,
+                                &current_input,
+                                &variables,
+                                agent_resolver,
+                                dispatch_agent,
+                            )
+                            .await;
                         let duration_ms = start.elapsed().as_millis() as u64;
 
                         match result {
-                            Ok(Some((output, input_tokens, output_tokens))) => {
+                            Ok(Some(outcome)) => {
                                 if let Some(run) = self.runs.write().await.get_mut(&run_id) {
                                     run.step_results.push(StepResult {
                                         step_name: step.name.clone(),
-                                        agent_id: agent_id.to_string(),
-                                        agent_name,
-                                        output: output.clone(),
-                                        input_tokens,
-                                        output_tokens,
+                                        agent_id: outcome.agent_id.to_string(),
+                                        agent_name: outcome.agent_name.clone(),
+                                        output: outcome.output.clone(),
+                                        input_tokens: outcome.input_tokens,
+                                        output_tokens: outcome.output_tokens,
                                         duration_ms,
                                     });
                                 }
 
                                 if let Some(symbol) = step.save_as.as_ref() {
-                                    variables.insert(symbol.clone(), output.clone());
+                                    variables.insert(symbol.clone(), outcome.output.clone());
                                 }
 
-                                all_outputs.push(output.clone());
-                                current_input = output;
+                                all_outputs.push(outcome.output.clone());
+                                current_input = outcome.output;
                                 self.record_step_completed_transition(
                                     run_id,
                                     &step.id,
@@ -3099,95 +3403,58 @@ impl WorkflowEngine {
                     }
 
                     let mut futures = Vec::new();
-                    let mut step_infos = Vec::new();
 
                     for (fan_index, fan_step) in &fan_out_steps {
-                        self.record_step_started_transition(run_id, fan_step)
-                            .await?;
-                        let agent = match Self::agent_target(fan_step) {
-                            Ok(agent) => agent,
-                            Err(error) => {
-                                self.record_step_failed_transition(run_id, &fan_step.id, &error, 1)
-                                    .await?;
-                                if let Err(persist_error) = self
-                                    .record_run_failed_transition(
-                                        run_id,
-                                        Some(&fan_step.id),
-                                        &error,
-                                    )
-                                    .await
-                                {
-                                    return Err(format!(
-                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
-                                    ));
-                                }
-                                return Err(error);
-                            }
-                        };
-                        let (agent_id, agent_name) = match agent_resolver(agent) {
-                            Some(agent) => agent,
-                            None => {
-                                let error = format!("Agent not found for step '{}'", fan_step.name);
-                                self.record_step_failed_transition(run_id, &fan_step.id, &error, 1)
-                                    .await?;
-                                if let Err(persist_error) = self
-                                    .record_run_failed_transition(
-                                        run_id,
-                                        Some(&fan_step.id),
-                                        &error,
-                                    )
-                                    .await
-                                {
-                                    return Err(format!(
-                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
-                                    ));
-                                }
-                                return Err(error);
-                            }
-                        };
-                        let prompt =
-                            Self::render_step_payload(fan_step, &current_input, &variables);
-
-                        step_infos.push((*fan_index, fan_step.name.clone(), agent_id, agent_name));
+                        let fan_index = *fan_index;
+                        let fan_step = *fan_step;
+                        let fan_input = current_input.clone();
+                        let fan_variables = variables.clone();
+                        let fan_agent_resolver = agent_resolver;
+                        let fan_dispatch_agent = dispatch_agent;
                         futures.push(async move {
                             let start = std::time::Instant::now();
-                            let result = Self::execute_step_with_error_mode(
-                                fan_step,
-                                agent_id,
-                                prompt,
-                                send_message,
-                            )
-                            .await;
+                            let result = self
+                                .dispatch_agent_step(
+                                    run_id,
+                                    fan_step,
+                                    &fan_input,
+                                    &fan_variables,
+                                    fan_agent_resolver,
+                                    fan_dispatch_agent,
+                                )
+                                .await;
                             let duration_ms = start.elapsed().as_millis() as u64;
-                            (result, duration_ms)
+                            (fan_index, fan_step.name.clone(), result, duration_ms)
                         });
                     }
 
                     let results = futures::future::join_all(futures).await;
 
-                    for (result_index, (result, duration_ms)) in results.into_iter().enumerate() {
-                        let (_, step_name, agent_id, agent_name) = &step_infos[result_index];
-                        let fan_step = fan_out_steps[result_index].1;
-
+                    for (result_index, step_name, result, duration_ms) in results {
+                        let fan_step = fan_out_steps
+                            .iter()
+                            .find(|(index_value, _)| *index_value == result_index)
+                            .map(|(_, step_value)| *step_value)
+                            .expect("fan-out step index should resolve");
                         match result {
-                            Ok(Some((output, input_tokens, output_tokens))) => {
+                            Ok(Some(outcome)) => {
                                 if let Some(run) = self.runs.write().await.get_mut(&run_id) {
                                     run.step_results.push(StepResult {
                                         step_name: step_name.clone(),
-                                        agent_id: agent_id.to_string(),
-                                        agent_name: agent_name.clone(),
-                                        output: output.clone(),
-                                        input_tokens,
-                                        output_tokens,
+                                        agent_id: outcome.agent_id.to_string(),
+                                        agent_name: outcome.agent_name.clone(),
+                                        output: outcome.output.clone(),
+                                        input_tokens: outcome.input_tokens,
+                                        output_tokens: outcome.output_tokens,
                                         duration_ms,
                                     });
                                 }
 
                                 if let Some(symbol) = fan_step.save_as.as_ref() {
-                                    variables.insert(symbol.clone(), output.clone());
+                                    variables.insert(symbol.clone(), outcome.output.clone());
                                 }
-                                all_outputs.push(output.clone());
-                                current_input = output;
+                                all_outputs.push(outcome.output.clone());
+                                current_input = outcome.output;
                                 self.record_step_completed_transition(
                                     run_id,
                                     &fan_step.id,
@@ -3231,8 +3498,9 @@ impl WorkflowEngine {
                     continue;
                 }
                 WorkflowV2FlowMode::Conditional { when } => {
-                    self.record_step_started_transition(run_id, step).await?;
                     if !Self::flow_condition_matches(when, &current_input) {
+                        self.record_step_started_transition(run_id, step, None)
+                            .await?;
                         self.record_step_skipped_transition(run_id, &step.id, "condition_not_met")
                             .await?;
                         info!(
@@ -3246,6 +3514,8 @@ impl WorkflowEngine {
                     }
 
                     if matches!(step.kind, WorkflowIrStepKind::Noop) {
+                        self.record_step_started_transition(run_id, step, None)
+                            .await?;
                         if let Some(symbol) = step.save_as.as_ref() {
                             variables.insert(symbol.clone(), current_input.clone());
                         }
@@ -3259,69 +3529,38 @@ impl WorkflowEngine {
                         )
                         .await?;
                     } else {
-                        let agent = match Self::agent_target(step) {
-                            Ok(agent) => agent,
-                            Err(error) => {
-                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
-                                    .await?;
-                                if let Err(persist_error) = self
-                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
-                                    .await
-                                {
-                                    return Err(format!(
-                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
-                                    ));
-                                }
-                                return Err(error);
-                            }
-                        };
-                        let (agent_id, agent_name) = match agent_resolver(agent) {
-                            Some(agent) => agent,
-                            None => {
-                                let error = format!("Agent not found for step '{}'", step.name);
-                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
-                                    .await?;
-                                if let Err(persist_error) = self
-                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
-                                    .await
-                                {
-                                    return Err(format!(
-                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
-                                    ));
-                                }
-                                return Err(error);
-                            }
-                        };
-                        let prompt = Self::render_step_payload(step, &current_input, &variables);
                         let start = std::time::Instant::now();
-                        let result = Self::execute_step_with_error_mode(
-                            step,
-                            agent_id,
-                            prompt,
-                            send_message,
-                        )
-                        .await;
+                        let result = self
+                            .dispatch_agent_step(
+                                run_id,
+                                step,
+                                &current_input,
+                                &variables,
+                                agent_resolver,
+                                dispatch_agent,
+                            )
+                            .await;
                         let duration_ms = start.elapsed().as_millis() as u64;
 
                         match result {
-                            Ok(Some((output, input_tokens, output_tokens))) => {
+                            Ok(Some(outcome)) => {
                                 if let Some(run) = self.runs.write().await.get_mut(&run_id) {
                                     run.step_results.push(StepResult {
                                         step_name: step.name.clone(),
-                                        agent_id: agent_id.to_string(),
-                                        agent_name,
-                                        output: output.clone(),
-                                        input_tokens,
-                                        output_tokens,
+                                        agent_id: outcome.agent_id.to_string(),
+                                        agent_name: outcome.agent_name.clone(),
+                                        output: outcome.output.clone(),
+                                        input_tokens: outcome.input_tokens,
+                                        output_tokens: outcome.output_tokens,
                                         duration_ms,
                                     });
                                 }
 
                                 if let Some(symbol) = step.save_as.as_ref() {
-                                    variables.insert(symbol.clone(), output.clone());
+                                    variables.insert(symbol.clone(), outcome.output.clone());
                                 }
-                                all_outputs.push(output.clone());
-                                current_input = output;
+                                all_outputs.push(outcome.output.clone());
+                                current_input = outcome.output;
                                 self.record_step_completed_transition(
                                     run_id,
                                     &step.id,
@@ -3359,8 +3598,9 @@ impl WorkflowEngine {
                     max_iterations,
                     until,
                 } => {
-                    self.record_step_started_transition(run_id, step).await?;
                     if matches!(step.kind, WorkflowIrStepKind::Noop) {
+                        self.record_step_started_transition(run_id, step, None)
+                            .await?;
                         for loop_iter in 0..*max_iterations {
                             if Self::flow_condition_matches(until, &current_input) {
                                 info!(
@@ -3386,55 +3626,22 @@ impl WorkflowEngine {
                         )
                         .await?;
                     } else {
-                        let agent = match Self::agent_target(step) {
-                            Ok(agent) => agent,
-                            Err(error) => {
-                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
-                                    .await?;
-                                if let Err(persist_error) = self
-                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
-                                    .await
-                                {
-                                    return Err(format!(
-                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
-                                    ));
-                                }
-                                return Err(error);
-                            }
-                        };
-                        let (agent_id, agent_name) = match agent_resolver(agent) {
-                            Some(agent) => agent,
-                            None => {
-                                let error = format!("Agent not found for step '{}'", step.name);
-                                self.record_step_failed_transition(run_id, &step.id, &error, 1)
-                                    .await?;
-                                if let Err(persist_error) = self
-                                    .record_run_failed_transition(run_id, Some(&step.id), &error)
-                                    .await
-                                {
-                                    return Err(format!(
-                                        "{error}; additionally failed to persist workflow failure: {persist_error}"
-                                    ));
-                                }
-                                return Err(error);
-                            }
-                        };
-
                         for loop_iter in 0..*max_iterations {
-                            let prompt =
-                                Self::render_step_payload(step, &current_input, &variables);
                             let start = std::time::Instant::now();
-                            let result = Self::execute_step_with_error_mode(
-                                step,
-                                agent_id,
-                                prompt,
-                                send_message,
-                            )
-                            .await;
+                            let result = self
+                                .dispatch_agent_step(
+                                    run_id,
+                                    step,
+                                    &current_input,
+                                    &variables,
+                                    agent_resolver,
+                                    dispatch_agent,
+                                )
+                                .await;
                             let duration_ms = start.elapsed().as_millis() as u64;
 
                             match result {
-                                Ok(Some((output, input_tokens, output_tokens))) => {
+                                Ok(Some(outcome)) => {
                                     if let Some(run) = self.runs.write().await.get_mut(&run_id) {
                                         run.step_results.push(StepResult {
                                             step_name: format!(
@@ -3442,18 +3649,18 @@ impl WorkflowEngine {
                                                 step.name,
                                                 loop_iter + 1
                                             ),
-                                            agent_id: agent_id.to_string(),
-                                            agent_name: agent_name.clone(),
-                                            output: output.clone(),
-                                            input_tokens,
-                                            output_tokens,
+                                            agent_id: outcome.agent_id.to_string(),
+                                            agent_name: outcome.agent_name.clone(),
+                                            output: outcome.output.clone(),
+                                            input_tokens: outcome.input_tokens,
+                                            output_tokens: outcome.output_tokens,
                                             duration_ms,
                                         });
                                     }
 
-                                    current_input = output.clone();
+                                    current_input = outcome.output.clone();
 
-                                    if Self::flow_condition_matches(until, &output) {
+                                    if Self::flow_condition_matches(until, &outcome.output) {
                                         info!(
                                             step = index + 1,
                                             name = %step.name,
@@ -3519,17 +3726,13 @@ impl WorkflowEngine {
     }
 
     /// Execute a workflow run from compiled IR.
-    pub async fn execute_run<F, Fut>(
+    pub(crate) async fn execute_run_with_dispatch(
         &self,
         run_id: WorkflowRunId,
         workflow: WorkflowIr,
-        agent_resolver: impl Fn(&str) -> Option<(AgentId, String)>,
-        send_message: F,
-    ) -> Result<String, String>
-    where
-        F: Fn(AgentId, String) -> Fut,
-        Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
-    {
+        agent_resolver: &WorkflowAgentResolver,
+        dispatch_agent: &WorkflowDispatchAgent,
+    ) -> Result<String, String> {
         let (input, run_workflow_id) = {
             let runs = self.runs.read().await;
             let run = runs.get(&run_id).ok_or("Workflow run not found")?;
@@ -3568,12 +3771,53 @@ impl WorkflowEngine {
                     start_run: true,
                 },
                 agent_resolver,
-                send_message,
+                dispatch_agent,
             )
             .await?
         {
             ExecutionOutcome::Completed(output) | ExecutionOutcome::Parked(output) => Ok(output),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_run<S, SFut>(
+        &self,
+        run_id: WorkflowRunId,
+        workflow: WorkflowIr,
+        agent_resolver: impl Fn(&str) -> Option<(AgentId, String)> + Send + Sync + 'static,
+        send_message: S,
+    ) -> Result<String, String>
+    where
+        S: Fn(AgentId, String) -> SFut + Send + Sync + 'static,
+        SFut: std::future::Future<Output = Result<(String, u64, u64), String>> + Send + 'static,
+    {
+        let resolver = move |agent: &str| {
+            agent_resolver(agent).ok_or_else(|| format!("Agent not found: {agent}"))
+        };
+        let send_message = Arc::new(send_message);
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let send_message = Arc::clone(&send_message);
+            Box::pin(async move {
+                match request.kind {
+                    DurableDispatchKind::Call => {
+                        let (output, input_tokens, output_tokens) =
+                            send_message(request.agent_id, request.prompt).await?;
+                        Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                            output,
+                            input_tokens,
+                            output_tokens,
+                        })
+                    }
+                    DurableDispatchKind::Send => Ok(WorkflowAgentDispatchOutcome::SendAccepted),
+                    DurableDispatchKind::Spawn => Ok(WorkflowAgentDispatchOutcome::Spawned {
+                        spawned_agent_id: request.agent_id.to_string(),
+                    }),
+                }
+            }) as WorkflowDispatchFuture
+        };
+
+        self.execute_run_with_dispatch(run_id, workflow, &resolver, &dispatch_agent)
+            .await
     }
 }
 
@@ -3797,6 +4041,74 @@ mod tests {
             .expect("durable workflow checkpoint query should succeed")
     }
 
+    async fn load_durable_dispatches(
+        engine: &WorkflowEngine,
+        run_id: WorkflowRunId,
+    ) -> Vec<DispatchRecord> {
+        engine
+            .workflow_stores
+            .dispatch
+            .find_by_run(&run_id.to_string())
+            .await
+            .expect("durable dispatch query should succeed")
+    }
+
+    async fn load_durable_dispatch(engine: &WorkflowEngine, dispatch_id: &str) -> DispatchRecord {
+        engine
+            .workflow_stores
+            .dispatch
+            .find_by_id(dispatch_id)
+            .await
+            .expect("durable dispatch lookup should succeed")
+            .expect("durable dispatch should exist")
+    }
+
+    async fn mark_dispatch_running_for_test(
+        dispatches: &openfang_memory::SqliteDispatchRepository,
+        dispatch_id: &str,
+        provider_driver: &str,
+        session_id: &str,
+    ) -> DispatchRecord {
+        let current = dispatches
+            .find_by_id(dispatch_id)
+            .await
+            .expect("dispatch lookup should succeed")
+            .expect("dispatch should exist");
+        let mut next = current.clone();
+        next.status = DispatchStatus::Running;
+        next.provider_driver = Some(provider_driver.to_string());
+        next.session_id = Some(session_id.to_string());
+        next.updated_at = now_timestamp();
+        dispatches
+            .update_status(&current, &next)
+            .await
+            .expect("dispatch should transition to running")
+    }
+
+    fn single_step_workflow(name: &str, agent_name: &str) -> Workflow {
+        Workflow {
+            id: WorkflowId::new(),
+            name: name.to_string(),
+            description: String::new(),
+            steps: vec![WorkflowStep {
+                name: "dispatch-step".to_string(),
+                agent: StepAgent::ByName {
+                    name: agent_name.to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+            }],
+            created_at: Utc::now(),
+        }
+    }
+
+    fn mock_dispatch_resolver(agent: &str) -> Result<(AgentId, String), String> {
+        Ok((AgentId::new(), agent.to_string()))
+    }
+
     #[tokio::test]
     async fn workflow_registry_readiness_starts_not_ready() {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
@@ -3804,6 +4116,638 @@ mod tests {
 
         assert!(!engine.is_ready());
         assert_eq!(engine.readiness(), WorkflowRegistryReadiness::Bootstrapping);
+    }
+
+    #[tokio::test]
+    async fn dispatch_record_should_have_session_id_after_provider_setup() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = single_step_workflow("dispatch-session", "analyst");
+        let mut workflow_ir = legacy_ir(&workflow);
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "inspect session".to_string())
+            .await
+            .expect("workflow run should be created");
+        let dispatches = engine.workflow_stores.dispatch.clone();
+
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let dispatches = dispatches.clone();
+            Box::pin(async move {
+                let running = mark_dispatch_running_for_test(
+                    &dispatches,
+                    &request.dispatch_id,
+                    "arky-codex",
+                    "session-dispatch-session",
+                )
+                .await;
+                let result_json = serde_json::json!({
+                    "response": "session captured",
+                });
+                dispatches
+                    .mark_completed(&running, Some(&result_json), &now_timestamp())
+                    .await
+                    .expect("dispatch should complete");
+                Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                    output: "session captured".to_string(),
+                    input_tokens: 7,
+                    output_tokens: 4,
+                })
+            }) as WorkflowDispatchFuture
+        };
+
+        workflow_ir.steps[0].runtime.dispatch = WorkflowDispatchMode::Call;
+        engine
+            .execute_run_with_dispatch(
+                run_id,
+                workflow_ir,
+                &mock_dispatch_resolver,
+                &dispatch_agent,
+            )
+            .await
+            .expect("workflow should complete");
+
+        let dispatch = load_durable_dispatches(&engine, run_id)
+            .await
+            .pop()
+            .expect("dispatch should be created");
+        assert_eq!(dispatch.provider_driver.as_deref(), Some("arky-codex"));
+        assert_eq!(
+            dispatch.session_id.as_deref(),
+            Some("session-dispatch-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_should_complete_with_result_json() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = single_step_workflow("dispatch-call", "analyst");
+        let workflow_ir = legacy_ir(&workflow);
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "call me".to_string())
+            .await
+            .expect("workflow run should be created");
+        let dispatches = engine.workflow_stores.dispatch.clone();
+
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let dispatches = dispatches.clone();
+            Box::pin(async move {
+                let running = mark_dispatch_running_for_test(
+                    &dispatches,
+                    &request.dispatch_id,
+                    "openfang-openai",
+                    "session-call",
+                )
+                .await;
+                let output = format!("completed: {}", request.prompt);
+                let result_json = serde_json::json!({
+                    "response": output,
+                });
+                dispatches
+                    .mark_completed(&running, Some(&result_json), &now_timestamp())
+                    .await
+                    .expect("dispatch should complete");
+                Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                    output: result_json["response"]
+                        .as_str()
+                        .expect("response should be text")
+                        .to_string(),
+                    input_tokens: 10,
+                    output_tokens: 6,
+                })
+            }) as WorkflowDispatchFuture
+        };
+
+        let output = engine
+            .execute_run_with_dispatch(
+                run_id,
+                workflow_ir,
+                &mock_dispatch_resolver,
+                &dispatch_agent,
+            )
+            .await
+            .expect("workflow should complete");
+
+        let dispatch = load_durable_dispatches(&engine, run_id)
+            .await
+            .pop()
+            .expect("dispatch should be created");
+        assert_eq!(output, "completed: call me");
+        assert_eq!(dispatch.status, DispatchStatus::Completed);
+        assert_eq!(
+            dispatch.result_json,
+            Some(serde_json::json!({ "response": "completed: call me" }))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_should_fail_with_error_json_on_provider_error() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = single_step_workflow("dispatch-call-fail", "analyst");
+        let workflow_ir = legacy_ir(&workflow);
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "call me".to_string())
+            .await
+            .expect("workflow run should be created");
+        let dispatches = engine.workflow_stores.dispatch.clone();
+
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let dispatches = dispatches.clone();
+            Box::pin(async move {
+                let _ = mark_dispatch_running_for_test(
+                    &dispatches,
+                    &request.dispatch_id,
+                    "openfang-openai",
+                    "session-call-fail",
+                )
+                .await;
+                Err("provider execution failed".to_string())
+            }) as WorkflowDispatchFuture
+        };
+
+        let error = engine
+            .execute_run_with_dispatch(
+                run_id,
+                workflow_ir,
+                &mock_dispatch_resolver,
+                &dispatch_agent,
+            )
+            .await
+            .expect_err("workflow should fail");
+
+        let dispatch = load_durable_dispatches(&engine, run_id)
+            .await
+            .pop()
+            .expect("dispatch should be created");
+        assert!(error.contains("provider execution failed"));
+        assert_eq!(dispatch.status, DispatchStatus::Failed);
+        let error_message = dispatch
+            .error_json
+            .as_ref()
+            .and_then(|value| value.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .expect("dispatch failure should include an error message");
+        assert!(error_message.contains("provider execution failed"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_retry_should_reset_dispatch_before_retrying() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = single_step_workflow("dispatch-call-retry", "analyst");
+        let mut workflow_ir = legacy_ir(&workflow);
+        workflow_ir.steps[0].runtime.error_mode = WorkflowV2ErrorMode::Retry { max_retries: 1 };
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "retry me".to_string())
+            .await
+            .expect("workflow run should be created");
+        let dispatches = engine.workflow_stores.dispatch.clone();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let dispatches = dispatches.clone();
+            let attempts = Arc::clone(&attempts);
+            Box::pin(async move {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let session_id = if attempt == 0 {
+                    "session-retry-1"
+                } else {
+                    "session-retry-2"
+                };
+                let running = mark_dispatch_running_for_test(
+                    &dispatches,
+                    &request.dispatch_id,
+                    "openfang-openai",
+                    session_id,
+                )
+                .await;
+
+                if attempt == 0 {
+                    let error_json = serde_json::json!({
+                        "message": "provider execution failed",
+                    });
+                    dispatches
+                        .mark_failed(&running, &error_json, &now_timestamp())
+                        .await
+                        .expect("first retry attempt should fail durably");
+                    Err("provider execution failed".to_string())
+                } else {
+                    let result_json = serde_json::json!({
+                        "response": "retried successfully",
+                    });
+                    dispatches
+                        .mark_completed(&running, Some(&result_json), &now_timestamp())
+                        .await
+                        .expect("second retry attempt should complete");
+                    Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                        output: "retried successfully".to_string(),
+                        input_tokens: 5,
+                        output_tokens: 3,
+                    })
+                }
+            }) as WorkflowDispatchFuture
+        };
+
+        let output = engine
+            .execute_run_with_dispatch(
+                run_id,
+                workflow_ir,
+                &mock_dispatch_resolver,
+                &dispatch_agent,
+            )
+            .await
+            .expect("workflow should recover after retry");
+
+        let dispatch = load_durable_dispatches(&engine, run_id)
+            .await
+            .pop()
+            .expect("dispatch should be created");
+        assert_eq!(output, "retried successfully");
+        assert_eq!(dispatch.status, DispatchStatus::Completed);
+        assert_eq!(dispatch.attempt, 2);
+        assert_eq!(dispatch.session_id.as_deref(), Some("session-retry-2"));
+        assert_eq!(
+            dispatch.result_json,
+            Some(serde_json::json!({ "response": "retried successfully" }))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_should_return_immediately_with_running_status() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = single_step_workflow("dispatch-send", "analyst");
+        let mut workflow_ir = legacy_ir(&workflow);
+        workflow_ir.steps[0].runtime.dispatch = WorkflowDispatchMode::Send;
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "send me".to_string())
+            .await
+            .expect("workflow run should be created");
+        let dispatches = engine.workflow_stores.dispatch.clone();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let ready_for_agent = Arc::clone(&ready);
+        let gate_for_agent = Arc::clone(&gate);
+
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let dispatches = dispatches.clone();
+            let ready = Arc::clone(&ready_for_agent);
+            let gate = Arc::clone(&gate_for_agent);
+            Box::pin(async move {
+                let running = mark_dispatch_running_for_test(
+                    &dispatches,
+                    &request.dispatch_id,
+                    "openfang-openai",
+                    "session-send",
+                )
+                .await;
+                tokio::spawn(async move {
+                    ready.notify_one();
+                    gate.notified().await;
+                    let result_json = serde_json::json!({ "response": "async send done" });
+                    dispatches
+                        .mark_completed(&running, Some(&result_json), &now_timestamp())
+                        .await
+                        .expect("background dispatch should complete");
+                });
+                Ok(WorkflowAgentDispatchOutcome::SendAccepted)
+            }) as WorkflowDispatchFuture
+        };
+
+        let dispatch_id = engine
+            .execute_run_with_dispatch(
+                run_id,
+                workflow_ir,
+                &mock_dispatch_resolver,
+                &dispatch_agent,
+            )
+            .await
+            .expect("workflow should return immediately");
+        ready.notified().await;
+
+        let dispatch = load_durable_dispatch(&engine, &dispatch_id).await;
+        assert_eq!(dispatch.status, DispatchStatus::Running);
+        assert_eq!(dispatch.provider_driver.as_deref(), Some("openfang-openai"));
+
+        gate.notify_one();
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_background_task_should_complete_and_update_record() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = single_step_workflow("dispatch-send-complete", "analyst");
+        let mut workflow_ir = legacy_ir(&workflow);
+        workflow_ir.steps[0].runtime.dispatch = WorkflowDispatchMode::Send;
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "send later".to_string())
+            .await
+            .expect("workflow run should be created");
+        let dispatches = engine.workflow_stores.dispatch.clone();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let ready_for_agent = Arc::clone(&ready);
+        let gate_for_agent = Arc::clone(&gate);
+
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let dispatches = dispatches.clone();
+            let ready = Arc::clone(&ready_for_agent);
+            let gate = Arc::clone(&gate_for_agent);
+            Box::pin(async move {
+                let running = mark_dispatch_running_for_test(
+                    &dispatches,
+                    &request.dispatch_id,
+                    "openfang-openai",
+                    "session-send-complete",
+                )
+                .await;
+                tokio::spawn(async move {
+                    ready.notify_one();
+                    gate.notified().await;
+                    let result_json = serde_json::json!({ "response": "send completed" });
+                    dispatches
+                        .mark_completed(&running, Some(&result_json), &now_timestamp())
+                        .await
+                        .expect("background dispatch should complete");
+                });
+                Ok(WorkflowAgentDispatchOutcome::SendAccepted)
+            }) as WorkflowDispatchFuture
+        };
+
+        let dispatch_id = engine
+            .execute_run_with_dispatch(
+                run_id,
+                workflow_ir,
+                &mock_dispatch_resolver,
+                &dispatch_agent,
+            )
+            .await
+            .expect("workflow should return immediately");
+        ready.notified().await;
+        gate.notify_one();
+
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let dispatch = load_durable_dispatch(&engine, &dispatch_id).await;
+                if dispatch.status == DispatchStatus::Completed {
+                    break dispatch;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background dispatch should finish within timeout");
+
+        assert_eq!(completed.status, DispatchStatus::Completed);
+        assert_eq!(
+            completed.result_json,
+            Some(serde_json::json!({ "response": "send completed" }))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_spawn_should_write_spawned_agent_id() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = single_step_workflow("dispatch-spawn", "analyst");
+        let mut workflow_ir = legacy_ir(&workflow);
+        workflow_ir.steps[0].runtime.dispatch = WorkflowDispatchMode::Spawn;
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "spawn me".to_string())
+            .await
+            .expect("workflow run should be created");
+        let dispatches = engine.workflow_stores.dispatch.clone();
+
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let dispatches = dispatches.clone();
+            Box::pin(async move {
+                let running = mark_dispatch_running_for_test(
+                    &dispatches,
+                    &request.dispatch_id,
+                    "openfang-openai",
+                    "session-spawn",
+                )
+                .await;
+                let mut completed = running.clone();
+                completed.status = DispatchStatus::Completed;
+                completed.spawned_agent_id = Some("spawned-agent-42".to_string());
+                completed.result_json = Some(serde_json::json!({
+                    "spawned_agent_id": "spawned-agent-42",
+                }));
+                completed.updated_at = now_timestamp();
+                completed.completed_at = Some(completed.updated_at.clone());
+                dispatches
+                    .update_status(&running, &completed)
+                    .await
+                    .expect("spawn dispatch should complete");
+                Ok(WorkflowAgentDispatchOutcome::Spawned {
+                    spawned_agent_id: "spawned-agent-42".to_string(),
+                })
+            }) as WorkflowDispatchFuture
+        };
+
+        let output = engine
+            .execute_run_with_dispatch(
+                run_id,
+                workflow_ir,
+                &mock_dispatch_resolver,
+                &dispatch_agent,
+            )
+            .await
+            .expect("workflow should complete");
+
+        let dispatch = load_durable_dispatches(&engine, run_id)
+            .await
+            .pop()
+            .expect("dispatch should be created");
+        assert_eq!(output, "spawned-agent-42");
+        assert_eq!(
+            dispatch.spawned_agent_id.as_deref(),
+            Some("spawned-agent-42")
+        );
+        assert_eq!(dispatch.status, DispatchStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn dispatch_invalid_provider_binding_should_fail_cleanly() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let workflow = single_step_workflow("dispatch-invalid-binding", "ghost-agent");
+        let workflow_ir = legacy_ir(&workflow);
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "broken".to_string())
+            .await
+            .expect("workflow run should be created");
+
+        let resolver =
+            |_agent: &str| Err("invalid provider binding: missing agent definition".to_string());
+        let dispatch_agent = |_request: WorkflowAgentDispatchRequest| {
+            Box::pin(async move { Ok(WorkflowAgentDispatchOutcome::SendAccepted) })
+                as WorkflowDispatchFuture
+        };
+
+        let error = engine
+            .execute_run_with_dispatch(run_id, workflow_ir, &resolver, &dispatch_agent)
+            .await
+            .expect_err("workflow should fail");
+
+        let dispatch = load_durable_dispatches(&engine, run_id)
+            .await
+            .pop()
+            .expect("dispatch should be created");
+        assert!(error.contains("invalid provider binding"));
+        assert_eq!(dispatch.status, DispatchStatus::Failed);
+        assert_eq!(
+            dispatch.error_json,
+            Some(serde_json::json!({
+                "message": "invalid provider binding: missing agent definition",
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_concurrent_call_dispatches_should_not_interfere() {
+        let engine = WorkflowEngine::new();
+        let workflow = Workflow {
+            id: WorkflowId::new(),
+            name: "dispatch-fanout".to_string(),
+            description: String::new(),
+            steps: vec![
+                WorkflowStep {
+                    name: "task-a".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "analyst".to_string(),
+                    },
+                    prompt_template: "Task A: {{input}}".to_string(),
+                    mode: StepMode::FanOut,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                },
+                WorkflowStep {
+                    name: "task-b".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "writer".to_string(),
+                    },
+                    prompt_template: "Task B: {{input}}".to_string(),
+                    mode: StepMode::FanOut,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                },
+                WorkflowStep {
+                    name: "collect".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "collector".to_string(),
+                    },
+                    prompt_template: "unused".to_string(),
+                    mode: StepMode::Collect,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                },
+            ],
+            created_at: Utc::now(),
+        };
+        let mut workflow_ir = legacy_ir(&workflow);
+        for step in workflow_ir.steps.iter_mut().take(2) {
+            step.runtime.dispatch = WorkflowDispatchMode::Call;
+        }
+        let workflow_id = engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = engine
+            .create_run(workflow_id, "fanout".to_string())
+            .await
+            .expect("workflow run should be created");
+        let dispatches = engine.workflow_stores.dispatch.clone();
+
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let dispatches = dispatches.clone();
+            Box::pin(async move {
+                let session_id = format!("session-{}", request.target_agent);
+                let running = mark_dispatch_running_for_test(
+                    &dispatches,
+                    &request.dispatch_id,
+                    "openfang-openai",
+                    &session_id,
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let output = format!("done: {}", request.target_agent);
+                let result_json = serde_json::json!({ "response": output });
+                dispatches
+                    .mark_completed(&running, Some(&result_json), &now_timestamp())
+                    .await
+                    .expect("dispatch should complete");
+                Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                    output: result_json["response"]
+                        .as_str()
+                        .expect("response should be text")
+                        .to_string(),
+                    input_tokens: 3,
+                    output_tokens: 2,
+                })
+            }) as WorkflowDispatchFuture
+        };
+
+        let output = engine
+            .execute_run_with_dispatch(
+                run_id,
+                workflow_ir,
+                &mock_dispatch_resolver,
+                &dispatch_agent,
+            )
+            .await
+            .expect("workflow should complete");
+        let dispatch_records = load_durable_dispatches(&engine, run_id).await;
+
+        assert!(output.contains("done: analyst"));
+        assert!(output.contains("done: writer"));
+        assert_eq!(dispatch_records.len(), 2);
+        assert!(dispatch_records
+            .iter()
+            .all(|dispatch| dispatch.status == DispatchStatus::Completed));
+        assert!(dispatch_records
+            .iter()
+            .any(|dispatch| dispatch.target_agent == "analyst"));
+        assert!(dispatch_records
+            .iter()
+            .any(|dispatch| dispatch.target_agent == "writer"));
     }
 
     #[tokio::test]
@@ -4077,6 +5021,7 @@ mod tests {
                     with: BTreeMap::new(),
                     save_as: Some("analysis".to_string()),
                 },
+                None,
             )
             .await
             .expect("step should start");

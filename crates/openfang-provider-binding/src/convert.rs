@@ -250,6 +250,7 @@ pub fn generate_response_to_completion(
             }),
         tool_calls,
         usage: usage_to_token_usage(response.usage.as_ref()),
+        metadata: None,
     })
 }
 
@@ -485,6 +486,7 @@ mod tests {
                 budget_tokens: 70_000,
                 stream_thinking: true,
             }),
+            session: None,
         };
 
         let provider_request = completion_request_to_provider(

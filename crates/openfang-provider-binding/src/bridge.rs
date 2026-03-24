@@ -8,15 +8,16 @@ use std::{
     },
 };
 
-use arky_config::ProviderConfig;
+use arky_config::{ArkyConfigBuilder, ProviderConfig, ProviderConfigBuilder};
 use arky_protocol::{
-    AgentEvent, Message as ArkyMessage, ModelRef, SessionRef, StreamDelta, TurnContext, TurnId,
-    Usage,
+    AgentEvent, Message as ArkyMessage, ModelRef, SessionId as ArkySessionId, SessionRef,
+    StreamDelta, TurnContext, TurnId, Usage,
 };
-use arky_provider::{Provider, ProviderFamily};
+use arky_provider::{Provider, ProviderFamily, ReplayWriter};
+use arky_session::{NewSession, SessionStore};
 use futures::StreamExt;
 use openfang_runtime::llm_driver::{
-    CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent,
+    CompletionMetadata, CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent,
 };
 use openfang_types::{
     message::{ContentBlock, StopReason},
@@ -45,25 +46,52 @@ pub enum BridgeError {
     /// The typed runtime config could not be instantiated into a live provider.
     #[error(transparent)]
     Instantiate(#[from] InstantiateError),
+    /// A placeholder install layer could not be assembled for the binding.
+    #[error("could not build placeholder provider install config for `{driver}`: {message}")]
+    PlaceholderInstallConfig {
+        /// Normalized driver name.
+        driver: String,
+        /// Builder failure message.
+        message: String,
+    },
 }
 
 /// Wraps an Arky provider behind the OpenFang `LlmDriver` trait.
 pub struct ArkyDriverBridge {
     provider: Arc<dyn Provider>,
     model_ref: ModelRef,
+    provider_driver: String,
     provider_family: ProviderFamily,
+    session_store: Option<Arc<dyn SessionStore>>,
     turn_sequence: AtomicU64,
 }
 
 impl ArkyDriverBridge {
     /// Creates a bridge for one live provider instance.
     #[must_use]
-    pub fn new(provider: Arc<dyn Provider>, model_ref: ModelRef) -> Self {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        model_ref: ModelRef,
+        provider_driver: impl Into<String>,
+    ) -> Self {
+        Self::with_session_store(provider, model_ref, provider_driver, None)
+    }
+
+    /// Creates a bridge for one live provider instance with optional replay persistence.
+    #[must_use]
+    pub fn with_session_store(
+        provider: Arc<dyn Provider>,
+        model_ref: ModelRef,
+        provider_driver: impl Into<String>,
+        session_store: Option<Arc<dyn SessionStore>>,
+    ) -> Self {
         let provider_family = provider.descriptor().family.clone();
         Self {
             provider,
             model_ref,
+            provider_driver: provider_driver.into(),
             provider_family,
+            session_store,
             turn_sequence: AtomicU64::new(0),
         }
     }
@@ -78,11 +106,13 @@ impl ArkyDriverBridge {
         request: CompletionRequest,
         stream_tx: Option<mpsc::Sender<StreamEvent>>,
     ) -> Result<CompletionResponse, LlmError> {
+        let session_ref = session_ref_from_request(&request)?;
+        let replay_session_id = session_ref.id.clone();
         let provider_request = completion_request_to_provider(
             &request,
             &self.model_ref,
             &self.provider_family,
-            SessionRef::new(None),
+            session_ref,
             self.next_turn(),
         )
         .map_err(convert_error_to_llm)?;
@@ -92,11 +122,26 @@ impl ArkyDriverBridge {
             .await
             .map_err(provider_error_to_llm)?;
 
-        let mut collector = TurnCollector::new(self.provider_family.clone());
+        let mut collector = TurnCollector::new(
+            self.provider_family.clone(),
+            self.provider_driver.clone(),
+            request
+                .session
+                .as_ref()
+                .and_then(|session| session.provider_resume_token.clone()),
+        );
+        let mut replay_writer =
+            replay_writer_for_request(self.session_store.clone(), &request, replay_session_id)
+                .await?;
         let mut stream_tx = stream_tx;
 
         while let Some(item) = provider_stream.next().await {
             let event = item.map_err(provider_error_to_llm)?;
+            if let Some(writer) = replay_writer.as_mut() {
+                writer.record(event.clone()).await.map_err(|error| {
+                    LlmError::Parse(format!("failed to persist Arky replay event: {error}"))
+                })?;
+            }
             let stream_events = collector.observe(&event);
             if let Some(sender) = stream_tx.as_mut() {
                 for stream_event in stream_events {
@@ -106,6 +151,12 @@ impl ArkyDriverBridge {
                     }
                 }
             }
+        }
+
+        if let Some(writer) = replay_writer.take() {
+            writer.finish().await.map_err(|error| {
+                LlmError::Parse(format!("failed to flush Arky replay state: {error}"))
+            })?;
         }
 
         if let Some(sender) = stream_tx.as_mut() {
@@ -128,6 +179,51 @@ impl ArkyDriverBridge {
 
         Ok(response)
     }
+}
+
+fn session_ref_from_request(request: &CompletionRequest) -> Result<SessionRef, LlmError> {
+    let Some(session) = request.session.as_ref() else {
+        return Ok(SessionRef::new(None));
+    };
+
+    let session_id = session
+        .session_id
+        .as_deref()
+        .map(ArkySessionId::parse_str)
+        .transpose()
+        .map_err(|error| LlmError::Parse(format!("invalid Arky session id: {error}")))?;
+
+    let mut session_ref = SessionRef::new(session_id);
+    if let Some(provider_resume_token) = session.provider_resume_token.as_ref() {
+        session_ref = session_ref.with_provider_session_id(provider_resume_token.clone());
+    }
+
+    Ok(session_ref)
+}
+
+async fn replay_writer_for_request(
+    session_store: Option<Arc<dyn SessionStore>>,
+    request: &CompletionRequest,
+    session_id: Option<ArkySessionId>,
+) -> Result<Option<ReplayWriter>, LlmError> {
+    let Some(session_store) = session_store else {
+        return Ok(None);
+    };
+
+    let session_id = match session_id {
+        Some(existing) => existing,
+        None => {
+            let new_session = NewSession {
+                model_id: Some(request.model.clone()),
+                ..NewSession::default()
+            };
+            session_store.create(new_session).await.map_err(|error| {
+                LlmError::Parse(format!("failed to create Arky session store row: {error}"))
+            })?
+        }
+    };
+
+    Ok(Some(ReplayWriter::new(session_store, session_id)))
 }
 
 #[async_trait::async_trait]
@@ -155,7 +251,50 @@ pub fn binding_to_driver(
     Ok(Arc::new(ArkyDriverBridge::new(
         provider,
         binding.model.clone(),
+        binding.driver.clone(),
     )))
+}
+
+/// Builds a live bridge using the driver's default install-layer settings.
+pub fn binding_to_driver_with_placeholder_install(
+    binding: &ProviderBinding,
+) -> Result<Arc<dyn LlmDriver>, BridgeError> {
+    let install = placeholder_install_config(binding.driver.as_str())?;
+    binding_to_driver(binding, &install)
+}
+
+/// Builds a live bridge using the driver's default install-layer settings and a replay store.
+pub fn binding_to_driver_with_placeholder_install_and_session_store(
+    binding: &ProviderBinding,
+    session_store: Arc<dyn SessionStore>,
+) -> Result<Arc<dyn LlmDriver>, BridgeError> {
+    let install = placeholder_install_config(binding.driver.as_str())?;
+    let config = build_provider_config(binding, &install)?;
+    let provider = instantiate_provider(config)?;
+    Ok(Arc::new(ArkyDriverBridge::with_session_store(
+        provider,
+        binding.model.clone(),
+        binding.driver.clone(),
+        Some(session_store),
+    )))
+}
+
+fn placeholder_install_config(driver: &str) -> Result<ProviderConfig, BridgeError> {
+    let config = ArkyConfigBuilder::new()
+        .provider("default", ProviderConfigBuilder::new().driver(driver))
+        .build()
+        .map_err(|error| BridgeError::PlaceholderInstallConfig {
+            driver: driver.to_owned(),
+            message: error.to_string(),
+        })?;
+
+    config
+        .provider("default")
+        .cloned()
+        .ok_or_else(|| BridgeError::PlaceholderInstallConfig {
+            driver: driver.to_owned(),
+            message: "placeholder provider config was not built".to_owned(),
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +330,7 @@ impl CollectedToolCall {
 #[derive(Debug)]
 struct TurnCollector {
     provider_family: ProviderFamily,
+    provider_driver: String,
     terminal_message: Option<ArkyMessage>,
     reasoning_order: Vec<String>,
     reasoning: BTreeMap<String, String>,
@@ -199,12 +339,19 @@ struct TurnCollector {
     tool_results: Vec<arky_protocol::ToolResult>,
     usage: Option<Usage>,
     finish_reason: Option<arky_protocol::FinishReason>,
+    session_id: Option<String>,
+    provider_resume_token: Option<String>,
 }
 
 impl TurnCollector {
-    fn new(provider_family: ProviderFamily) -> Self {
+    fn new(
+        provider_family: ProviderFamily,
+        provider_driver: String,
+        provider_resume_token: Option<String>,
+    ) -> Self {
         Self {
             provider_family,
+            provider_driver,
             terminal_message: None,
             reasoning_order: Vec::new(),
             reasoning: BTreeMap::new(),
@@ -213,11 +360,16 @@ impl TurnCollector {
             tool_results: Vec::new(),
             usage: None,
             finish_reason: None,
+            session_id: None,
+            provider_resume_token,
         }
     }
 
     fn observe(&mut self, event: &AgentEvent) -> Vec<StreamEvent> {
         let mut emitted = Vec::new();
+        if let Some(session_id) = event.metadata().session_id.as_ref() {
+            self.session_id = Some(session_id.to_string());
+        }
         match event {
             AgentEvent::MessageStart { message, .. } | AgentEvent::MessageEnd { message, .. } => {
                 self.terminal_message = Some(message.clone());
@@ -341,6 +493,9 @@ impl TurnCollector {
                 is_error: *is_error,
             }),
             AgentEvent::Custom { payload, .. } => {
+                if let Some(provider_resume_token) = provider_resume_token_from_payload(payload) {
+                    self.provider_resume_token = Some(provider_resume_token);
+                }
                 if let Some(finish_reason) = finish_reason_from_payload(payload) {
                     self.finish_reason = Some(finish_reason);
                 }
@@ -465,6 +620,11 @@ impl TurnCollector {
             stop_reason,
             tool_calls,
             usage: usage_to_token_usage(self.usage.as_ref()),
+            metadata: Some(CompletionMetadata {
+                provider_driver: Some(self.provider_driver),
+                session_id: self.session_id,
+                provider_resume_token: self.provider_resume_token,
+            }),
         })
     }
 
@@ -479,6 +639,14 @@ impl TurnCollector {
 
         StopReason::EndTurn
     }
+}
+
+fn provider_resume_token_from_payload(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn convert_error_to_llm(error: ConvertError) -> LlmError {
@@ -622,6 +790,7 @@ mod tests {
                 claude_tool_use_events(),
             )),
             ModelRef::new("claude-sonnet").with_provider_id(ProviderId::new("claude-code")),
+            "claude-code",
         );
 
         let response = bridge
@@ -648,6 +817,7 @@ mod tests {
                 claude_tool_use_events(),
             )),
             ModelRef::new("claude-sonnet").with_provider_id(ProviderId::new("claude-code")),
+            "claude-code",
         );
         let (tx, mut rx) = mpsc::channel(32);
 
@@ -709,6 +879,7 @@ mod tests {
                 })],
             )),
             ModelRef::new("gpt-5").with_provider_id(ProviderId::new("codex")),
+            "codex",
         );
 
         let error = bridge
@@ -730,6 +901,7 @@ mod tests {
         let bridge = ArkyDriverBridge::new(
             provider.clone(),
             ModelRef::new("gpt-5").with_provider_id(ProviderId::new("codex")),
+            "codex",
         );
 
         bridge
@@ -765,6 +937,7 @@ mod tests {
                 ],
             )),
             ModelRef::new("gpt-5").with_provider_id(ProviderId::new("codex")),
+            "codex",
         );
 
         let response = bridge
@@ -804,6 +977,7 @@ mod tests {
             temperature: 0.2,
             system: Some("You are helpful".to_owned()),
             thinking: None,
+            session: None,
         }
     }
 

@@ -29,7 +29,10 @@ pub use crate::adapter::{
     binding_to_claude_code_config, binding_to_claude_compatible_config, binding_to_codex_config,
     build_provider_config, AdapterError, CompozyProviderConfig,
 };
-pub use crate::bridge::{binding_to_driver, ArkyDriverBridge, BridgeError};
+pub use crate::bridge::{
+    binding_to_driver, binding_to_driver_with_placeholder_install,
+    binding_to_driver_with_placeholder_install_and_session_store, ArkyDriverBridge, BridgeError,
+};
 pub use crate::convert::{
     agent_event_to_stream_event, arky_blocks_to_of, arky_message_to_of,
     completion_request_to_provider, extract_tool_calls, finish_reason_from_payload,

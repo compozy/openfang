@@ -65,6 +65,33 @@ pub struct CompletionRequest {
     pub system: Option<String>,
     /// Extended thinking configuration (if supported by the model).
     pub thinking: Option<openfang_types::config::ThinkingConfig>,
+    /// Stable session context forwarded to drivers that support native resume.
+    pub session: Option<CompletionSessionContext>,
+}
+
+/// Stable session context carried with one completion request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionSessionContext {
+    /// Stable SDK session identifier for request-scoped continuity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Provider-native opaque resume token when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_resume_token: Option<String>,
+}
+
+/// Provider/session metadata collected while handling one completion request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionMetadata {
+    /// Driver identifier that handled the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_driver: Option<String>,
+    /// Stable SDK session identifier for the provider request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Provider-native opaque resume token when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_resume_token: Option<String>,
 }
 
 /// A response from an LLM completion.
@@ -78,6 +105,8 @@ pub struct CompletionResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Token usage statistics.
     pub usage: TokenUsage,
+    /// Provider/session metadata observed during the completion.
+    pub metadata: Option<CompletionMetadata>,
 }
 
 impl CompletionResponse {
@@ -225,6 +254,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
             usage: TokenUsage::default(),
+            metadata: None,
         };
         assert_eq!(response.text(), "Hello world!");
     }
@@ -290,6 +320,7 @@ mod tests {
                         input_tokens: 5,
                         output_tokens: 3,
                     },
+                    metadata: None,
                 })
             }
         }
@@ -304,6 +335,7 @@ mod tests {
             temperature: 0.0,
             system: None,
             thinking: None,
+            session: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

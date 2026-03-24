@@ -4784,35 +4784,8 @@ pub async fn start_workflow_run_v1(
             let kernel = Arc::clone(&state.kernel);
             let definition_id = id.clone();
             tokio::spawn(async move {
-                let resolver = |agent_ref: &str| -> Option<(AgentId, String)> {
-                    if let Ok(agent_id) = agent_ref.parse::<AgentId>() {
-                        let entry = kernel.registry.get(agent_id)?;
-                        return Some((agent_id, entry.name.clone()));
-                    }
-
-                    let entry = kernel.registry.find_by_name(agent_ref)?;
-                    Some((entry.id, entry.name.clone()))
-                };
-                let send_message = |agent_id: AgentId, message: String| {
-                    let kernel = Arc::clone(&kernel);
-                    async move {
-                        kernel
-                            .send_message(agent_id, &message)
-                            .await
-                            .map(|response| {
-                                (
-                                    response.response,
-                                    response.total_usage.input_tokens,
-                                    response.total_usage.output_tokens,
-                                )
-                            })
-                            .map_err(|error| format!("{error}"))
-                    }
-                };
-
                 if let Err(error) = kernel
-                    .workflows
-                    .execute_run(run_id, workflow_ir_for_task, resolver, send_message)
+                    .execute_compiled_workflow_run(run_id, workflow_ir_for_task)
                     .await
                 {
                     tracing::warn!(workflow_id = %definition_id, run_id = %run_id, "Workflow execution failed: {error}");
@@ -12106,6 +12079,7 @@ pub async fn test_provider(
                 temperature: 0.0,
                 system: None,
                 thinking: None,
+                session: None,
             };
             match driver.complete(test_req).await {
                 Ok(_) => {

@@ -491,6 +491,7 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
         stop_reason,
         tool_calls,
         usage,
+        metadata: None,
     })
 }
 
@@ -821,6 +822,7 @@ impl LlmDriver for GeminiDriver {
                 stop_reason,
                 tool_calls,
                 usage,
+                metadata: None,
             });
         }
 
@@ -987,6 +989,7 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            session: None,
         };
 
         let tools = convert_tools(&request);
@@ -1005,6 +1008,7 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            session: None,
         };
 
         let tools = convert_tools(&request);

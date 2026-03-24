@@ -14,14 +14,19 @@ use crate::scheduler::AgentScheduler;
 use crate::supervisor::Supervisor;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{
-    Workflow, WorkflowBootstrapResult, WorkflowDefinitionStore, WorkflowEngine, WorkflowId,
-    WorkflowRunId,
+    Workflow, WorkflowAgentDispatchOutcome, WorkflowAgentDispatchRequest, WorkflowBootstrapResult,
+    WorkflowDefinitionStore, WorkflowEngine, WorkflowId, WorkflowRunId,
 };
 
-use openfang_memory::{
-    AgentRuntimeRecord, AgentSessionRecord, MemorySubstrate, RuntimeStoreSet, WorkflowSignalRecord,
-    WorkflowStoreSet,
+use arky_session::{NewSession, SessionStore, SqliteSessionStore};
+use openfang_agent_definition::{
+    compile as compile_agent_definition, stage4_normalize, AgentDefinition, CompiledAgentDefinition,
 };
+use openfang_memory::{
+    AgentRuntimeRecord, AgentSessionRecord, DispatchRepository, DispatchStatus, MemorySubstrate,
+    RuntimeStoreSet, WorkflowSignalRecord, WorkflowStoreSet,
+};
+use openfang_provider_binding::binding_to_driver_with_placeholder_install_and_session_store;
 use openfang_runtime::agent_loop::{
     run_agent_loop, run_agent_loop_streaming, strip_provider_prefix, AgentLoopResult,
 };
@@ -42,12 +47,15 @@ use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
 use openfang_types::memory::Memory;
 use openfang_types::tool::ToolDefinition;
+use openfang_types::workflow::WorkflowIr;
 
 use async_trait::async_trait;
 use rusqlite::Connection;
-use std::collections::HashSet;
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// The main OpenFang kernel — coordinates all subsystems.
@@ -82,6 +90,19 @@ pub struct AgentMessageDispatch<'a> {
 pub struct ScheduleExecutionResult {
     pub run_id: Option<String>,
     pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedDefinitionRuntime {
+    definition: AgentDefinition,
+    compiled: CompiledAgentDefinition,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct StoredAgentDefinitionFile {
+    #[serde(flatten)]
+    definition: AgentDefinition,
 }
 
 pub struct OpenFangKernel {
@@ -190,6 +211,10 @@ pub struct OpenFangKernel {
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// Tracked background workflow dispatch tasks.
+    workflow_dispatch_tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// Cooperative cancellation token shared by background workflow dispatches.
+    workflow_dispatch_cancel: CancellationToken,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -1186,6 +1211,8 @@ impl OpenFangKernel {
             channel_adapters: dashmap::DashMap::new(),
             default_model_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
+            workflow_dispatch_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            workflow_dispatch_cancel: CancellationToken::new(),
             self_handle: OnceLock::new(),
         };
 
@@ -2573,6 +2600,7 @@ impl OpenFangKernel {
             cost_usd: None,
             silent: false,
             directives: Default::default(),
+            provider_metadata: None,
         })
     }
 
@@ -2633,6 +2661,7 @@ impl OpenFangKernel {
             iterations: 1,
             silent: false,
             directives: Default::default(),
+            provider_metadata: None,
         })
     }
 
@@ -2647,6 +2676,33 @@ impl OpenFangKernel {
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+    ) -> KernelResult<AgentLoopResult> {
+        self.execute_llm_agent_with_overrides(
+            entry,
+            agent_id,
+            message,
+            kernel_handle,
+            content_blocks,
+            sender_id,
+            sender_name,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_llm_agent_with_overrides(
+        &self,
+        entry: &AgentEntry,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
+        manifest_override: Option<AgentManifest>,
+        driver_override: Option<Arc<dyn LlmDriver>>,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
@@ -2715,7 +2771,7 @@ impl OpenFangKernel {
         );
 
         // Apply model routing if configured (disabled in Stable mode)
-        let mut manifest = entry.manifest.clone();
+        let mut manifest = manifest_override.unwrap_or_else(|| entry.manifest.clone());
 
         // Lazy backfill: create workspace for existing agents spawned before workspaces
         if manifest.workspace.is_none() {
@@ -2844,50 +2900,57 @@ impl OpenFangKernel {
 
         let is_stable = self.config.mode == openfang_types::config::KernelMode::Stable;
 
-        if is_stable {
-            // In Stable mode: use pinned_model if set, otherwise default model
-            if let Some(ref pinned) = manifest.pinned_model {
+        if driver_override.is_none() {
+            if is_stable {
+                // In Stable mode: use pinned_model if set, otherwise default model
+                if let Some(ref pinned) = manifest.pinned_model {
+                    info!(
+                        agent = %manifest.name,
+                        pinned_model = %pinned,
+                        "Stable mode: using pinned model"
+                    );
+                    manifest.model.model = pinned.clone();
+                }
+            } else if let Some(ref routing_config) = manifest.routing {
+                let mut router = ModelRouter::new(routing_config.clone());
+                // Resolve aliases (e.g. "sonnet" -> "claude-sonnet-4-20250514") before scoring
+                router
+                    .resolve_aliases(&self.model_catalog.read().unwrap_or_else(|e| e.into_inner()));
+                // Build a probe request to score complexity
+                let probe = CompletionRequest {
+                    model: strip_provider_prefix(&manifest.model.model, &manifest.model.provider),
+                    messages: vec![openfang_types::message::Message::user(message)],
+                    tools: tools.clone(),
+                    max_tokens: manifest.model.max_tokens,
+                    temperature: manifest.model.temperature,
+                    system: Some(manifest.model.system_prompt.clone()),
+                    thinking: None,
+                    session: None,
+                };
+                let (complexity, routed_model) = router.select_model(&probe);
                 info!(
                     agent = %manifest.name,
-                    pinned_model = %pinned,
-                    "Stable mode: using pinned model"
+                    complexity = %complexity,
+                    routed_model = %routed_model,
+                    "Model routing applied"
                 );
-                manifest.model.model = pinned.clone();
-            }
-        } else if let Some(ref routing_config) = manifest.routing {
-            let mut router = ModelRouter::new(routing_config.clone());
-            // Resolve aliases (e.g. "sonnet" -> "claude-sonnet-4-20250514") before scoring
-            router.resolve_aliases(&self.model_catalog.read().unwrap_or_else(|e| e.into_inner()));
-            // Build a probe request to score complexity
-            let probe = CompletionRequest {
-                model: strip_provider_prefix(&manifest.model.model, &manifest.model.provider),
-                messages: vec![openfang_types::message::Message::user(message)],
-                tools: tools.clone(),
-                max_tokens: manifest.model.max_tokens,
-                temperature: manifest.model.temperature,
-                system: Some(manifest.model.system_prompt.clone()),
-                thinking: None,
-            };
-            let (complexity, routed_model) = router.select_model(&probe);
-            info!(
-                agent = %manifest.name,
-                complexity = %complexity,
-                routed_model = %routed_model,
-                "Model routing applied"
-            );
-            manifest.model.model = routed_model.clone();
-            // Also update provider if the routed model belongs to a different provider
-            if let Ok(cat) = self.model_catalog.read() {
-                if let Some(entry) = cat.find_model(&routed_model) {
-                    if entry.provider != manifest.model.provider {
-                        info!(old = %manifest.model.provider, new = %entry.provider, "Model routing changed provider");
-                        manifest.model.provider = entry.provider.clone();
+                manifest.model.model = routed_model.clone();
+                // Also update provider if the routed model belongs to a different provider
+                if let Ok(cat) = self.model_catalog.read() {
+                    if let Some(entry) = cat.find_model(&routed_model) {
+                        if entry.provider != manifest.model.provider {
+                            info!(old = %manifest.model.provider, new = %entry.provider, "Model routing changed provider");
+                            manifest.model.provider = entry.provider.clone();
+                        }
                     }
                 }
             }
         }
 
-        let driver = self.resolve_driver(&manifest)?;
+        let driver = match driver_override {
+            Some(driver) => driver,
+            None => self.resolve_driver(&manifest)?,
+        };
 
         // Look up model's actual context window from the catalog
         let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
@@ -4165,6 +4228,690 @@ impl OpenFangKernel {
             .map_err(Into::into)
     }
 
+    fn stable_runtime_agent_id(definition_id: &str) -> AgentId {
+        AgentId::from_string(&format!("compozy-definition:{definition_id}"))
+    }
+
+    fn runtime_definition_id(entry: &AgentEntry) -> Option<&str> {
+        entry
+            .manifest
+            .metadata
+            .get("compozy")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|value| value.get("definition_id"))
+            .and_then(serde_json::Value::as_str)
+    }
+
+    fn agent_definition_path(&self, definition_id: &str) -> PathBuf {
+        self.config
+            .home_dir
+            .join("agents")
+            .join(format!("{definition_id}.toml"))
+    }
+
+    fn load_definition_runtime_by_id(
+        &self,
+        definition_id: &str,
+    ) -> KernelResult<Option<LoadedDefinitionRuntime>> {
+        let path = self.agent_definition_path(definition_id);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Failed to read agent definition '{}': {error}",
+                    path.display()
+                ))));
+            }
+        };
+
+        let stored = toml::from_str::<StoredAgentDefinitionFile>(&content).map_err(|error| {
+            KernelError::OpenFang(OpenFangError::Internal(format!(
+                "Failed to deserialize agent definition '{}': {error}",
+                path.display()
+            )))
+        })?;
+        let definition = stage4_normalize(stored.definition);
+        let compiled = compile_agent_definition(definition.clone()).map_err(|error| {
+            KernelError::OpenFang(OpenFangError::Internal(format!(
+                "Failed to compile agent definition '{definition_id}': {error}"
+            )))
+        })?;
+
+        Ok(Some(LoadedDefinitionRuntime {
+            definition,
+            compiled,
+        }))
+    }
+
+    fn load_definition_runtime_for_reference(
+        &self,
+        agent_ref: &str,
+    ) -> KernelResult<Option<LoadedDefinitionRuntime>> {
+        if let Some(runtime) = self.load_definition_runtime_by_id(agent_ref)? {
+            return Ok(Some(runtime));
+        }
+
+        let agents_dir = self.config.home_dir.join("agents");
+        if !agents_dir.exists() {
+            return Ok(None);
+        }
+
+        let entries = std::fs::read_dir(&agents_dir).map_err(|error| {
+            KernelError::OpenFang(OpenFangError::Internal(format!(
+                "Failed to read agent definitions directory '{}': {error}",
+                agents_dir.display()
+            )))
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Failed to inspect agent definition directory entry: {error}"
+                )))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("toml") {
+                continue;
+            }
+
+            let content = std::fs::read_to_string(&path).map_err(|error| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Failed to read agent definition '{}': {error}",
+                    path.display()
+                )))
+            })?;
+            let stored =
+                toml::from_str::<StoredAgentDefinitionFile>(&content).map_err(|error| {
+                    KernelError::OpenFang(OpenFangError::Internal(format!(
+                        "Failed to deserialize agent definition '{}': {error}",
+                        path.display()
+                    )))
+                })?;
+            let definition = stage4_normalize(stored.definition);
+            if definition.name != agent_ref {
+                continue;
+            }
+
+            let compiled = compile_agent_definition(definition.clone()).map_err(|error| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Failed to compile agent definition '{}': {error}",
+                    definition.id
+                )))
+            })?;
+            return Ok(Some(LoadedDefinitionRuntime {
+                definition,
+                compiled,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn find_runtime_agent_for_definition(&self, definition_id: &str) -> Option<AgentEntry> {
+        self.registry
+            .list()
+            .into_iter()
+            .filter(|entry| Self::runtime_definition_id(entry) == Some(definition_id))
+            .max_by_key(|entry| entry.created_at)
+    }
+
+    fn resolve_workflow_agent_target(&self, agent_ref: &str) -> Result<(AgentId, String), String> {
+        if let Ok(agent_id) = agent_ref.parse::<AgentId>() {
+            let entry = self
+                .registry
+                .get(agent_id)
+                .ok_or_else(|| format!("Agent '{agent_ref}' not found"))?;
+            return Ok((agent_id, entry.name.clone()));
+        }
+
+        if let Some(entry) = self.registry.find_by_name(agent_ref) {
+            return Ok((entry.id, entry.name.clone()));
+        }
+
+        let Some(runtime) = self
+            .load_definition_runtime_for_reference(agent_ref)
+            .map_err(|error| error.to_string())?
+        else {
+            return Err(format!("Agent or definition '{agent_ref}' not found"));
+        };
+
+        let definition_id = runtime.definition.id.clone();
+        if let Some(entry) = self.find_runtime_agent_for_definition(&definition_id) {
+            return Ok((entry.id, entry.name));
+        }
+
+        let stable_id = Self::stable_runtime_agent_id(&definition_id);
+        match self.spawn_agent_with_parent(runtime.compiled.agent_manifest, None, Some(stable_id)) {
+            Ok(agent_id) => {
+                let entry = self.registry.get(agent_id).ok_or_else(|| {
+                    format!(
+                        "Runtime agent '{}' was spawned but not registered",
+                        definition_id
+                    )
+                })?;
+                Ok((agent_id, entry.name))
+            }
+            Err(error) => self
+                .find_runtime_agent_for_definition(&definition_id)
+                .map(|entry| (entry.id, entry.name))
+                .ok_or_else(|| {
+                    format!(
+                        "Failed to start runtime agent for definition '{}': {error}",
+                        definition_id
+                    )
+                }),
+        }
+    }
+
+    fn compiled_definition_for_entry(
+        &self,
+        entry: &AgentEntry,
+    ) -> Result<Option<LoadedDefinitionRuntime>, String> {
+        let Some(definition_id) = Self::runtime_definition_id(entry) else {
+            return Ok(None);
+        };
+
+        self.load_definition_runtime_by_id(definition_id)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn open_arky_session_store(&self) -> Result<Arc<dyn SessionStore>, String> {
+        let store_path = self.config.data_dir.join("arky_sessions.db");
+        let store = SqliteSessionStore::open(&store_path)
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to open Arky session store '{}': {error}",
+                    store_path.display()
+                )
+            })?;
+        Ok(Arc::new(store))
+    }
+
+    async fn load_dispatch_record(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<openfang_memory::DispatchRecord, String> {
+        self.workflow_stores
+            .dispatch
+            .find_by_id(dispatch_id)
+            .await
+            .map_err(|error| format!("Failed to load dispatch '{dispatch_id}': {error}"))?
+            .ok_or_else(|| format!("Dispatch '{dispatch_id}' not found"))
+    }
+
+    async fn mark_dispatch_running(
+        &self,
+        dispatch_id: &str,
+        provider_driver: &str,
+        session_id: &str,
+        provider_resume_token: Option<String>,
+    ) -> Result<openfang_memory::DispatchRecord, String> {
+        let current = self.load_dispatch_record(dispatch_id).await?;
+        let mut next = current.clone();
+        next.status = DispatchStatus::Running;
+        next.provider_driver = Some(provider_driver.to_string());
+        next.session_id = Some(session_id.to_string());
+        next.provider_resume_token = provider_resume_token.or(next.provider_resume_token);
+        next.updated_at = openfang_memory::now_timestamp();
+        self.workflow_stores
+            .dispatch
+            .update_status(&current, &next)
+            .await
+            .map_err(|error| format!("Failed to persist running dispatch '{dispatch_id}': {error}"))
+    }
+
+    async fn complete_dispatch(
+        &self,
+        dispatch_id: &str,
+        result_json: serde_json::Value,
+        provider_resume_token: Option<String>,
+    ) -> Result<openfang_memory::DispatchRecord, String> {
+        let current = self.load_dispatch_record(dispatch_id).await?;
+        let mut next = current.clone();
+        next.status = DispatchStatus::Completed;
+        next.result_json = Some(result_json);
+        next.error_json = None;
+        if provider_resume_token.is_some() {
+            next.provider_resume_token = provider_resume_token;
+        }
+        next.updated_at = openfang_memory::now_timestamp();
+        next.completed_at = Some(next.updated_at.clone());
+        self.workflow_stores
+            .dispatch
+            .update_status(&current, &next)
+            .await
+            .map_err(|error| format!("Failed to complete dispatch '{dispatch_id}': {error}"))
+    }
+
+    async fn fail_dispatch(
+        &self,
+        dispatch_id: &str,
+        error_message: &str,
+        provider_resume_token: Option<String>,
+    ) -> Result<openfang_memory::DispatchRecord, String> {
+        let current = self.load_dispatch_record(dispatch_id).await?;
+        if current.status == DispatchStatus::Failed {
+            return Ok(current);
+        }
+        let mut next = current.clone();
+        next.status = DispatchStatus::Failed;
+        next.error_json = Some(serde_json::json!({
+            "message": error_message,
+        }));
+        if provider_resume_token.is_some() {
+            next.provider_resume_token = provider_resume_token;
+        }
+        next.updated_at = openfang_memory::now_timestamp();
+        next.completed_at = Some(next.updated_at.clone());
+        self.workflow_stores
+            .dispatch
+            .update_status(&current, &next)
+            .await
+            .map_err(|error| format!("Failed to fail dispatch '{dispatch_id}': {error}"))
+    }
+
+    async fn cancel_dispatch(
+        &self,
+        dispatch_id: &str,
+        reason: &str,
+    ) -> Result<openfang_memory::DispatchRecord, String> {
+        let current = self.load_dispatch_record(dispatch_id).await?;
+        let mut next = current.clone();
+        next.status = DispatchStatus::Cancelled;
+        next.error_json = Some(serde_json::json!({
+            "message": reason,
+        }));
+        next.updated_at = openfang_memory::now_timestamp();
+        next.completed_at = Some(next.updated_at.clone());
+        self.workflow_stores
+            .dispatch
+            .update_status(&current, &next)
+            .await
+            .map_err(|error| format!("Failed to cancel dispatch '{dispatch_id}': {error}"))
+    }
+
+    async fn complete_spawn_dispatch(
+        &self,
+        dispatch_id: &str,
+        spawned_agent_id: &str,
+    ) -> Result<openfang_memory::DispatchRecord, String> {
+        let current = self.load_dispatch_record(dispatch_id).await?;
+        let mut next = current.clone();
+        next.status = DispatchStatus::Completed;
+        next.spawned_agent_id = Some(spawned_agent_id.to_string());
+        next.result_json = Some(serde_json::json!({
+            "spawned_agent_id": spawned_agent_id,
+        }));
+        next.error_json = None;
+        next.updated_at = openfang_memory::now_timestamp();
+        next.completed_at = Some(next.updated_at.clone());
+        self.workflow_stores
+            .dispatch
+            .update_status(&current, &next)
+            .await
+            .map_err(|error| format!("Failed to complete spawn dispatch '{dispatch_id}': {error}"))
+    }
+
+    fn dispatch_result_json(result: &AgentLoopResult) -> serde_json::Value {
+        serde_json::json!({
+            "response": result.response,
+            "usage": {
+                "input_tokens": result.total_usage.input_tokens,
+                "output_tokens": result.total_usage.output_tokens,
+            },
+            "iterations": result.iterations,
+            "silent": result.silent,
+        })
+    }
+
+    async fn reap_workflow_dispatch_tasks(&self) {
+        let mut tasks = self.workflow_dispatch_tasks.lock().await;
+        while tasks.try_join_next().is_some() {}
+    }
+
+    async fn track_workflow_dispatch_task(
+        self: &Arc<Self>,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        self.reap_workflow_dispatch_tasks().await;
+        let mut tasks = self.workflow_dispatch_tasks.lock().await;
+        tasks.spawn(task);
+    }
+
+    async fn run_legacy_workflow_dispatch_call(
+        &self,
+        request: &WorkflowAgentDispatchRequest,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+    ) -> Result<AgentLoopResult, String> {
+        self.run_legacy_workflow_dispatch_call_inner(request, kernel_handle, None)
+            .await
+    }
+
+    async fn run_legacy_workflow_dispatch_call_inner(
+        &self,
+        request: &WorkflowAgentDispatchRequest,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        driver_override: Option<Arc<dyn LlmDriver>>,
+    ) -> Result<AgentLoopResult, String> {
+        let entry = self
+            .registry
+            .get(request.agent_id)
+            .ok_or_else(|| format!("Agent '{}' is no longer registered", request.agent_id))?;
+        self.mark_dispatch_running(
+            &request.dispatch_id,
+            &entry.manifest.model.provider,
+            &entry.session_id.to_string(),
+            None,
+        )
+        .await?;
+
+        let dispatch_result = match driver_override {
+            Some(driver) => self
+                .execute_llm_agent_with_overrides(
+                    &entry,
+                    request.agent_id,
+                    &request.prompt,
+                    kernel_handle,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(driver),
+                )
+                .await
+                .map_err(|error| error.to_string()),
+            None => self
+                .send_message_with_handle(
+                    request.agent_id,
+                    &request.prompt,
+                    kernel_handle,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string()),
+        };
+
+        match dispatch_result {
+            Ok(result) => {
+                self.complete_dispatch(
+                    &request.dispatch_id,
+                    Self::dispatch_result_json(&result),
+                    result
+                        .provider_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.provider_resume_token.clone()),
+                )
+                .await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let error_message = error.to_string();
+                let _ = self
+                    .fail_dispatch(&request.dispatch_id, &error_message, None)
+                    .await;
+                Err(error_message)
+            }
+        }
+    }
+
+    async fn run_arky_workflow_dispatch_call(
+        &self,
+        request: &WorkflowAgentDispatchRequest,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+    ) -> Result<AgentLoopResult, String> {
+        self.run_arky_workflow_dispatch_call_inner(request, kernel_handle, None, None, None)
+            .await
+    }
+
+    async fn run_arky_workflow_dispatch_call_inner(
+        &self,
+        request: &WorkflowAgentDispatchRequest,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        runtime_override: Option<LoadedDefinitionRuntime>,
+        session_store_override: Option<Arc<dyn SessionStore>>,
+        driver_override: Option<Arc<dyn LlmDriver>>,
+    ) -> Result<AgentLoopResult, String> {
+        let entry = self
+            .registry
+            .get(request.agent_id)
+            .ok_or_else(|| format!("Agent '{}' is no longer registered", request.agent_id))?;
+        let runtime = if let Some(runtime) = runtime_override {
+            runtime
+        } else {
+            let Some(runtime) = self.compiled_definition_for_entry(&entry)? else {
+                return Err(format!(
+                    "Agent '{}' does not have a compiled provider binding",
+                    request.target_agent
+                ));
+            };
+            runtime
+        };
+
+        let session_store = if let Some(session_store) = session_store_override {
+            session_store
+        } else {
+            self.open_arky_session_store().await?
+        };
+        let session_id = session_store
+            .create(NewSession {
+                model_id: Some(runtime.compiled.provider_binding.model.model_id.clone()),
+                labels: BTreeMap::from([
+                    ("dispatch_id".to_string(), request.dispatch_id.clone()),
+                    ("run_id".to_string(), request.run_id.to_string()),
+                    ("step_id".to_string(), request.step_id.clone()),
+                ]),
+                ..NewSession::default()
+            })
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to create Arky session for dispatch '{}': {error}",
+                    request.dispatch_id
+                )
+            })?;
+        let session_id_text = session_id.to_string();
+
+        self.mark_dispatch_running(
+            &request.dispatch_id,
+            &runtime.compiled.provider_binding.driver,
+            &session_id_text,
+            None,
+        )
+        .await?;
+
+        let driver = if let Some(driver) = driver_override {
+            driver
+        } else {
+            binding_to_driver_with_placeholder_install_and_session_store(
+                &runtime.compiled.provider_binding,
+                Arc::clone(&session_store),
+            )
+            .map_err(|error| {
+                format!(
+                    "Failed to initialize provider driver for definition '{}': {error}",
+                    runtime.definition.id
+                )
+            })?
+        };
+
+        let mut manifest = entry.manifest.clone();
+        manifest.metadata.insert(
+            "compozy_dispatch_session".to_string(),
+            serde_json::json!({
+                "session_id": session_id_text,
+            }),
+        );
+
+        match self
+            .execute_llm_agent_with_overrides(
+                &entry,
+                request.agent_id,
+                &request.prompt,
+                kernel_handle,
+                None,
+                None,
+                None,
+                Some(manifest),
+                Some(driver),
+            )
+            .await
+        {
+            Ok(result) => {
+                let provider_resume_token = result
+                    .provider_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.provider_resume_token.clone());
+                self.complete_dispatch(
+                    &request.dispatch_id,
+                    Self::dispatch_result_json(&result),
+                    provider_resume_token,
+                )
+                .await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let error_message = error.to_string();
+                let provider_resume_token =
+                    match self.load_dispatch_record(&request.dispatch_id).await {
+                        Ok(dispatch) => dispatch.provider_resume_token,
+                        Err(_) => None,
+                    };
+                let _ = self
+                    .fail_dispatch(&request.dispatch_id, &error_message, provider_resume_token)
+                    .await;
+                Err(error_message)
+            }
+        }
+    }
+
+    async fn execute_workflow_dispatch(
+        &self,
+        request: WorkflowAgentDispatchRequest,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        background_kernel: Option<Arc<Self>>,
+    ) -> Result<WorkflowAgentDispatchOutcome, String> {
+        if request.kind == openfang_memory::DispatchKind::Spawn {
+            self.complete_spawn_dispatch(&request.dispatch_id, &request.agent_id.to_string())
+                .await?;
+            return Ok(WorkflowAgentDispatchOutcome::Spawned {
+                spawned_agent_id: request.agent_id.to_string(),
+            });
+        }
+
+        let entry = self
+            .registry
+            .get(request.agent_id)
+            .ok_or_else(|| format!("Agent '{}' is no longer registered", request.agent_id))?;
+        let uses_arky_runtime = self.compiled_definition_for_entry(&entry)?.is_some();
+
+        if request.kind == openfang_memory::DispatchKind::Send {
+            let Some(background_kernel) = background_kernel else {
+                return Err(
+                    "Workflow send dispatch requires a kernel self handle for background execution"
+                        .to_string(),
+                );
+            };
+
+            let cancel_token = background_kernel.workflow_dispatch_cancel.child_token();
+            let background_request = request.clone();
+            let background_kernel_handle = kernel_handle.clone();
+            let tracked_kernel = background_kernel.clone();
+            let task_kernel = background_kernel.clone();
+            tracked_kernel
+                .track_workflow_dispatch_task(async move {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => {
+                            let _ = task_kernel
+                                .cancel_dispatch(
+                                    &background_request.dispatch_id,
+                                    "workflow dispatch cancelled during shutdown",
+                                )
+                                .await;
+                        }
+                        result = async {
+                            if uses_arky_runtime {
+                                task_kernel
+                                    .run_arky_workflow_dispatch_call(
+                                        &background_request,
+                                        background_kernel_handle.clone(),
+                                    )
+                                    .await
+                            } else {
+                                task_kernel
+                                    .run_legacy_workflow_dispatch_call(
+                                        &background_request,
+                                        background_kernel_handle.clone(),
+                                    )
+                                    .await
+                            }
+                        } => {
+                            if let Err(error) = result {
+                                let _ = task_kernel
+                                    .fail_dispatch(
+                                        &background_request.dispatch_id,
+                                        &error,
+                                        None,
+                                    )
+                                    .await;
+                                warn!(
+                                    dispatch_id = %background_request.dispatch_id,
+                                    step_id = %background_request.step_id,
+                                    "Background workflow dispatch failed: {error}"
+                                );
+                            }
+                        }
+                    }
+                })
+                .await;
+
+            return Ok(WorkflowAgentDispatchOutcome::SendAccepted);
+        }
+
+        let result = if uses_arky_runtime {
+            self.run_arky_workflow_dispatch_call(&request, kernel_handle)
+                .await?
+        } else {
+            self.run_legacy_workflow_dispatch_call(&request, kernel_handle)
+                .await?
+        };
+
+        Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+            output: result.response,
+            input_tokens: result.total_usage.input_tokens,
+            output_tokens: result.total_usage.output_tokens,
+        })
+    }
+
+    pub async fn execute_compiled_workflow_run(
+        self: &Arc<Self>,
+        run_id: WorkflowRunId,
+        workflow_ir: WorkflowIr,
+    ) -> Result<(), String> {
+        let kernel_handle: Option<Arc<dyn KernelHandle>> =
+            Some(Arc::clone(self) as Arc<dyn KernelHandle>);
+        let resolver_kernel = Arc::clone(self);
+        let resolver =
+            move |agent_ref: &str| resolver_kernel.resolve_workflow_agent_target(agent_ref);
+        let dispatch_kernel = Arc::clone(self);
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let kernel = Arc::clone(&dispatch_kernel);
+            let kernel_handle = kernel_handle.clone();
+            Box::pin(async move {
+                kernel
+                    .execute_workflow_dispatch(request, kernel_handle, Some(Arc::clone(&kernel)))
+                    .await
+            }) as crate::workflow::WorkflowDispatchFuture
+        };
+
+        self.workflows
+            .execute_run_with_dispatch(run_id, workflow_ir, &resolver, &dispatch_agent)
+            .await
+            .map(|_| ())
+    }
+
     /// Run a workflow pipeline end-to-end with optional durable labels and
     /// metadata.
     pub async fn run_workflow_with_context(
@@ -4197,29 +4944,29 @@ impl OpenFangKernel {
             .await
             .map_err(KernelError::from)?;
 
-        // Agent resolver: accepts either a stable AgentId string or a human-readable name.
-        let resolver = |agent_ref: &str| -> Option<(AgentId, String)> {
-            if let Ok(agent_id) = agent_ref.parse::<AgentId>() {
-                let entry = self.registry.get(agent_id)?;
-                return Some((agent_id, entry.name.clone()));
-            }
-
-            let entry = self.registry.find_by_name(agent_ref)?;
-            Some((entry.id, entry.name.clone()))
+        let background_kernel = self.self_handle.get().and_then(|weak| weak.upgrade());
+        let kernel_handle = background_kernel
+            .as_ref()
+            .map(|kernel| Arc::clone(kernel) as Arc<dyn KernelHandle>);
+        let Some(callback_kernel) = background_kernel.clone() else {
+            return Err(KernelError::OpenFang(OpenFangError::Internal(
+                "Workflow execution requires a kernel self handle".to_string(),
+            )));
         };
 
-        // Message sender: sends to agent and returns (output, in_tokens, out_tokens)
-        let send_message = |agent_id: AgentId, message: String| async move {
-            self.send_message(agent_id, &message)
-                .await
-                .map(|r| {
-                    (
-                        r.response,
-                        r.total_usage.input_tokens,
-                        r.total_usage.output_tokens,
-                    )
-                })
-                .map_err(|e| format!("{e}"))
+        let resolver_kernel = Arc::clone(&callback_kernel);
+        let resolver =
+            move |agent_ref: &str| resolver_kernel.resolve_workflow_agent_target(agent_ref);
+        let dispatch_kernel = callback_kernel;
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let kernel_handle = kernel_handle.clone();
+            let background_kernel = background_kernel.clone();
+            let dispatch_kernel = Arc::clone(&dispatch_kernel);
+            Box::pin(async move {
+                dispatch_kernel
+                    .execute_workflow_dispatch(request, kernel_handle, background_kernel)
+                    .await
+            }) as crate::workflow::WorkflowDispatchFuture
         };
 
         // SECURITY: Global workflow timeout to prevent runaway execution.
@@ -4227,8 +4974,12 @@ impl OpenFangKernel {
 
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(MAX_WORKFLOW_SECS),
-            self.workflows
-                .execute_run(run_id, workflow_ir, resolver, send_message),
+            self.workflows.execute_run_with_dispatch(
+                run_id,
+                workflow_ir,
+                &resolver,
+                &dispatch_agent,
+            ),
         )
         .await
         .map_err(|_| {
@@ -4257,31 +5008,32 @@ impl OpenFangKernel {
         &self,
         resume: crate::workflow::SignalResumeContext,
     ) -> KernelResult<()> {
-        let resolver = |agent_ref: &str| -> Option<(AgentId, String)> {
-            if let Ok(agent_id) = agent_ref.parse::<AgentId>() {
-                let entry = self.registry.get(agent_id)?;
-                return Some((agent_id, entry.name.clone()));
-            }
-
-            let entry = self.registry.find_by_name(agent_ref)?;
-            Some((entry.id, entry.name.clone()))
+        let background_kernel = self.self_handle.get().and_then(|weak| weak.upgrade());
+        let kernel_handle = background_kernel
+            .as_ref()
+            .map(|kernel| Arc::clone(kernel) as Arc<dyn KernelHandle>);
+        let Some(callback_kernel) = background_kernel.clone() else {
+            return Err(KernelError::OpenFang(OpenFangError::Internal(
+                "Workflow signal resume requires a kernel self handle".to_string(),
+            )));
         };
-
-        let send_message = |agent_id: AgentId, message: String| async move {
-            self.send_message(agent_id, &message)
-                .await
-                .map(|result| {
-                    (
-                        result.response,
-                        result.total_usage.input_tokens,
-                        result.total_usage.output_tokens,
-                    )
-                })
-                .map_err(|error| error.to_string())
+        let resolver_kernel = Arc::clone(&callback_kernel);
+        let resolver =
+            move |agent_ref: &str| resolver_kernel.resolve_workflow_agent_target(agent_ref);
+        let dispatch_kernel = callback_kernel;
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let kernel_handle = kernel_handle.clone();
+            let background_kernel = background_kernel.clone();
+            let dispatch_kernel = Arc::clone(&dispatch_kernel);
+            Box::pin(async move {
+                dispatch_kernel
+                    .execute_workflow_dispatch(request, kernel_handle, background_kernel)
+                    .await
+            }) as crate::workflow::WorkflowDispatchFuture
         };
 
         self.workflows
-            .resume_after_signal(resume, resolver, send_message)
+            .resume_after_signal_with_dispatch(resume, &resolver, &dispatch_agent)
             .await
             .map_err(|error| {
                 KernelError::OpenFang(OpenFangError::Internal(format!(
@@ -4419,35 +5171,8 @@ impl OpenFangKernel {
                 let kernel = Arc::clone(self);
                 let definition_id = workflow_id.clone();
                 tokio::spawn(async move {
-                    let resolver = |agent_ref: &str| -> Option<(AgentId, String)> {
-                        if let Ok(agent_id) = agent_ref.parse::<AgentId>() {
-                            let entry = kernel.registry.get(agent_id)?;
-                            return Some((agent_id, entry.name.clone()));
-                        }
-
-                        let entry = kernel.registry.find_by_name(agent_ref)?;
-                        Some((entry.id, entry.name.clone()))
-                    };
-                    let send_message = |agent_id: AgentId, message: String| {
-                        let kernel = Arc::clone(&kernel);
-                        async move {
-                            kernel
-                                .send_message(agent_id, &message)
-                                .await
-                                .map(|response| {
-                                    (
-                                        response.response,
-                                        response.total_usage.input_tokens,
-                                        response.total_usage.output_tokens,
-                                    )
-                                })
-                                .map_err(|error| format!("{error}"))
-                        }
-                    };
-
                     if let Err(error) = kernel
-                        .workflows
-                        .execute_run(run_id, workflow_ir_for_task, resolver, send_message)
+                        .execute_compiled_workflow_run(run_id, workflow_ir_for_task)
                         .await
                     {
                         tracing::warn!(workflow_id = %definition_id, run_id = %run_id, "Workflow execution failed: {error}");
@@ -5195,6 +5920,7 @@ impl OpenFangKernel {
         }
 
         self.supervisor.shutdown();
+        self.workflow_dispatch_cancel.cancel();
 
         // Update agent states to Suspended in persistent storage (not delete)
         for entry in self.registry.list() {
@@ -7139,7 +7865,10 @@ impl openfang_wire::peer::PeerHandle for OpenFangKernel {
 mod tests {
     use super::*;
     use crate::db_migration::{self, MigrationStep};
+    use async_trait::async_trait;
+    use openfang_runtime::llm_driver::CompletionMetadata;
     use openfang_types::config::PersistenceConfig;
+    use openfang_types::message::{ContentBlock, StopReason, TokenUsage};
     use rusqlite::{Connection, OptionalExtension};
     use std::collections::HashMap;
     use std::path::Path;
@@ -7149,6 +7878,145 @@ mod tests {
             home_dir: root.to_path_buf(),
             data_dir: root.join("data"),
             ..KernelConfig::default()
+        }
+    }
+
+    struct StaticTextDriver {
+        text: String,
+        metadata: Option<CompletionMetadata>,
+    }
+
+    impl StaticTextDriver {
+        fn new(text: impl Into<String>, metadata: Option<CompletionMetadata>) -> Self {
+            Self {
+                text: text.into(),
+                metadata,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmDriver for StaticTextDriver {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: self.text.clone(),
+                    provider_metadata: None,
+                }],
+                stop_reason: StopReason::EndTurn,
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 12,
+                    output_tokens: 6,
+                },
+                metadata: self.metadata.clone(),
+            })
+        }
+    }
+
+    fn register_test_agent(
+        kernel: &OpenFangKernel,
+        name: &str,
+        mut manifest: AgentManifest,
+    ) -> (AgentId, AgentEntry) {
+        manifest.name = name.to_string();
+        let entry = AgentEntry {
+            id: AgentId::new(),
+            name: name.to_string(),
+            manifest,
+            state: AgentState::Running,
+            mode: AgentMode::default(),
+            created_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+            parent: None,
+            children: vec![],
+            session_id: SessionId::new(),
+            tags: vec![],
+            identity: Default::default(),
+            onboarding_completed: false,
+            onboarding_completed_at: None,
+        };
+        kernel
+            .registry
+            .register(entry.clone())
+            .expect("agent registration should succeed");
+        (entry.id, entry)
+    }
+
+    async fn seed_pending_dispatch(
+        kernel: &OpenFangKernel,
+        request: &WorkflowAgentDispatchRequest,
+    ) {
+        let timestamp = openfang_memory::now_timestamp();
+        let record = openfang_memory::DispatchRecord {
+            dispatch_id: request.dispatch_id.clone(),
+            run_id: request.run_id.to_string(),
+            step_id: Some(request.step_id.clone()),
+            kind: request.kind,
+            target_agent: request.target_agent.clone(),
+            status: DispatchStatus::Pending,
+            input_json: serde_json::json!({ "message": request.prompt }),
+            result_json: None,
+            error_json: None,
+            attempt: 1,
+            parent_dispatch_id: None,
+            spawned_agent_id: None,
+            provider_driver: None,
+            session_id: None,
+            provider_resume_token: None,
+            started_at: timestamp.clone(),
+            updated_at: timestamp,
+            completed_at: None,
+        };
+        kernel
+            .workflow_stores
+            .dispatch
+            .create(&record)
+            .await
+            .expect("pending dispatch should persist");
+    }
+
+    fn sample_dispatch_request(
+        agent_id: AgentId,
+        target_agent: &str,
+    ) -> WorkflowAgentDispatchRequest {
+        WorkflowAgentDispatchRequest {
+            run_id: WorkflowRunId::new(),
+            step_id: "dispatch-step".to_string(),
+            target_agent: target_agent.to_string(),
+            agent_id,
+            agent_name: target_agent.to_string(),
+            prompt: "hello dispatch".to_string(),
+            dispatch_id: uuid::Uuid::new_v4().to_string(),
+            kind: openfang_memory::DispatchKind::Call,
+        }
+    }
+
+    fn minimal_codex_runtime() -> LoadedDefinitionRuntime {
+        let definition: AgentDefinition = serde_json::from_value(serde_json::json!({
+            "id": "dispatch-codex",
+            "name": "Dispatch Codex",
+            "provider": {
+                "driver": "codex",
+                "model": "gpt-5",
+                "defaults": {
+                    "max_tokens": 512
+                },
+                "config": {
+                    "web_search": true
+                }
+            }
+        }))
+        .expect("definition should deserialize");
+        let definition = stage4_normalize(definition);
+        let compiled =
+            compile_agent_definition(definition.clone()).expect("definition should compile");
+        LoadedDefinitionRuntime {
+            definition,
+            compiled,
         }
     }
 
@@ -7164,6 +8032,193 @@ mod tests {
         .optional()
         .expect("schema_migration exists query")
         .is_some()
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_end_to_end_with_openfang_llm_driver() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel should boot");
+        let mut manifest = test_manifest("legacy-dispatch", "Legacy dispatch agent", vec![]);
+        manifest.model.provider = "openai".to_string();
+        manifest.model.model = "gpt-4o-mini".to_string();
+        let (agent_id, entry) = register_test_agent(&kernel, "legacy-dispatch", manifest);
+        let request = sample_dispatch_request(agent_id, "legacy-dispatch");
+        seed_pending_dispatch(&kernel, &request).await;
+
+        let result = kernel
+            .run_legacy_workflow_dispatch_call_inner(
+                &request,
+                None,
+                Some(Arc::new(StaticTextDriver::new(
+                    "legacy completed",
+                    Some(CompletionMetadata {
+                        provider_driver: Some("openai".to_string()),
+                        session_id: Some(entry.session_id.to_string()),
+                        provider_resume_token: Some("legacy-resume".to_string()),
+                    }),
+                ))),
+            )
+            .await
+            .expect("legacy dispatch should complete");
+
+        let dispatch = kernel
+            .workflow_stores
+            .dispatch
+            .find_by_id(&request.dispatch_id)
+            .await
+            .expect("dispatch lookup should succeed")
+            .expect("dispatch should exist");
+
+        assert_eq!(result.response, "legacy completed");
+        assert_eq!(dispatch.status, DispatchStatus::Completed);
+        assert_eq!(dispatch.provider_driver.as_deref(), Some("openai"));
+        let expected_session_id = entry.session_id.to_string();
+        assert_eq!(
+            dispatch.session_id.as_deref(),
+            Some(expected_session_id.as_str())
+        );
+        assert_eq!(
+            dispatch.provider_resume_token.as_deref(),
+            Some("legacy-resume")
+        );
+        assert_eq!(
+            dispatch.result_json,
+            Some(serde_json::json!({
+                "response": "legacy completed",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 6,
+                },
+                "iterations": 1,
+                "silent": false,
+            }))
+        );
+        kernel.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_end_to_end_with_arky_provider() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel should boot");
+        let runtime = minimal_codex_runtime();
+        let (agent_id, _entry) = register_test_agent(
+            &kernel,
+            "arky-dispatch",
+            runtime.compiled.agent_manifest.clone(),
+        );
+        let request = sample_dispatch_request(agent_id, "arky-dispatch");
+        seed_pending_dispatch(&kernel, &request).await;
+        let session_store = Arc::new(
+            SqliteSessionStore::open(tmp.path().join("arky-sessions.db"))
+                .await
+                .expect("session store should open"),
+        );
+
+        let result = kernel
+            .run_arky_workflow_dispatch_call_inner(
+                &request,
+                None,
+                Some(runtime.clone()),
+                Some(session_store),
+                Some(Arc::new(StaticTextDriver::new(
+                    "arky completed",
+                    Some(CompletionMetadata {
+                        provider_driver: Some("codex".to_string()),
+                        session_id: None,
+                        provider_resume_token: Some("arky-resume".to_string()),
+                    }),
+                ))),
+            )
+            .await
+            .expect("arky dispatch should complete");
+
+        let dispatch = kernel
+            .workflow_stores
+            .dispatch
+            .find_by_id(&request.dispatch_id)
+            .await
+            .expect("dispatch lookup should succeed")
+            .expect("dispatch should exist");
+
+        assert_eq!(result.response, "arky completed");
+        assert_eq!(dispatch.status, DispatchStatus::Completed);
+        assert_eq!(dispatch.provider_driver.as_deref(), Some("codex"));
+        assert!(dispatch.session_id.is_some());
+        assert_eq!(
+            dispatch.provider_resume_token.as_deref(),
+            Some("arky-resume")
+        );
+        kernel.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dispatch_session_identity_survives_reconnect() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel should boot");
+        let runtime = minimal_codex_runtime();
+        let (agent_id, _entry) = register_test_agent(
+            &kernel,
+            "arky-reconnect",
+            runtime.compiled.agent_manifest.clone(),
+        );
+        let request = sample_dispatch_request(agent_id, "arky-reconnect");
+        seed_pending_dispatch(&kernel, &request).await;
+        let store_path = tmp.path().join("arky-reconnect.db");
+        let session_store = Arc::new(
+            SqliteSessionStore::open(&store_path)
+                .await
+                .expect("session store should open"),
+        );
+
+        kernel
+            .run_arky_workflow_dispatch_call_inner(
+                &request,
+                None,
+                Some(runtime),
+                Some(session_store),
+                Some(Arc::new(StaticTextDriver::new(
+                    "arky reconnect",
+                    Some(CompletionMetadata {
+                        provider_driver: Some("codex".to_string()),
+                        session_id: None,
+                        provider_resume_token: Some("resume-after-reconnect".to_string()),
+                    }),
+                ))),
+            )
+            .await
+            .expect("arky dispatch should complete");
+
+        let dispatch = kernel
+            .workflow_stores
+            .dispatch
+            .find_by_id(&request.dispatch_id)
+            .await
+            .expect("dispatch lookup should succeed")
+            .expect("dispatch should exist");
+        let reopened = SqliteSessionStore::open(&store_path)
+            .await
+            .expect("session store should reopen");
+        let session_id = arky_session::SessionId::parse_str(
+            dispatch
+                .session_id
+                .as_deref()
+                .expect("dispatch should record session id"),
+        )
+        .expect("session id should parse");
+        let snapshot = reopened
+            .load(&session_id)
+            .await
+            .expect("session snapshot should load after reconnect");
+
+        assert_eq!(
+            snapshot.metadata.labels.get("dispatch_id"),
+            Some(&request.dispatch_id)
+        );
+        assert_eq!(dispatch.provider_driver.as_deref(), Some("codex"));
+        kernel.shutdown();
     }
 
     fn schema_migration_rows(path: &Path) -> Vec<(u32, String, String)> {

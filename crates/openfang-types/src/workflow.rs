@@ -305,6 +305,9 @@ pub struct RuntimeBlock {
     pub timeout_secs: Option<u64>,
     /// Optional error handling override for the step.
     pub error_mode: Option<ErrorMode>,
+    /// Optional dispatch mode override for agent steps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<DispatchMode>,
 }
 
 /// Error handling behavior for a workflow step.
@@ -321,6 +324,19 @@ pub enum ErrorMode {
         /// Maximum number of retries before the step fails permanently.
         max_retries: u32,
     },
+}
+
+/// Durable dispatch mode for one workflow agent step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchMode {
+    /// Invoke the agent and wait for the result before advancing.
+    #[default]
+    Call,
+    /// Start the agent asynchronously and advance immediately.
+    Send,
+    /// Resolve or create a long-lived runtime agent and return its identity.
+    Spawn,
 }
 
 /// Severity for machine-readable workflow validation issues.
@@ -400,6 +416,8 @@ pub struct ResolvedRuntimeSettings {
     pub timeout_secs: u64,
     /// Effective error handling behavior for the workflow or step.
     pub error_mode: ErrorMode,
+    /// Effective dispatch mode for agent steps.
+    pub dispatch: DispatchMode,
 }
 
 impl Default for ResolvedRuntimeSettings {
@@ -407,6 +425,7 @@ impl Default for ResolvedRuntimeSettings {
         Self {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             error_mode: ErrorMode::default(),
+            dispatch: DispatchMode::default(),
         }
     }
 }
@@ -426,6 +445,7 @@ impl ResolvedRuntimeSettings {
             error_mode: runtime
                 .and_then(|value| value.error_mode.clone())
                 .unwrap_or_else(|| defaults.error_mode.clone()),
+            dispatch: runtime.and_then(|value| value.dispatch).unwrap_or_default(),
         }
     }
 }
@@ -435,6 +455,7 @@ impl From<WorkflowDefaults> for ResolvedRuntimeSettings {
         Self {
             timeout_secs: value.timeout_secs,
             error_mode: value.error_mode,
+            dispatch: DispatchMode::default(),
         }
     }
 }
@@ -805,6 +826,7 @@ mod tests {
             runtime: Some(RuntimeBlock {
                 timeout_secs: Some(300),
                 error_mode: Some(ErrorMode::Fail),
+                dispatch: None,
             }),
         };
 
@@ -1070,6 +1092,7 @@ mod tests {
         let runtime = RuntimeBlock {
             timeout_secs: Some(45),
             error_mode: Some(ErrorMode::Retry { max_retries: 2 }),
+            dispatch: None,
         };
 
         let round_trip: RuntimeBlock = serde_json::from_str(

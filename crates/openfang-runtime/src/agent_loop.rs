@@ -8,7 +8,10 @@ use crate::context_budget::{apply_context_guard, truncate_tool_result_dynamic, C
 use crate::context_overflow::{recover_from_overflow, RecoveryStage};
 use crate::embedding::EmbeddingDriver;
 use crate::kernel_handle::KernelHandle;
-use crate::llm_driver::{CompletionRequest, LlmDriver, LlmError, StreamEvent};
+use crate::llm_driver::{
+    CompletionMetadata, CompletionRequest, CompletionSessionContext, LlmDriver, LlmError,
+    StreamEvent,
+};
 use crate::llm_errors;
 use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
 use crate::mcp::McpConnection;
@@ -88,6 +91,30 @@ fn append_tool_error_guidance(tool_result_blocks: &mut Vec<ContentBlock>) {
     }
 }
 
+fn completion_session_from_manifest(manifest: &AgentManifest) -> Option<CompletionSessionContext> {
+    let session = manifest
+        .metadata
+        .get("compozy_dispatch_session")?
+        .as_object()?;
+    let session_id = session
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let provider_resume_token = session
+        .get("provider_resume_token")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+
+    if session_id.is_none() && provider_resume_token.is_none() {
+        return None;
+    }
+
+    Some(CompletionSessionContext {
+        session_id,
+        provider_resume_token,
+    })
+}
+
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
 /// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
@@ -142,6 +169,8 @@ pub struct AgentLoopResult {
     pub silent: bool,
     /// Reply directives extracted from the agent's response.
     pub directives: openfang_types::message::ReplyDirectives,
+    /// Provider/session metadata captured during the execution.
+    pub provider_metadata: Option<CompletionMetadata>,
 }
 
 /// Run the agent execution loop for a single user message.
@@ -352,6 +381,7 @@ pub async fn run_agent_loop(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    let mut completion_metadata: Option<CompletionMetadata> = None;
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
@@ -383,6 +413,7 @@ pub async fn run_agent_loop(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            session: completion_session_from_manifest(manifest),
         };
 
         // Notify phase: Thinking
@@ -393,6 +424,9 @@ pub async fn run_agent_loop(
         // Call LLM with retry, error classification, and circuit breaker
         let provider_name = manifest.model.provider.as_str();
         let mut response = call_with_retry(&*driver, request, Some(provider_name), None).await?;
+        if response.metadata.is_some() {
+            completion_metadata = response.metadata.clone();
+        }
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
@@ -457,6 +491,7 @@ pub async fn run_agent_loop(
                             current_thread: parsed_directives.current_thread,
                             silent: true,
                         },
+                        provider_metadata: completion_metadata.clone(),
                     });
                 }
 
@@ -616,6 +651,7 @@ pub async fn run_agent_loop(
                     cost_usd: None,
                     silent: false,
                     directives: Default::default(),
+                    provider_metadata: completion_metadata.clone(),
                 });
             }
             StopReason::ToolUse => {
@@ -896,6 +932,7 @@ pub async fn run_agent_loop(
                         cost_usd: None,
                         silent: false,
                         directives: Default::default(),
+                        provider_metadata: completion_metadata.clone(),
                     });
                 }
                 // Model hit token limit — add partial response and continue
@@ -1361,6 +1398,7 @@ pub async fn run_agent_loop_streaming(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    let mut completion_metadata: Option<CompletionMetadata> = None;
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
@@ -1402,6 +1440,7 @@ pub async fn run_agent_loop_streaming(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            session: completion_session_from_manifest(manifest),
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
@@ -1425,6 +1464,9 @@ pub async fn run_agent_loop_streaming(
             None,
         )
         .await?;
+        if response.metadata.is_some() {
+            completion_metadata = response.metadata.clone();
+        }
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
@@ -1486,6 +1528,7 @@ pub async fn run_agent_loop_streaming(
                             current_thread: parsed_directives_s.current_thread,
                             silent: true,
                         },
+                        provider_metadata: completion_metadata.clone(),
                     });
                 }
 
@@ -1624,6 +1667,7 @@ pub async fn run_agent_loop_streaming(
                     cost_usd: None,
                     silent: false,
                     directives: Default::default(),
+                    provider_metadata: completion_metadata.clone(),
                 });
             }
             StopReason::ToolUse => {
@@ -1911,6 +1955,7 @@ pub async fn run_agent_loop_streaming(
                         cost_usd: None,
                         silent: false,
                         directives: Default::default(),
+                        provider_metadata: completion_metadata.clone(),
                     });
                 }
                 let text = response.text();
@@ -2874,6 +2919,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 5,
                     },
+                    metadata: None,
                 })
             } else {
                 // Second call: LLM returns EndTurn with EMPTY text (the bug)
@@ -2885,6 +2931,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 0,
                     },
+                    metadata: None,
                 })
             }
         }
@@ -2908,6 +2955,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 0,
                 },
+                metadata: None,
             })
         }
     }
@@ -2932,6 +2980,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 8,
                 },
+                metadata: None,
             })
         }
     }
@@ -3226,6 +3275,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 0,
                     },
+                    metadata: None,
                 })
             } else {
                 // Second call (retry): normal response
@@ -3240,6 +3290,7 @@ mod tests {
                         input_tokens: 15,
                         output_tokens: 8,
                     },
+                    metadata: None,
                 })
             }
         }
@@ -3263,6 +3314,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 0,
                 },
+                metadata: None,
             })
         }
     }
@@ -4223,6 +4275,7 @@ mod tests {
                         input_tokens: 20,
                         output_tokens: 15,
                     },
+                    metadata: None,
                 })
             } else {
                 // After tool result, return normal response
@@ -4237,6 +4290,7 @@ mod tests {
                         input_tokens: 30,
                         output_tokens: 12,
                     },
+                    metadata: None,
                 })
             }
         }
