@@ -803,6 +803,25 @@ pub(crate) struct WorkflowAgentContinuation {
     pub answer: HitlAnswer,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct HitlResumeContext {
+    pub hitl_record: HitlRecord,
+    pub answer: HitlAnswer,
+    pub run_id: WorkflowRunId,
+    pub workflow: WorkflowIr,
+    pub step: WorkflowIrStep,
+    pub step_index: usize,
+    pub variables: HashMap<String, String>,
+    pub dispatch: DispatchRecord,
+    pub checkpoint: WorkflowCheckpointRecord,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum HitlAnswerDisposition {
+    Live { record: Box<HitlRecord> },
+    Reconstruct(Box<HitlResumeContext>),
+}
+
 #[derive(Default)]
 struct HitlRegistry {
     senders: Mutex<HashMap<String, oneshot::Sender<HitlAnswer>>>,
@@ -2353,6 +2372,65 @@ impl WorkflowEngine {
             .map_err(OpenFangError::from)?;
 
         for record in records {
+            if record.status == DurableWorkflowRunStatus::WaitingHitl {
+                match (
+                    record.active_hitl_request_id.as_deref(),
+                    record.active_dispatch_id.as_deref(),
+                ) {
+                    (Some(hitl_request_id), Some(dispatch_id)) => {
+                        match self.workflow_stores.dispatch.find_by_id(dispatch_id).await {
+                            Ok(Some(dispatch))
+                                if dispatch.status == DispatchStatus::WaitingHitl =>
+                            {
+                                info!(
+                                    run_id = %record.run_id,
+                                    hitl_request_id = hitl_request_id,
+                                    dispatch_id = dispatch_id,
+                                    "Run has pending HITL request awaiting human answer"
+                                );
+                            }
+                            Ok(Some(dispatch)) => {
+                                warn!(
+                                    run_id = %record.run_id,
+                                    hitl_request_id = hitl_request_id,
+                                    dispatch_id = dispatch_id,
+                                    dispatch_status = %dispatch.status,
+                                    "Workflow run waiting_hitl had a non-waiting dispatch during recovery"
+                                );
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    run_id = %record.run_id,
+                                    hitl_request_id = hitl_request_id,
+                                    dispatch_id = dispatch_id,
+                                    "Workflow run waiting_hitl referenced a missing dispatch during recovery"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(
+                                    run_id = %record.run_id,
+                                    hitl_request_id = hitl_request_id,
+                                    dispatch_id = dispatch_id,
+                                    "Failed to inspect waiting HITL dispatch during recovery: {error}"
+                                );
+                            }
+                        }
+                    }
+                    (None, _) => {
+                        warn!(
+                            run_id = %record.run_id,
+                            "Workflow run is waiting_hitl without an active_hitl_request_id"
+                        );
+                    }
+                    (Some(hitl_request_id), None) => {
+                        warn!(
+                            run_id = %record.run_id,
+                            hitl_request_id = hitl_request_id,
+                            "Workflow run is waiting_hitl without an active dispatch"
+                        );
+                    }
+                }
+            }
             writer
                 .sync_cache_from_record(&record, None)
                 .await
@@ -2717,12 +2795,12 @@ impl WorkflowEngine {
         }
     }
 
-    pub async fn answer_hitl_request(
+    pub(crate) async fn answer_hitl_request_with_disposition(
         &self,
         hitl_request_id: &str,
         response_json: JsonValue,
         metadata_json: JsonValue,
-    ) -> Result<HitlRecord, String> {
+    ) -> Result<HitlAnswerDisposition, String> {
         let (record, answer) = self
             .transition_writer()
             .answer_hitl_request(hitl_request_id, response_json, metadata_json)
@@ -2730,15 +2808,61 @@ impl WorkflowEngine {
             .map_err(transition_error_to_string)?;
 
         if let Some(sender) = self.hitl_registry.remove(hitl_request_id).await {
-            if sender.send(answer).is_err() {
+            if sender.send(answer.clone()).is_err() {
                 warn!(
                     hitl_request_id = hitl_request_id,
                     "HITL answer was committed durably, but the live workflow continuation receiver was gone"
                 );
+            } else {
+                return Ok(HitlAnswerDisposition::Live {
+                    record: Box::new(record),
+                });
             }
         }
 
-        Ok(record)
+        let resume = self
+            .build_hitl_resume_context(record.clone(), answer)
+            .await?;
+        Ok(HitlAnswerDisposition::Reconstruct(Box::new(resume)))
+    }
+
+    pub(crate) async fn record_hitl_resume_failure(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let current = self
+            .workflow_stores
+            .workflow_run
+            .find_by_id(&run_id.to_string())
+            .map_err(|store_error| {
+                format!(
+                    "Failed to load workflow run '{}' before marking HITL resume failure: {store_error}",
+                    run_id
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "Workflow run '{}' disappeared before marking HITL resume failure",
+                    run_id
+                )
+            })?;
+        if matches!(
+            current.status,
+            DurableWorkflowRunStatus::Failed
+                | DurableWorkflowRunStatus::Completed
+                | DurableWorkflowRunStatus::Cancelled
+        ) {
+            info!(
+                run_id = %run_id,
+                step_id = step_id,
+                "Skipping duplicate HITL resume failure transition for terminal workflow run"
+            );
+            return Ok(());
+        }
+
+        self.mark_hitl_resume_failed(run_id, step_id, error).await
     }
 
     pub async fn cancel_hitl_request(&self, hitl_request_id: &str) -> Result<HitlRecord, String> {
@@ -3406,6 +3530,353 @@ impl WorkflowEngine {
             .await
             .ok_or_else(|| format!("Workflow definition '{}' not found", record.workflow_id))?;
         Ok(Self::legacy_workflow_to_ir(&workflow))
+    }
+
+    async fn latest_checkpoint_for_step(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+    ) -> Result<WorkflowCheckpointRecord, String> {
+        let repository = self.workflow_stores.workflow_checkpoint.clone();
+        let run_id_text = run_id.to_string();
+        let checkpoints =
+            tokio::task::spawn_blocking(move || repository.list_for_run(&run_id_text))
+                .await
+                .map_err(|error| format!("Workflow checkpoint query task failed: {error}"))?
+                .map_err(|error| error.to_string())?;
+
+        checkpoints
+            .into_iter()
+            .rev()
+            .find(|checkpoint| checkpoint.step_id.as_deref() == Some(step_id))
+            .ok_or_else(|| {
+                format!(
+                    "No durable checkpoint found for workflow run '{}' step '{}'",
+                    run_id, step_id
+                )
+            })
+    }
+
+    async fn build_hitl_resume_context(
+        &self,
+        record: HitlRecord,
+        answer: HitlAnswer,
+    ) -> Result<HitlResumeContext, String> {
+        let run_record = self
+            .workflow_stores
+            .workflow_run
+            .find_by_id(&record.run_id)
+            .map_err(|error| {
+                format!(
+                    "Failed to load durable workflow run '{}': {error}",
+                    record.run_id
+                )
+            })?
+            .ok_or_else(|| format!("Workflow run '{}' not found for HITL resume", record.run_id))?;
+        let run_id = WorkflowRunId(Uuid::parse_str(&run_record.run_id).map_err(|error| {
+            format!(
+                "Stored workflow run id '{}' is invalid: {error}",
+                run_record.run_id
+            )
+        })?);
+        let workflow = self.workflow_ir_for_record(&run_record).await?;
+        let step_id = run_record
+            .current_step_id
+            .clone()
+            .unwrap_or_else(|| record.step_id.clone());
+        let step_index = workflow
+            .steps
+            .iter()
+            .position(|step| step.id == step_id)
+            .ok_or_else(|| {
+                format!(
+                    "Workflow step '{}' not found in workflow '{}'",
+                    step_id, workflow.workflow_id
+                )
+            })?;
+        let checkpoint = self.latest_checkpoint_for_step(run_id, &step_id).await?;
+        let dispatch_id = record.dispatch_id.clone().ok_or_else(|| {
+            format!(
+                "HITL request '{}' had no dispatch id for restart reconstruction",
+                record.hitl_request_id
+            )
+        })?;
+        let dispatch = self
+            .workflow_stores
+            .dispatch
+            .find_by_id(&dispatch_id)
+            .await
+            .map_err(|error| format!("Failed to load durable dispatch '{dispatch_id}': {error}"))?
+            .ok_or_else(|| format!("Dispatch '{dispatch_id}' not found for HITL resume"))?;
+        let variables = parse_workflow_vars(&run_record.vars_json)?;
+
+        Ok(HitlResumeContext {
+            hitl_record: record,
+            answer,
+            run_id,
+            workflow: workflow.clone(),
+            step: workflow.steps[step_index].clone(),
+            step_index,
+            variables,
+            dispatch,
+            checkpoint,
+        })
+    }
+
+    async fn push_step_result_to_cache(
+        &self,
+        run_id: WorkflowRunId,
+        step_name: String,
+        outcome: &WorkflowAgentStepOutcome,
+        duration_ms: u64,
+    ) {
+        if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+            run.step_results.push(StepResult {
+                step_name,
+                agent_id: outcome.agent_id.to_string(),
+                agent_name: outcome.agent_name.clone(),
+                output: outcome.output.clone(),
+                input_tokens: outcome.input_tokens,
+                output_tokens: outcome.output_tokens,
+                duration_ms,
+            });
+        }
+    }
+
+    async fn resume_current_hitl_dispatch(
+        &self,
+        resume: &HitlResumeContext,
+        agent_resolver: &WorkflowAgentResolver,
+        dispatch_agent: &WorkflowDispatchAgent,
+    ) -> Result<(WorkflowAgentStepOutcome, u64), String> {
+        let target_agent = Self::agent_target(&resume.step)?;
+        let (agent_id, agent_name) = match agent_resolver(target_agent) {
+            Ok(agent) => agent,
+            Err(error) => {
+                let _ = self
+                    .fail_dispatch(&resume.dispatch.dispatch_id, &error)
+                    .await;
+                return Err(error);
+            }
+        };
+
+        let request = WorkflowAgentDispatchRequest {
+            run_id: resume.run_id,
+            step_id: resume.step.id.clone(),
+            target_agent: target_agent.to_string(),
+            agent_id,
+            agent_name,
+            prompt: resume.answer.continuation_message(),
+            dispatch_id: resume.dispatch.dispatch_id.clone(),
+            kind: resume.dispatch.kind,
+            continuation: Some(WorkflowAgentContinuation {
+                hitl_request_id: resume.hitl_record.hitl_request_id.clone(),
+                answer: resume.answer.clone(),
+            }),
+        };
+        let started_at = std::time::Instant::now();
+        let outcome = self
+            .execute_agent_step_with_error_mode(&resume.step, request, dispatch_agent)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "Resumed HITL step '{}' returned no output for dispatch '{}'",
+                    resume.step.id, resume.dispatch.dispatch_id
+                )
+            })?;
+
+        Ok((outcome, started_at.elapsed().as_millis() as u64))
+    }
+
+    async fn mark_hitl_resume_failed(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        self.record_step_failed_transition(run_id, step_id, error, 1)
+            .await?;
+        self.record_run_failed_transition(run_id, Some(step_id), error)
+            .await
+    }
+
+    async fn loop_iterations_before_resume(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &str,
+        resumed_dispatch_id: &str,
+    ) -> Result<usize, String> {
+        let dispatches = self
+            .workflow_stores
+            .dispatch
+            .find_by_run(&run_id.to_string())
+            .await
+            .map_err(|error| {
+                format!("Failed to list durable dispatches for run '{run_id}': {error}")
+            })?;
+
+        Ok(dispatches
+            .into_iter()
+            .filter(|dispatch| dispatch.step_id.as_deref() == Some(step_id))
+            .filter(|dispatch| dispatch.dispatch_id != resumed_dispatch_id)
+            .count())
+    }
+
+    pub(crate) async fn resume_after_hitl_with_dispatch(
+        &self,
+        resume: HitlResumeContext,
+        agent_resolver: &WorkflowAgentResolver,
+        dispatch_agent: &WorkflowDispatchAgent,
+    ) -> Result<(), String> {
+        debug!(
+            run_id = %resume.run_id,
+            step_id = %resume.step.id,
+            dispatch_id = %resume.dispatch.dispatch_id,
+            checkpoint_kind = %resume.checkpoint.kind,
+            "Reconstructing workflow step after restart for HITL answer"
+        );
+
+        let (resumed_outcome, resumed_duration_ms) = match self
+            .resume_current_hitl_dispatch(&resume, agent_resolver, dispatch_agent)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.mark_hitl_resume_failed(resume.run_id, &resume.step.id, &error)
+                    .await?;
+                return Err(error);
+            }
+        };
+
+        let mut variables = resume.variables.clone();
+        let mut current_input = resumed_outcome.output.clone();
+        let next_index = resume.step_index + 1;
+
+        match &resume.step.flow.mode {
+            WorkflowV2FlowMode::Sequential | WorkflowV2FlowMode::Conditional { .. } => {
+                self.push_step_result_to_cache(
+                    resume.run_id,
+                    resume.step.name.clone(),
+                    &resumed_outcome,
+                    resumed_duration_ms,
+                )
+                .await;
+
+                if let Some(symbol) = resume.step.save_as.as_ref() {
+                    variables.insert(symbol.clone(), current_input.clone());
+                }
+
+                self.record_step_completed_transition(
+                    resume.run_id,
+                    &resume.step.id,
+                    resume.step.save_as.as_deref(),
+                    &checkpoint_output_summary(&current_input),
+                    serde_json::to_string(&variables).unwrap_or_else(|_| "{}".to_string()),
+                )
+                .await?;
+            }
+            WorkflowV2FlowMode::Loop {
+                max_iterations,
+                until,
+            } => {
+                let mut completed_iterations = self
+                    .loop_iterations_before_resume(
+                        resume.run_id,
+                        &resume.step.id,
+                        &resume.dispatch.dispatch_id,
+                    )
+                    .await?;
+                completed_iterations += 1;
+                self.push_step_result_to_cache(
+                    resume.run_id,
+                    format!("{} (iter {})", resume.step.name, completed_iterations),
+                    &resumed_outcome,
+                    resumed_duration_ms,
+                )
+                .await;
+
+                while !Self::flow_condition_matches(until, &current_input)
+                    && completed_iterations < *max_iterations as usize
+                {
+                    let started_at = std::time::Instant::now();
+                    let outcome = match self
+                        .dispatch_agent_step(
+                            resume.run_id,
+                            &resume.step,
+                            &current_input,
+                            &variables,
+                            agent_resolver,
+                            dispatch_agent,
+                        )
+                        .await
+                    {
+                        Ok(Some(outcome)) => outcome,
+                        Ok(None) => {
+                            let error = format!(
+                                "Loop step '{}' returned no output during HITL restart resume",
+                                resume.step.id
+                            );
+                            self.mark_hitl_resume_failed(resume.run_id, &resume.step.id, &error)
+                                .await?;
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            self.mark_hitl_resume_failed(resume.run_id, &resume.step.id, &error)
+                                .await?;
+                            return Err(error);
+                        }
+                    };
+                    completed_iterations += 1;
+                    self.push_step_result_to_cache(
+                        resume.run_id,
+                        format!("{} (iter {})", resume.step.name, completed_iterations),
+                        &outcome,
+                        started_at.elapsed().as_millis() as u64,
+                    )
+                    .await;
+                    current_input = outcome.output;
+                }
+
+                if let Some(symbol) = resume.step.save_as.as_ref() {
+                    variables.insert(symbol.clone(), current_input.clone());
+                }
+
+                self.record_step_completed_transition(
+                    resume.run_id,
+                    &resume.step.id,
+                    resume.step.save_as.as_deref(),
+                    &checkpoint_output_summary(&current_input),
+                    serde_json::to_string(&variables).unwrap_or_else(|_| "{}".to_string()),
+                )
+                .await?;
+            }
+            WorkflowV2FlowMode::FanOut => {
+                let error = format!(
+                    "Post-restart HITL reconstruction does not support fan-out step '{}'",
+                    resume.step.id
+                );
+                self.mark_hitl_resume_failed(resume.run_id, &resume.step.id, &error)
+                    .await?;
+                return Err(error);
+            }
+        }
+
+        let _ = self
+            .execute_steps(
+                ExecutionContext {
+                    run_id: resume.run_id,
+                    workflow: resume.workflow,
+                    start_index: next_index,
+                    input: current_input,
+                    variables,
+                    start_run: false,
+                },
+                agent_resolver,
+                dispatch_agent,
+            )
+            .await?;
+
+        Ok(())
     }
 
     async fn waiting_resume_input(
@@ -4647,6 +5118,19 @@ mod tests {
         .expect("expected hitl requests to appear before timeout")
     }
 
+    async fn answer_live_hitl(
+        engine: &WorkflowEngine,
+        hitl_request_id: &str,
+        response_json: JsonValue,
+        metadata_json: JsonValue,
+    ) {
+        let disposition = engine
+            .answer_hitl_request_with_disposition(hitl_request_id, response_json, metadata_json)
+            .await
+            .expect("hitl answer should succeed");
+        assert!(matches!(disposition, HitlAnswerDisposition::Live { .. }));
+    }
+
     async fn mark_dispatch_running_for_test(
         dispatches: &openfang_memory::SqliteDispatchRepository,
         dispatch_id: &str,
@@ -4865,14 +5349,13 @@ mod tests {
             .await
             .expect("hitl pause should succeed");
 
-        engine
-            .answer_hitl_request(
-                &hitl_request.hitl_request_id,
-                json!({ "type": "text", "value": "continue" }),
-                json!({ "source": "test" }),
-            )
-            .await
-            .expect("hitl answer should succeed");
+        answer_live_hitl(
+            &engine,
+            &hitl_request.hitl_request_id,
+            json!({ "type": "text", "value": "continue" }),
+            json!({ "source": "test" }),
+        )
+        .await;
         let _answer = engine
             .wait_for_hitl_answer(&hitl_request.hitl_request_id, receiver)
             .await
@@ -4907,14 +5390,13 @@ mod tests {
             .await
             .expect("hitl pause should succeed");
 
-        engine
-            .answer_hitl_request(
-                &hitl_request.hitl_request_id,
-                json!({ "type": "choice", "value": "b2b_admins_first" }),
-                json!({ "source": "api" }),
-            )
-            .await
-            .expect("hitl answer should succeed");
+        answer_live_hitl(
+            &engine,
+            &hitl_request.hitl_request_id,
+            json!({ "type": "choice", "value": "b2b_admins_first" }),
+            json!({ "source": "api" }),
+        )
+        .await;
 
         let answer = engine
             .wait_for_hitl_answer(&hitl_request.hitl_request_id, receiver)
@@ -4926,6 +5408,614 @@ mod tests {
         );
         assert_eq!(answer.metadata_json, json!({ "source": "api" }));
         assert_eq!(answer.hitl_request_id, hitl_request.hitl_request_id);
+    }
+
+    #[tokio::test]
+    async fn two_branch_dispatch_should_use_live_path_when_sender_exists() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let (run_id, step, dispatch) =
+            seed_running_hitl_context(&engine, "hitl-live-dispatch-branch").await;
+
+        let (hitl_request, receiver) = engine
+            .request_hitl_pause(
+                run_id,
+                &step.id,
+                &dispatch.dispatch_id,
+                WorkflowHitlSignal {
+                    kind: HitlKind::Clarification,
+                    question: "Need a live answer".to_string(),
+                    context: json!({ "branch": "live" }),
+                },
+                None,
+            )
+            .await
+            .expect("hitl pause should succeed");
+
+        let disposition = engine
+            .answer_hitl_request_with_disposition(
+                &hitl_request.hitl_request_id,
+                json!({ "type": "text", "value": "live answer" }),
+                json!({ "source": "api" }),
+            )
+            .await
+            .expect("hitl answer should succeed");
+
+        assert!(matches!(disposition, HitlAnswerDisposition::Live { .. }));
+        let answer = engine
+            .wait_for_hitl_answer(&hitl_request.hitl_request_id, receiver)
+            .await
+            .expect("receiver should resolve");
+        assert_eq!(answer.continuation_message(), "live answer");
+    }
+
+    #[tokio::test]
+    async fn two_branch_dispatch_should_use_reconstruction_when_no_sender() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().to_path_buf();
+        let workflow_stores = in_memory_workflow_stores();
+        let first_engine = WorkflowEngine::with_definitions_dir_and_stores(
+            workflows_dir.clone(),
+            workflow_stores.clone(),
+        );
+        let (run_id, step, dispatch) =
+            seed_running_hitl_context(&first_engine, "hitl-reconstruct-branch").await;
+
+        let (hitl_request, receiver) = first_engine
+            .request_hitl_pause(
+                run_id,
+                &step.id,
+                &dispatch.dispatch_id,
+                WorkflowHitlSignal {
+                    kind: HitlKind::Clarification,
+                    question: "Need restart reconstruction".to_string(),
+                    context: json!({ "branch": "reconstruct" }),
+                },
+                Some("resume-after-restart".to_string()),
+            )
+            .await
+            .expect("hitl pause should succeed");
+        drop(receiver);
+        drop(first_engine);
+
+        let restarted_engine =
+            WorkflowEngine::with_definitions_dir_and_stores(workflows_dir.clone(), workflow_stores);
+        let _ = restarted_engine
+            .bootstrap_from_store(WorkflowDefinitionStore::new(workflows_dir))
+            .await;
+
+        let disposition = restarted_engine
+            .answer_hitl_request_with_disposition(
+                &hitl_request.hitl_request_id,
+                json!({ "type": "text", "value": "resume from durable state" }),
+                json!({ "source": "api" }),
+            )
+            .await
+            .expect("restart hitl answer should succeed");
+
+        match disposition {
+            HitlAnswerDisposition::Live { .. } => {
+                panic!("expected reconstruction branch after restart")
+            }
+            HitlAnswerDisposition::Reconstruct(resume) => {
+                assert_eq!(resume.run_id, run_id);
+                assert_eq!(resume.step.id, step.id);
+                assert_eq!(resume.dispatch.dispatch_id, dispatch.dispatch_id);
+                assert_eq!(resume.checkpoint.kind, DurableCheckpointKind::HitlRequested);
+                assert_eq!(
+                    resume.hitl_record.hitl_request_id,
+                    hitl_request.hitl_request_id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hitl_restart_during_pending_request_should_preserve_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().to_path_buf();
+        let workflow_stores = in_memory_workflow_stores();
+        let first_engine = WorkflowEngine::with_definitions_dir_and_stores(
+            workflows_dir.clone(),
+            workflow_stores.clone(),
+        );
+        let (run_id, step, dispatch) =
+            seed_running_hitl_context(&first_engine, "hitl-restart-preserve").await;
+
+        let (hitl_request, _receiver) = first_engine
+            .request_hitl_pause(
+                run_id,
+                &step.id,
+                &dispatch.dispatch_id,
+                WorkflowHitlSignal {
+                    kind: HitlKind::Clarification,
+                    question: "Wait across restart".to_string(),
+                    context: json!({ "restart": true }),
+                },
+                Some("resume-after-restart".to_string()),
+            )
+            .await
+            .expect("hitl pause should succeed");
+        drop(first_engine);
+
+        let restarted_engine =
+            WorkflowEngine::with_definitions_dir_and_stores(workflows_dir.clone(), workflow_stores);
+        let _ = restarted_engine
+            .bootstrap_from_store(WorkflowDefinitionStore::new(workflows_dir))
+            .await;
+        let recovered = restarted_engine
+            .recover_durable_runs()
+            .await
+            .expect("recovery should succeed");
+        let run = load_durable_run(&restarted_engine, run_id);
+        let durable_dispatch =
+            load_durable_dispatch(&restarted_engine, &dispatch.dispatch_id).await;
+        let durable_hitl =
+            load_hitl_request(&restarted_engine, &hitl_request.hitl_request_id).await;
+
+        assert_eq!(recovered, 0);
+        assert_eq!(run.status, DurableWorkflowRunStatus::WaitingHitl);
+        assert_eq!(
+            run.active_dispatch_id.as_deref(),
+            Some(dispatch.dispatch_id.as_str())
+        );
+        assert_eq!(
+            run.active_hitl_request_id.as_deref(),
+            Some(hitl_request.hitl_request_id.as_str())
+        );
+        assert_eq!(durable_dispatch.status, DispatchStatus::WaitingHitl);
+        assert_eq!(durable_hitl.status, openfang_memory::HitlStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn post_restart_resume_should_reconstruct_step_executor() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().to_path_buf();
+        let workflow_stores = in_memory_workflow_stores();
+        let first_engine = WorkflowEngine::with_definitions_dir_and_stores(
+            workflows_dir.clone(),
+            workflow_stores.clone(),
+        );
+        let workflow = test_workflow();
+        let workflow_ir = legacy_ir(&workflow);
+        let first_step = workflow_ir.steps[0].clone();
+        let workflow_id = first_engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = first_engine
+            .create_run(workflow_id, "draft the PRD".to_string())
+            .await
+            .expect("workflow run should be created");
+        first_engine
+            .record_run_started_transition(run_id, Some(&first_step.id))
+            .await
+            .expect("run should start");
+        let dispatch = first_engine
+            .create_pending_dispatch(run_id, &first_step, "analyst", "draft the PRD")
+            .await
+            .expect("dispatch should be created");
+        first_engine
+            .record_step_started_transition(run_id, &first_step, Some(&dispatch.record.dispatch_id))
+            .await
+            .expect("step should start");
+        let running_dispatch = mark_dispatch_running_for_test(
+            &first_engine.workflow_stores.dispatch,
+            &dispatch.record.dispatch_id,
+            "openfang-openai",
+            "session-hitl-post-restart",
+        )
+        .await;
+        let (hitl_request, receiver) = first_engine
+            .request_hitl_pause(
+                run_id,
+                &first_step.id,
+                &running_dispatch.dispatch_id,
+                WorkflowHitlSignal {
+                    kind: HitlKind::Clarification,
+                    question: "Clarify the audience".to_string(),
+                    context: json!({ "stage": "restart" }),
+                },
+                Some("resume-after-restart".to_string()),
+            )
+            .await
+            .expect("hitl pause should succeed");
+        drop(receiver);
+        drop(first_engine);
+
+        let restarted_engine = Arc::new(WorkflowEngine::with_definitions_dir_and_stores(
+            workflows_dir.clone(),
+            workflow_stores,
+        ));
+        let _ = restarted_engine
+            .bootstrap_from_store(WorkflowDefinitionStore::new(workflows_dir))
+            .await;
+        let disposition = restarted_engine
+            .answer_hitl_request_with_disposition(
+                &hitl_request.hitl_request_id,
+                json!({ "type": "text", "value": "admins first" }),
+                json!({ "source": "api" }),
+            )
+            .await
+            .expect("restart answer should succeed");
+        let HitlAnswerDisposition::Reconstruct(resume) = disposition else {
+            panic!("expected reconstruction branch after restart");
+        };
+        let dispatches = restarted_engine.workflow_stores.dispatch.clone();
+        let reused_dispatch_id = resume.dispatch.dispatch_id.clone();
+        let reconstructed_dispatches = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let reconstructed_dispatches_for_call = Arc::clone(&reconstructed_dispatches);
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let dispatches = dispatches.clone();
+            let reconstructed_dispatches = Arc::clone(&reconstructed_dispatches_for_call);
+            let reused_dispatch_id = reused_dispatch_id.clone();
+            Box::pin(async move {
+                if request.step_id == "analyze" {
+                    assert_eq!(request.dispatch_id, reused_dispatch_id);
+                    assert!(request.continuation.is_some());
+                    reconstructed_dispatches
+                        .lock()
+                        .await
+                        .push(request.dispatch_id.clone());
+                    let current = dispatches
+                        .find_by_id(&request.dispatch_id)
+                        .await
+                        .expect("dispatch lookup should succeed")
+                        .expect("dispatch should exist");
+                    let result_json = json!({ "response": "analysis after restart" });
+                    dispatches
+                        .mark_completed(&current, Some(&result_json), &now_timestamp())
+                        .await
+                        .expect("dispatch should complete");
+                    Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                        output: "analysis after restart".to_string(),
+                        input_tokens: 12,
+                        output_tokens: 6,
+                    })
+                } else {
+                    let current = dispatches
+                        .find_by_id(&request.dispatch_id)
+                        .await
+                        .expect("dispatch lookup should succeed")
+                        .expect("dispatch should exist");
+                    let current = if current.status == DispatchStatus::Pending {
+                        mark_dispatch_running_for_test(
+                            &dispatches,
+                            &request.dispatch_id,
+                            "openfang-openai",
+                            "session-hitl-post-restart",
+                        )
+                        .await
+                    } else {
+                        current
+                    };
+                    let result_json = json!({ "response": "summary after restart" });
+                    dispatches
+                        .mark_completed(&current, Some(&result_json), &now_timestamp())
+                        .await
+                        .expect("dispatch should complete");
+                    Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                        output: "summary after restart".to_string(),
+                        input_tokens: 9,
+                        output_tokens: 5,
+                    })
+                }
+            }) as WorkflowDispatchFuture
+        };
+
+        restarted_engine
+            .resume_after_hitl_with_dispatch(*resume, &mock_dispatch_resolver, &dispatch_agent)
+            .await
+            .expect("reconstructed workflow step should resume");
+
+        let run = restarted_engine
+            .get_run(run_id)
+            .await
+            .expect("workflow run should remain in cache");
+        let durable_dispatches = load_durable_dispatches(&restarted_engine, run_id).await;
+
+        assert_eq!(
+            reconstructed_dispatches.lock().await.as_slice(),
+            std::slice::from_ref(&dispatch.record.dispatch_id)
+        );
+        assert!(matches!(run.state, WorkflowRunState::Completed));
+        assert_eq!(run.output.as_deref(), Some("summary after restart"));
+        assert_eq!(durable_dispatches.len(), 2);
+        assert!(durable_dispatches.iter().any(|record| {
+            record.dispatch_id == dispatch.record.dispatch_id
+                && record.status == DispatchStatus::Completed
+        }));
+        assert!(durable_dispatches
+            .iter()
+            .any(|record| record.step_id.as_deref() == Some("summarize")));
+    }
+
+    #[tokio::test]
+    async fn hitl_post_restart_resume_should_complete_step() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().to_path_buf();
+        let workflow_stores = in_memory_workflow_stores();
+        let first_engine = WorkflowEngine::with_definitions_dir_and_stores(
+            workflows_dir.clone(),
+            workflow_stores.clone(),
+        );
+        let workflow = test_workflow();
+        let workflow_ir = legacy_ir(&workflow);
+        let first_step = workflow_ir.steps[0].clone();
+        let workflow_id = first_engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = first_engine
+            .create_run(workflow_id, "draft the PRD".to_string())
+            .await
+            .expect("workflow run should be created");
+        first_engine
+            .record_run_started_transition(run_id, Some(&first_step.id))
+            .await
+            .expect("run should start");
+        let dispatch = first_engine
+            .create_pending_dispatch(run_id, &first_step, "analyst", "draft the PRD")
+            .await
+            .expect("dispatch should be created");
+        first_engine
+            .record_step_started_transition(run_id, &first_step, Some(&dispatch.record.dispatch_id))
+            .await
+            .expect("step should start");
+        let running_dispatch = mark_dispatch_running_for_test(
+            &first_engine.workflow_stores.dispatch,
+            &dispatch.record.dispatch_id,
+            "openfang-openai",
+            "session-hitl-post-restart-complete",
+        )
+        .await;
+        let (hitl_request, receiver) = first_engine
+            .request_hitl_pause(
+                run_id,
+                &first_step.id,
+                &running_dispatch.dispatch_id,
+                WorkflowHitlSignal {
+                    kind: HitlKind::Clarification,
+                    question: "Clarify the audience".to_string(),
+                    context: json!({ "stage": "restart" }),
+                },
+                None,
+            )
+            .await
+            .expect("hitl pause should succeed");
+        drop(receiver);
+        drop(first_engine);
+
+        let restarted_engine = Arc::new(WorkflowEngine::with_definitions_dir_and_stores(
+            workflows_dir.clone(),
+            workflow_stores,
+        ));
+        let _ = restarted_engine
+            .bootstrap_from_store(WorkflowDefinitionStore::new(workflows_dir))
+            .await;
+        let disposition = restarted_engine
+            .answer_hitl_request_with_disposition(
+                &hitl_request.hitl_request_id,
+                json!({ "type": "text", "value": "admins first" }),
+                json!({ "source": "api" }),
+            )
+            .await
+            .expect("restart answer should succeed");
+        let HitlAnswerDisposition::Reconstruct(resume) = disposition else {
+            panic!("expected reconstruction branch after restart");
+        };
+        let dispatches = restarted_engine.workflow_stores.dispatch.clone();
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let dispatches = dispatches.clone();
+            Box::pin(async move {
+                let current = dispatches
+                    .find_by_id(&request.dispatch_id)
+                    .await
+                    .expect("dispatch lookup should succeed")
+                    .expect("dispatch should exist");
+                let current = if current.status == DispatchStatus::Pending {
+                    mark_dispatch_running_for_test(
+                        &dispatches,
+                        &request.dispatch_id,
+                        "openfang-openai",
+                        "session-hitl-post-restart-complete",
+                    )
+                    .await
+                } else {
+                    current
+                };
+                let output = if request.step_id == "analyze" {
+                    "analysis after restart"
+                } else {
+                    "summary after restart"
+                };
+                let result_json = json!({ "response": output });
+                dispatches
+                    .mark_completed(&current, Some(&result_json), &now_timestamp())
+                    .await
+                    .expect("dispatch should complete");
+                Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                    output: output.to_string(),
+                    input_tokens: 10,
+                    output_tokens: 5,
+                })
+            }) as WorkflowDispatchFuture
+        };
+
+        restarted_engine
+            .resume_after_hitl_with_dispatch(*resume, &mock_dispatch_resolver, &dispatch_agent)
+            .await
+            .expect("reconstructed workflow should complete");
+
+        let final_run = load_durable_run(&restarted_engine, run_id);
+        assert_eq!(final_run.status, DurableWorkflowRunStatus::Completed);
+        assert_eq!(final_run.active_hitl_request_id, None);
+    }
+
+    #[tokio::test]
+    async fn hitl_multi_turn_after_restart_should_use_live_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflows_dir = temp_dir.path().to_path_buf();
+        let workflow_stores = in_memory_workflow_stores();
+        let first_engine = WorkflowEngine::with_definitions_dir_and_stores(
+            workflows_dir.clone(),
+            workflow_stores.clone(),
+        );
+        let workflow = single_step_workflow("hitl-restart-multi-turn", "analyst");
+        let workflow_ir = legacy_ir(&workflow);
+        let step = workflow_ir.steps[0].clone();
+        let workflow_id = first_engine
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = first_engine
+            .create_run(workflow_id, "plan the rollout".to_string())
+            .await
+            .expect("workflow run should be created");
+        first_engine
+            .record_run_started_transition(run_id, Some(&step.id))
+            .await
+            .expect("run should start");
+        let dispatch = first_engine
+            .create_pending_dispatch(run_id, &step, "analyst", "plan the rollout")
+            .await
+            .expect("dispatch should be created");
+        first_engine
+            .record_step_started_transition(run_id, &step, Some(&dispatch.record.dispatch_id))
+            .await
+            .expect("step should start");
+        let running_dispatch = mark_dispatch_running_for_test(
+            &first_engine.workflow_stores.dispatch,
+            &dispatch.record.dispatch_id,
+            "openfang-openai",
+            "session-hitl-restart-multi-turn",
+        )
+        .await;
+        let (hitl_request, receiver) = first_engine
+            .request_hitl_pause(
+                run_id,
+                &step.id,
+                &running_dispatch.dispatch_id,
+                WorkflowHitlSignal {
+                    kind: HitlKind::Clarification,
+                    question: "Who is the first audience?".to_string(),
+                    context: json!({ "turn": 1 }),
+                },
+                None,
+            )
+            .await
+            .expect("first hitl pause should succeed");
+        drop(receiver);
+        drop(first_engine);
+
+        let restarted_engine = Arc::new(WorkflowEngine::with_definitions_dir_and_stores(
+            workflows_dir.clone(),
+            workflow_stores,
+        ));
+        let _ = restarted_engine
+            .bootstrap_from_store(WorkflowDefinitionStore::new(workflows_dir))
+            .await;
+        let disposition = restarted_engine
+            .answer_hitl_request_with_disposition(
+                &hitl_request.hitl_request_id,
+                json!({ "type": "text", "value": "admins" }),
+                json!({ "source": "api" }),
+            )
+            .await
+            .expect("restart answer should succeed");
+        let HitlAnswerDisposition::Reconstruct(resume) = disposition else {
+            panic!("expected reconstruction branch after restart");
+        };
+        let dispatches = restarted_engine.workflow_stores.dispatch.clone();
+        let engine_for_resume = Arc::clone(&restarted_engine);
+        let resume_handle = tokio::spawn(async move {
+            let engine_for_dispatch = Arc::clone(&engine_for_resume);
+            let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+                let engine = Arc::clone(&engine_for_dispatch);
+                let dispatches = dispatches.clone();
+                Box::pin(async move {
+                    let (second_request, receiver) = engine
+                        .request_hitl_pause(
+                            request.run_id,
+                            &request.step_id,
+                            &request.dispatch_id,
+                            WorkflowHitlSignal {
+                                kind: HitlKind::Clarification,
+                                question: "What is the second priority?".to_string(),
+                                context: json!({ "turn": 2 }),
+                            },
+                            None,
+                        )
+                        .await?;
+                    let second_answer = engine
+                        .wait_for_hitl_answer(&second_request.hitl_request_id, receiver)
+                        .await?;
+                    let current = dispatches
+                        .find_by_id(&request.dispatch_id)
+                        .await
+                        .expect("dispatch lookup should succeed")
+                        .expect("dispatch should exist");
+                    let output = format!(
+                        "{} | {}",
+                        request.prompt,
+                        second_answer.continuation_message()
+                    );
+                    let result_json = json!({ "response": output });
+                    dispatches
+                        .mark_completed(&current, Some(&result_json), &now_timestamp())
+                        .await
+                        .expect("dispatch should complete");
+                    Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                        output,
+                        input_tokens: 11,
+                        output_tokens: 6,
+                    })
+                }) as WorkflowDispatchFuture
+            };
+
+            engine_for_resume
+                .resume_after_hitl_with_dispatch(*resume, &mock_dispatch_resolver, &dispatch_agent)
+                .await
+        });
+
+        let second_request = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let requests = restarted_engine
+                    .workflow_stores
+                    .hitl
+                    .find_pending_for_run(&run_id.to_string())
+                    .await
+                    .expect("pending hitl lookup should succeed");
+                if let Some(request) = requests
+                    .into_iter()
+                    .find(|request| request.sequence_no == 2)
+                {
+                    break request;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second hitl request should appear");
+        let second_disposition = restarted_engine
+            .answer_hitl_request_with_disposition(
+                &second_request.hitl_request_id,
+                json!({ "type": "text", "value": "compliance" }),
+                json!({ "source": "api" }),
+            )
+            .await
+            .expect("second hitl answer should succeed");
+
+        assert!(matches!(
+            second_disposition,
+            HitlAnswerDisposition::Live { .. }
+        ));
+        resume_handle
+            .await
+            .expect("resume task should join")
+            .expect("workflow should resume after second live answer");
+        let final_run = load_durable_run(&restarted_engine, run_id);
+        assert_eq!(final_run.status, DurableWorkflowRunStatus::Completed);
     }
 
     #[tokio::test]
@@ -4949,14 +6039,13 @@ mod tests {
             )
             .await
             .expect("first hitl pause should succeed");
-        engine
-            .answer_hitl_request(
-                &first_request.hitl_request_id,
-                json!({ "type": "text", "value": "answer one" }),
-                json!({ "source": "test" }),
-            )
-            .await
-            .expect("first answer should succeed");
+        answer_live_hitl(
+            &engine,
+            &first_request.hitl_request_id,
+            json!({ "type": "text", "value": "answer one" }),
+            json!({ "source": "test" }),
+        )
+        .await;
         let _ = engine
             .wait_for_hitl_answer(&first_request.hitl_request_id, first_receiver)
             .await
@@ -4976,14 +6065,13 @@ mod tests {
             )
             .await
             .expect("second hitl pause should succeed");
-        engine
-            .answer_hitl_request(
-                &second_request.hitl_request_id,
-                json!({ "type": "text", "value": "answer two" }),
-                json!({ "source": "test" }),
-            )
-            .await
-            .expect("second answer should succeed");
+        answer_live_hitl(
+            &engine,
+            &second_request.hitl_request_id,
+            json!({ "type": "text", "value": "answer two" }),
+            json!({ "source": "test" }),
+        )
+        .await;
         let _ = engine
             .wait_for_hitl_answer(&second_request.hitl_request_id, second_receiver)
             .await
@@ -5155,14 +6243,13 @@ mod tests {
             .into_iter()
             .next()
             .expect("pending hitl request should exist");
-        engine
-            .answer_hitl_request(
-                &hitl_request.hitl_request_id,
-                json!({ "type": "text", "value": "B2B admins first" }),
-                json!({ "source": "test" }),
-            )
-            .await
-            .expect("hitl answer should succeed");
+        answer_live_hitl(
+            &engine,
+            &hitl_request.hitl_request_id,
+            json!({ "type": "text", "value": "B2B admins first" }),
+            json!({ "source": "test" }),
+        )
+        .await;
 
         let output = run_handle
             .await
@@ -5262,14 +6349,13 @@ mod tests {
             .into_iter()
             .next()
             .expect("pending hitl request should exist");
-        engine
-            .answer_hitl_request(
-                &hitl_request.hitl_request_id,
-                json!({ "type": "text", "value": "admins first" }),
-                json!({ "source": "api" }),
-            )
-            .await
-            .expect("hitl answer should succeed");
+        answer_live_hitl(
+            &engine,
+            &hitl_request.hitl_request_id,
+            json!({ "type": "text", "value": "admins first" }),
+            json!({ "source": "api" }),
+        )
+        .await;
 
         let output = run_handle
             .await
@@ -5391,14 +6477,13 @@ mod tests {
             .into_iter()
             .next()
             .expect("first hitl request should exist");
-        engine
-            .answer_hitl_request(
-                &first_request.hitl_request_id,
-                json!({ "type": "text", "value": "admins" }),
-                json!({ "source": "api" }),
-            )
-            .await
-            .expect("first hitl answer should succeed");
+        answer_live_hitl(
+            &engine,
+            &first_request.hitl_request_id,
+            json!({ "type": "text", "value": "admins" }),
+            json!({ "source": "api" }),
+        )
+        .await;
 
         let second_request = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -5419,14 +6504,13 @@ mod tests {
         })
         .await
         .expect("second hitl request should appear");
-        engine
-            .answer_hitl_request(
-                &second_request.hitl_request_id,
-                json!({ "type": "text", "value": "compliance" }),
-                json!({ "source": "api" }),
-            )
-            .await
-            .expect("second hitl answer should succeed");
+        answer_live_hitl(
+            &engine,
+            &second_request.hitl_request_id,
+            json!({ "type": "text", "value": "compliance" }),
+            json!({ "source": "api" }),
+        )
+        .await;
 
         let output = run_handle
             .await
@@ -7202,6 +8286,94 @@ mod tests {
                     .map(|value| value == serde_json::json!({ "previous_status": "running" }))
                     .unwrap_or(false)
         }));
+    }
+
+    #[tokio::test]
+    async fn recovery_scan_should_skip_waiting_hitl_dispatches() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let (run_id, step, dispatch) =
+            seed_running_hitl_context(&engine, "recovery-skip-waiting-hitl").await;
+
+        let (hitl_request, _receiver) = engine
+            .request_hitl_pause(
+                run_id,
+                &step.id,
+                &dispatch.dispatch_id,
+                WorkflowHitlSignal {
+                    kind: HitlKind::Clarification,
+                    question: "Pause for restart".to_string(),
+                    context: json!({ "recovery": true }),
+                },
+                None,
+            )
+            .await
+            .expect("hitl pause should succeed");
+        engine.clear_run_cache().await;
+
+        let recovered = engine
+            .recover_durable_runs()
+            .await
+            .expect("recovery scan should succeed");
+        let run = load_durable_run(&engine, run_id);
+        let durable_dispatch = load_durable_dispatch(&engine, &dispatch.dispatch_id).await;
+        let cached = engine
+            .get_run(run_id)
+            .await
+            .expect("waiting run should be projected into cache");
+
+        assert_eq!(recovered, 0);
+        assert_eq!(run.status, DurableWorkflowRunStatus::WaitingHitl);
+        assert_eq!(
+            run.active_hitl_request_id.as_deref(),
+            Some(hitl_request.hitl_request_id.as_str())
+        );
+        assert_eq!(durable_dispatch.status, DispatchStatus::WaitingHitl);
+        assert!(matches!(cached.state, WorkflowRunState::WaitingHitl));
+    }
+
+    #[tokio::test]
+    async fn recovery_scan_should_project_inconsistent_waiting_hitl_runs_into_cache() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let engine = test_engine(temp_dir.path().to_path_buf());
+        let run_id = WorkflowRunId::new();
+
+        engine
+            .workflow_stores
+            .workflow_run
+            .insert_run(&WorkflowRunRecord {
+                run_id: run_id.to_string(),
+                workflow_id: WorkflowId::new().to_string(),
+                workflow_version: "legacy".to_string(),
+                status: DurableWorkflowRunStatus::WaitingHitl,
+                input_json: json!("draft release notes").to_string(),
+                vars_json: "{}".to_string(),
+                current_step_id: Some("review".to_string()),
+                waiting_kind: Some("hitl".to_string()),
+                waiting_ref: Some("hitl-missing-dispatch".to_string()),
+                active_dispatch_id: None,
+                active_hitl_request_id: None,
+                labels_json: "[]".to_string(),
+                metadata_json: "{}".to_string(),
+                error_json: None,
+                started_at: now_timestamp(),
+                updated_at: now_timestamp(),
+                completed_at: None,
+            })
+            .expect("inconsistent waiting HITL run should persist");
+        engine.clear_run_cache().await;
+
+        let recovered = engine
+            .recover_durable_runs()
+            .await
+            .expect("recovery scan should succeed");
+        let cached = engine
+            .get_run(run_id)
+            .await
+            .expect("inconsistent waiting HITL run should remain visible in cache");
+
+        assert_eq!(recovered, 0);
+        assert!(matches!(cached.state, WorkflowRunState::WaitingHitl));
     }
 
     #[tokio::test]

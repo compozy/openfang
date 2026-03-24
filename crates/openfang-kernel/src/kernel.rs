@@ -14,8 +14,9 @@ use crate::scheduler::AgentScheduler;
 use crate::supervisor::Supervisor;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{
-    Workflow, WorkflowAgentDispatchOutcome, WorkflowAgentDispatchRequest, WorkflowBootstrapResult,
-    WorkflowDefinitionStore, WorkflowEngine, WorkflowHitlSignal, WorkflowId, WorkflowRunId,
+    HitlAnswerDisposition, HitlResumeContext, Workflow, WorkflowAgentDispatchOutcome,
+    WorkflowAgentDispatchRequest, WorkflowBootstrapResult, WorkflowDefinitionStore, WorkflowEngine,
+    WorkflowHitlSignal, WorkflowId, WorkflowRunId,
 };
 
 use arky_session::{NewSession, SessionStore, SqliteSessionStore};
@@ -23,8 +24,8 @@ use openfang_agent_definition::{
     compile as compile_agent_definition, stage4_normalize, AgentDefinition, CompiledAgentDefinition,
 };
 use openfang_memory::{
-    AgentRuntimeRecord, AgentSessionRecord, DispatchRepository, DispatchStatus, MemorySubstrate,
-    RuntimeStoreSet, WorkflowSignalRecord, WorkflowStoreSet,
+    AgentRuntimeRecord, AgentSessionRecord, DispatchRepository, DispatchStatus, HitlRecord,
+    MemorySubstrate, RuntimeStoreSet, WorkflowSignalRecord, WorkflowStoreSet,
 };
 use openfang_provider_binding::binding_to_driver_with_placeholder_install_and_session_store;
 use openfang_runtime::agent_loop::{
@@ -5311,6 +5312,166 @@ impl OpenFangKernel {
             })
     }
 
+    async fn load_hitl_resume_session(&self, resume: &HitlResumeContext) -> Result<(), String> {
+        let (agent_id, _) = self.resolve_workflow_agent_target(&resume.dispatch.target_agent)?;
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            format!(
+                "Agent '{}' is no longer registered for HITL resume",
+                resume.dispatch.target_agent
+            )
+        })?;
+        let dispatch_session_id = resume.dispatch.session_id.as_deref().ok_or_else(|| {
+            format!(
+                "Dispatch '{}' is missing a durable session id for HITL resume",
+                resume.dispatch.dispatch_id
+            )
+        })?;
+
+        if self.compiled_definition_for_entry(&entry)?.is_some() {
+            let session_store = self.open_arky_session_store().await?;
+            let session_id =
+                arky_session::SessionId::parse_str(dispatch_session_id).map_err(|error| {
+                    format!(
+                        "Stored Arky session id '{}' for dispatch '{}' is invalid: {error}",
+                        dispatch_session_id, resume.dispatch.dispatch_id
+                    )
+                })?;
+            let snapshot = session_store.load(&session_id).await.map_err(|error| {
+                format!(
+                    "Failed to load Arky session '{}' for dispatch '{}': {error}",
+                    session_id, resume.dispatch.dispatch_id
+                )
+            })?;
+            debug!(
+                dispatch_id = %resume.dispatch.dispatch_id,
+                session_id = %session_id,
+                messages = snapshot.messages.len(),
+                "Loaded durable Arky session for HITL restart resume"
+            );
+            return Ok(());
+        }
+
+        let session_id =
+            SessionId(uuid::Uuid::parse_str(dispatch_session_id).map_err(|error| {
+                format!(
+                    "Stored legacy session id '{}' for dispatch '{}' is invalid: {error}",
+                    dispatch_session_id, resume.dispatch.dispatch_id
+                )
+            })?);
+        let session = self
+            .memory
+            .get_session(session_id)
+            .map_err(|error| {
+                format!(
+                    "Failed to load legacy session '{}' for dispatch '{}': {error}",
+                    session_id, resume.dispatch.dispatch_id
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "Legacy session '{}' for dispatch '{}' was not found during HITL resume",
+                    session_id, resume.dispatch.dispatch_id
+                )
+            })?;
+        debug!(
+            dispatch_id = %resume.dispatch.dispatch_id,
+            session_id = %session.id,
+            messages = session.messages.len(),
+            "Loaded durable legacy session for HITL restart resume"
+        );
+        Ok(())
+    }
+
+    async fn resume_workflow_hitl_context(&self, resume: HitlResumeContext) -> KernelResult<()> {
+        let background_kernel = self.self_handle.get().and_then(|weak| weak.upgrade());
+        let kernel_handle = background_kernel
+            .as_ref()
+            .map(|kernel| Arc::clone(kernel) as Arc<dyn KernelHandle>);
+        let Some(callback_kernel) = background_kernel.clone() else {
+            return Err(KernelError::OpenFang(OpenFangError::Internal(
+                "Workflow HITL resume requires a kernel self handle".to_string(),
+            )));
+        };
+
+        callback_kernel
+            .load_hitl_resume_session(&resume)
+            .await
+            .map_err(|error| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Workflow HITL resume session load failed: {error}"
+                )))
+            })?;
+
+        let resolver_kernel = Arc::clone(&callback_kernel);
+        let resolver =
+            move |agent_ref: &str| resolver_kernel.resolve_workflow_agent_target(agent_ref);
+        let dispatch_kernel = callback_kernel;
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let kernel_handle = kernel_handle.clone();
+            let background_kernel = background_kernel.clone();
+            let dispatch_kernel = Arc::clone(&dispatch_kernel);
+            Box::pin(async move {
+                dispatch_kernel
+                    .execute_workflow_dispatch(request, kernel_handle, background_kernel)
+                    .await
+            }) as crate::workflow::WorkflowDispatchFuture
+        };
+
+        self.workflows
+            .resume_after_hitl_with_dispatch(resume, &resolver, &dispatch_agent)
+            .await
+            .map_err(|error| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Workflow HITL resume failed: {error}"
+                )))
+            })
+    }
+
+    pub async fn answer_hitl_request(
+        self: &Arc<Self>,
+        hitl_request_id: &str,
+        response_json: JsonValue,
+        metadata_json: JsonValue,
+    ) -> KernelResult<HitlRecord> {
+        let disposition = self
+            .workflows
+            .answer_hitl_request_with_disposition(hitl_request_id, response_json, metadata_json)
+            .await
+            .map_err(|error| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Workflow HITL answer failed: {error}"
+                )))
+            })?;
+
+        match disposition {
+            HitlAnswerDisposition::Live { record } => Ok(*record),
+            HitlAnswerDisposition::Reconstruct(resume) => {
+                let record = resume.hitl_record.clone();
+                let failed_run_id = resume.run_id;
+                let failed_step_id = resume.step.id.clone();
+                let kernel = Arc::clone(self);
+                self.track_workflow_dispatch_task(async move {
+                    if let Err(error) = kernel.resume_workflow_hitl_context(*resume).await {
+                        warn!("Failed to resume workflow after HITL answer: {error}");
+                        if let Err(mark_error) = kernel
+                            .workflows
+                            .record_hitl_resume_failure(failed_run_id, &failed_step_id, &error.to_string())
+                            .await
+                        {
+                            warn!(
+                                run_id = %failed_run_id,
+                                step_id = failed_step_id,
+                                "Failed to persist HITL resume failure after reconstruction error: {mark_error}"
+                            );
+                        }
+                    }
+                })
+                .await;
+                Ok(record)
+            }
+        }
+    }
+
     pub async fn submit_run_signal(
         self: &Arc<Self>,
         run_id: WorkflowRunId,
@@ -8135,6 +8296,11 @@ mod tests {
     use super::*;
     use crate::db_migration::{self, MigrationStep};
     use async_trait::async_trait;
+    use chrono::Utc;
+    use openfang_memory::{
+        CheckpointKind, DispatchRecord, HitlKind as DurableHitlKind, HitlRepository,
+        NewHitlRequest, WorkflowCheckpointRecord, WorkflowRunRecord, WorkflowRunStatus,
+    };
     use openfang_runtime::llm_driver::CompletionMetadata;
     use openfang_types::config::PersistenceConfig;
     use openfang_types::message::{ContentBlock, StopReason, TokenUsage};
@@ -8215,6 +8381,13 @@ mod tests {
         (entry.id, entry)
     }
 
+    fn persist_test_agent(kernel: &OpenFangKernel, entry: &AgentEntry) {
+        kernel
+            .memory
+            .save_agent(entry)
+            .expect("agent runtime should persist");
+    }
+
     async fn seed_pending_dispatch(
         kernel: &OpenFangKernel,
         request: &WorkflowAgentDispatchRequest,
@@ -8287,6 +8460,141 @@ mod tests {
         LoadedDefinitionRuntime {
             definition,
             compiled,
+        }
+    }
+
+    struct SeedHitlDispatchSession<'a> {
+        target_agent: &'a str,
+        provider_driver: &'a str,
+        session_id: &'a str,
+        provider_resume_token: Option<&'a str>,
+        question: &'a str,
+    }
+
+    async fn seed_waiting_hitl_state(
+        kernel: &Arc<OpenFangKernel>,
+        workflow: Workflow,
+        input: &str,
+        session: SeedHitlDispatchSession<'_>,
+    ) -> (WorkflowRunId, String, String) {
+        let workflow_id = kernel
+            .workflows
+            .register(workflow.clone())
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = WorkflowRunId::new();
+        let dispatch_id = uuid::Uuid::new_v4().to_string();
+        let hitl_request_id = uuid::Uuid::new_v4().to_string();
+        let step_id = workflow
+            .steps
+            .first()
+            .expect("workflow should have one step")
+            .name
+            .clone();
+        let timestamp = openfang_memory::now_timestamp();
+
+        kernel
+            .workflow_stores
+            .workflow_run
+            .insert_run(&WorkflowRunRecord {
+                run_id: run_id.to_string(),
+                workflow_id: workflow_id.to_string(),
+                workflow_version: "legacy".to_string(),
+                status: WorkflowRunStatus::WaitingHitl,
+                input_json: serde_json::to_string(input).expect("input should serialize"),
+                vars_json: "{}".to_string(),
+                current_step_id: Some(step_id.clone()),
+                waiting_kind: Some("hitl".to_string()),
+                waiting_ref: Some(hitl_request_id.clone()),
+                active_dispatch_id: Some(dispatch_id.clone()),
+                active_hitl_request_id: Some(hitl_request_id.clone()),
+                labels_json: "[]".to_string(),
+                metadata_json: "{}".to_string(),
+                error_json: None,
+                started_at: timestamp.clone(),
+                updated_at: timestamp.clone(),
+                completed_at: None,
+            })
+            .expect("waiting workflow run should persist");
+        kernel
+            .workflow_stores
+            .dispatch
+            .create(&DispatchRecord {
+                dispatch_id: dispatch_id.clone(),
+                run_id: run_id.to_string(),
+                step_id: Some(step_id.clone()),
+                kind: openfang_memory::DispatchKind::Call,
+                target_agent: session.target_agent.to_string(),
+                status: DispatchStatus::WaitingHitl,
+                input_json: serde_json::json!({ "message": input }),
+                result_json: None,
+                error_json: None,
+                attempt: 1,
+                parent_dispatch_id: None,
+                spawned_agent_id: None,
+                provider_driver: Some(session.provider_driver.to_string()),
+                session_id: Some(session.session_id.to_string()),
+                provider_resume_token: session.provider_resume_token.map(ToOwned::to_owned),
+                started_at: timestamp.clone(),
+                updated_at: timestamp.clone(),
+                completed_at: None,
+            })
+            .await
+            .expect("waiting dispatch should persist");
+        kernel
+            .workflow_stores
+            .hitl
+            .create(NewHitlRequest {
+                hitl_request_id: hitl_request_id.clone(),
+                run_id: run_id.to_string(),
+                step_id: step_id.clone(),
+                dispatch_id: Some(dispatch_id.clone()),
+                kind: DurableHitlKind::Clarification,
+                question: session.question.to_string(),
+                context_json: serde_json::json!({ "source": "test" }),
+                created_at: Utc::now(),
+                timeout_at: None,
+            })
+            .await
+            .expect("hitl request should persist");
+        kernel
+            .workflow_stores
+            .workflow_checkpoint
+            .append(&WorkflowCheckpointRecord {
+                checkpoint_id: uuid::Uuid::new_v4().to_string(),
+                run_id: run_id.to_string(),
+                step_id: Some(step_id),
+                kind: CheckpointKind::HitlRequested,
+                data_json: serde_json::json!({
+                    "hitl_request_id": hitl_request_id,
+                    "dispatch_id": dispatch_id,
+                    "question": session.question,
+                })
+                .to_string(),
+                created_at: timestamp,
+            })
+            .expect("hitl checkpoint should persist");
+
+        (run_id, hitl_request_id, dispatch_id)
+    }
+
+    fn single_step_workflow(name: &str, agent_name: &str) -> Workflow {
+        Workflow {
+            id: WorkflowId::new(),
+            name: name.to_string(),
+            description: String::new(),
+            steps: vec![crate::workflow::WorkflowStep {
+                name: "dispatch-step".to_string(),
+                agent: crate::workflow::StepAgent::ByName {
+                    name: agent_name.to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: crate::workflow::StepMode::Sequential,
+                timeout_secs: 30,
+                error_mode: crate::workflow::ErrorMode::Fail,
+                output_var: None,
+            }],
+            created_at: Utc::now(),
         }
     }
 
@@ -8489,6 +8797,245 @@ mod tests {
         );
         assert_eq!(dispatch.provider_driver.as_deref(), Some("codex"));
         kernel.shutdown();
+    }
+
+    #[tokio::test]
+    async fn post_restart_resume_should_load_session_from_store() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let kernel =
+            Arc::new(OpenFangKernel::boot_with_config(config.clone()).expect("first boot"));
+        kernel.set_self_handle();
+        let runtime = minimal_codex_runtime();
+        let mut manifest = runtime.compiled.agent_manifest.clone();
+        manifest.metadata.insert(
+            "compozy".to_string(),
+            serde_json::json!({ "definition_id": runtime.definition.id.clone() }),
+        );
+        let (_agent_id, entry) = register_test_agent(&kernel, "arky-hitl-resume", manifest);
+        persist_test_agent(&kernel, &entry);
+        let definition_path = kernel
+            .config
+            .home_dir
+            .join("agents")
+            .join(format!("{}.toml", runtime.definition.id));
+        std::fs::create_dir_all(
+            definition_path
+                .parent()
+                .expect("definition path should have a parent"),
+        )
+        .expect("agent definition directory should exist");
+        std::fs::write(
+            &definition_path,
+            toml::to_string_pretty(&runtime.definition).expect("agent definition should serialize"),
+        )
+        .expect("agent definition should persist");
+        let arky_store_path = kernel.config.data_dir.join("arky_sessions.db");
+        let session_store = SqliteSessionStore::open(&arky_store_path)
+            .await
+            .expect("session store should open");
+        let session_id = session_store
+            .create(NewSession {
+                model_id: Some("gpt-5".to_string()),
+                labels: BTreeMap::from([(
+                    "dispatch_id".to_string(),
+                    "resume-dispatch".to_string(),
+                )]),
+                ..NewSession::default()
+            })
+            .await
+            .expect("session should be created");
+        let workflow = single_step_workflow("arky-hitl-resume-workflow", "arky-hitl-resume");
+        let session_id_text = session_id.to_string();
+        let (_run_id, hitl_request_id, _dispatch_id) = seed_waiting_hitl_state(
+            &kernel,
+            workflow,
+            "clarify this",
+            SeedHitlDispatchSession {
+                target_agent: "arky-hitl-resume",
+                provider_driver: "codex",
+                session_id: &session_id_text,
+                provider_resume_token: Some("resume-token"),
+                question: "Which audience should this target?",
+            },
+        )
+        .await;
+        kernel.shutdown();
+
+        let restarted =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("second boot should succeed"));
+        restarted.set_self_handle();
+        restarted.bootstrap_workflow_definitions().await;
+
+        let disposition = restarted
+            .workflows
+            .answer_hitl_request_with_disposition(
+                &hitl_request_id,
+                serde_json::json!({ "type": "text", "value": "admins" }),
+                serde_json::json!({ "source": "api" }),
+            )
+            .await
+            .expect("restart answer should succeed");
+
+        match disposition {
+            HitlAnswerDisposition::Live { .. } => {
+                panic!("expected reconstruction branch after restart")
+            }
+            HitlAnswerDisposition::Reconstruct(resume) => {
+                restarted
+                    .load_hitl_resume_session(&resume)
+                    .await
+                    .expect("durable arky session should load");
+                assert_eq!(
+                    resume.dispatch.session_id.as_deref(),
+                    Some(session_id.to_string().as_str())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_restart_resume_should_load_legacy_session_from_store() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let kernel =
+            Arc::new(OpenFangKernel::boot_with_config(config.clone()).expect("first boot"));
+        kernel.set_self_handle();
+        let mut manifest = test_manifest("legacy-hitl-resume", "Legacy HITL resume", vec![]);
+        manifest.model.provider = "openai".to_string();
+        manifest.model.model = "gpt-4o-mini".to_string();
+        let (_agent_id, entry) = register_test_agent(&kernel, "legacy-hitl-resume", manifest);
+        persist_test_agent(&kernel, &entry);
+        kernel
+            .memory
+            .save_session_async(&openfang_memory::session::Session {
+                id: entry.session_id,
+                agent_id: entry.id,
+                messages: Vec::new(),
+                context_window_tokens: 0,
+                label: Some("restart".to_string()),
+            })
+            .await
+            .expect("legacy session should persist");
+        let workflow = single_step_workflow("legacy-hitl-resume-workflow", "legacy-hitl-resume");
+        let session_id_text = entry.session_id.to_string();
+        let (_run_id, hitl_request_id, _dispatch_id) = seed_waiting_hitl_state(
+            &kernel,
+            workflow,
+            "clarify this",
+            SeedHitlDispatchSession {
+                target_agent: "legacy-hitl-resume",
+                provider_driver: "openai",
+                session_id: &session_id_text,
+                provider_resume_token: Some("resume-token"),
+                question: "Which audience should this target?",
+            },
+        )
+        .await;
+        kernel.shutdown();
+
+        let restarted =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("second boot should succeed"));
+        restarted.set_self_handle();
+        restarted.bootstrap_workflow_definitions().await;
+
+        let disposition = restarted
+            .workflows
+            .answer_hitl_request_with_disposition(
+                &hitl_request_id,
+                serde_json::json!({ "type": "text", "value": "admins" }),
+                serde_json::json!({ "source": "api" }),
+            )
+            .await
+            .expect("restart answer should succeed");
+
+        match disposition {
+            HitlAnswerDisposition::Live { .. } => {
+                panic!("expected reconstruction branch after restart")
+            }
+            HitlAnswerDisposition::Reconstruct(resume) => {
+                restarted
+                    .load_hitl_resume_session(&resume)
+                    .await
+                    .expect("durable legacy session should load");
+                assert_eq!(
+                    resume.dispatch.session_id.as_deref(),
+                    Some(entry.session_id.to_string().as_str())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_restart_resume_should_fail_run_when_session_load_fails() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let kernel =
+            Arc::new(OpenFangKernel::boot_with_config(config.clone()).expect("first boot"));
+        kernel.set_self_handle();
+        let mut manifest = test_manifest("broken-hitl-resume", "Broken HITL resume", vec![]);
+        manifest.model.provider = "openai".to_string();
+        manifest.model.model = "gpt-4o-mini".to_string();
+        let (_agent_id, entry) = register_test_agent(&kernel, "broken-hitl-resume", manifest);
+        persist_test_agent(&kernel, &entry);
+        let missing_session_id = uuid::Uuid::new_v4().to_string();
+        let workflow = single_step_workflow("broken-hitl-resume-workflow", "broken-hitl-resume");
+        let (run_id, hitl_request_id, _dispatch_id) = seed_waiting_hitl_state(
+            &kernel,
+            workflow,
+            "clarify this",
+            SeedHitlDispatchSession {
+                target_agent: "broken-hitl-resume",
+                provider_driver: "openai",
+                session_id: &missing_session_id,
+                provider_resume_token: Some("resume-token"),
+                question: "Which audience should this target?",
+            },
+        )
+        .await;
+        kernel.shutdown();
+
+        let restarted =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("second boot should succeed"));
+        restarted.set_self_handle();
+        restarted.bootstrap_workflow_definitions().await;
+
+        let _ = restarted
+            .answer_hitl_request(
+                &hitl_request_id,
+                serde_json::json!({ "type": "text", "value": "admins" }),
+                serde_json::json!({ "source": "api" }),
+            )
+            .await
+            .expect("answer should be durably accepted before async resume");
+
+        let failed_run = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let record = restarted
+                    .workflow_stores
+                    .workflow_run
+                    .find_by_id(&run_id.to_string())
+                    .expect("workflow run lookup should succeed")
+                    .expect("workflow run should persist");
+                if record.status == WorkflowRunStatus::Failed {
+                    break record;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restart reconstruction failure should mark the run failed");
+
+        assert_eq!(failed_run.status, WorkflowRunStatus::Failed);
+        assert!(
+            failed_run
+                .error_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("resume session load failed"),
+            "{:?}",
+            failed_run.error_json
+        );
     }
 
     fn schema_migration_rows(path: &Path) -> Vec<(u32, String, String)> {

@@ -1,8 +1,13 @@
 //! Integration coverage for dual-database kernel bootstrap.
 
+use chrono::{DateTime, Utc};
 use openfang_kernel::workflow::{WorkflowRunId, WorkflowRunState};
 use openfang_kernel::OpenFangKernel;
-use openfang_memory::{AgentRuntimeRecord, CheckpointKind, WorkflowRunRecord, WorkflowRunStatus};
+use openfang_memory::{
+    AgentRuntimeRecord, CheckpointKind, DispatchKind, DispatchRecord, DispatchRepository,
+    DispatchStatus, HitlKind, HitlRepository, HitlStatus, NewHitlRequest, WorkflowRunRecord,
+    WorkflowRunStatus,
+};
 use openfang_types::agent::{AgentMode, AgentState};
 use openfang_types::config::KernelConfig;
 use openfang_types::scheduler::{CronAction, CronDelivery, CronJob, CronJobId, CronSchedule};
@@ -96,6 +101,63 @@ fn sample_workflow_run(run_id: &str) -> WorkflowRunRecord {
         started_at: "2026-03-23T12:00:00Z".to_string(),
         updated_at: "2026-03-23T12:00:00Z".to_string(),
         completed_at: None,
+    }
+}
+
+fn fixed_test_timestamp() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-03-23T12:00:00Z")
+        .expect("valid fixed timestamp")
+        .with_timezone(&Utc)
+}
+
+fn sample_waiting_hitl_dispatch(
+    dispatch_id: &str,
+    run_id: &str,
+    step_id: &str,
+    updated_at: &str,
+) -> DispatchRecord {
+    DispatchRecord {
+        dispatch_id: dispatch_id.to_string(),
+        run_id: run_id.to_string(),
+        step_id: Some(step_id.to_string()),
+        kind: DispatchKind::Call,
+        target_agent: "review-agent".to_string(),
+        status: DispatchStatus::WaitingHitl,
+        input_json: json!({
+            "prompt": "Please review the pending item",
+        }),
+        result_json: None,
+        error_json: None,
+        attempt: 1,
+        parent_dispatch_id: None,
+        spawned_agent_id: None,
+        provider_driver: Some("openfang".to_string()),
+        session_id: Some(Uuid::new_v4().to_string()),
+        provider_resume_token: None,
+        started_at: updated_at.to_string(),
+        updated_at: updated_at.to_string(),
+        completed_at: None,
+    }
+}
+
+fn sample_pending_hitl_request(
+    hitl_request_id: &str,
+    run_id: &str,
+    step_id: &str,
+    dispatch_id: &str,
+) -> NewHitlRequest {
+    NewHitlRequest {
+        hitl_request_id: hitl_request_id.to_string(),
+        run_id: run_id.to_string(),
+        step_id: step_id.to_string(),
+        dispatch_id: Some(dispatch_id.to_string()),
+        kind: HitlKind::Clarification,
+        question: "Is this ready to ship?".to_string(),
+        context_json: json!({
+            "source": "dual_database_boot_test",
+        }),
+        created_at: fixed_test_timestamp(),
+        timeout_at: None,
     }
 }
 
@@ -418,11 +480,15 @@ async fn waiting_hitl_run_should_survive_restart_unchanged() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let config = boot_test_config(tmp.path());
     let mut record = sample_workflow_run("run-waiting-hitl-survival");
+    let dispatch_id = "dispatch-hitl-42".to_string();
+    let hitl_request_id = "hitl-request-42".to_string();
+
     record.status = WorkflowRunStatus::WaitingHitl;
     record.current_step_id = Some("step-review".to_string());
     record.waiting_kind = Some("hitl".to_string());
-    record.waiting_ref = Some("hitl-request-42".to_string());
-    record.active_hitl_request_id = Some("hitl-request-42".to_string());
+    record.waiting_ref = Some(hitl_request_id.clone());
+    record.active_dispatch_id = Some(dispatch_id.clone());
+    record.active_hitl_request_id = Some(hitl_request_id.clone());
 
     let first_kernel = OpenFangKernel::boot_with_config(config.clone()).expect("first boot");
     first_kernel
@@ -430,6 +496,28 @@ async fn waiting_hitl_run_should_survive_restart_unchanged() {
         .workflow_run
         .insert_run(&record)
         .expect("store workflow run");
+    first_kernel
+        .workflow_stores
+        .dispatch
+        .create(&sample_waiting_hitl_dispatch(
+            &dispatch_id,
+            &record.run_id,
+            "step-review",
+            &record.updated_at,
+        ))
+        .await
+        .expect("store waiting HITL dispatch");
+    let created_hitl = first_kernel
+        .workflow_stores
+        .hitl
+        .create(sample_pending_hitl_request(
+            &hitl_request_id,
+            &record.run_id,
+            "step-review",
+            &dispatch_id,
+        ))
+        .await
+        .expect("store pending HITL request");
     first_kernel.shutdown();
 
     let second_kernel = OpenFangKernel::boot_with_config(config).expect("second boot");
@@ -447,6 +535,13 @@ async fn waiting_hitl_run_should_survive_restart_unchanged() {
         ))
         .await
         .expect("waiting workflow run should be projected into cache");
+    let loaded_hitl = second_kernel
+        .workflow_stores
+        .hitl
+        .find_by_id(&created_hitl.hitl_request_id)
+        .await
+        .expect("load pending HITL request")
+        .expect("pending HITL request should persist");
     let checkpoints = second_kernel
         .workflow_stores
         .workflow_checkpoint
@@ -458,8 +553,13 @@ async fn waiting_hitl_run_should_survive_restart_unchanged() {
     assert_eq!(loaded.waiting_ref.as_deref(), Some("hitl-request-42"));
     assert_eq!(
         loaded.active_hitl_request_id.as_deref(),
-        Some("hitl-request-42")
+        Some(hitl_request_id.as_str())
     );
+    assert_eq!(
+        loaded.active_dispatch_id.as_deref(),
+        Some(dispatch_id.as_str())
+    );
+    assert_eq!(loaded_hitl.status, HitlStatus::Pending);
     assert!(matches!(cached.state, WorkflowRunState::WaitingHitl));
     assert!(checkpoints.is_empty());
 
