@@ -4,11 +4,11 @@
 //! streams while sharing a single ordered execution path.
 
 use openfang_memory::{
-    AGENT_RUNTIME_CORE_MIGRATION_SQL, AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL,
-    SCHEDULE_RUNTIME_CORE_MIGRATION_SQL, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
-    WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL, WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL,
-    WORKFLOW_RUN_CORE_MIGRATION_SQL, WORKFLOW_SIGNAL_MIGRATION_SQL,
-    WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
+    AGENT_DISPATCH_MIGRATION_SQL, AGENT_RUNTIME_CORE_MIGRATION_SQL,
+    AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL, SCHEDULE_RUNTIME_CORE_MIGRATION_SQL,
+    WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
+    WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
+    WORKFLOW_SIGNAL_MIGRATION_SQL, WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
@@ -164,6 +164,7 @@ const COMPOZY_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[
         "0007_workflow_run_control_plane",
         WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL,
     ),
+    MigrationStep::new(8, "0008_agent_dispatch", AGENT_DISPATCH_MIGRATION_SQL),
 ];
 
 /// Returns the current `runtime.db` migration slice.
@@ -668,6 +669,37 @@ mod tests {
     }
 
     #[test]
+    fn compozy_db_migration_should_add_dispatch_table_cleanly() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_compozy_migrations(&conn);
+
+        assert!(table_exists(&conn, "agent_dispatch"));
+        assert_eq!(
+            table_columns(&conn, "agent_dispatch"),
+            vec![
+                "dispatch_id".to_string(),
+                "run_id".to_string(),
+                "step_id".to_string(),
+                "kind".to_string(),
+                "target_agent".to_string(),
+                "status".to_string(),
+                "input_json".to_string(),
+                "result_json".to_string(),
+                "error_json".to_string(),
+                "attempt".to_string(),
+                "parent_dispatch_id".to_string(),
+                "spawned_agent_id".to_string(),
+                "provider_driver".to_string(),
+                "session_id".to_string(),
+                "provider_resume_token".to_string(),
+                "started_at".to_string(),
+                "updated_at".to_string(),
+                "completed_at".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn compozy_db_migration_should_create_all_required_indexes() {
         let conn = Connection::open_in_memory().expect("in-memory db");
         apply_compozy_migrations(&conn);
@@ -681,6 +713,9 @@ mod tests {
             "idx_workflow_signal_run_consumed",
             "idx_workflow_signal_run_name",
             "idx_workflow_signal_run_idempotency",
+            "idx_dispatch_run",
+            "idx_dispatch_parent",
+            "idx_dispatch_status",
         ] {
             assert!(
                 index_exists(&conn, index_name),
@@ -745,8 +780,6 @@ mod tests {
             .join("\n");
 
         for disallowed_fragment in [
-            "CREATE TABLE agent_dispatch",
-            "CREATE TABLE IF NOT EXISTS agent_dispatch",
             "CREATE TABLE hitl_request",
             "CREATE TABLE IF NOT EXISTS hitl_request",
             "CREATE TABLE task",
@@ -761,6 +794,33 @@ mod tests {
                 "compozy.db migrations unexpectedly reference {disallowed_fragment}"
             );
         }
+    }
+
+    #[test]
+    fn compozy_db_migration_should_be_idempotent() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+
+        apply_compozy_migrations(&conn);
+        apply_compozy_migrations(&conn);
+
+        assert!(table_exists(&conn, "agent_dispatch"));
+        for index_name in [
+            "idx_dispatch_run",
+            "idx_dispatch_parent",
+            "idx_dispatch_status",
+        ] {
+            assert!(
+                index_exists(&conn, index_name),
+                "missing required compozy.db index after second migration run: {index_name}"
+            );
+        }
+
+        let migration_count = conn
+            .query_row("SELECT COUNT(*) FROM schema_migration", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("query schema_migration row count");
+        assert_eq!(migration_count, 8);
     }
 
     #[test]

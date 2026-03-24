@@ -1,5 +1,8 @@
 //! Typed `compozy.db` repositories for durable workflow runtime state.
 
+use crate::dispatch::{
+    list_dispatch_summaries_by_run, DispatchSummaryRecord, SqliteDispatchRepository,
+};
 use chrono::Utc;
 use openfang_types::error::OpenFangError;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
@@ -40,6 +43,8 @@ pub struct WorkflowStoreSet {
     pub workflow_checkpoint: WorkflowCheckpointRepository,
     /// Repository for durable workflow signals.
     pub workflow_signal: WorkflowSignalRepository,
+    /// Repository for durable agent dispatch state.
+    pub dispatch: SqliteDispatchRepository,
 }
 
 impl WorkflowStoreSet {
@@ -50,6 +55,7 @@ impl WorkflowStoreSet {
             connection: Arc::clone(&conn),
             workflow_run: WorkflowRunRepository::new(Arc::clone(&conn)),
             workflow_checkpoint: WorkflowCheckpointRepository::new(Arc::clone(&conn)),
+            dispatch: SqliteDispatchRepository::new(Arc::clone(&conn)),
             workflow_signal: WorkflowSignalRepository::new(conn),
         }
     }
@@ -80,6 +86,9 @@ pub enum WorkflowStoreError {
     /// JSON serialization or deserialization failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// Dispatch repository returned a typed durable dispatch error.
+    #[error(transparent)]
+    Dispatch(#[from] crate::dispatch::DispatchStoreError),
     /// The requested workflow run does not exist.
     #[error("workflow run '{run_id}' was not found")]
     RunNotFound { run_id: String },
@@ -406,23 +415,7 @@ pub struct WorkflowRunRecoveryRecord {
 }
 
 /// Durable dispatch summary for one run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkflowDispatchSummaryRecord {
-    /// Stable dispatch identifier.
-    pub dispatch_id: String,
-    /// Owning run identifier.
-    pub run_id: String,
-    /// Associated step identifier, if any.
-    pub step_id: Option<String>,
-    /// Dispatch kind such as `call` or `spawn`.
-    pub kind: String,
-    /// Target agent identifier.
-    pub target_agent: String,
-    /// Current durable dispatch status.
-    pub status: String,
-    /// Last update timestamp.
-    pub updated_at: String,
-}
+pub type WorkflowDispatchSummaryRecord = DispatchSummaryRecord;
 
 /// Repository for `workflow_run`.
 #[derive(Clone)]
@@ -1333,18 +1326,7 @@ fn list_run_dispatches(
         return Ok(Vec::new());
     }
 
-    let mut stmt = conn.prepare(
-        "SELECT dispatch_id, run_id, step_id, kind, target_agent, status, updated_at
-         FROM agent_dispatch
-         WHERE run_id = ?1
-         ORDER BY updated_at DESC, dispatch_id DESC",
-    )?;
-    let rows = stmt.query_map([run_id], read_workflow_dispatch_summary_row)?;
-    let mut records = Vec::new();
-    for row in rows {
-        records.push(row?);
-    }
-    Ok(records)
+    list_dispatch_summaries_by_run(conn, run_id).map_err(WorkflowStoreError::from)
 }
 
 fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, rusqlite::Error> {
@@ -1518,20 +1500,6 @@ fn read_workflow_signal_row(
     })
 }
 
-fn read_workflow_dispatch_summary_row(
-    row: &rusqlite::Row<'_>,
-) -> Result<WorkflowDispatchSummaryRecord, rusqlite::Error> {
-    Ok(WorkflowDispatchSummaryRecord {
-        dispatch_id: row.get(0)?,
-        run_id: row.get(1)?,
-        step_id: row.get(2)?,
-        kind: row.get(3)?,
-        target_agent: row.get(4)?,
-        status: row.get(5)?,
-        updated_at: row.get(6)?,
-    })
-}
-
 fn invalid_text_error(error: WorkflowStoreError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
 }
@@ -1572,6 +1540,8 @@ mod tests {
             .expect("apply workflow signal waiting-state migration");
         conn.execute_batch(WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL)
             .expect("apply workflow control-plane migration");
+        conn.execute_batch(crate::dispatch::AGENT_DISPATCH_MIGRATION_SQL)
+            .expect("apply agent_dispatch migration");
         Arc::new(Mutex::new(conn))
     }
 

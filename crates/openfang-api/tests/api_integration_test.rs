@@ -16,7 +16,10 @@ use openfang_kernel::workflow::{
 };
 use openfang_kernel::workflow_compiler::{compile_workflow_definition, WorkflowCompileRegistry};
 use openfang_kernel::OpenFangKernel;
-use openfang_memory::{now_timestamp, WorkflowRunRecord, WorkflowRunStatus, WorkflowSignalRecord};
+use openfang_memory::{
+    now_timestamp, DispatchKind, DispatchRecord, DispatchRepository, DispatchStatus,
+    WorkflowRunRecord, WorkflowRunStatus, WorkflowSignalRecord,
+};
 use openfang_types::agent::AgentId;
 use openfang_types::config::{DefaultModelConfig, KernelConfig};
 use openfang_types::workflow::{
@@ -1202,44 +1205,33 @@ async fn get_run_dispatches_reads_from_compozy_db_not_memory() {
         .workflow_run
         .insert_run(&durable_run_record(&run_id, WorkflowRunStatus::Running))
         .expect("durable run should persist");
-    {
-        let connection = server.state.kernel.workflow_stores.connection();
-        let guard = connection.lock().expect("lock compozy db");
-        guard
-            .execute_batch(
-                "CREATE TABLE agent_dispatch (
-                    dispatch_id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL,
-                    step_id TEXT,
-                    kind TEXT NOT NULL,
-                    target_agent TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );",
-            )
-            .expect("agent_dispatch table should be created");
-        guard
-            .execute_batch(&format!(
-                "INSERT INTO agent_dispatch (
-                    dispatch_id,
-                    run_id,
-                    step_id,
-                    kind,
-                    target_agent,
-                    status,
-                    updated_at
-                ) VALUES (
-                    'dispatch-1',
-                    '{run_id}',
-                    'step-1',
-                    'call',
-                    'agent-alpha',
-                    'running',
-                    '2026-03-23T12:01:00Z'
-                );"
-            ))
-            .expect("dispatch row should persist");
-    }
+    server
+        .state
+        .kernel
+        .workflow_stores
+        .dispatch
+        .create(&DispatchRecord {
+            dispatch_id: "dispatch-1".to_string(),
+            run_id: run_id.clone(),
+            step_id: Some("step-1".to_string()),
+            kind: DispatchKind::Call,
+            target_agent: "agent-alpha".to_string(),
+            status: DispatchStatus::Running,
+            input_json: serde_json::json!({ "prompt": "hello" }),
+            result_json: None,
+            error_json: None,
+            attempt: 1,
+            parent_dispatch_id: None,
+            spawned_agent_id: None,
+            provider_driver: None,
+            session_id: None,
+            provider_resume_token: None,
+            started_at: "2026-03-23T12:00:00Z".to_string(),
+            updated_at: "2026-03-23T12:01:00Z".to_string(),
+            completed_at: None,
+        })
+        .await
+        .expect("dispatch row should persist");
     server.state.kernel.workflows.clear_run_cache().await;
 
     let response = client

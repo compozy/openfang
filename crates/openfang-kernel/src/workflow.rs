@@ -17,10 +17,10 @@ use chrono::{DateTime, Utc};
 use openfang_memory::{
     now_timestamp, CheckpointKind as DurableCheckpointKind, SubmittedSignalResume,
     WorkflowCheckpointRecord, WorkflowRunRecord, WorkflowRunStatus as DurableWorkflowRunStatus,
-    WorkflowStoreError, WorkflowStoreSet, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
-    WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL, WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL,
-    WORKFLOW_RUN_CORE_MIGRATION_SQL, WORKFLOW_SIGNAL_MIGRATION_SQL,
-    WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
+    WorkflowStoreError, WorkflowStoreSet, AGENT_DISPATCH_MIGRATION_SQL,
+    WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
+    WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
+    WORKFLOW_SIGNAL_MIGRATION_SQL, WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
 };
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -736,6 +736,8 @@ fn in_memory_workflow_stores() -> WorkflowStoreSet {
         .expect("workflow engine should apply workflow signal waiting-state migration");
     conn.execute_batch(WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL)
         .expect("workflow engine should apply workflow control-plane migration");
+    conn.execute_batch(AGENT_DISPATCH_MIGRATION_SQL)
+        .expect("workflow engine should apply agent_dispatch migration");
     WorkflowStoreSet::new(Arc::new(StdMutex::new(conn)))
 }
 

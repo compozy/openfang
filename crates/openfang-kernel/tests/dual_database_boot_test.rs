@@ -199,7 +199,7 @@ fn migration_status_is_queryable_after_boot() {
     let compozy_rows = schema_migration_rows(&compozy_db);
 
     assert_eq!(runtime_rows.len(), 4);
-    assert_eq!(compozy_rows.len(), 7);
+    assert_eq!(compozy_rows.len(), 8);
     assert_eq!(runtime_rows[0].0, 1);
     assert_eq!(compozy_rows[0].0, 1);
     assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -213,6 +213,7 @@ fn migration_status_is_queryable_after_boot() {
     assert_eq!(compozy_rows[4].1, "0005_workflow_runtime_durability");
     assert_eq!(compozy_rows[5].1, "0006_workflow_signal_waiting_state");
     assert_eq!(compozy_rows[6].1, "0007_workflow_run_control_plane");
+    assert_eq!(compozy_rows[7].1, "0008_agent_dispatch");
 
     kernel.shutdown();
 }

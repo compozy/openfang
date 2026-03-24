@@ -8,6 +8,7 @@
 //! Agents interact with a single `Memory` trait that abstracts over all three stores.
 
 pub mod consolidation;
+pub mod dispatch;
 pub mod knowledge;
 pub mod migration;
 pub mod runtime_store;
@@ -18,6 +19,11 @@ pub mod usage;
 pub mod workflow_store;
 
 mod substrate;
+pub use dispatch::{
+    DispatchKind, DispatchRecord, DispatchRepository, DispatchStatus, DispatchStore,
+    DispatchStoreError, DispatchSummaryRecord, SqliteDispatchRepository,
+    AGENT_DISPATCH_MIGRATION_SQL,
+};
 pub use runtime_store::{
     AgentMessageRecord, AgentMessageStore, AgentRuntimeRecord, AgentRuntimeStore,
     AgentSessionRecord, AgentSessionStore, RuntimeStoreSet, ScheduleExecutionRecord,
