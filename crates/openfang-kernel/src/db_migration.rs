@@ -6,10 +6,10 @@
 use openfang_memory::{
     AGENT_DISPATCH_MIGRATION_SQL, AGENT_RUNTIME_CORE_MIGRATION_SQL,
     AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL, HITL_REQUEST_MIGRATION_SQL,
-    SCHEDULE_RUNTIME_CORE_MIGRATION_SQL, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
-    WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL, WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL,
-    WORKFLOW_RUN_CORE_MIGRATION_SQL, WORKFLOW_SIGNAL_MIGRATION_SQL,
-    WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
+    SCHEDULE_RUNTIME_CORE_MIGRATION_SQL, TASK_SUBTASK_MIGRATION_SQL,
+    WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
+    WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
+    WORKFLOW_SIGNAL_MIGRATION_SQL, WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
@@ -167,6 +167,7 @@ const COMPOZY_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[
     ),
     MigrationStep::new(8, "0008_agent_dispatch", AGENT_DISPATCH_MIGRATION_SQL),
     MigrationStep::new(9, "0009_hitl_request", HITL_REQUEST_MIGRATION_SQL),
+    MigrationStep::new(10, "0010_task_subtask", TASK_SUBTASK_MIGRATION_SQL),
 ];
 
 /// Returns the current `runtime.db` migration slice.
@@ -282,6 +283,7 @@ mod tests {
     use chrono::NaiveDateTime;
     use pretty_assertions::assert_eq;
     use rusqlite::params;
+    use tempfile::tempdir;
 
     fn applied_versions(conn: &Connection) -> Vec<u32> {
         let mut stmt = conn
@@ -804,7 +806,8 @@ mod tests {
     }
 
     #[test]
-    fn compozy_db_migration_should_not_include_later_phase_tables_or_cross_database_sql() {
+    fn compozy_db_migration_should_not_include_later_phase_tables_beyond_task_subtask_or_cross_database_sql(
+    ) {
         let compozy_sql = compozy_migration_steps()
             .iter()
             .map(|step| step.sql)
@@ -812,10 +815,14 @@ mod tests {
             .join("\n");
 
         for disallowed_fragment in [
-            "CREATE TABLE task",
-            "CREATE TABLE IF NOT EXISTS task",
-            "CREATE TABLE subtask",
-            "CREATE TABLE IF NOT EXISTS subtask",
+            "CREATE TABLE looper_run",
+            "CREATE TABLE IF NOT EXISTS looper_run",
+            "CREATE TABLE looper_subtask",
+            "CREATE TABLE IF NOT EXISTS looper_subtask",
+            "CREATE TABLE artifact",
+            "CREATE TABLE IF NOT EXISTS artifact",
+            "CREATE TABLE doc",
+            "CREATE TABLE IF NOT EXISTS doc",
             "ATTACH DATABASE",
             "attach database",
         ] {
@@ -835,6 +842,8 @@ mod tests {
 
         assert!(table_exists(&conn, "agent_dispatch"));
         assert!(table_exists(&conn, "hitl_request"));
+        assert!(table_exists(&conn, "task"));
+        assert!(table_exists(&conn, "subtask"));
         for index_name in [
             "idx_dispatch_run",
             "idx_dispatch_parent",
@@ -843,6 +852,11 @@ mod tests {
             "idx_hitl_dispatch",
             "idx_hitl_status",
             "idx_hitl_run_step_sequence",
+            "idx_task_status",
+            "idx_task_priority",
+            "idx_task_source_run",
+            "idx_subtask_task_id",
+            "idx_subtask_status",
         ] {
             assert!(
                 index_exists(&conn, index_name),
@@ -855,7 +869,72 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("query schema_migration row count");
-        assert_eq!(migration_count, 9);
+        assert_eq!(migration_count, 10);
+    }
+
+    #[test]
+    fn compozy_db_file_migration_should_bootstrap_task_subtask_schema_idempotently() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("compozy.db");
+        let conn = Connection::open(&db_path).expect("open file-backed compozy.db");
+
+        run_migrations(&conn, DatabaseIdentity::Compozy, compozy_migration_steps())
+            .expect("first migration run should succeed");
+        run_migrations(&conn, DatabaseIdentity::Compozy, compozy_migration_steps())
+            .expect("second migration run should succeed");
+
+        assert!(table_exists(&conn, "task"));
+        assert!(table_exists(&conn, "subtask"));
+        assert_eq!(
+            table_columns(&conn, "task"),
+            vec![
+                "task_id",
+                "slug",
+                "source_run_id",
+                "title",
+                "description",
+                "status",
+                "priority",
+                "complexity",
+                "position",
+                "owner_kind",
+                "owner_ref",
+                "created_by_kind",
+                "created_by_ref",
+                "repository_refs_json",
+                "label_refs_json",
+                "artifact_refs_json",
+                "doc_refs_json",
+                "file_refs_json",
+                "metadata_json",
+                "created_at",
+                "updated_at",
+                "completed_at",
+            ]
+        );
+        assert_eq!(
+            table_columns(&conn, "subtask"),
+            vec![
+                "subtask_id",
+                "task_id",
+                "title",
+                "description",
+                "kind",
+                "status",
+                "complexity",
+                "position",
+                "assignee_kind",
+                "assignee_ref",
+                "depends_on_json",
+                "parallelizable",
+                "input_json",
+                "result_json",
+                "metadata_json",
+                "created_at",
+                "updated_at",
+                "completed_at",
+            ]
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod runtime_store;
 pub mod semantic;
 pub mod session;
 pub mod structured;
+pub mod task;
 pub mod usage;
 pub mod workflow_store;
 
@@ -37,6 +38,9 @@ pub use runtime_store::{
     SCHEDULE_RUNTIME_CORE_MIGRATION_SQL,
 };
 pub use substrate::MemorySubstrate;
+pub use task::{
+    SubtaskRepository, TaskRepository, TaskStoreError, TaskStoreSet, TASK_SUBTASK_MIGRATION_SQL,
+};
 pub use workflow_store::{
     now_timestamp, CheckpointKind, SubmittedSignalResume, WorkflowCheckpointRecord,
     WorkflowCheckpointRepository, WorkflowCheckpointStore, WorkflowDispatchSummaryRecord,

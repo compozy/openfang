@@ -127,10 +127,15 @@ impl DatabaseManager {
         })?;
 
         connection
-            .execute_batch("PRAGMA journal_mode=WAL;")
+            .execute_batch(
+                "
+                PRAGMA foreign_keys = ON;
+                PRAGMA journal_mode = WAL;
+                ",
+            )
             .map_err(|error| {
                 KernelError::BootFailed(format!(
-                    "Failed to configure WAL for {database_name} at {}: {error}",
+                    "Failed to configure SQLite pragmas for {database_name} at {}: {error}",
                     path.display()
                 ))
             })?;

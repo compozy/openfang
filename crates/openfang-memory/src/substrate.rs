@@ -94,8 +94,13 @@ impl MemorySubstrate {
     }
 
     fn configure_connection(conn: &Connection) -> OpenFangResult<()> {
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+            PRAGMA journal_mode = WAL;
+            ",
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         conn.busy_timeout(Duration::from_millis(5000))
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
