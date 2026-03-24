@@ -123,6 +123,16 @@ pub struct ScheduleListQueryParams {
     pub search: Option<String>,
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct SkillListQueryParams {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default, rename = "q")]
+    pub search: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct WorkflowRunPageQuery {
     limit: usize,
@@ -367,6 +377,12 @@ pub struct AppState {
     /// Avoids blocking the `/api/providers` endpoint on TCP timeouts to
     /// unreachable local services. 60-second TTL.
     pub provider_probe_cache: openfang_runtime::provider_health::ProbeCache,
+}
+
+impl AppState {
+    fn skill_registry(&self) -> &std::sync::RwLock<openfang_skills::registry::SkillRegistry> {
+        &self.kernel.skill_registry
+    }
 }
 
 fn agent_error_response(
@@ -3787,6 +3803,78 @@ fn reverse_if_desc(ordering: Ordering, order: Ordering) -> Ordering {
         Ordering::Greater => ordering.reverse(),
         Ordering::Equal => ordering,
     }
+}
+
+fn skill_detail_from_installed_skill(skill: &openfang_skills::InstalledSkill) -> SkillResponse {
+    SkillResponse {
+        id: skill.manifest.skill.name.clone(),
+        name: skill.manifest.skill.name.clone(),
+        description: skill.manifest.skill.description.clone(),
+        source: skill.source_path.display().to_string(),
+        created_at: skill.created_at.clone(),
+        updated_at: skill.updated_at.clone(),
+    }
+}
+
+fn skill_summary_from_detail(skill: &SkillResponse) -> SkillSummary {
+    SkillSummary {
+        id: skill.id.clone(),
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        source: skill.source.clone(),
+    }
+}
+
+fn skill_matches_search(skill: &SkillResponse, needle: &str) -> bool {
+    let needle = needle.to_lowercase();
+    skill.name.to_lowercase().contains(&needle)
+        || skill.description.to_lowercase().contains(&needle)
+}
+
+fn paginate_skill_summaries(
+    items: Vec<SkillSummary>,
+    limit: usize,
+    offset: usize,
+) -> SkillListResponse {
+    let next_cursor = if offset + limit < items.len() {
+        Some((offset + limit).to_string())
+    } else {
+        None
+    };
+    let items = items.into_iter().skip(offset).take(limit).collect();
+
+    SkillListResponse { items, next_cursor }
+}
+
+fn list_registered_skills_v1(state: &AppState) -> Vec<SkillResponse> {
+    let skills_root = state.kernel.config.home_dir.join("skills");
+    let registry = state
+        .skill_registry()
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut skills = registry
+        .list()
+        .into_iter()
+        .filter(|skill| skill.source_path.starts_with(&skills_root))
+        .map(skill_detail_from_installed_skill)
+        .collect::<Vec<_>>();
+    skills.sort_by(|left, right| left.id.cmp(&right.id));
+    skills
+}
+
+fn find_registered_skill_v1(state: &AppState, skill_id: &str) -> Option<SkillResponse> {
+    list_registered_skills_v1(state)
+        .into_iter()
+        .find(|skill| skill.id == skill_id)
+}
+
+fn skill_not_found_response(skill_id: &str) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        format!("skill '{skill_id}' not found"),
+        None,
+    )
 }
 
 fn workflow_dry_run_initial_dispatches(workflow_ir: &WorkflowIr) -> usize {
@@ -7800,6 +7888,48 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
 // ---------------------------------------------------------------------------
 // Skills endpoints
 // ---------------------------------------------------------------------------
+
+/// GET /api/v1/skills — List file-backed skills from the boot-loaded registry.
+pub async fn list_skills_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SkillListQueryParams>,
+) -> impl IntoResponse {
+    let limit = match parse_pagination_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
+    let offset = match parse_cursor_offset(params.cursor.as_deref()) {
+        Ok(offset) => offset,
+        Err(response) => return response,
+    };
+
+    let mut items = list_registered_skills_v1(&state);
+    if let Some(search) = params.search.as_deref() {
+        items.retain(|skill| skill_matches_search(skill, search));
+    }
+    let items = items
+        .into_iter()
+        .map(|skill| skill_summary_from_detail(&skill))
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(paginate_skill_summaries(
+            items, limit, offset
+        ))),
+    )
+}
+
+/// GET /api/v1/skills/{id} — Load one file-backed skill from the boot-loaded registry.
+pub async fn get_skill_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match find_registered_skill_v1(&state, &id) {
+        Some(skill) => (StatusCode::OK, Json(serde_json::json!(skill))).into_response(),
+        None => skill_not_found_response(&id).into_response(),
+    }
+}
 
 /// GET /api/skills — List installed skills.
 pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -18095,5 +18225,59 @@ mod agent_definition_route_tests {
             .expect("runtime projection should exist");
         assert!(!runtime.enabled);
         assert!(runtime.next_run.is_none());
+    }
+}
+
+#[cfg(test)]
+mod skill_v1_route_tests {
+    use super::*;
+
+    fn skill(id: &str, name: &str, description: &str) -> SkillResponse {
+        SkillResponse {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+            source: format!("/tmp/skills/{id}/skill.toml"),
+            created_at: "2026-03-24T00:00:00Z".to_string(),
+            updated_at: "2026-03-24T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn skill_matches_search_should_be_case_insensitive_for_name_and_description() {
+        let writing = skill(
+            "writing",
+            "Writing Coach",
+            "Structured document authoring guidance",
+        );
+        let testing = skill("testing", "Regression Guard", "Catches hidden regressions");
+
+        assert!(skill_matches_search(&writing, "writing"));
+        assert!(skill_matches_search(&writing, "AUTHORING"));
+        assert!(!skill_matches_search(&testing, "writing"));
+    }
+
+    #[test]
+    fn paginate_skill_summaries_should_return_items_and_next_cursor_across_pages() {
+        let items = (0..5)
+            .map(|index| SkillSummary {
+                id: format!("skill-{index}"),
+                name: format!("Skill {index}"),
+                description: format!("Description {index}"),
+                source: format!("/tmp/skills/skill-{index}/skill.toml"),
+            })
+            .collect::<Vec<_>>();
+
+        let first_page = paginate_skill_summaries(items.clone(), 2, 0);
+        assert_eq!(first_page.items.len(), 2);
+        assert_eq!(first_page.next_cursor.as_deref(), Some("2"));
+
+        let second_page = paginate_skill_summaries(items.clone(), 2, 2);
+        assert_eq!(second_page.items.len(), 2);
+        assert_eq!(second_page.next_cursor.as_deref(), Some("4"));
+
+        let final_page = paginate_skill_summaries(items, 2, 4);
+        assert_eq!(final_page.items.len(), 1);
+        assert!(final_page.next_cursor.is_none());
     }
 }

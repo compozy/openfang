@@ -7,6 +7,7 @@ use openfang_types::agent::AgentManifest;
 use openfang_types::scheduler::{
     CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDelivery, CronSchedule,
 };
+pub use openfang_types::skill::{SkillDetail, SkillSummary};
 use openfang_types::workflow::{
     NormalizedWorkflow, ValidationIssue as WorkflowValidationIssue, WorkflowIr,
     WorkflowV2Definition,
@@ -186,6 +187,17 @@ pub struct SkillInstallRequest {
 pub struct SkillUninstallRequest {
     pub name: String,
 }
+
+/// Paginated skill list response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct SkillListResponse {
+    pub items: Vec<SkillSummary>,
+    pub next_cursor: Option<String>,
+}
+
+/// Full detail response for one skill resource.
+pub type SkillResponse = SkillDetail;
 
 /// Request to update an agent's manifest.
 #[derive(Debug, Deserialize)]

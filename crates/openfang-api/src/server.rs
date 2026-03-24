@@ -408,6 +408,11 @@ pub async fn build_router(
             "/api/v1/schedules/{id}/run-now/dry-run",
             axum::routing::post(routes::dry_run_schedule_definition_now_v1),
         )
+        .route("/api/v1/skills", axum::routing::get(routes::list_skills_v1))
+        .route(
+            "/api/v1/skills/{id}",
+            axum::routing::get(routes::get_skill_v1),
+        )
         // Workflow v1 control-plane endpoints
         .route(
             "/api/v1/workflows",

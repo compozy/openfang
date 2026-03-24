@@ -4,6 +4,7 @@ use crate::bundled;
 use crate::openclaw_compat;
 use crate::verify::SkillVerifier;
 use crate::{InstalledSkill, SkillError, SkillManifest, SkillToolDef};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -61,6 +62,7 @@ impl SkillRegistry {
     pub fn load_bundled(&mut self) -> usize {
         let bundled = bundled::bundled_skills();
         let mut count = 0;
+        let now = Utc::now().to_rfc3339();
 
         for (name, content) in &bundled {
             match bundled::parse_bundled(name, content) {
@@ -85,7 +87,10 @@ impl SkillRegistry {
                         InstalledSkill {
                             manifest,
                             path: PathBuf::from("<bundled>"),
+                            source_path: PathBuf::from("<bundled>"),
                             enabled: true,
+                            created_at: now.clone(),
+                            updated_at: now.clone(),
                         },
                     );
                     count += 1;
@@ -205,6 +210,7 @@ impl SkillRegistry {
         let manifest_path = skill_dir.join("skill.toml");
         let toml_str = std::fs::read_to_string(&manifest_path)?;
         let manifest: SkillManifest = toml::from_str(&toml_str)?;
+        let (created_at, updated_at) = skill_file_timestamps(&manifest_path);
 
         let name = manifest.skill.name.clone();
 
@@ -213,7 +219,10 @@ impl SkillRegistry {
             InstalledSkill {
                 manifest,
                 path: skill_dir.to_path_buf(),
+                source_path: manifest_path,
                 enabled: true,
+                created_at,
+                updated_at,
             },
         );
 
@@ -382,6 +391,23 @@ impl SkillRegistry {
         }
         Ok(count)
     }
+}
+
+fn skill_file_timestamps(manifest_path: &Path) -> (String, String) {
+    let now = Utc::now();
+    let metadata = manifest_path.metadata().ok();
+    let modified = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(DateTime::<Utc>::from)
+        .unwrap_or(now);
+    let created = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.created().ok())
+        .map(DateTime::<Utc>::from)
+        .unwrap_or(modified);
+
+    (created.to_rfc3339(), modified.to_rfc3339())
 }
 
 #[cfg(test)]

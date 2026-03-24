@@ -174,8 +174,14 @@ pub struct InstalledSkill {
     pub manifest: SkillManifest,
     /// Path to skill directory.
     pub path: PathBuf,
+    /// Canonical manifest file path the registry loaded.
+    pub source_path: PathBuf,
     /// Whether this skill is enabled.
     pub enabled: bool,
+    /// Creation timestamp captured when the manifest was loaded.
+    pub created_at: String,
+    /// Last update timestamp captured when the manifest was loaded.
+    pub updated_at: String,
 }
 
 /// Result of executing a skill tool.
