@@ -28,10 +28,11 @@ pub use runtime_store::{
 pub use substrate::MemorySubstrate;
 pub use workflow_store::{
     now_timestamp, CheckpointKind, SubmittedSignalResume, WorkflowCheckpointRecord,
-    WorkflowCheckpointRepository, WorkflowCheckpointStore, WorkflowRunListQuery, WorkflowRunRecord,
-    WorkflowRunRepository, WorkflowRunStatus, WorkflowRunStore, WorkflowSignalRecord,
-    WorkflowSignalRepository, WorkflowSignalStore, WorkflowStoreError, WorkflowStoreSet,
-    WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
+    WorkflowCheckpointRepository, WorkflowCheckpointStore, WorkflowDispatchSummaryRecord,
+    WorkflowRunListQuery, WorkflowRunRecord, WorkflowRunRecoveryRecord, WorkflowRunRepository,
+    WorkflowRunStatus, WorkflowRunStore, WorkflowSignalRecord, WorkflowSignalRepository,
+    WorkflowSignalStore, WorkflowStoreError, WorkflowStoreSet, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
+    WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL, WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL,
     WORKFLOW_RUN_CORE_MIGRATION_SQL, WORKFLOW_SIGNAL_MIGRATION_SQL,
     WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
 };

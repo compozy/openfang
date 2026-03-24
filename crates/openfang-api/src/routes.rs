@@ -149,6 +149,94 @@ fn signal_record_to_json(
     }))
 }
 
+fn dispatch_summary_record_to_json(
+    record: &openfang_memory::WorkflowDispatchSummaryRecord,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": record.dispatch_id,
+        "run_id": record.run_id,
+        "step_id": record.step_id,
+        "kind": record.kind,
+        "target_agent": record.target_agent,
+        "status": record.status,
+        "updated_at": record.updated_at,
+    })
+}
+
+fn run_not_found_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": {
+                "code": "not_found",
+                "message": "Run not found",
+                "details": [],
+            }
+        })),
+    )
+}
+
+fn run_internal_error_response(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message,
+                "details": [],
+            }
+        })),
+    )
+}
+
+fn invalid_run_transition_response(
+    action: &str,
+    current_status: WorkflowRunStatus,
+    allowed_statuses: &[WorkflowRunStatus],
+) -> (StatusCode, Json<serde_json::Value>) {
+    let action_phrase = match action {
+        "pause" => "paused",
+        "resume" => "resumed",
+        "cancel" => "cancelled",
+        _ => action,
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": {
+                "code": "invalid_run_transition",
+                "message": format!(
+                    "Run cannot be {action_phrase} from status '{}'",
+                    current_status.as_str()
+                ),
+                "details": [{
+                    "action": action,
+                    "current_status": current_status.as_str(),
+                    "allowed_statuses": allowed_statuses
+                        .iter()
+                        .map(|status| status.as_str())
+                        .collect::<Vec<_>>(),
+                }],
+            }
+        })),
+    )
+}
+
+fn run_action_accepted_response(
+    run_id: &str,
+    status: WorkflowRunStatus,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "accepted": true,
+            "resource_id": run_id,
+            "run_id": run_id,
+            "status": status.as_str(),
+        })),
+    )
+}
+
 /// Shared application state.
 ///
 /// The kernel is wrapped in Arc so it can serve as both the main kernel
@@ -1531,28 +1619,10 @@ pub async fn get_run_v1(
             Ok(body) => (StatusCode::OK, Json(body)),
             Err(response) => response,
         },
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "not_found",
-                    "message": "Run not found",
-                    "details": [],
-                }
-            })),
-        ),
+        Ok(None) => run_not_found_response(),
         Err(error) => {
             tracing::warn!("Failed to load durable run {id}: {error}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "run_load_failed",
-                        "message": "Failed to load run",
-                        "details": [],
-                    }
-                })),
-            )
+            run_internal_error_response("run_load_failed", "Failed to load run")
         }
     }
 }
@@ -1562,11 +1632,20 @@ pub async fn get_run_checkpoints_v1(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    match state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return run_not_found_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load durable run {id} before listing checkpoints: {error}");
+            return run_internal_error_response("run_load_failed", "Failed to load run");
+        }
+    }
+
     match state
         .kernel
         .workflow_stores
-        .workflow_checkpoint
-        .list_for_run(&id)
+        .workflow_run
+        .find_checkpoints_for_run(&id)
     {
         Ok(records) => {
             let mut items = Vec::with_capacity(records.len());
@@ -1602,6 +1681,43 @@ pub async fn get_run_checkpoints_v1(
     }
 }
 
+/// GET /api/v1/runs/{id}/dispatches — List durable dispatches for one run.
+pub async fn get_run_dispatches_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return run_not_found_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load durable run {id} before listing dispatches: {error}");
+            return run_internal_error_response("run_load_failed", "Failed to load run");
+        }
+    }
+
+    match state
+        .kernel
+        .workflow_stores
+        .workflow_run
+        .list_dispatches_for_run(&id)
+    {
+        Ok(records) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": records
+                    .iter()
+                    .map(dispatch_summary_record_to_json)
+                    .collect::<Vec<_>>(),
+                "next_cursor": serde_json::Value::Null,
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!("Failed to list dispatches for run {id}: {error}");
+            run_internal_error_response("dispatch_list_failed", "Failed to list run dispatches")
+        }
+    }
+}
+
 /// GET /api/v1/runs/{id}/signals — List durable signals for one run.
 pub async fn get_run_signals_v1(
     State(state): State<Arc<AppState>>,
@@ -1610,30 +1726,10 @@ pub async fn get_run_signals_v1(
 ) -> impl IntoResponse {
     match state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
         Ok(Some(_)) => {}
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "not_found",
-                        "message": "Run not found",
-                        "details": [],
-                    }
-                })),
-            );
-        }
+        Ok(None) => return run_not_found_response(),
         Err(error) => {
             tracing::warn!("Failed to load durable run {id} before listing signals: {error}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "run_load_failed",
-                        "message": "Failed to load run",
-                        "details": [],
-                    }
-                })),
-            );
+            return run_internal_error_response("run_load_failed", "Failed to load run");
         }
     }
 
@@ -1663,16 +1759,184 @@ pub async fn get_run_signals_v1(
         }
         Err(error) => {
             tracing::warn!("Failed to list signals for run {id}: {error}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
+            run_internal_error_response("signal_list_failed", "Failed to list run signals")
+        }
+    }
+}
+
+/// POST /api/v1/runs/{id}/pause — Pause a durable run.
+pub async fn pause_run_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let current = match state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
+        Ok(Some(run)) => run,
+        Ok(None) => return run_not_found_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load durable run {id} before pause: {error}");
+            return run_internal_error_response("run_load_failed", "Failed to load run");
+        }
+    };
+
+    if !matches!(
+        current.status,
+        WorkflowRunStatus::Running | WorkflowRunStatus::WaitingSignal
+    ) {
+        return invalid_run_transition_response(
+            "pause",
+            current.status,
+            &[WorkflowRunStatus::Running, WorkflowRunStatus::WaitingSignal],
+        );
+    }
+
+    let run_id = match id.parse() {
+        Ok(value) => WorkflowRunId(value),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": {
-                        "code": "signal_list_failed",
-                        "message": "Failed to list run signals",
+                        "code": "invalid_run_id",
+                        "message": "Invalid run ID",
                         "details": [],
                     }
                 })),
-            )
+            );
+        }
+    };
+
+    match state.kernel.workflows.pause_run(run_id, "api").await {
+        Ok(()) => run_action_accepted_response(&id, WorkflowRunStatus::Paused),
+        Err(error) => {
+            tracing::warn!("Failed to pause run {id}: {error}");
+            if let Ok(Some(latest)) = state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
+                return invalid_run_transition_response(
+                    "pause",
+                    latest.status,
+                    &[WorkflowRunStatus::Running, WorkflowRunStatus::WaitingSignal],
+                );
+            }
+            run_internal_error_response("run_pause_failed", "Failed to pause run")
+        }
+    }
+}
+
+/// POST /api/v1/runs/{id}/resume — Resume a durable run.
+pub async fn resume_run_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let current = match state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
+        Ok(Some(run)) => run,
+        Ok(None) => return run_not_found_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load durable run {id} before resume: {error}");
+            return run_internal_error_response("run_load_failed", "Failed to load run");
+        }
+    };
+
+    if current.status != WorkflowRunStatus::Paused {
+        return invalid_run_transition_response(
+            "resume",
+            current.status,
+            &[WorkflowRunStatus::Paused],
+        );
+    }
+
+    let run_id = match id.parse() {
+        Ok(value) => WorkflowRunId(value),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "invalid_run_id",
+                        "message": "Invalid run ID",
+                        "details": [],
+                    }
+                })),
+            );
+        }
+    };
+
+    match state.kernel.workflows.resume_run(run_id, "api").await {
+        Ok(()) => run_action_accepted_response(&id, WorkflowRunStatus::Running),
+        Err(error) => {
+            tracing::warn!("Failed to resume run {id}: {error}");
+            if let Ok(Some(latest)) = state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
+                return invalid_run_transition_response(
+                    "resume",
+                    latest.status,
+                    &[WorkflowRunStatus::Paused],
+                );
+            }
+            run_internal_error_response("run_resume_failed", "Failed to resume run")
+        }
+    }
+}
+
+/// POST /api/v1/runs/{id}/cancel — Cancel a durable run.
+pub async fn cancel_run_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let current = match state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
+        Ok(Some(run)) => run,
+        Ok(None) => return run_not_found_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load durable run {id} before cancel: {error}");
+            return run_internal_error_response("run_load_failed", "Failed to load run");
+        }
+    };
+
+    if current.status.is_terminal() {
+        return invalid_run_transition_response(
+            "cancel",
+            current.status,
+            &[
+                WorkflowRunStatus::Pending,
+                WorkflowRunStatus::Running,
+                WorkflowRunStatus::WaitingSignal,
+                WorkflowRunStatus::WaitingHitl,
+                WorkflowRunStatus::Paused,
+            ],
+        );
+    }
+
+    let run_id = match id.parse() {
+        Ok(value) => WorkflowRunId(value),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "invalid_run_id",
+                        "message": "Invalid run ID",
+                        "details": [],
+                    }
+                })),
+            );
+        }
+    };
+
+    match state.kernel.workflows.cancel_run(run_id, "api").await {
+        Ok(()) => run_action_accepted_response(&id, WorkflowRunStatus::Cancelled),
+        Err(error) => {
+            tracing::warn!("Failed to cancel run {id}: {error}");
+            if let Ok(Some(latest)) = state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
+                return invalid_run_transition_response(
+                    "cancel",
+                    latest.status,
+                    &[
+                        WorkflowRunStatus::Pending,
+                        WorkflowRunStatus::Running,
+                        WorkflowRunStatus::WaitingSignal,
+                        WorkflowRunStatus::WaitingHitl,
+                        WorkflowRunStatus::Paused,
+                    ],
+                );
+            }
+            run_internal_error_response("run_cancel_failed", "Failed to cancel run")
         }
     }
 }

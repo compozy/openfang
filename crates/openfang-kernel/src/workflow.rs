@@ -18,8 +18,9 @@ use openfang_memory::{
     now_timestamp, CheckpointKind as DurableCheckpointKind, SubmittedSignalResume,
     WorkflowCheckpointRecord, WorkflowRunRecord, WorkflowRunStatus as DurableWorkflowRunStatus,
     WorkflowStoreError, WorkflowStoreSet, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
-    WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
-    WORKFLOW_SIGNAL_MIGRATION_SQL, WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
+    WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL, WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL,
+    WORKFLOW_RUN_CORE_MIGRATION_SQL, WORKFLOW_SIGNAL_MIGRATION_SQL,
+    WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
 };
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -171,10 +172,11 @@ pub enum WorkflowRunState {
     Pending,
     Running,
     WaitingSignal,
+    WaitingHitl,
+    Paused,
     Completed,
     Failed,
     Cancelled,
-    Interrupted,
 }
 
 /// A running workflow instance.
@@ -645,10 +647,11 @@ fn workflow_state_from_status(status: DurableWorkflowRunStatus) -> WorkflowRunSt
         DurableWorkflowRunStatus::Pending => WorkflowRunState::Pending,
         DurableWorkflowRunStatus::Running => WorkflowRunState::Running,
         DurableWorkflowRunStatus::WaitingSignal => WorkflowRunState::WaitingSignal,
+        DurableWorkflowRunStatus::WaitingHitl => WorkflowRunState::WaitingHitl,
+        DurableWorkflowRunStatus::Paused => WorkflowRunState::Paused,
         DurableWorkflowRunStatus::Completed => WorkflowRunState::Completed,
         DurableWorkflowRunStatus::Failed => WorkflowRunState::Failed,
         DurableWorkflowRunStatus::Cancelled => WorkflowRunState::Cancelled,
-        DurableWorkflowRunStatus::Interrupted => WorkflowRunState::Interrupted,
     }
 }
 
@@ -707,6 +710,12 @@ fn checkpoint_data_json(value: JsonValue) -> Result<String, TransitionError> {
     serde_json::to_string(&value).map_err(Into::into)
 }
 
+fn control_action_checkpoint_data(actor_source: &str) -> Result<String, TransitionError> {
+    checkpoint_data_json(serde_json::json!({
+        "actor_source": actor_source,
+    }))
+}
+
 fn checkpoint_output_summary(output: &str) -> String {
     const MAX_CHARS: usize = 240;
     output.chars().take(MAX_CHARS).collect()
@@ -725,6 +734,8 @@ fn in_memory_workflow_stores() -> WorkflowStoreSet {
         .expect("workflow engine should apply workflow durability migration");
     conn.execute_batch(WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL)
         .expect("workflow engine should apply workflow signal waiting-state migration");
+    conn.execute_batch(WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL)
+        .expect("workflow engine should apply workflow control-plane migration");
     WorkflowStoreSet::new(Arc::new(StdMutex::new(conn)))
 }
 
@@ -1362,14 +1373,84 @@ impl TransitionWriter {
         self.sync_cache_from_record(&next, None).await
     }
 
+    async fn record_run_paused(
+        &self,
+        run_id: WorkflowRunId,
+        actor_source: &str,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if !matches!(
+            current.status,
+            DurableWorkflowRunStatus::Running | DurableWorkflowRunStatus::WaitingSignal
+        ) {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Paused.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.status = DurableWorkflowRunStatus::Paused;
+        next.updated_at = now_timestamp();
+        next.waiting_kind = None;
+        next.waiting_ref = None;
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: current.current_step_id.clone(),
+            kind: DurableCheckpointKind::RunPaused,
+            data_json: control_action_checkpoint_data(actor_source)?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+
+    async fn record_run_resumed(
+        &self,
+        run_id: WorkflowRunId,
+        actor_source: &str,
+    ) -> Result<(), TransitionError> {
+        let current = self.load_run(run_id).await?;
+        if current.status != DurableWorkflowRunStatus::Paused {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current.run_id.clone(),
+                from: current.status.to_string(),
+                to: DurableWorkflowRunStatus::Running.to_string(),
+            });
+        }
+
+        let mut next = current.clone();
+        next.status = DurableWorkflowRunStatus::Running;
+        next.updated_at = now_timestamp();
+        next.waiting_kind = None;
+        next.waiting_ref = None;
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: Uuid::new_v4().to_string(),
+            run_id: current.run_id.clone(),
+            step_id: current.current_step_id.clone(),
+            kind: DurableCheckpointKind::RunResumed,
+            data_json: control_action_checkpoint_data(actor_source)?,
+            created_at: next.updated_at.clone(),
+        };
+
+        self.persist_transition(current, next.clone(), checkpoint)
+            .await?;
+        self.sync_cache_from_record(&next, None).await
+    }
+
     async fn record_run_cancelled(
         &self,
         run_id: WorkflowRunId,
-        cancelled_by: &str,
-        reason: &str,
+        actor_source: &str,
     ) -> Result<(), TransitionError> {
         let current = self.load_run(run_id).await?;
-        if current.status != DurableWorkflowRunStatus::Running {
+        if current.status.is_terminal() {
             return Err(TransitionError::InvalidStatusTransition {
                 run_id: current.run_id.clone(),
                 from: current.status.to_string(),
@@ -1389,44 +1470,7 @@ impl TransitionWriter {
             run_id: current.run_id.clone(),
             step_id: current.current_step_id.clone(),
             kind: DurableCheckpointKind::RunCancelled,
-            data_json: checkpoint_data_json(serde_json::json!({
-                "cancelled_by": cancelled_by,
-                "reason": reason,
-            }))?,
-            created_at: next.updated_at.clone(),
-        };
-
-        self.persist_transition(current, next.clone(), checkpoint)
-            .await?;
-        self.sync_cache_from_record(&next, None).await
-    }
-
-    async fn record_run_interrupted(
-        &self,
-        run_id: WorkflowRunId,
-        reason: &str,
-    ) -> Result<(), TransitionError> {
-        let current = self.load_run(run_id).await?;
-        if current.status != DurableWorkflowRunStatus::Running {
-            return Err(TransitionError::InvalidStatusTransition {
-                run_id: current.run_id.clone(),
-                from: current.status.to_string(),
-                to: DurableWorkflowRunStatus::Interrupted.to_string(),
-            });
-        }
-
-        let mut next = current.clone();
-        next.status = DurableWorkflowRunStatus::Interrupted;
-        next.updated_at = now_timestamp();
-        next.waiting_kind = None;
-        next.waiting_ref = None;
-
-        let checkpoint = WorkflowCheckpointRecord {
-            checkpoint_id: Uuid::new_v4().to_string(),
-            run_id: current.run_id.clone(),
-            step_id: current.current_step_id.clone(),
-            kind: DurableCheckpointKind::RunInterrupted,
-            data_json: checkpoint_data_json(serde_json::json!({ "reason": reason }))?,
+            data_json: control_action_checkpoint_data(actor_source)?,
             created_at: next.updated_at.clone(),
         };
 
@@ -1729,46 +1773,33 @@ impl WorkflowEngine {
     }
 
     pub async fn recover_durable_runs(&self) -> OpenFangResult<usize> {
-        let writer = self.transition_writer();
-        let repository = writer.workflow_stores.workflow_run.clone();
-        let records = tokio::task::spawn_blocking(move || repository.list_non_terminal())
+        let repository = self.workflow_stores.workflow_run.clone();
+        let recovered = tokio::task::spawn_blocking(move || repository.recover_running_runs())
             .await
             .map_err(|error| {
                 OpenFangError::Internal(format!("Workflow recovery query task failed: {error}"))
             })?
             .map_err(OpenFangError::from)?;
-
-        let mut interrupted = 0usize;
-        for record in records {
-            let run_id = WorkflowRunId(Uuid::parse_str(&record.run_id).map_err(|error| {
+        let recovered_count = recovered.len();
+        let writer = self.transition_writer();
+        let repository = writer.workflow_stores.workflow_run.clone();
+        let records = tokio::task::spawn_blocking(move || repository.list_non_terminal())
+            .await
+            .map_err(|error| {
                 OpenFangError::Internal(format!(
-                    "Invalid stored workflow run identifier '{}': {error}",
-                    record.run_id
+                    "Workflow recovery projection task failed: {error}"
                 ))
-            })?);
+            })?
+            .map_err(OpenFangError::from)?;
 
-            match record.status {
-                DurableWorkflowRunStatus::Running => {
-                    writer
-                        .record_run_interrupted(run_id, "recovered during bootstrap")
-                        .await
-                        .map_err(|error| OpenFangError::Internal(error.to_string()))?;
-                    interrupted += 1;
-                }
-                DurableWorkflowRunStatus::Pending | DurableWorkflowRunStatus::WaitingSignal => {
-                    writer
-                        .sync_cache_from_record(&record, None)
-                        .await
-                        .map_err(|error| OpenFangError::Internal(error.to_string()))?;
-                }
-                DurableWorkflowRunStatus::Completed
-                | DurableWorkflowRunStatus::Failed
-                | DurableWorkflowRunStatus::Cancelled
-                | DurableWorkflowRunStatus::Interrupted => {}
-            }
+        for record in records {
+            writer
+                .sync_cache_from_record(&record, None)
+                .await
+                .map_err(|error| OpenFangError::Internal(error.to_string()))?;
         }
 
-        Ok(interrupted)
+        Ok(recovered_count)
     }
 
     pub async fn create_run_with_context(
@@ -1892,10 +1923,11 @@ impl WorkflowEngine {
                         "pending" => matches!(r.state, WorkflowRunState::Pending),
                         "running" => matches!(r.state, WorkflowRunState::Running),
                         "waiting_signal" => matches!(r.state, WorkflowRunState::WaitingSignal),
+                        "waiting_hitl" => matches!(r.state, WorkflowRunState::WaitingHitl),
+                        "paused" => matches!(r.state, WorkflowRunState::Paused),
                         "completed" => matches!(r.state, WorkflowRunState::Completed),
                         "failed" => matches!(r.state, WorkflowRunState::Failed),
                         "cancelled" => matches!(r.state, WorkflowRunState::Cancelled),
-                        "interrupted" => matches!(r.state, WorkflowRunState::Interrupted),
                         _ => true,
                     })
                     .unwrap_or(true)
@@ -1943,11 +1975,30 @@ impl WorkflowEngine {
     pub async fn cancel_run(
         &self,
         run_id: WorkflowRunId,
-        cancelled_by: &str,
-        reason: &str,
+        actor_source: &str,
     ) -> Result<(), String> {
         self.transition_writer()
-            .record_run_cancelled(run_id, cancelled_by, reason)
+            .record_run_cancelled(run_id, actor_source)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    /// Pause a workflow run through the durable transition writer.
+    pub async fn pause_run(&self, run_id: WorkflowRunId, actor_source: &str) -> Result<(), String> {
+        self.transition_writer()
+            .record_run_paused(run_id, actor_source)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    /// Resume a workflow run through the durable transition writer.
+    pub async fn resume_run(
+        &self,
+        run_id: WorkflowRunId,
+        actor_source: &str,
+    ) -> Result<(), String> {
+        self.transition_writer()
+            .record_run_resumed(run_id, actor_source)
             .await
             .map_err(transition_error_to_string)
     }
@@ -2052,11 +2103,13 @@ impl WorkflowEngine {
         for run in runs.values().filter(|run| run.workflow_id == workflow.id) {
             match run.state {
                 WorkflowRunState::Running => active_runs += 1,
-                WorkflowRunState::Pending | WorkflowRunState::WaitingSignal => waiting_runs += 1,
+                WorkflowRunState::Pending
+                | WorkflowRunState::WaitingSignal
+                | WorkflowRunState::WaitingHitl => waiting_runs += 1,
+                WorkflowRunState::Paused => {}
                 WorkflowRunState::Completed
                 | WorkflowRunState::Failed
-                | WorkflowRunState::Cancelled
-                | WorkflowRunState::Interrupted => {}
+                | WorkflowRunState::Cancelled => {}
             }
 
             if last_run_at
@@ -4668,7 +4721,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_recovery_marks_running_runs_interrupted() {
+    async fn restart_recovery_marks_running_runs_paused_with_checkpoint() {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let engine = test_engine(temp_dir.path().to_path_buf());
         let workflow = test_workflow();
@@ -4692,14 +4745,21 @@ mod tests {
             .await
             .expect("durable runs should recover");
         let record = load_durable_run(&engine, run_id);
+        let checkpoints = load_durable_checkpoints(&engine, run_id);
         let cached = engine
             .get_run(run_id)
             .await
             .expect("recovered run should be projected into cache");
 
         assert_eq!(interrupted, 1);
-        assert_eq!(record.status, DurableWorkflowRunStatus::Interrupted);
-        assert!(matches!(cached.state, WorkflowRunState::Interrupted));
+        assert_eq!(record.status, DurableWorkflowRunStatus::Paused);
+        assert!(matches!(cached.state, WorkflowRunState::Paused));
+        assert!(checkpoints.iter().any(|checkpoint| {
+            checkpoint.kind == DurableCheckpointKind::RunRecoveredNeedsResume
+                && serde_json::from_str::<serde_json::Value>(&checkpoint.data_json)
+                    .map(|value| value == serde_json::json!({ "previous_status": "running" }))
+                    .unwrap_or(false)
+        }));
     }
 
     #[tokio::test]

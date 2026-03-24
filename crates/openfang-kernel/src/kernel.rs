@@ -554,6 +554,35 @@ fn initialize_workflow_stores(compozy_db: Arc<Mutex<Connection>>) -> WorkflowSto
     WorkflowStoreSet::new(compozy_db)
 }
 
+fn recover_workflow_runs_on_startup(workflow_stores: &WorkflowStoreSet) -> KernelResult<usize> {
+    let recovered = workflow_stores
+        .workflow_run
+        .recover_running_runs()
+        .map_err(|error| {
+            KernelError::BootFailed(format!(
+                "Failed to recover durable workflow runs during boot: {error}"
+            ))
+        })?;
+
+    if recovered.is_empty() {
+        return Ok(0);
+    }
+
+    for record in &recovered {
+        debug!(
+            run_id = %record.run_id,
+            previous_status = %record.previous_status,
+            "Recovered durable workflow run during boot"
+        );
+    }
+    info!(
+        recovered_runs = recovered.len(),
+        "Recovered durable workflow runs before serving requests"
+    );
+
+    Ok(recovered.len())
+}
+
 impl OpenFangKernel {
     /// Boot the kernel with configuration from the given path.
     pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
@@ -643,6 +672,7 @@ impl OpenFangKernel {
         )?;
         let runtime_stores = initialize_runtime_stores(Arc::clone(&runtime_db));
         let workflow_stores = initialize_workflow_stores(Arc::clone(&compozy_db));
+        let _recovered_runs = recover_workflow_runs_on_startup(&workflow_stores)?;
 
         // Initialize credential resolver (vault → dotenv → env var)
         let credential_resolver = {
@@ -4179,9 +4209,9 @@ impl OpenFangKernel {
         let workflows_dir = self.workflows_dir();
         let result = self.load_workflows_from_dir(&workflows_dir).await;
         match self.workflows.recover_durable_runs().await {
-            Ok(interrupted) if interrupted > 0 => {
+            Ok(recovered) if recovered > 0 => {
                 info!(
-                    interrupted_runs = interrupted,
+                    recovered_runs = recovered,
                     "Recovered durable workflow runs after bootstrap"
                 );
             }
@@ -7217,7 +7247,7 @@ mod tests {
         let compozy_rows = schema_migration_rows(&compozy_db);
 
         assert_eq!(runtime_rows.len(), 4);
-        assert_eq!(compozy_rows.len(), 6);
+        assert_eq!(compozy_rows.len(), 7);
         assert_eq!(runtime_rows[0].0, 1);
         assert_eq!(compozy_rows[0].0, 1);
         assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -7230,6 +7260,7 @@ mod tests {
         assert_eq!(compozy_rows[3].1, "0004_workflow_signal");
         assert_eq!(compozy_rows[4].1, "0005_workflow_runtime_durability");
         assert_eq!(compozy_rows[5].1, "0006_workflow_signal_waiting_state");
+        assert_eq!(compozy_rows[6].1, "0007_workflow_run_control_plane");
 
         kernel.shutdown();
     }

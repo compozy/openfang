@@ -26,6 +26,10 @@ pub const WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL: &str =
 pub const WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL: &str =
     include_str!("../migrations/compozy/20260323_006_workflow_signal_waiting_state.sql");
 
+/// SQL for migration `0007_workflow_run_control_plane`.
+pub const WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL: &str =
+    include_str!("../migrations/compozy/20260323_007_workflow_run_control_plane.sql");
+
 /// Shared `compozy.db` repository handles.
 #[derive(Clone)]
 pub struct WorkflowStoreSet {
@@ -128,14 +132,16 @@ pub enum WorkflowRunStatus {
     Running,
     /// The run is durably parked on an external wait condition.
     WaitingSignal,
+    /// The run is durably parked on a human-in-the-loop request.
+    WaitingHitl,
+    /// The run is paused and requires an explicit resume action.
+    Paused,
     /// The run completed successfully.
     Completed,
     /// The run failed.
     Failed,
     /// The run was cancelled.
     Cancelled,
-    /// The run was interrupted by process restart or crash recovery.
-    Interrupted,
 }
 
 impl WorkflowRunStatus {
@@ -145,10 +151,11 @@ impl WorkflowRunStatus {
             Self::Pending => "pending",
             Self::Running => "running",
             Self::WaitingSignal => "waiting_signal",
+            Self::WaitingHitl => "waiting_hitl",
+            Self::Paused => "paused",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
-            Self::Interrupted => "interrupted",
         }
     }
 
@@ -157,10 +164,11 @@ impl WorkflowRunStatus {
             "pending" => Ok(Self::Pending),
             "running" => Ok(Self::Running),
             "waiting" | "waiting_signal" => Ok(Self::WaitingSignal),
+            "waiting_hitl" => Ok(Self::WaitingHitl),
+            "paused" | "interrupted" => Ok(Self::Paused),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
-            "interrupted" => Ok(Self::Interrupted),
             other => Err(WorkflowStoreError::InvalidRunStatus {
                 status: other.to_string(),
             }),
@@ -214,17 +222,17 @@ pub enum CheckpointKind {
     RunFailed,
     /// The run was cancelled.
     RunCancelled,
-    /// The run was interrupted during restart recovery.
+    /// Legacy Task 16 checkpoint kind kept for migration compatibility.
     RunInterrupted,
     /// Legacy Task 9 checkpoint kind kept for migration compatibility.
     StepSelected,
-    /// Legacy Task 9 checkpoint kind kept for migration compatibility.
+    /// The run is durably waiting on a signal.
     WaitingSignal,
-    /// Legacy Task 9 checkpoint kind kept for migration compatibility.
+    /// The run was paused by an explicit control-plane action.
     RunPaused,
-    /// Legacy Task 9 checkpoint kind kept for migration compatibility.
+    /// The run was resumed by an explicit control-plane action.
     RunResumed,
-    /// Legacy Task 9 checkpoint kind kept for migration compatibility.
+    /// The run was recovered during startup and now needs manual resume.
     RunRecoveredNeedsResume,
 }
 
@@ -388,6 +396,34 @@ pub struct WorkflowRunListQuery {
     pub search: Option<String>,
 }
 
+/// One run downgraded during startup recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunRecoveryRecord {
+    /// Run identifier that was recovered.
+    pub run_id: String,
+    /// Previous status observed before the downgrade.
+    pub previous_status: WorkflowRunStatus,
+}
+
+/// Durable dispatch summary for one run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowDispatchSummaryRecord {
+    /// Stable dispatch identifier.
+    pub dispatch_id: String,
+    /// Owning run identifier.
+    pub run_id: String,
+    /// Associated step identifier, if any.
+    pub step_id: Option<String>,
+    /// Dispatch kind such as `call` or `spawn`.
+    pub kind: String,
+    /// Target agent identifier.
+    pub target_agent: String,
+    /// Current durable dispatch status.
+    pub status: String,
+    /// Last update timestamp.
+    pub updated_at: String,
+}
+
 /// Repository for `workflow_run`.
 #[derive(Clone)]
 pub struct WorkflowRunRepository {
@@ -488,6 +524,15 @@ impl WorkflowRunRepository {
         Ok(records)
     }
 
+    /// List durable workflow runs using the canonical database-backed query
+    /// parameters.
+    pub fn list(
+        &self,
+        query: &WorkflowRunListQuery,
+    ) -> Result<Vec<WorkflowRunRecord>, WorkflowStoreError> {
+        self.list_runs(query)
+    }
+
     /// List durable runs for one workflow definition.
     pub fn list_for_workflow(
         &self,
@@ -497,6 +542,38 @@ impl WorkflowRunRepository {
             workflow_id: Some(workflow_id.to_string()),
             ..WorkflowRunListQuery::default()
         })
+    }
+
+    /// Append a checkpoint row for an existing run.
+    pub fn insert_checkpoint(
+        &self,
+        checkpoint: &WorkflowCheckpointRecord,
+    ) -> Result<(), WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        insert_checkpoint(&conn, checkpoint)?;
+        Ok(())
+    }
+
+    /// List checkpoints for one run ordered by creation time.
+    pub fn find_checkpoints_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<WorkflowCheckpointRecord>, WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        list_run_checkpoints(&conn, run_id)
+    }
+
+    /// Update one durable workflow run status and write the matching checkpoint
+    /// in the same transaction.
+    pub fn update_status(
+        &self,
+        current: &WorkflowRunRecord,
+        next: &WorkflowRunRecord,
+        checkpoint: &WorkflowCheckpointRecord,
+    ) -> Result<WorkflowRunRecord, WorkflowStoreError> {
+        validate_status_update_transition(current, next, checkpoint)?;
+        self.persist_transition(current, next, checkpoint)?;
+        Ok(next.clone())
     }
 
     /// Return the canonical set of non-terminal runs used for restart
@@ -523,7 +600,7 @@ impl WorkflowRunRepository {
                 updated_at,
                 completed_at
              FROM workflow_run
-             WHERE status IN ('pending', 'running', 'waiting_signal')
+             WHERE status IN ('pending', 'running', 'waiting_signal', 'waiting_hitl', 'paused')
              ORDER BY updated_at ASC, run_id ASC",
         )?;
         let rows = stmt.query_map([], read_workflow_run_row)?;
@@ -532,6 +609,27 @@ impl WorkflowRunRepository {
             records.push(row?);
         }
         Ok(records)
+    }
+
+    /// Atomically downgrade all `running` rows to `paused` and append one
+    /// recovery checkpoint per affected run.
+    pub fn recover_running_runs(
+        &self,
+    ) -> Result<Vec<WorkflowRunRecoveryRecord>, WorkflowStoreError> {
+        let mut conn = lock_conn(&self.conn)?;
+        recover_running_runs_with(&mut conn, |run, index| {
+            format!("chk-recovered-{}-{index}", run.run_id)
+        })
+    }
+
+    /// List durable dispatch summaries for one run. Returns an empty list until
+    /// the later dispatch schema lands in `compozy.db`.
+    pub fn list_dispatches_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<WorkflowDispatchSummaryRecord>, WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        list_run_dispatches(&conn, run_id)
     }
 
     /// Append a checkpoint row and then replace the durable run row inside one
@@ -657,18 +755,7 @@ impl WorkflowCheckpointRepository {
         run_id: &str,
     ) -> Result<Vec<WorkflowCheckpointRecord>, WorkflowStoreError> {
         let conn = lock_conn(&self.conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT checkpoint_id, run_id, step_id, kind, data_json, created_at
-             FROM workflow_checkpoint
-             WHERE run_id = ?1
-             ORDER BY created_at ASC, checkpoint_id ASC",
-        )?;
-        let rows = stmt.query_map([run_id], read_workflow_checkpoint_row)?;
-        let mut records = Vec::new();
-        for row in rows {
-            records.push(row?);
-        }
-        Ok(records)
+        list_run_checkpoints(&conn, run_id)
     }
 }
 
@@ -1089,6 +1176,191 @@ fn consume_signal_row(
     }
 }
 
+fn recover_running_runs_with<F>(
+    conn: &mut Connection,
+    mut checkpoint_id_for: F,
+) -> Result<Vec<WorkflowRunRecoveryRecord>, WorkflowStoreError>
+where
+    F: FnMut(&WorkflowRunRecord, usize) -> String,
+{
+    let transaction = conn.unchecked_transaction()?;
+    let running = list_workflow_runs_by_status(&transaction, WorkflowRunStatus::Running)?;
+    let recovered_at = now_timestamp();
+    let mut recovered = Vec::with_capacity(running.len());
+
+    for (index, current) in running.into_iter().enumerate() {
+        let mut next = current.clone();
+        next.status = WorkflowRunStatus::Paused;
+        next.waiting_kind = None;
+        next.waiting_ref = None;
+        next.updated_at = recovered_at.clone();
+
+        let checkpoint = WorkflowCheckpointRecord {
+            checkpoint_id: checkpoint_id_for(&current, index),
+            run_id: current.run_id.clone(),
+            step_id: current.current_step_id.clone(),
+            kind: CheckpointKind::RunRecoveredNeedsResume,
+            data_json: serde_json::json!({
+                "previous_status": current.status.as_str(),
+            })
+            .to_string(),
+            created_at: recovered_at.clone(),
+        };
+        insert_checkpoint(&transaction, &checkpoint)?;
+
+        let rows =
+            update_workflow_run_record(&transaction, &next, Some(WorkflowRunStatus::Running))?;
+        if rows == 0 {
+            return Err(resolve_update_conflict(
+                &transaction,
+                &current.run_id,
+                Some(WorkflowRunStatus::Running),
+            ));
+        }
+
+        recovered.push(WorkflowRunRecoveryRecord {
+            run_id: current.run_id,
+            previous_status: WorkflowRunStatus::Running,
+        });
+    }
+
+    transaction.commit()?;
+    Ok(recovered)
+}
+
+fn validate_status_update_transition(
+    current: &WorkflowRunRecord,
+    next: &WorkflowRunRecord,
+    checkpoint: &WorkflowCheckpointRecord,
+) -> Result<(), WorkflowStoreError> {
+    match checkpoint.kind {
+        CheckpointKind::RunPaused => {
+            if !matches!(
+                current.status,
+                WorkflowRunStatus::Running | WorkflowRunStatus::WaitingSignal
+            ) {
+                return Err(WorkflowStoreError::UnexpectedRunState {
+                    run_id: current.run_id.clone(),
+                    expected: "running, waiting_signal".to_string(),
+                    actual: current.status.to_string(),
+                });
+            }
+            if next.status != WorkflowRunStatus::Paused {
+                return Err(WorkflowStoreError::UnexpectedRunState {
+                    run_id: current.run_id.clone(),
+                    expected: WorkflowRunStatus::Paused.to_string(),
+                    actual: next.status.to_string(),
+                });
+            }
+        }
+        CheckpointKind::RunResumed => {
+            if current.status != WorkflowRunStatus::Paused {
+                return Err(WorkflowStoreError::UnexpectedRunState {
+                    run_id: current.run_id.clone(),
+                    expected: WorkflowRunStatus::Paused.to_string(),
+                    actual: current.status.to_string(),
+                });
+            }
+            if next.status != WorkflowRunStatus::Running {
+                return Err(WorkflowStoreError::UnexpectedRunState {
+                    run_id: current.run_id.clone(),
+                    expected: WorkflowRunStatus::Running.to_string(),
+                    actual: next.status.to_string(),
+                });
+            }
+        }
+        CheckpointKind::RunCancelled => {
+            if current.status.is_terminal() {
+                return Err(WorkflowStoreError::UnexpectedRunState {
+                    run_id: current.run_id.clone(),
+                    expected: "pending, running, waiting_signal, waiting_hitl, paused".to_string(),
+                    actual: current.status.to_string(),
+                });
+            }
+            if next.status != WorkflowRunStatus::Cancelled {
+                return Err(WorkflowStoreError::UnexpectedRunState {
+                    run_id: current.run_id.clone(),
+                    expected: WorkflowRunStatus::Cancelled.to_string(),
+                    actual: next.status.to_string(),
+                });
+            }
+        }
+        CheckpointKind::RunRecoveredNeedsResume => {
+            if current.status != WorkflowRunStatus::Running {
+                return Err(WorkflowStoreError::UnexpectedRunState {
+                    run_id: current.run_id.clone(),
+                    expected: WorkflowRunStatus::Running.to_string(),
+                    actual: current.status.to_string(),
+                });
+            }
+            if next.status != WorkflowRunStatus::Paused {
+                return Err(WorkflowStoreError::UnexpectedRunState {
+                    run_id: current.run_id.clone(),
+                    expected: WorkflowRunStatus::Paused.to_string(),
+                    actual: next.status.to_string(),
+                });
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn list_run_checkpoints(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Vec<WorkflowCheckpointRecord>, WorkflowStoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT checkpoint_id, run_id, step_id, kind, data_json, created_at
+         FROM workflow_checkpoint
+         WHERE run_id = ?1
+         ORDER BY created_at ASC, checkpoint_id ASC",
+    )?;
+    let rows = stmt.query_map([run_id], read_workflow_checkpoint_row)?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row?);
+    }
+    Ok(records)
+}
+
+fn list_run_dispatches(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Vec<WorkflowDispatchSummaryRecord>, WorkflowStoreError> {
+    if !table_exists(conn, "agent_dispatch")? {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT dispatch_id, run_id, step_id, kind, target_agent, status, updated_at
+         FROM agent_dispatch
+         WHERE run_id = ?1
+         ORDER BY updated_at DESC, dispatch_id DESC",
+    )?;
+    let rows = stmt.query_map([run_id], read_workflow_dispatch_summary_row)?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row?);
+    }
+    Ok(records)
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = ?1
+        )",
+        [table_name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists == 1)
+}
+
 fn load_workflow_run(
     conn: &Connection,
     run_id: &str,
@@ -1145,6 +1417,41 @@ fn list_all_workflow_runs(conn: &Connection) -> Result<Vec<WorkflowRunRecord>, W
          ORDER BY updated_at DESC, run_id DESC",
     )?;
     let rows = stmt.query_map([], read_workflow_run_row)?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row?);
+    }
+    Ok(records)
+}
+
+fn list_workflow_runs_by_status(
+    conn: &Connection,
+    status: WorkflowRunStatus,
+) -> Result<Vec<WorkflowRunRecord>, WorkflowStoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            run_id,
+            workflow_id,
+            workflow_version,
+            status,
+            input_json,
+            vars_json,
+            current_step_id,
+            waiting_kind,
+            waiting_ref,
+            active_dispatch_id,
+            active_hitl_request_id,
+            labels_json,
+            metadata_json,
+            error_json,
+            started_at,
+            updated_at,
+            completed_at
+         FROM workflow_run
+         WHERE status = ?1
+         ORDER BY updated_at ASC, run_id ASC",
+    )?;
+    let rows = stmt.query_map([status.as_str()], read_workflow_run_row)?;
     let mut records = Vec::new();
     for row in rows {
         records.push(row?);
@@ -1211,6 +1518,20 @@ fn read_workflow_signal_row(
     })
 }
 
+fn read_workflow_dispatch_summary_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<WorkflowDispatchSummaryRecord, rusqlite::Error> {
+    Ok(WorkflowDispatchSummaryRecord {
+        dispatch_id: row.get(0)?,
+        run_id: row.get(1)?,
+        step_id: row.get(2)?,
+        kind: row.get(3)?,
+        target_agent: row.get(4)?,
+        status: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
 fn invalid_text_error(error: WorkflowStoreError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
 }
@@ -1249,6 +1570,8 @@ mod tests {
             .expect("apply workflow runtime durability migration");
         conn.execute_batch(WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL)
             .expect("apply workflow signal waiting-state migration");
+        conn.execute_batch(WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL)
+            .expect("apply workflow control-plane migration");
         Arc::new(Mutex::new(conn))
     }
 
@@ -1286,6 +1609,23 @@ mod tests {
             step_id: step_id.map(ToOwned::to_owned),
             kind,
             data_json: "{}".to_string(),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    fn sample_status_checkpoint(
+        run_id: &str,
+        step_id: Option<&str>,
+        kind: CheckpointKind,
+        created_at: &str,
+        data: serde_json::Value,
+    ) -> WorkflowCheckpointRecord {
+        WorkflowCheckpointRecord {
+            checkpoint_id: format!("chk-{run_id}-{created_at}-{kind}"),
+            run_id: run_id.to_string(),
+            step_id: step_id.map(ToOwned::to_owned),
+            kind,
+            data_json: data.to_string(),
             created_at: created_at.to_string(),
         }
     }
@@ -1363,6 +1703,8 @@ mod tests {
         let pending = sample_run_record("run-pending");
         let mut running = sample_run_record("run-running");
         let mut waiting = sample_run_record("run-waiting");
+        let mut waiting_hitl = sample_run_record("run-waiting-hitl");
+        let mut paused = sample_run_record("run-paused");
         let mut completed = sample_run_record("run-completed");
 
         running.status = WorkflowRunStatus::Running;
@@ -1371,11 +1713,24 @@ mod tests {
         waiting.waiting_kind = Some("signal".to_string());
         waiting.waiting_ref = Some("artifact-approved".to_string());
         waiting.updated_at = "2026-03-23T12:02:00Z".to_string();
+        waiting_hitl.status = WorkflowRunStatus::WaitingHitl;
+        waiting_hitl.waiting_kind = Some("hitl".to_string());
+        waiting_hitl.waiting_ref = Some("hitl-request-42".to_string());
+        waiting_hitl.updated_at = "2026-03-23T12:02:30Z".to_string();
+        paused.status = WorkflowRunStatus::Paused;
+        paused.updated_at = "2026-03-23T12:02:45Z".to_string();
         completed.status = WorkflowRunStatus::Completed;
         completed.completed_at = Some("2026-03-23T12:03:00Z".to_string());
         completed.updated_at = "2026-03-23T12:03:00Z".to_string();
 
-        for record in [&pending, &running, &waiting, &completed] {
+        for record in [
+            &pending,
+            &running,
+            &waiting,
+            &waiting_hitl,
+            &paused,
+            &completed,
+        ] {
             stores
                 .workflow_run
                 .insert_run(record)
@@ -1397,8 +1752,367 @@ mod tests {
                 pending.run_id.clone(),
                 running.run_id.clone(),
                 waiting.run_id.clone(),
+                waiting_hitl.run_id.clone(),
+                paused.run_id.clone(),
             ]
         );
+    }
+
+    #[test]
+    fn running_runs_downgrade_to_paused_on_recovery_scan() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let mut running = sample_run_record("run-recovery-running");
+        running.status = WorkflowRunStatus::Running;
+        running.current_step_id = Some("step-1".to_string());
+        running.updated_at = "2026-03-23T12:01:00Z".to_string();
+
+        stores
+            .workflow_run
+            .insert_run(&running)
+            .expect("insert running workflow run");
+
+        let recovered = stores
+            .workflow_run
+            .recover_running_runs()
+            .expect("recover running runs");
+        let loaded = stores
+            .workflow_run
+            .find_by_id(&running.run_id)
+            .expect("load recovered run")
+            .expect("run should exist");
+        let checkpoints = stores
+            .workflow_run
+            .find_checkpoints_for_run(&running.run_id)
+            .expect("load recovery checkpoints");
+
+        assert_eq!(
+            recovered,
+            vec![WorkflowRunRecoveryRecord {
+                run_id: running.run_id.clone(),
+                previous_status: WorkflowRunStatus::Running,
+            }]
+        );
+        assert_eq!(loaded.status, WorkflowRunStatus::Paused);
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].kind, CheckpointKind::RunRecoveredNeedsResume);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&checkpoints[0].data_json)
+                .expect("checkpoint data should deserialize"),
+            serde_json::json!({ "previous_status": "running" })
+        );
+    }
+
+    #[test]
+    fn waiting_signal_runs_survive_recovery_scan_unchanged() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let mut waiting = sample_run_record("run-recovery-wait-signal");
+        waiting.status = WorkflowRunStatus::WaitingSignal;
+        waiting.current_step_id = Some("await-approval".to_string());
+        waiting.waiting_kind = Some("signal".to_string());
+        waiting.waiting_ref = Some("approval".to_string());
+        waiting.updated_at = "2026-03-23T12:02:00Z".to_string();
+
+        stores
+            .workflow_run
+            .insert_run(&waiting)
+            .expect("insert waiting workflow run");
+
+        let recovered = stores
+            .workflow_run
+            .recover_running_runs()
+            .expect("recover running runs");
+        let loaded = stores
+            .workflow_run
+            .find_by_id(&waiting.run_id)
+            .expect("load waiting run")
+            .expect("waiting run should exist");
+        let checkpoints = stores
+            .workflow_run
+            .find_checkpoints_for_run(&waiting.run_id)
+            .expect("load waiting checkpoints");
+
+        assert!(recovered.is_empty());
+        assert_eq!(loaded, waiting);
+        assert!(checkpoints.is_empty());
+    }
+
+    #[test]
+    fn waiting_hitl_runs_survive_recovery_scan_unchanged() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let mut waiting = sample_run_record("run-recovery-wait-hitl");
+        waiting.status = WorkflowRunStatus::WaitingHitl;
+        waiting.current_step_id = Some("await-review".to_string());
+        waiting.waiting_kind = Some("hitl".to_string());
+        waiting.waiting_ref = Some("hitl-request-42".to_string());
+        waiting.active_hitl_request_id = Some("hitl-request-42".to_string());
+        waiting.updated_at = "2026-03-23T12:03:00Z".to_string();
+
+        stores
+            .workflow_run
+            .insert_run(&waiting)
+            .expect("insert waiting workflow run");
+
+        let recovered = stores
+            .workflow_run
+            .recover_running_runs()
+            .expect("recover running runs");
+        let loaded = stores
+            .workflow_run
+            .find_by_id(&waiting.run_id)
+            .expect("load waiting run")
+            .expect("waiting run should exist");
+        let checkpoints = stores
+            .workflow_run
+            .find_checkpoints_for_run(&waiting.run_id)
+            .expect("load waiting checkpoints");
+
+        assert!(recovered.is_empty());
+        assert_eq!(loaded, waiting);
+        assert!(checkpoints.is_empty());
+    }
+
+    #[test]
+    fn terminal_runs_are_not_touched_by_recovery_scan() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let mut completed = sample_run_record("run-recovery-completed");
+        let mut failed = sample_run_record("run-recovery-failed");
+        let mut cancelled = sample_run_record("run-recovery-cancelled");
+
+        completed.status = WorkflowRunStatus::Completed;
+        completed.completed_at = Some("2026-03-23T12:03:00Z".to_string());
+        completed.updated_at = "2026-03-23T12:03:00Z".to_string();
+        failed.status = WorkflowRunStatus::Failed;
+        failed.error_json = Some(serde_json::json!({ "message": "boom" }).to_string());
+        failed.completed_at = Some("2026-03-23T12:04:00Z".to_string());
+        failed.updated_at = "2026-03-23T12:04:00Z".to_string();
+        cancelled.status = WorkflowRunStatus::Cancelled;
+        cancelled.completed_at = Some("2026-03-23T12:05:00Z".to_string());
+        cancelled.updated_at = "2026-03-23T12:05:00Z".to_string();
+
+        for record in [&completed, &failed, &cancelled] {
+            stores
+                .workflow_run
+                .insert_run(record)
+                .expect("insert terminal run");
+        }
+
+        let recovered = stores
+            .workflow_run
+            .recover_running_runs()
+            .expect("recover running runs");
+
+        assert!(recovered.is_empty());
+        for record in [&completed, &failed, &cancelled] {
+            let loaded = stores
+                .workflow_run
+                .find_by_id(&record.run_id)
+                .expect("load terminal run")
+                .expect("terminal run should exist");
+            let checkpoints = stores
+                .workflow_run
+                .find_checkpoints_for_run(&record.run_id)
+                .expect("load terminal checkpoints");
+
+            assert_eq!(loaded, *record);
+            assert!(checkpoints.is_empty());
+        }
+    }
+
+    #[test]
+    fn recovery_scan_is_atomic() {
+        let conn = compozy_conn();
+        let stores = WorkflowStoreSet::new(Arc::clone(&conn));
+        let mut first = sample_run_record("run-recovery-atomic-a");
+        let mut second = sample_run_record("run-recovery-atomic-b");
+        first.status = WorkflowRunStatus::Running;
+        second.status = WorkflowRunStatus::Running;
+        first.current_step_id = Some("step-a".to_string());
+        second.current_step_id = Some("step-b".to_string());
+
+        stores
+            .workflow_run
+            .insert_run(&first)
+            .expect("insert first running run");
+        stores
+            .workflow_run
+            .insert_run(&second)
+            .expect("insert second running run");
+
+        {
+            let mut guard = conn.lock().expect("lock workflow db");
+            let result = recover_running_runs_with(&mut guard, |_run, _index| {
+                "chk-recovery-duplicate".to_string()
+            });
+            assert!(result.is_err(), "duplicate checkpoint ids should fail");
+        }
+
+        for run_id in [&first.run_id, &second.run_id] {
+            let loaded = stores
+                .workflow_run
+                .find_by_id(run_id)
+                .expect("load run after failed recovery")
+                .expect("run should exist");
+            let checkpoints = stores
+                .workflow_run
+                .find_checkpoints_for_run(run_id)
+                .expect("load checkpoints after failed recovery");
+
+            assert_eq!(loaded.status, WorkflowRunStatus::Running);
+            assert!(checkpoints.is_empty());
+        }
+    }
+
+    #[test]
+    fn recovery_checkpoints_record_previous_status() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let mut first = sample_run_record("run-recovery-data-a");
+        let mut second = sample_run_record("run-recovery-data-b");
+        first.status = WorkflowRunStatus::Running;
+        second.status = WorkflowRunStatus::Running;
+
+        stores
+            .workflow_run
+            .insert_run(&first)
+            .expect("insert first running run");
+        stores
+            .workflow_run
+            .insert_run(&second)
+            .expect("insert second running run");
+        stores
+            .workflow_run
+            .recover_running_runs()
+            .expect("recover running runs");
+
+        for run_id in [&first.run_id, &second.run_id] {
+            let checkpoints = stores
+                .workflow_run
+                .find_checkpoints_for_run(run_id)
+                .expect("load recovery checkpoints");
+            assert_eq!(checkpoints.len(), 1);
+            assert_eq!(checkpoints[0].kind, CheckpointKind::RunRecoveredNeedsResume);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&checkpoints[0].data_json)
+                    .expect("checkpoint data should deserialize")["previous_status"],
+                "running"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_scan_is_idempotent() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let mut running = sample_run_record("run-recovery-idempotent");
+        running.status = WorkflowRunStatus::Running;
+
+        stores
+            .workflow_run
+            .insert_run(&running)
+            .expect("insert running workflow run");
+
+        let first = stores
+            .workflow_run
+            .recover_running_runs()
+            .expect("first recovery should succeed");
+        let second = stores
+            .workflow_run
+            .recover_running_runs()
+            .expect("second recovery should succeed");
+        let checkpoints = stores
+            .workflow_run
+            .find_checkpoints_for_run(&running.run_id)
+            .expect("load recovery checkpoints");
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].kind, CheckpointKind::RunRecoveredNeedsResume);
+    }
+
+    #[test]
+    fn pause_action_rejects_invalid_source_status() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let mut current = sample_run_record("run-pause-invalid");
+        current.status = WorkflowRunStatus::Completed;
+        current.completed_at = Some("2026-03-23T12:04:00Z".to_string());
+        current.updated_at = "2026-03-23T12:04:00Z".to_string();
+        let mut next = current.clone();
+        next.status = WorkflowRunStatus::Paused;
+        next.updated_at = "2026-03-23T12:05:00Z".to_string();
+        let checkpoint = sample_status_checkpoint(
+            &current.run_id,
+            current.current_step_id.as_deref(),
+            CheckpointKind::RunPaused,
+            &next.updated_at,
+            serde_json::json!({ "actor_source": "api" }),
+        );
+
+        stores
+            .workflow_run
+            .insert_run(&current)
+            .expect("insert completed run");
+
+        let result = stores
+            .workflow_run
+            .update_status(&current, &next, &checkpoint);
+        let loaded = stores
+            .workflow_run
+            .find_by_id(&current.run_id)
+            .expect("load completed run")
+            .expect("completed run should exist");
+        let checkpoints = stores
+            .workflow_run
+            .find_checkpoints_for_run(&current.run_id)
+            .expect("load completed run checkpoints");
+
+        assert!(matches!(
+            result,
+            Err(WorkflowStoreError::UnexpectedRunState { .. })
+        ));
+        assert_eq!(loaded, current);
+        assert!(checkpoints.is_empty());
+    }
+
+    #[test]
+    fn resume_action_only_valid_from_paused() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+        let mut current = sample_run_record("run-resume-invalid");
+        current.status = WorkflowRunStatus::Running;
+        current.current_step_id = Some("step-1".to_string());
+        current.updated_at = "2026-03-23T12:01:00Z".to_string();
+        let mut next = current.clone();
+        next.updated_at = "2026-03-23T12:02:00Z".to_string();
+        let checkpoint = sample_status_checkpoint(
+            &current.run_id,
+            current.current_step_id.as_deref(),
+            CheckpointKind::RunResumed,
+            &next.updated_at,
+            serde_json::json!({ "actor_source": "api" }),
+        );
+
+        stores
+            .workflow_run
+            .insert_run(&current)
+            .expect("insert running run");
+
+        let result = stores
+            .workflow_run
+            .update_status(&current, &next, &checkpoint);
+        let loaded = stores
+            .workflow_run
+            .find_by_id(&current.run_id)
+            .expect("load running run")
+            .expect("running run should exist");
+        let checkpoints = stores
+            .workflow_run
+            .find_checkpoints_for_run(&current.run_id)
+            .expect("load running run checkpoints");
+
+        assert!(matches!(
+            result,
+            Err(WorkflowStoreError::UnexpectedRunState { .. })
+        ));
+        assert_eq!(loaded.status, WorkflowRunStatus::Running);
+        assert!(checkpoints.is_empty());
     }
 
     #[test]

@@ -356,8 +356,24 @@ pub async fn build_router(
             axum::routing::get(routes::get_run_checkpoints_v1),
         )
         .route(
+            "/api/v1/runs/{id}/dispatches",
+            axum::routing::get(routes::get_run_dispatches_v1),
+        )
+        .route(
             "/api/v1/runs/{id}/signals",
             axum::routing::get(routes::get_run_signals_v1).post(routes::post_run_signal_v1),
+        )
+        .route(
+            "/api/v1/runs/{id}/pause",
+            axum::routing::post(routes::pause_run_v1),
+        )
+        .route(
+            "/api/v1/runs/{id}/resume",
+            axum::routing::post(routes::resume_run_v1),
+        )
+        .route(
+            "/api/v1/runs/{id}/cancel",
+            axum::routing::post(routes::cancel_run_v1),
         )
         // Skills endpoints
         .route("/api/skills", axum::routing::get(routes::list_skills))

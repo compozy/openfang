@@ -199,7 +199,7 @@ fn migration_status_is_queryable_after_boot() {
     let compozy_rows = schema_migration_rows(&compozy_db);
 
     assert_eq!(runtime_rows.len(), 4);
-    assert_eq!(compozy_rows.len(), 6);
+    assert_eq!(compozy_rows.len(), 7);
     assert_eq!(runtime_rows[0].0, 1);
     assert_eq!(compozy_rows[0].0, 1);
     assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -212,6 +212,7 @@ fn migration_status_is_queryable_after_boot() {
     assert_eq!(compozy_rows[3].1, "0004_workflow_signal");
     assert_eq!(compozy_rows[4].1, "0005_workflow_runtime_durability");
     assert_eq!(compozy_rows[5].1, "0006_workflow_signal_waiting_state");
+    assert_eq!(compozy_rows[6].1, "0007_workflow_run_control_plane");
 
     kernel.shutdown();
 }
@@ -265,7 +266,7 @@ fn boot_should_create_compozy_db_with_all_phase_1_tables() {
 }
 
 #[tokio::test]
-async fn boot_should_recover_running_workflow_runs_as_interrupted() {
+async fn boot_should_recover_running_workflow_runs_before_cache_projection() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let config = boot_test_config(tmp.path());
     let mut record = sample_workflow_run("run-recovery-boot");
@@ -281,18 +282,44 @@ async fn boot_should_recover_running_workflow_runs_as_interrupted() {
     first_kernel.shutdown();
 
     let second_kernel = OpenFangKernel::boot_with_config(config).expect("second boot");
-    second_kernel.bootstrap_workflow_definitions().await;
-    let loaded = second_kernel
+    let loaded_before_bootstrap = second_kernel
         .workflow_stores
         .workflow_run
         .find_by_id(&record.run_id)
         .expect("load recovered workflow run")
         .expect("workflow run should persist");
-    let checkpoints = second_kernel
+    let checkpoints_before_bootstrap = second_kernel
         .workflow_stores
         .workflow_checkpoint
         .list_for_run(&record.run_id)
         .expect("load checkpoints");
+
+    assert_eq!(loaded_before_bootstrap.status, WorkflowRunStatus::Paused);
+    assert_eq!(
+        checkpoints_before_bootstrap
+            .iter()
+            .filter(|checkpoint| checkpoint.kind == CheckpointKind::RunRecoveredNeedsResume)
+            .count(),
+        1
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&checkpoints_before_bootstrap[0].data_json)
+            .expect("recovery checkpoint data should deserialize"),
+        json!({ "previous_status": "running" })
+    );
+
+    second_kernel.bootstrap_workflow_definitions().await;
+    let loaded = second_kernel
+        .workflow_stores
+        .workflow_run
+        .find_by_id(&record.run_id)
+        .expect("load recovered workflow run after bootstrap")
+        .expect("workflow run should persist");
+    let checkpoints = second_kernel
+        .workflow_stores
+        .workflow_checkpoint
+        .list_for_run(&record.run_id)
+        .expect("load checkpoints after bootstrap");
     let cached = second_kernel
         .workflows
         .get_run(WorkflowRunId(
@@ -301,15 +328,15 @@ async fn boot_should_recover_running_workflow_runs_as_interrupted() {
         .await
         .expect("workflow run should be projected into cache");
 
-    assert_eq!(loaded.status, WorkflowRunStatus::Interrupted);
+    assert_eq!(loaded.status, WorkflowRunStatus::Paused);
     assert_eq!(
         checkpoints
             .iter()
-            .filter(|checkpoint| checkpoint.kind == CheckpointKind::RunInterrupted)
+            .filter(|checkpoint| checkpoint.kind == CheckpointKind::RunRecoveredNeedsResume)
             .count(),
         1
     );
-    assert!(matches!(cached.state, WorkflowRunState::Interrupted));
+    assert!(matches!(cached.state, WorkflowRunState::Paused));
 
     second_kernel.shutdown();
 }
@@ -379,6 +406,59 @@ async fn waiting_run_should_survive_restart_and_remain_resumable() {
     assert_eq!(loaded.waiting_kind.as_deref(), Some("signal"));
     assert_eq!(loaded.waiting_ref.as_deref(), Some("approval-42"));
     assert!(matches!(cached.state, WorkflowRunState::WaitingSignal));
+
+    second_kernel.shutdown();
+}
+
+#[tokio::test]
+async fn waiting_hitl_run_should_survive_restart_unchanged() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let config = boot_test_config(tmp.path());
+    let mut record = sample_workflow_run("run-waiting-hitl-survival");
+    record.status = WorkflowRunStatus::WaitingHitl;
+    record.current_step_id = Some("step-review".to_string());
+    record.waiting_kind = Some("hitl".to_string());
+    record.waiting_ref = Some("hitl-request-42".to_string());
+    record.active_hitl_request_id = Some("hitl-request-42".to_string());
+
+    let first_kernel = OpenFangKernel::boot_with_config(config.clone()).expect("first boot");
+    first_kernel
+        .workflow_stores
+        .workflow_run
+        .insert_run(&record)
+        .expect("store workflow run");
+    first_kernel.shutdown();
+
+    let second_kernel = OpenFangKernel::boot_with_config(config).expect("second boot");
+    second_kernel.bootstrap_workflow_definitions().await;
+    let loaded = second_kernel
+        .workflow_stores
+        .workflow_run
+        .find_by_id(&record.run_id)
+        .expect("load workflow run")
+        .expect("workflow run should persist");
+    let cached = second_kernel
+        .workflows
+        .get_run(WorkflowRunId(
+            Uuid::parse_str(&record.run_id).expect("valid run id"),
+        ))
+        .await
+        .expect("waiting workflow run should be projected into cache");
+    let checkpoints = second_kernel
+        .workflow_stores
+        .workflow_checkpoint
+        .list_for_run(&record.run_id)
+        .expect("load checkpoints");
+
+    assert_eq!(loaded.status, WorkflowRunStatus::WaitingHitl);
+    assert_eq!(loaded.waiting_kind.as_deref(), Some("hitl"));
+    assert_eq!(loaded.waiting_ref.as_deref(), Some("hitl-request-42"));
+    assert_eq!(
+        loaded.active_hitl_request_id.as_deref(),
+        Some("hitl-request-42")
+    );
+    assert!(matches!(cached.state, WorkflowRunState::WaitingHitl));
+    assert!(checkpoints.is_empty());
 
     second_kernel.shutdown();
 }
