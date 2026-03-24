@@ -14,6 +14,8 @@ use openfang_agent_definition::{
     CompiledAgentDefinition, ValidationContext as AgentValidationContext,
     ValidationIssue as AgentValidationIssue,
 };
+use openfang_kernel::cron::JobMeta as ScheduleJobMeta;
+use openfang_kernel::kernel::ScheduleExecutionResult;
 use openfang_kernel::metering::MeteringEngine;
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
@@ -24,11 +26,15 @@ use openfang_kernel::workflow_compiler::{
     validate_workflow_value, WorkflowCompileError,
 };
 use openfang_kernel::{AgentMessageDispatch, OpenFangKernel};
-use openfang_memory::{AgentRuntimeRecord, AgentSessionRecord};
+use openfang_memory::{AgentRuntimeRecord, AgentSessionRecord, ScheduleRuntimeRecord};
 use openfang_memory::{WorkflowRunListQuery, WorkflowRunStatus, WorkflowSignalRecord};
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest, AgentState, SessionId};
+use openfang_types::scheduler::{
+    CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDelivery, CronJob, CronJobId,
+    CronSchedule, CronTextInputItem, CronTextInputPayload, CronWorkflowSignalSelector,
+};
 use openfang_types::workflow::{WorkflowIr, WorkflowIrStepKind};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -67,6 +73,7 @@ pub struct AgentSessionDetailQuery {
 const DEFAULT_PAGE_LIMIT: usize = 50;
 const MAX_PAGE_LIMIT: usize = 200;
 static WORKFLOW_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static SCHEDULE_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct WorkflowListQueryParams {
@@ -96,6 +103,24 @@ pub struct WorkflowRunsListQueryParams {
     pub sort: Option<String>,
     #[serde(default)]
     pub order: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ScheduleListQueryParams {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub schedule_kind: Option<String>,
+    #[serde(default)]
+    pub action_kind: Option<String>,
+    #[serde(default, rename = "q")]
+    pub search: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -12601,352 +12626,1502 @@ pub async fn reload_integrations(State(state): State<Arc<AppState>>) -> impl Int
 }
 
 // ---------------------------------------------------------------------------
-// Scheduled Jobs (cron) endpoints
+// Schedule v1 routes
 // ---------------------------------------------------------------------------
 
-/// The well-known shared-memory agent ID used for cross-agent KV storage.
-/// Must match the value in `openfang-kernel/src/kernel.rs::shared_memory_agent_id()`.
-fn schedule_shared_agent_id() -> AgentId {
-    AgentId(uuid::Uuid::from_bytes([
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x01,
-    ]))
+fn schedule_error_response(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    details: Option<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message.into(),
+                "details": details.unwrap_or_else(|| serde_json::json!([])),
+            }
+        })),
+    )
 }
 
-const SCHEDULES_KEY: &str = "__openfang_schedules";
-
-/// GET /api/schedules — List all cron-based scheduled jobs.
-pub async fn list_schedules(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let agent_id = schedule_shared_agent_id();
-    match state.kernel.memory.structured_get(agent_id, SCHEDULES_KEY) {
-        Ok(Some(serde_json::Value::Array(arr))) => {
-            let total = arr.len();
-            Json(serde_json::json!({"schedules": arr, "total": total}))
-        }
-        Ok(_) => Json(serde_json::json!({"schedules": [], "total": 0})),
-        Err(e) => {
-            tracing::warn!("Failed to load schedules: {e}");
-            Json(serde_json::json!({"schedules": [], "total": 0, "error": format!("{e}")}))
-        }
+fn schedule_json_rejection(rejection: JsonRejection) -> (StatusCode, Json<serde_json::Value>) {
+    match rejection {
+        JsonRejection::MissingJsonContentType(_) => schedule_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Missing `Content-Type: application/json` header",
+            None,
+        ),
+        JsonRejection::JsonDataError(error) => schedule_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Invalid JSON body: {error}"),
+            None,
+        ),
+        JsonRejection::JsonSyntaxError(error) => schedule_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Invalid JSON body: {error}"),
+            None,
+        ),
+        JsonRejection::BytesRejection(error) => schedule_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Failed to read request body: {error}"),
+            None,
+        ),
+        rejection => schedule_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Invalid request body: {rejection}"),
+            None,
+        ),
     }
 }
 
-/// POST /api/schedules — Create a new cron-based scheduled job.
-pub async fn create_schedule(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let name = match req["name"].as_str() {
-        Some(n) if !n.is_empty() => n.to_string(),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Missing 'name' field"})),
-            );
-        }
-    };
+fn schedule_definition_id_is_safe(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
 
-    let cron = match req["cron"].as_str() {
-        Some(c) if !c.is_empty() => c.to_string(),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Missing 'cron' field"})),
-            );
-        }
-    };
-
-    // Validate cron expression: must be 5 space-separated fields
-    let cron_parts: Vec<&str> = cron.split_whitespace().collect();
-    if cron_parts.len() != 5 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::json!({"error": "Invalid cron expression: must have 5 fields (min hour dom mon dow)"}),
-            ),
-        );
+fn ensure_safe_schedule_definition_id(
+    id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if schedule_definition_id_is_safe(id) {
+        return Ok(());
     }
 
-    let agent_id_str = req["agent_id"].as_str().unwrap_or("").to_string();
-    if agent_id_str.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Missing required field: agent_id"})),
-        );
+    Err(schedule_error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        "Schedule IDs may only contain ASCII letters, digits, `.`, `_`, or `-`",
+        Some(serde_json::json!([{
+            "path": "id",
+            "value": id,
+        }])),
+    ))
+}
+
+fn schedule_not_found_response() -> (StatusCode, Json<serde_json::Value>) {
+    schedule_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Schedule definition not found",
+        None,
+    )
+}
+
+fn schedule_validation_issue(
+    severity: &str,
+    code: &str,
+    path: &str,
+    message: impl Into<String>,
+) -> ScheduleValidationIssue {
+    ScheduleValidationIssue {
+        severity: severity.to_string(),
+        code: code.to_string(),
+        path: path.to_string(),
+        message: message.into(),
     }
-    // Validate agent exists (UUID or name lookup)
-    let agent_exists = if let Ok(aid) = agent_id_str.parse::<AgentId>() {
-        state.kernel.registry.get(aid).is_some()
+}
+
+fn schedule_validation_error_response(
+    issues: &[ScheduleValidationIssue],
+) -> (StatusCode, Json<serde_json::Value>) {
+    schedule_error_response(
+        StatusCode::BAD_REQUEST,
+        "validation_error",
+        "schedule definition is invalid",
+        Some(serde_json::to_value(issues).unwrap_or_else(|_| serde_json::json!([]))),
+    )
+}
+
+fn schedule_definition_is_valid(issues: &[ScheduleValidationIssue], strict: bool) -> bool {
+    if strict {
+        issues.is_empty()
     } else {
-        state
-            .kernel
-            .registry
-            .list()
-            .iter()
-            .any(|a| a.name == agent_id_str)
-    };
-    if !agent_exists {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Agent not found: {agent_id_str}")})),
-        );
+        !issues.iter().any(|issue| issue.severity == "error")
     }
-    let message = req["message"].as_str().unwrap_or("").to_string();
-    let enabled = req.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-
-    let schedule_id = uuid::Uuid::new_v4().to_string();
-    let entry = serde_json::json!({
-        "id": schedule_id,
-        "name": name,
-        "cron": cron,
-        "agent_id": agent_id_str,
-        "message": message,
-        "enabled": enabled,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "last_run": null,
-        "run_count": 0,
-    });
-
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-
-    schedules.push(entry.clone());
-    if let Err(e) = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        tracing::warn!("Failed to save schedule: {e}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save schedule: {e}")})),
-        );
-    }
-
-    (StatusCode::CREATED, Json(entry))
 }
 
-/// PUT /api/schedules/:id — Update a scheduled job (toggle enabled, edit fields).
-pub async fn update_schedule(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(req): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
+fn generate_schedule_definition_id() -> String {
+    format!("sched_{}", uuid::Uuid::new_v4().simple())
+}
 
-    let mut found = false;
-    for s in schedules.iter_mut() {
-        if s["id"].as_str() == Some(&id) {
-            found = true;
-            if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
-                s["enabled"] = serde_json::Value::Bool(enabled);
+fn schedule_kind_name(schedule: &CronSchedule) -> &'static str {
+    match schedule {
+        CronSchedule::At { .. } => "at",
+        CronSchedule::Every { .. } => "every",
+        CronSchedule::Cron { .. } => "cron",
+    }
+}
+
+fn schedule_action_kind_name(action: &CronAction) -> &'static str {
+    match action {
+        CronAction::SystemEvent { .. } => "system_event",
+        CronAction::AgentTurn { .. } => "agent_turn",
+        CronAction::WorkflowRun { .. } => "workflow_run",
+        CronAction::WorkflowSignal { .. } => "workflow_signal",
+    }
+}
+
+fn schedule_runtime_snapshot(meta: &ScheduleJobMeta) -> ScheduleRuntimeRecord {
+    ScheduleRuntimeRecord {
+        schedule_id: meta.definition_id.clone(),
+        enabled: meta.job.enabled,
+        last_run: meta.job.last_run.map(|value| value.to_rfc3339()),
+        next_run: meta.job.next_run.map(|value| value.to_rfc3339()),
+        last_status: meta.last_status.clone(),
+        consecutive_errors: meta.consecutive_errors,
+        one_shot: meta.one_shot,
+        updated_at: meta.updated_at.clone(),
+    }
+}
+
+fn schedule_runtime_status_from_record(record: &ScheduleRuntimeRecord) -> ScheduleRuntimeStatus {
+    ScheduleRuntimeStatus {
+        last_run: record.last_run.clone(),
+        next_run: record.next_run.clone(),
+        last_status: record.last_status.clone(),
+        consecutive_errors: record.consecutive_errors,
+        one_shot: record.one_shot,
+    }
+}
+
+fn schedule_runtime_response_from_record(
+    record: &ScheduleRuntimeRecord,
+) -> ScheduleRuntimeResponse {
+    ScheduleRuntimeResponse {
+        schedule_id: record.schedule_id.clone(),
+        enabled: record.enabled,
+        last_run: record.last_run.clone(),
+        next_run: record.next_run.clone(),
+        last_status: record.last_status.clone(),
+        consecutive_errors: record.consecutive_errors,
+        one_shot: record.one_shot,
+    }
+}
+
+fn schedule_list_item(meta: &ScheduleJobMeta, runtime: &ScheduleRuntimeRecord) -> ScheduleListItem {
+    ScheduleListItem {
+        id: meta.definition_id.clone(),
+        agent: meta.agent_ref.clone(),
+        name: meta.job.name.clone(),
+        enabled: meta.job.enabled,
+        schedule: meta.job.schedule.clone(),
+        action: meta.job.action.clone(),
+        runtime_status: ScheduleListRuntimeStatus {
+            next_run: runtime.next_run.clone(),
+            last_status: runtime.last_status.clone(),
+        },
+        updated_at: meta.updated_at.clone(),
+    }
+}
+
+fn schedule_response(meta: &ScheduleJobMeta, runtime: &ScheduleRuntimeRecord) -> ScheduleResponse {
+    ScheduleResponse {
+        id: meta.definition_id.clone(),
+        agent: meta.agent_ref.clone(),
+        name: meta.job.name.clone(),
+        enabled: meta.job.enabled,
+        schedule: meta.job.schedule.clone(),
+        action: meta.job.action.clone(),
+        delivery: meta.job.delivery.clone(),
+        origin: meta.origin.clone(),
+        forked_from: meta.forked_from.clone(),
+        created_at: meta.job.created_at.to_rfc3339(),
+        updated_at: meta.updated_at.clone(),
+        runtime_status: schedule_runtime_status_from_record(runtime),
+    }
+}
+
+fn schedule_runtime_record_for_meta(
+    state: &AppState,
+    meta: &ScheduleJobMeta,
+) -> Result<ScheduleRuntimeRecord, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .kernel
+        .runtime_stores
+        .schedule_runtime
+        .get_schedule_runtime(&meta.definition_id)
+        .map_err(|error| {
+            schedule_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime_status_failed",
+                "Failed to load schedule runtime status",
+                Some(serde_json::json!([{
+                    "message": error.to_string(),
+                }])),
+            )
+        })
+        .map(|record| record.unwrap_or_else(|| schedule_runtime_snapshot(meta)))
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedScheduleAgent {
+    public_ref: String,
+    runtime_id: AgentId,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedScheduleDefinition {
+    definition: ScheduleDefinition,
+    runtime_agent_id: AgentId,
+}
+
+fn resolve_schedule_agent_reference(
+    state: &AppState,
+    value: &str,
+) -> Option<ResolvedScheduleAgent> {
+    if let Ok(Some(_)) = load_agent_definition_resource(state, value) {
+        return Some(ResolvedScheduleAgent {
+            public_ref: value.to_string(),
+            runtime_id: stable_runtime_agent_id(value),
+        });
+    }
+
+    if let Ok(definitions) = agent_definition_store(state).list() {
+        if let Some(resource) = definitions
+            .into_iter()
+            .find(|resource| resource.definition.name == value)
+        {
+            return Some(ResolvedScheduleAgent {
+                public_ref: resource.definition.id.clone(),
+                runtime_id: stable_runtime_agent_id(&resource.definition.id),
+            });
+        }
+    }
+
+    if let Ok(agent_id) = value.parse::<AgentId>() {
+        if let Some(entry) = state.kernel.registry.get(agent_id) {
+            return Some(ResolvedScheduleAgent {
+                public_ref: runtime_definition_id(&entry)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| entry.name.clone()),
+                runtime_id: agent_id,
+            });
+        }
+    }
+
+    state
+        .kernel
+        .registry
+        .find_by_name(value)
+        .map(|entry| ResolvedScheduleAgent {
+            public_ref: runtime_definition_id(&entry)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| entry.name.clone()),
+            runtime_id: entry.id,
+        })
+}
+
+fn resolve_schedule_workflow_reference(state: &AppState, value: &str) -> Option<String> {
+    match load_workflow_definition_resource(state, value) {
+        Ok(Some(_)) => Some(value.to_string()),
+        Ok(None) => load_all_workflow_definition_resources(state)
+            .ok()
+            .and_then(|resources| {
+                resources
+                    .into_iter()
+                    .find(|resource| resource.definition.name == value)
+                    .map(|resource| resource.definition.id)
+            }),
+        Err(_) => None,
+    }
+}
+
+fn parse_schedule_timeout_secs(
+    action: &serde_json::Map<String, serde_json::Value>,
+    issues: &mut Vec<ScheduleValidationIssue>,
+) -> Option<u64> {
+    let value = action.get("timeout_secs")?;
+    let Some(timeout_secs) = value.as_u64() else {
+        issues.push(schedule_validation_issue(
+            "error",
+            "invalid_type",
+            "action.timeout_secs",
+            "`action.timeout_secs` must be an unsigned integer",
+        ));
+        return None;
+    };
+    Some(timeout_secs)
+}
+
+fn parse_schedule_block(
+    value: Option<&serde_json::Value>,
+    issues: &mut Vec<ScheduleValidationIssue>,
+) -> Option<CronSchedule> {
+    let Some(serde_json::Value::Object(object)) = value else {
+        issues.push(schedule_validation_issue(
+            "error",
+            "missing_field",
+            "schedule",
+            "`schedule` must be an object",
+        ));
+        return None;
+    };
+    let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) else {
+        issues.push(schedule_validation_issue(
+            "error",
+            "missing_field",
+            "schedule.kind",
+            "`schedule.kind` is required",
+        ));
+        return None;
+    };
+
+    match kind {
+        "cron" => {
+            let Some(expr) = object.get("expr").and_then(serde_json::Value::as_str) else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "schedule.expr",
+                    "`schedule.expr` is required",
+                ));
+                return None;
+            };
+            let normalized_expr = expr.split_whitespace().collect::<Vec<_>>().join(" ");
+            let fields = normalized_expr.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 5 {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "invalid_cron",
+                    "schedule.expr",
+                    "cron expression must have exactly 5 fields",
+                ));
+                return None;
             }
-            if let Some(name) = req.get("name").and_then(|v| v.as_str()) {
-                s["name"] = serde_json::Value::String(name.to_string());
+            let seven_field = format!("0 {normalized_expr} *");
+            if let Err(error) = seven_field.parse::<cron::Schedule>() {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "invalid_cron",
+                    "schedule.expr",
+                    format!("invalid cron expression: {error}"),
+                ));
+                return None;
             }
-            if let Some(cron) = req.get("cron").and_then(|v| v.as_str()) {
-                let cron_parts: Vec<&str> = cron.split_whitespace().collect();
-                if cron_parts.len() != 5 {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "Invalid cron expression"})),
-                    );
+            let timezone = object
+                .get("tz")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            if let Some(timezone) = timezone.as_deref() {
+                if timezone.parse::<chrono_tz::Tz>().is_err() {
+                    issues.push(schedule_validation_issue(
+                        "error",
+                        "invalid_timezone",
+                        "schedule.tz",
+                        format!("invalid timezone: {timezone}"),
+                    ));
+                    return None;
                 }
-                s["cron"] = serde_json::Value::String(cron.to_string());
             }
-            if let Some(agent_id) = req.get("agent_id").and_then(|v| v.as_str()) {
-                s["agent_id"] = serde_json::Value::String(agent_id.to_string());
+
+            Some(CronSchedule::Cron {
+                expr: normalized_expr,
+                tz: timezone,
+            })
+        }
+        "every" => object
+            .get("every_secs")
+            .and_then(serde_json::Value::as_u64)
+            .map(|every_secs| CronSchedule::Every { every_secs })
+            .or_else(|| {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "schedule.every_secs",
+                    "`schedule.every_secs` is required",
+                ));
+                None
+            }),
+        "at" => {
+            let Some(at) = object.get("at").and_then(serde_json::Value::as_str) else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "schedule.at",
+                    "`schedule.at` is required",
+                ));
+                return None;
+            };
+            match chrono::DateTime::parse_from_rfc3339(at) {
+                Ok(timestamp) => Some(CronSchedule::At {
+                    at: timestamp.with_timezone(&chrono::Utc),
+                }),
+                Err(error) => {
+                    issues.push(schedule_validation_issue(
+                        "error",
+                        "invalid_datetime",
+                        "schedule.at",
+                        format!("invalid RFC 3339 timestamp: {error}"),
+                    ));
+                    None
+                }
             }
-            if let Some(message) = req.get("message").and_then(|v| v.as_str()) {
-                s["message"] = serde_json::Value::String(message.to_string());
-            }
-            break;
+        }
+        other => {
+            issues.push(schedule_validation_issue(
+                "error",
+                "unsupported_schedule_kind",
+                "schedule.kind",
+                format!("unsupported schedule kind `{other}`"),
+            ));
+            None
         }
     }
-
-    if !found {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Schedule not found"})),
-        );
-    }
-
-    if let Err(e) = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to update schedule: {e}")})),
-        );
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "updated", "schedule_id": id})),
-    )
 }
 
-/// DELETE /api/schedules/:id — Remove a scheduled job.
-pub async fn delete_schedule(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-
-    let before = schedules.len();
-    schedules.retain(|s| s["id"].as_str() != Some(&id));
-
-    if schedules.len() == before {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Schedule not found"})),
-        );
-    }
-
-    if let Err(e) = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to delete schedule: {e}")})),
-        );
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "removed", "schedule_id": id})),
-    )
-}
-
-/// POST /api/schedules/:id/run — Manually run a scheduled job now.
-pub async fn run_schedule(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let schedules: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-
-    let schedule = match schedules.iter().find(|s| s["id"].as_str() == Some(&id)) {
-        Some(s) => s.clone(),
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Schedule not found"})),
-            );
-        }
+fn parse_schedule_action_block(
+    state: &AppState,
+    value: Option<&serde_json::Value>,
+    issues: &mut Vec<ScheduleValidationIssue>,
+) -> Option<CronAction> {
+    let Some(serde_json::Value::Object(object)) = value else {
+        issues.push(schedule_validation_issue(
+            "error",
+            "missing_field",
+            "action",
+            "`action` must be an object",
+        ));
+        return None;
+    };
+    let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) else {
+        issues.push(schedule_validation_issue(
+            "error",
+            "missing_field",
+            "action.kind",
+            "`action.kind` is required",
+        ));
+        return None;
     };
 
-    let agent_id_str = schedule["agent_id"].as_str().unwrap_or("");
-    let message = schedule["message"]
-        .as_str()
-        .unwrap_or("Scheduled task triggered manually.");
-    let name = schedule["name"].as_str().unwrap_or("(unnamed)");
+    match kind {
+        "system_event" => {
+            let Some(event) = object
+                .get("event")
+                .or_else(|| object.get("text"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "action.event",
+                    "`action.event` is required",
+                ));
+                return None;
+            };
 
-    // Find the target agent — require explicit agent_id, no silent fallback
-    let target_agent = if !agent_id_str.is_empty() {
-        if let Ok(aid) = agent_id_str.parse::<AgentId>() {
-            if state.kernel.registry.get(aid).is_some() {
-                Some(aid)
-            } else {
-                None
-            }
-        } else {
-            state
-                .kernel
-                .registry
-                .list()
-                .iter()
-                .find(|a| a.name == agent_id_str)
-                .map(|a| a.id)
+            Some(CronAction::SystemEvent {
+                event: event.to_string(),
+                payload: object
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            })
         }
+        "agent_turn" => {
+            let model_override = object
+                .get("model_override")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            let timeout_secs = parse_schedule_timeout_secs(object, issues);
+            let parsed_input = object
+                .get("input")
+                .cloned()
+                .map(serde_json::from_value::<CronTextInputPayload>)
+                .transpose();
+            let input = match parsed_input {
+                Ok(Some(input)) => input,
+                Ok(None) => CronTextInputPayload::default(),
+                Err(error) => {
+                    issues.push(schedule_validation_issue(
+                        "error",
+                        "invalid_input",
+                        "action.input",
+                        format!("invalid `action.input`: {error}"),
+                    ));
+                    CronTextInputPayload::default()
+                }
+            };
+            let legacy_message = object
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            let normalized_input = if !input.items.is_empty() {
+                input
+            } else if let Some(message) = legacy_message.as_deref() {
+                CronTextInputPayload {
+                    items: vec![CronTextInputItem {
+                        item_type: "text".to_string(),
+                        text: Some(message.to_string()),
+                    }],
+                }
+            } else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "action.input",
+                    "`action.input` is required for `agent_turn`",
+                ));
+                CronTextInputPayload::default()
+            };
+
+            Some(CronAction::AgentTurn {
+                message: None,
+                input: normalized_input,
+                model_override,
+                timeout_secs,
+            })
+        }
+        "workflow_run" => {
+            let Some(workflow_id) = object
+                .get("workflow_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "action.workflow_id",
+                    "`action.workflow_id` is required",
+                ));
+                return None;
+            };
+            let Some(workflow_id) = resolve_schedule_workflow_reference(state, workflow_id) else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "not_found",
+                    "action.workflow_id",
+                    format!("workflow definition not found: {workflow_id}"),
+                ));
+                return None;
+            };
+
+            Some(CronAction::WorkflowRun {
+                workflow_id,
+                input: object.get("input").cloned(),
+                timeout_secs: parse_schedule_timeout_secs(object, issues),
+            })
+        }
+        "workflow_signal" => {
+            let Some(signal) = object.get("signal").and_then(serde_json::Value::as_str) else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "action.signal",
+                    "`action.signal` is required",
+                ));
+                return None;
+            };
+            let Some(selector) = object
+                .get("selector")
+                .and_then(serde_json::Value::as_object)
+            else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "action.selector.workflow_id",
+                    "`action.selector.workflow_id` is required",
+                ));
+                return None;
+            };
+            let Some(workflow_id) = selector
+                .get("workflow_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "action.selector.workflow_id",
+                    "`action.selector.workflow_id` is required",
+                ));
+                return None;
+            };
+            let Some(workflow_id) = resolve_schedule_workflow_reference(state, workflow_id) else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "not_found",
+                    "action.selector.workflow_id",
+                    format!("workflow definition not found: {workflow_id}"),
+                ));
+                return None;
+            };
+
+            Some(CronAction::WorkflowSignal {
+                signal: signal.to_string(),
+                selector: CronWorkflowSignalSelector { workflow_id },
+                payload: object
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        }
+        other => {
+            issues.push(schedule_validation_issue(
+                "error",
+                "unsupported_action_kind",
+                "action.kind",
+                format!("unsupported action kind `{other}`"),
+            ));
+            None
+        }
+    }
+}
+
+fn parse_schedule_delivery_block(
+    value: Option<&serde_json::Value>,
+    issues: &mut Vec<ScheduleValidationIssue>,
+) -> Option<CronDelivery> {
+    let Some(value) = value else {
+        return Some(CronDelivery::None);
+    };
+    let Some(object) = value.as_object() else {
+        issues.push(schedule_validation_issue(
+            "error",
+            "invalid_type",
+            "delivery",
+            "`delivery` must be an object",
+        ));
+        return None;
+    };
+    let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) else {
+        issues.push(schedule_validation_issue(
+            "error",
+            "missing_field",
+            "delivery.kind",
+            "`delivery.kind` is required",
+        ));
+        return None;
+    };
+
+    match kind {
+        "none" => Some(CronDelivery::None),
+        "last_channel" => Some(CronDelivery::LastChannel),
+        "channel" => {
+            let Some(channel) = object.get("channel").and_then(serde_json::Value::as_str) else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "delivery.channel",
+                    "`delivery.channel` is required",
+                ));
+                return None;
+            };
+            let Some(to) = object.get("to").and_then(serde_json::Value::as_str) else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "delivery.to",
+                    "`delivery.to` is required",
+                ));
+                return None;
+            };
+            Some(CronDelivery::Channel {
+                channel: channel.to_string(),
+                to: to.to_string(),
+            })
+        }
+        "webhook" => {
+            let Some(url) = object.get("url").and_then(serde_json::Value::as_str) else {
+                issues.push(schedule_validation_issue(
+                    "error",
+                    "missing_field",
+                    "delivery.url",
+                    "`delivery.url` is required",
+                ));
+                return None;
+            };
+            Some(CronDelivery::Webhook {
+                url: url.to_string(),
+            })
+        }
+        other => {
+            issues.push(schedule_validation_issue(
+                "error",
+                "unsupported_delivery_kind",
+                "delivery.kind",
+                format!("unsupported delivery kind `{other}`"),
+            ));
+            None
+        }
+    }
+}
+
+fn schedule_validation_issue_from_error(error: &str) -> ScheduleValidationIssue {
+    let path = if error.contains("cron expression") {
+        "schedule.expr"
+    } else if error.contains("timezone") {
+        "schedule.tz"
+    } else if error.contains("every_secs") {
+        "schedule.every_secs"
+    } else if error.contains("scheduled time") {
+        "schedule.at"
+    } else if error.contains("workflow signal selector.workflow_id") {
+        "action.selector.workflow_id"
+    } else if error.contains("workflow signal name") {
+        "action.signal"
+    } else if error.contains("workflow_id") {
+        "action.workflow_id"
+    } else if error.contains("timeout_secs") {
+        "action.timeout_secs"
+    } else if error.contains("agent turn input") {
+        "action.input"
+    } else if error.contains("system event") {
+        "action.event"
+    } else if error.contains("webhook URL") {
+        "delivery.url"
+    } else if error.contains("delivery channel") {
+        "delivery.channel"
+    } else if error.contains("recipient") {
+        "delivery.to"
+    } else if error.contains("name") {
+        "name"
+    } else {
+        "definition"
+    };
+    schedule_validation_issue("error", "invalid_definition", path, error)
+}
+
+fn validate_schedule_definition_value(
+    state: &AppState,
+    body: &serde_json::Value,
+) -> (
+    Vec<ScheduleValidationIssue>,
+    Option<ValidatedScheduleDefinition>,
+) {
+    let mut issues = Vec::new();
+    let Some(object) = body.as_object() else {
+        issues.push(schedule_validation_issue(
+            "error",
+            "invalid_request",
+            "definition",
+            "schedule definition body must be an object",
+        ));
+        return (issues, None);
+    };
+
+    let agent_value = object.get("agent").and_then(serde_json::Value::as_str);
+    let resolved_agent = match agent_value {
+        Some(value) if !value.trim().is_empty() => resolve_schedule_agent_reference(state, value),
+        _ => {
+            issues.push(schedule_validation_issue(
+                "error",
+                "missing_field",
+                "agent",
+                "`agent` is required",
+            ));
+            None
+        }
+    };
+    if agent_value.is_some() && resolved_agent.is_none() {
+        issues.push(schedule_validation_issue(
+            "error",
+            "not_found",
+            "agent",
+            format!(
+                "agent definition or runtime not found: {}",
+                agent_value.unwrap_or_default()
+            ),
+        ));
+    }
+
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            issues.push(schedule_validation_issue(
+                "error",
+                "missing_field",
+                "name",
+                "`name` is required",
+            ));
+            String::new()
+        });
+
+    let enabled = match object.get("enabled") {
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => {
+            issues.push(schedule_validation_issue(
+                "error",
+                "invalid_type",
+                "enabled",
+                "`enabled` must be a boolean",
+            ));
+            true
+        }
+        None => true,
+    };
+
+    let schedule = parse_schedule_block(object.get("schedule"), &mut issues);
+    let action = parse_schedule_action_block(state, object.get("action"), &mut issues);
+    let delivery = parse_schedule_delivery_block(object.get("delivery"), &mut issues);
+
+    let (Some(resolved_agent), Some(schedule), Some(action), Some(delivery)) =
+        (resolved_agent, schedule, action, delivery)
+    else {
+        return (issues, None);
+    };
+
+    let normalized = ScheduleDefinition {
+        agent: resolved_agent.public_ref.clone(),
+        name,
+        enabled,
+        schedule,
+        action,
+        delivery,
+    };
+
+    let candidate = CronJob {
+        id: CronJobId::new(),
+        agent_id: resolved_agent.runtime_id,
+        name: normalized.name.clone(),
+        enabled: normalized.enabled,
+        schedule: normalized.schedule.clone(),
+        action: normalized.action.clone(),
+        delivery: normalized.delivery.clone(),
+        created_at: chrono::Utc::now(),
+        last_run: None,
+        next_run: None,
+    };
+    if let Err(error) = candidate.validate(0) {
+        issues.push(schedule_validation_issue_from_error(&error));
+        return (issues, None);
+    }
+
+    (
+        issues,
+        Some(ValidatedScheduleDefinition {
+            definition: normalized,
+            runtime_agent_id: resolved_agent.runtime_id,
+        }),
+    )
+}
+
+fn schedule_definition_to_meta(
+    definition_id: String,
+    validated: ValidatedScheduleDefinition,
+    existing: Option<&ScheduleJobMeta>,
+) -> ScheduleJobMeta {
+    let timestamp = chrono::Utc::now();
+    let one_shot = matches!(validated.definition.schedule, CronSchedule::At { .. });
+    let (created_at, last_run, last_status, consecutive_errors, origin, forked_from) = existing
+        .map(|meta| {
+            (
+                meta.job.created_at,
+                meta.job.last_run,
+                meta.last_status.clone(),
+                meta.consecutive_errors,
+                meta.origin.clone(),
+                meta.forked_from.clone(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                timestamp,
+                None,
+                None,
+                0,
+                CronDefinitionOrigin::user(),
+                None::<CronDefinitionForkedFrom>,
+            )
+        });
+
+    ScheduleJobMeta {
+        job: CronJob {
+            id: existing.map(|meta| meta.job.id).unwrap_or_default(),
+            agent_id: validated.runtime_agent_id,
+            name: validated.definition.name.clone(),
+            enabled: validated.definition.enabled,
+            schedule: validated.definition.schedule.clone(),
+            action: validated.definition.action.clone(),
+            delivery: validated.definition.delivery.clone(),
+            created_at,
+            last_run,
+            next_run: None,
+        },
+        definition_id,
+        agent_ref: validated.definition.agent,
+        origin,
+        forked_from,
+        updated_at: timestamp.to_rfc3339(),
+        one_shot,
+        last_status,
+        consecutive_errors,
+    }
+}
+
+/// GET /api/v1/schedules — List typed schedule definitions.
+pub async fn list_schedule_definitions_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ScheduleListQueryParams>,
+) -> impl IntoResponse {
+    let limit = match parse_pagination_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
+    let offset = match parse_cursor_offset(params.cursor.as_deref()) {
+        Ok(offset) => offset,
+        Err(response) => return response,
+    };
+
+    let search = params.search.map(|value| value.to_lowercase());
+    let mut items = state
+        .kernel
+        .cron_scheduler
+        .list_all_metas()
+        .into_iter()
+        .filter(|meta| {
+            params
+                .agent
+                .as_ref()
+                .map(|agent| meta.agent_ref == *agent)
+                .unwrap_or(true)
+        })
+        .filter(|meta| {
+            params
+                .enabled
+                .map(|enabled| meta.job.enabled == enabled)
+                .unwrap_or(true)
+        })
+        .filter(|meta| {
+            params
+                .schedule_kind
+                .as_ref()
+                .map(|kind| schedule_kind_name(&meta.job.schedule) == kind)
+                .unwrap_or(true)
+        })
+        .filter(|meta| {
+            params
+                .action_kind
+                .as_ref()
+                .map(|kind| schedule_action_kind_name(&meta.job.action) == kind)
+                .unwrap_or(true)
+        })
+        .filter(|meta| {
+            search.as_ref().is_none_or(|needle| {
+                let haystack = format!(
+                    "{} {} {} {} {}",
+                    meta.definition_id,
+                    meta.agent_ref,
+                    meta.job.name,
+                    serde_json::to_string(&meta.job.schedule).unwrap_or_default(),
+                    serde_json::to_string(&meta.job.action).unwrap_or_default(),
+                )
+                .to_lowercase();
+                haystack.contains(needle)
+            })
+        })
+        .map(|meta| {
+            let runtime = state
+                .kernel
+                .runtime_stores
+                .schedule_runtime
+                .get_schedule_runtime(&meta.definition_id)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| schedule_runtime_snapshot(&meta));
+            schedule_list_item(&meta, &runtime)
+        })
+        .collect::<Vec<_>>();
+
+    items.sort_by(|left, right| {
+        left.updated_at
+            .cmp(&right.updated_at)
+            .then(left.id.cmp(&right.id))
+    });
+    let next_cursor = if offset + limit < items.len() {
+        Some((offset + limit).to_string())
     } else {
         None
     };
+    let items = items
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
 
-    let target_agent = match target_agent {
-        Some(a) => a,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(
-                    serde_json::json!({"error": "No target agent found. Specify an agent_id or start an agent first."}),
-                ),
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(ScheduleListResponse {
+            items,
+            next_cursor
+        })),
+    )
+}
+
+/// POST /api/v1/schedules — Create and persist a typed schedule definition.
+pub async fn create_schedule_definition_v1(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(body) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return schedule_json_rejection(rejection),
+    };
+    let _write_guard = SCHEDULE_DEFINITION_WRITE_LOCK.lock().await;
+
+    if body.get("id").is_some() {
+        return schedule_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Schedule IDs are assigned by the server",
+            Some(serde_json::json!([{
+                "path": "id",
+            }])),
+        );
+    }
+
+    let (issues, validated) = validate_schedule_definition_value(&state, &body);
+    if validated.is_none() {
+        return schedule_validation_error_response(&issues);
+    }
+    let validated = validated.expect("validated schedule definition should exist");
+    let definition_id = generate_schedule_definition_id();
+    let meta = schedule_definition_to_meta(definition_id.clone(), validated, None);
+    match state.kernel.cron_scheduler.add_job_meta(meta.clone()) {
+        Ok(_) => {}
+        Err(error) => {
+            return schedule_error_response(
+                StatusCode::BAD_REQUEST,
+                "validation_error",
+                "schedule definition is invalid",
+                Some(serde_json::json!([schedule_validation_issue_from_error(
+                    &error.to_string(),
+                )])),
+            )
+        }
+    }
+    if let Err(error) = state.kernel.cron_scheduler.persist() {
+        return schedule_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_persist_failed",
+            "Failed to persist schedule definition",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+    let runtime = match schedule_runtime_record_for_meta(&state, &meta) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
+    };
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!(schedule_response(&meta, &runtime))),
+    )
+}
+
+/// GET /api/v1/schedules/{id} — Load one schedule definition.
+pub async fn get_schedule_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_schedule_definition_id(&id) {
+        return response;
+    }
+    let Some(meta) = state.kernel.cron_scheduler.get_meta_by_definition_id(&id) else {
+        return schedule_not_found_response();
+    };
+    let runtime = match schedule_runtime_record_for_meta(&state, &meta) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(schedule_response(&meta, &runtime))),
+    )
+}
+
+/// PUT /api/v1/schedules/{id} — Replace one persisted schedule definition.
+pub async fn update_schedule_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_schedule_definition_id(&id) {
+        return response;
+    }
+    let Json(body) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return schedule_json_rejection(rejection),
+    };
+    let _write_guard = SCHEDULE_DEFINITION_WRITE_LOCK.lock().await;
+    let Some(existing) = state.kernel.cron_scheduler.get_meta_by_definition_id(&id) else {
+        return schedule_not_found_response();
+    };
+
+    if let Some(body_id) = body.get("id").and_then(serde_json::Value::as_str) {
+        if body_id != id {
+            return schedule_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Path ID and body ID must match",
+                Some(serde_json::json!([{
+                    "path": "id",
+                    "expected": id,
+                    "actual": body_id,
+                }])),
             );
         }
+    }
+
+    let (issues, validated) = validate_schedule_definition_value(&state, &body);
+    if validated.is_none() {
+        return schedule_validation_error_response(&issues);
+    }
+    let meta =
+        schedule_definition_to_meta(id.clone(), validated.expect("validated"), Some(&existing));
+    let meta = match state
+        .kernel
+        .cron_scheduler
+        .replace_job_meta_by_definition_id(&id, meta)
+    {
+        Ok(meta) => meta,
+        Err(error) => {
+            return schedule_error_response(
+                StatusCode::BAD_REQUEST,
+                "validation_error",
+                "schedule definition is invalid",
+                Some(serde_json::json!([schedule_validation_issue_from_error(
+                    &error.to_string(),
+                )])),
+            )
+        }
+    };
+    if let Err(error) = state.kernel.cron_scheduler.persist() {
+        return schedule_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_persist_failed",
+            "Failed to persist schedule definition",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+    let runtime = match schedule_runtime_record_for_meta(&state, &meta) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
     };
 
-    let run_message = if message.is_empty() {
-        format!("[Scheduled task '{}' triggered manually]", name)
-    } else {
-        message.to_string()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(schedule_response(&meta, &runtime))),
+    )
+}
+
+/// DELETE /api/v1/schedules/{id} — Delete one persisted schedule definition.
+pub async fn delete_schedule_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_schedule_definition_id(&id) {
+        return response.into_response();
+    }
+    let _write_guard = SCHEDULE_DEFINITION_WRITE_LOCK.lock().await;
+    match state.kernel.cron_scheduler.remove_job_by_definition_id(&id) {
+        Ok(_) => {}
+        Err(_) => return schedule_not_found_response().into_response(),
+    }
+    if let Err(error) = state.kernel.cron_scheduler.persist() {
+        return schedule_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_delete_failed",
+            "Failed to persist schedule deletion",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        )
+        .into_response();
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// POST /api/v1/schedules/validate — Validate a schedule definition.
+pub async fn validate_schedule_definition_v1(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<ScheduleValidateRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return schedule_json_rejection(rejection),
+    };
+    let (issues, validated) = validate_schedule_definition_value(&state, &request.definition);
+    let normalized = validated.map(|validated| validated.definition);
+    let valid = schedule_definition_is_valid(&issues, request.strict.unwrap_or(false));
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(ScheduleValidateResponse {
+            valid,
+            issues,
+            normalized,
+        })),
+    )
+}
+
+/// POST /api/v1/schedules/{id}/fork — Fork an existing schedule definition.
+pub async fn fork_schedule_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<ScheduleForkRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_schedule_definition_id(&id) {
+        return response;
+    }
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return schedule_json_rejection(rejection),
+    };
+    let _write_guard = SCHEDULE_DEFINITION_WRITE_LOCK.lock().await;
+    if request.mode.as_deref().unwrap_or("shadow") != "shadow" {
+        return schedule_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Schedule forks currently support only `shadow` mode",
+            Some(serde_json::json!([{
+                "path": "mode",
+                "value": request.mode,
+            }])),
+        );
+    }
+    let Some(existing) = state.kernel.cron_scheduler.get_meta_by_definition_id(&id) else {
+        return schedule_not_found_response();
     };
 
-    // Update last_run and run_count
-    let mut schedules_updated: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-    for s in schedules_updated.iter_mut() {
-        if s["id"].as_str() == Some(&id) {
-            s["last_run"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
-            let count = s["run_count"].as_u64().unwrap_or(0);
-            s["run_count"] = serde_json::json!(count + 1);
-            break;
+    let forked_id = generate_schedule_definition_id();
+    let validated = ValidatedScheduleDefinition {
+        runtime_agent_id: existing.job.agent_id,
+        definition: ScheduleDefinition {
+            agent: existing.agent_ref.clone(),
+            name: format!("{} Fork", existing.job.name),
+            enabled: existing.job.enabled,
+            schedule: existing.job.schedule.clone(),
+            action: existing.job.action.clone(),
+            delivery: existing.job.delivery.clone(),
+        },
+    };
+    let mut meta = schedule_definition_to_meta(forked_id.clone(), validated, None);
+    meta.origin = CronDefinitionOrigin::user();
+    meta.forked_from = Some(CronDefinitionForkedFrom {
+        kind: existing.origin.kind.clone(),
+        pack_id: existing.origin.pack_id.clone(),
+        pack_version: existing.origin.pack_version.clone(),
+        resource_type: "schedule".to_string(),
+        resource_id: existing.definition_id.clone(),
+    });
+
+    match state.kernel.cron_scheduler.add_job_meta(meta.clone()) {
+        Ok(_) => {}
+        Err(error) => {
+            return schedule_error_response(
+                StatusCode::BAD_REQUEST,
+                "validation_error",
+                "schedule definition is invalid",
+                Some(serde_json::json!([schedule_validation_issue_from_error(
+                    &error.to_string(),
+                )])),
+            )
         }
     }
-    let _ = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules_updated),
-    );
+    if let Err(error) = state.kernel.cron_scheduler.persist() {
+        return schedule_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_persist_failed",
+            "Failed to persist schedule definition",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+    let runtime = match schedule_runtime_record_for_meta(&state, &meta) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
+    };
 
-    let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(schedule_response(&meta, &runtime))),
+    )
+}
+
+/// GET /api/v1/schedules/{id}/runtime — Load runtime state for one schedule definition.
+pub async fn get_schedule_runtime_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_schedule_definition_id(&id) {
+        return response;
+    }
+    let Some(meta) = state.kernel.cron_scheduler.get_meta_by_definition_id(&id) else {
+        return schedule_not_found_response();
+    };
+    let runtime = match schedule_runtime_record_for_meta(&state, &meta) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(schedule_runtime_response_from_record(
+            &runtime
+        ))),
+    )
+}
+
+fn schedule_action_accepted_response(
+    id: &str,
+    execution: ScheduleExecutionResult,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!(ScheduleAcceptedActionResponse {
+            accepted: true,
+            resource_id: id.to_string(),
+            status: "accepted".to_string(),
+            session_id: execution.session_id,
+            run_id: execution.run_id,
+        })),
+    )
+}
+
+/// POST /api/v1/schedules/{id}/enable — Enable a schedule definition.
+pub async fn enable_schedule_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_schedule_definition_id(&id) {
+        return response;
+    }
+    let _write_guard = SCHEDULE_DEFINITION_WRITE_LOCK.lock().await;
     match state
         .kernel
-        .send_message_with_handle(target_agent, &run_message, Some(kernel_handle), None, None)
-        .await
+        .cron_scheduler
+        .set_enabled_by_definition_id(&id, true)
     {
-        Ok(result) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "completed",
-                "schedule_id": id,
-                "agent_id": target_agent.to_string(),
-                "response": result.response,
-            })),
-        ),
-        Err(e) => (
+        Ok(_) => {}
+        Err(_) => return schedule_not_found_response(),
+    }
+    if let Err(error) = state.kernel.cron_scheduler.persist() {
+        return schedule_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "status": "failed",
-                "schedule_id": id,
-                "error": format!("{e}"),
-            })),
+            "definition_persist_failed",
+            "Failed to persist schedule definition",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    schedule_action_accepted_response(&id, ScheduleExecutionResult::default())
+}
+
+/// POST /api/v1/schedules/{id}/disable — Disable a schedule definition.
+pub async fn disable_schedule_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_schedule_definition_id(&id) {
+        return response;
+    }
+    let _write_guard = SCHEDULE_DEFINITION_WRITE_LOCK.lock().await;
+    match state
+        .kernel
+        .cron_scheduler
+        .set_enabled_by_definition_id(&id, false)
+    {
+        Ok(_) => {}
+        Err(_) => return schedule_not_found_response(),
+    }
+    if let Err(error) = state.kernel.cron_scheduler.persist() {
+        return schedule_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_persist_failed",
+            "Failed to persist schedule definition",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        );
+    }
+
+    schedule_action_accepted_response(&id, ScheduleExecutionResult::default())
+}
+
+/// POST /api/v1/schedules/{id}/run-now — Trigger a schedule action immediately.
+pub async fn run_schedule_definition_now_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<ScheduleRunNowRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_schedule_definition_id(&id) {
+        return response;
+    }
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return schedule_json_rejection(rejection),
+    };
+    let Some(meta) = state.kernel.cron_scheduler.get_meta_by_definition_id(&id) else {
+        return schedule_not_found_response();
+    };
+    let metadata = request
+        .metadata
+        .or_else(|| Some(serde_json::json!({ "source": "api" })));
+    match state.kernel.execute_schedule_now(&meta, metadata).await {
+        Ok(execution) => schedule_action_accepted_response(&id, execution),
+        Err(error) => schedule_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "schedule_execution_failed",
+            "Failed to execute schedule action",
+            Some(serde_json::json!([{
+                "message": error,
+            }])),
         ),
     }
+}
+
+/// POST /api/v1/schedules/{id}/run-now/dry-run — Simulate an immediate schedule execution.
+pub async fn dry_run_schedule_definition_now_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<ScheduleRunNowRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_schedule_definition_id(&id) {
+        return response;
+    }
+    let Json(_request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return schedule_json_rejection(rejection),
+    };
+    let Some(meta) = state.kernel.cron_scheduler.get_meta_by_definition_id(&id) else {
+        return schedule_not_found_response();
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(ScheduleDryRunResponse {
+            would_execute: true,
+            resolved: ScheduleDryRunResolved {
+                schedule_id: id,
+                action: meta.job.action.clone(),
+            },
+            effects: ScheduleDryRunEffects {
+                schedule_fire: true,
+            },
+            explanation: ScheduleDryRunExplanation {
+                delivery: meta.job.delivery.clone(),
+            },
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -16577,5 +17752,348 @@ mod agent_definition_route_tests {
         assert!(content_type.starts_with("text/event-stream"));
         assert!(body.contains("event: error"));
         assert!(body.contains("\"code\":\"not_found\""));
+    }
+
+    fn noop_workflow_definition(id: &str) -> openfang_types::workflow::WorkflowV2Definition {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": format!("Workflow {id}"),
+            "version": "1.0.0",
+            "description": "Schedule route test workflow",
+            "enabled": true,
+            "tags": ["tests", "schedules"],
+            "input": {
+                "kind": "object",
+                "required": [],
+                "open": true,
+                "fields": {}
+            },
+            "output": {
+                "kind": "object",
+                "required": ["result"],
+                "open": false,
+                "fields": {
+                    "result": { "kind": "string" }
+                }
+            },
+            "steps": [{
+                "id": "noop-step",
+                "name": "Noop Step",
+                "kind": "noop",
+                "save_as": "result",
+                "flow": { "mode": "sequential" }
+            }],
+            "outputs": {
+                "result": "{{ vars.result }}"
+            }
+        }))
+        .expect("fixture should deserialize")
+    }
+
+    async fn register_schedule_workflow(context: &RouteTestContext, id: &str) {
+        let (status, body) = json_response(
+            create_workflow_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(
+                    serde_json::to_value(noop_workflow_definition(id))
+                        .expect("workflow definition should serialize"),
+                )),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["id"], json!(id));
+    }
+
+    fn workflow_run_schedule_definition(agent: &str, workflow_id: &str, enabled: bool) -> Value {
+        json!({
+            "agent": agent,
+            "name": "Nightly Repo Review",
+            "enabled": enabled,
+            "schedule": {
+                "kind": "cron",
+                "expr": "0 2 * * *",
+                "tz": "UTC"
+            },
+            "action": {
+                "kind": "workflow_run",
+                "workflow_id": workflow_id,
+                "input": {
+                    "scope": "open_prs"
+                },
+                "timeout_secs": 300
+            },
+            "delivery": {
+                "kind": "none"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn validate_schedule_definition_should_accept_valid_five_field_cron() {
+        let context = route_test_context().await;
+        create_definition(&context, "schedule-writer", "Schedule Writer").await;
+        register_schedule_workflow(&context, "repo-review").await;
+
+        let (status, body) = json_response(
+            validate_schedule_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(ScheduleValidateRequest {
+                    definition: workflow_run_schedule_definition(
+                        "schedule-writer",
+                        "repo-review",
+                        true,
+                    ),
+                    strict: Some(true),
+                    context: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["valid"], json!(true));
+        assert_eq!(body["issues"], json!([]));
+        assert_eq!(body["normalized"]["schedule"]["expr"], json!("0 2 * * *"));
+    }
+
+    #[tokio::test]
+    async fn validate_schedule_definition_should_report_invalid_cron_expression() {
+        let context = route_test_context().await;
+        create_definition(&context, "schedule-writer", "Schedule Writer").await;
+        register_schedule_workflow(&context, "repo-review").await;
+        let mut definition =
+            workflow_run_schedule_definition("schedule-writer", "repo-review", true);
+        definition["schedule"]["expr"] = json!("99 99 99 99 99");
+
+        let (status, body) = json_response(
+            validate_schedule_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(ScheduleValidateRequest {
+                    definition,
+                    strict: Some(false),
+                    context: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["valid"], json!(false));
+        assert!(body["issues"]
+            .as_array()
+            .expect("issues should be an array")
+            .iter()
+            .any(|issue| issue["path"] == json!("schedule.expr")));
+    }
+
+    #[tokio::test]
+    async fn validate_schedule_definition_should_report_invalid_timezone() {
+        let context = route_test_context().await;
+        create_definition(&context, "schedule-writer", "Schedule Writer").await;
+        register_schedule_workflow(&context, "repo-review").await;
+        let mut definition =
+            workflow_run_schedule_definition("schedule-writer", "repo-review", true);
+        definition["schedule"]["tz"] = json!("Mars/Phobos");
+
+        let (status, body) = json_response(
+            validate_schedule_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(ScheduleValidateRequest {
+                    definition,
+                    strict: Some(false),
+                    context: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["valid"], json!(false));
+        assert!(body["issues"]
+            .as_array()
+            .expect("issues should be an array")
+            .iter()
+            .any(|issue| issue["path"] == json!("schedule.tz")));
+    }
+
+    #[tokio::test]
+    async fn validate_schedule_definition_should_require_workflow_id_for_workflow_run() {
+        let context = route_test_context().await;
+        create_definition(&context, "schedule-writer", "Schedule Writer").await;
+        register_schedule_workflow(&context, "repo-review").await;
+        let mut definition =
+            workflow_run_schedule_definition("schedule-writer", "repo-review", true);
+        definition["action"]
+            .as_object_mut()
+            .expect("action should be an object")
+            .remove("workflow_id");
+
+        let (status, body) = json_response(
+            validate_schedule_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(ScheduleValidateRequest {
+                    definition,
+                    strict: Some(false),
+                    context: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["valid"], json!(false));
+        assert!(body["issues"]
+            .as_array()
+            .expect("issues should be an array")
+            .iter()
+            .any(|issue| issue["path"] == json!("action.workflow_id")));
+    }
+
+    #[tokio::test]
+    async fn validate_schedule_definition_should_report_unsupported_action_kind() {
+        let context = route_test_context().await;
+        create_definition(&context, "schedule-writer", "Schedule Writer").await;
+        register_schedule_workflow(&context, "repo-review").await;
+        let mut definition =
+            workflow_run_schedule_definition("schedule-writer", "repo-review", true);
+        definition["action"]["kind"] = json!("launch_missiles");
+
+        let (status, body) = json_response(
+            validate_schedule_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(ScheduleValidateRequest {
+                    definition,
+                    strict: Some(false),
+                    context: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["valid"], json!(false));
+        assert!(body["issues"]
+            .as_array()
+            .expect("issues should be an array")
+            .iter()
+            .any(|issue| {
+                issue["path"] == json!("action.kind")
+                    && issue["code"] == json!("unsupported_action_kind")
+            }));
+    }
+
+    #[tokio::test]
+    async fn validate_schedule_definition_should_require_workflow_signal_selector() {
+        let context = route_test_context().await;
+        create_definition(&context, "schedule-writer", "Schedule Writer").await;
+        register_schedule_workflow(&context, "release-prep").await;
+        let definition = json!({
+            "agent": "schedule-writer",
+            "name": "Signal Release",
+            "enabled": true,
+            "schedule": {
+                "kind": "cron",
+                "expr": "0 2 * * *",
+                "tz": "UTC"
+            },
+            "action": {
+                "kind": "workflow_signal",
+                "signal": "deadline_reached",
+                "payload": {
+                    "reason": "scheduled_check"
+                }
+            },
+            "delivery": {
+                "kind": "none"
+            }
+        });
+
+        let (status, body) = json_response(
+            validate_schedule_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(ScheduleValidateRequest {
+                    definition,
+                    strict: Some(false),
+                    context: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["valid"], json!(false));
+        assert!(body["issues"]
+            .as_array()
+            .expect("issues should be an array")
+            .iter()
+            .any(|issue| issue["path"] == json!("action.selector.workflow_id")));
+    }
+
+    #[tokio::test]
+    async fn disable_schedule_definition_should_update_runtime_and_active_queue_synchronously() {
+        let context = route_test_context().await;
+        create_definition(&context, "schedule-writer", "Schedule Writer").await;
+        register_schedule_workflow(&context, "repo-review").await;
+
+        let (create_status, create_body) = json_response(
+            create_schedule_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(workflow_run_schedule_definition(
+                    "schedule-writer",
+                    "repo-review",
+                    true,
+                ))),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(create_status, StatusCode::CREATED);
+        let schedule_id = create_body["id"]
+            .as_str()
+            .expect("schedule ID should be returned")
+            .to_string();
+
+        let (disable_status, disable_body) = json_response(
+            disable_schedule_definition_v1(
+                State(Arc::clone(&context.state)),
+                Path(schedule_id.clone()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(disable_status, StatusCode::ACCEPTED);
+        assert_eq!(disable_body["accepted"], json!(true));
+        assert_eq!(disable_body["resource_id"], json!(schedule_id.clone()));
+
+        let meta = context
+            .state
+            .kernel
+            .cron_scheduler
+            .get_meta_by_definition_id(&schedule_id)
+            .expect("schedule should still exist");
+        assert!(!meta.job.enabled);
+        assert!(meta.job.next_run.is_none());
+
+        let runtime = context
+            .state
+            .kernel
+            .runtime_stores
+            .schedule_runtime
+            .get_schedule_runtime(&schedule_id)
+            .expect("runtime projection should load")
+            .expect("runtime projection should exist");
+        assert!(!runtime.enabled);
+        assert!(runtime.next_run.is_none());
     }
 }

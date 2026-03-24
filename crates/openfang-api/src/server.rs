@@ -368,18 +368,45 @@ pub async fn build_router(
             "/api/triggers/{id}",
             axum::routing::delete(routes::delete_trigger).put(routes::update_trigger),
         )
-        // Schedule (cron job) endpoints
+        // Schedule v1 control-plane endpoints
         .route(
-            "/api/schedules",
-            axum::routing::get(routes::list_schedules).post(routes::create_schedule),
+            "/api/v1/schedules",
+            axum::routing::get(routes::list_schedule_definitions_v1)
+                .post(routes::create_schedule_definition_v1),
         )
         .route(
-            "/api/schedules/{id}",
-            axum::routing::delete(routes::delete_schedule).put(routes::update_schedule),
+            "/api/v1/schedules/{id}",
+            axum::routing::get(routes::get_schedule_definition_v1)
+                .put(routes::update_schedule_definition_v1)
+                .delete(routes::delete_schedule_definition_v1),
         )
         .route(
-            "/api/schedules/{id}/run",
-            axum::routing::post(routes::run_schedule),
+            "/api/v1/schedules/validate",
+            axum::routing::post(routes::validate_schedule_definition_v1),
+        )
+        .route(
+            "/api/v1/schedules/{id}/fork",
+            axum::routing::post(routes::fork_schedule_definition_v1),
+        )
+        .route(
+            "/api/v1/schedules/{id}/runtime",
+            axum::routing::get(routes::get_schedule_runtime_v1),
+        )
+        .route(
+            "/api/v1/schedules/{id}/enable",
+            axum::routing::post(routes::enable_schedule_definition_v1),
+        )
+        .route(
+            "/api/v1/schedules/{id}/disable",
+            axum::routing::post(routes::disable_schedule_definition_v1),
+        )
+        .route(
+            "/api/v1/schedules/{id}/run-now",
+            axum::routing::post(routes::run_schedule_definition_now_v1),
+        )
+        .route(
+            "/api/v1/schedules/{id}/run-now/dry-run",
+            axum::routing::post(routes::dry_run_schedule_definition_now_v1),
         )
         // Workflow v1 control-plane endpoints
         .route(

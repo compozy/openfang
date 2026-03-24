@@ -78,6 +78,12 @@ pub struct AgentMessageDispatch<'a> {
     pub sender_name: Option<String>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct ScheduleExecutionResult {
+    pub run_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
 pub struct OpenFangKernel {
     /// Kernel configuration.
     pub config: KernelConfig,
@@ -4315,6 +4321,194 @@ impl OpenFangKernel {
         Ok(signal)
     }
 
+    pub async fn execute_schedule_now(
+        self: &Arc<Self>,
+        meta: &crate::cron::JobMeta,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<ScheduleExecutionResult, String> {
+        match &meta.job.action {
+            openfang_types::scheduler::CronAction::SystemEvent { event, payload } => {
+                let payload_bytes = serde_json::to_vec(&serde_json::json!({
+                    "type": event,
+                    "payload": payload,
+                    "schedule_id": meta.definition_id,
+                    "schedule_name": meta.job.name,
+                    "metadata": metadata.unwrap_or_else(|| serde_json::json!({})),
+                }))
+                .map_err(|error| format!("Failed to encode system event payload: {error}"))?;
+                let system_event = Event::new(
+                    AgentId::new(),
+                    EventTarget::Broadcast,
+                    EventPayload::Custom(payload_bytes),
+                );
+                self.publish_event(system_event).await;
+                Ok(ScheduleExecutionResult::default())
+            }
+            openfang_types::scheduler::CronAction::AgentTurn {
+                message,
+                input,
+                timeout_secs,
+                ..
+            } => {
+                let message_text = scheduled_agent_turn_message(message.as_deref(), input)?;
+                let timeout_s = timeout_secs.unwrap_or(120);
+                let timeout = std::time::Duration::from_secs(timeout_s);
+                let kernel_handle: Arc<dyn KernelHandle> = self.clone();
+                let result = tokio::time::timeout(
+                    timeout,
+                    self.send_message_with_handle(
+                        meta.job.agent_id,
+                        &message_text,
+                        Some(kernel_handle),
+                        None,
+                        None,
+                    ),
+                )
+                .await
+                .map_err(|_| format!("timed out after {timeout_s}s"))?
+                .map_err(|error| format!("{error}"))?;
+
+                cron_deliver_response(
+                    self,
+                    meta.job.agent_id,
+                    &result.response,
+                    &meta.job.delivery,
+                )
+                .await?;
+
+                Ok(ScheduleExecutionResult {
+                    session_id: self
+                        .registry
+                        .get(meta.job.agent_id)
+                        .map(|entry| entry.session_id.to_string()),
+                    run_id: None,
+                })
+            }
+            openfang_types::scheduler::CronAction::WorkflowRun {
+                workflow_id,
+                input,
+                timeout_secs: _timeout_secs,
+            } => {
+                let Some(definition) = self.workflows.get_workflow_v2_definition(workflow_id).await
+                else {
+                    return Err(format!("workflow not found: {workflow_id}"));
+                };
+                let Some(workflow_ir) = self.workflows.get_compiled_workflow(workflow_id).await
+                else {
+                    return Err(format!("compiled workflow not found: {workflow_id}"));
+                };
+
+                let metadata = metadata.unwrap_or_else(|| serde_json::json!({}));
+                let input_json = input.clone().unwrap_or_else(|| serde_json::json!({}));
+                let input = serde_json::to_string(&input_json)
+                    .map_err(|error| format!("Failed to encode workflow input: {error}"))?;
+                let run_id = self
+                    .workflows
+                    .create_run_from_compiled_workflow(
+                        workflow_ir.workflow_id.clone(),
+                        definition.name.clone(),
+                        workflow_ir.workflow_version.clone(),
+                        input,
+                        Vec::new(),
+                        metadata,
+                    )
+                    .await
+                    .map_err(|error| format!("{error}"))?;
+
+                let workflow_ir_for_task = workflow_ir.clone();
+                let kernel = Arc::clone(self);
+                let definition_id = workflow_id.clone();
+                tokio::spawn(async move {
+                    let resolver = |agent_ref: &str| -> Option<(AgentId, String)> {
+                        if let Ok(agent_id) = agent_ref.parse::<AgentId>() {
+                            let entry = kernel.registry.get(agent_id)?;
+                            return Some((agent_id, entry.name.clone()));
+                        }
+
+                        let entry = kernel.registry.find_by_name(agent_ref)?;
+                        Some((entry.id, entry.name.clone()))
+                    };
+                    let send_message = |agent_id: AgentId, message: String| {
+                        let kernel = Arc::clone(&kernel);
+                        async move {
+                            kernel
+                                .send_message(agent_id, &message)
+                                .await
+                                .map(|response| {
+                                    (
+                                        response.response,
+                                        response.total_usage.input_tokens,
+                                        response.total_usage.output_tokens,
+                                    )
+                                })
+                                .map_err(|error| format!("{error}"))
+                        }
+                    };
+
+                    if let Err(error) = kernel
+                        .workflows
+                        .execute_run(run_id, workflow_ir_for_task, resolver, send_message)
+                        .await
+                    {
+                        tracing::warn!(workflow_id = %definition_id, run_id = %run_id, "Workflow execution failed: {error}");
+                    }
+                });
+
+                Ok(ScheduleExecutionResult {
+                    run_id: Some(run_id.to_string()),
+                    session_id: None,
+                })
+            }
+            openfang_types::scheduler::CronAction::WorkflowSignal {
+                signal,
+                selector,
+                payload,
+            } => {
+                let runs = self
+                    .workflow_stores
+                    .workflow_run
+                    .list_for_workflow(&selector.workflow_id)
+                    .map_err(|error| format!("{error}"))?;
+                let waiting_runs = runs
+                    .into_iter()
+                    .filter(|record| {
+                        record.status == openfang_memory::WorkflowRunStatus::WaitingSignal
+                    })
+                    .collect::<Vec<_>>();
+                if waiting_runs.is_empty() {
+                    return Err(format!(
+                        "no waiting workflow runs found for {}",
+                        selector.workflow_id
+                    ));
+                }
+
+                let source = metadata
+                    .as_ref()
+                    .and_then(|value| value.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("schedule")
+                    .to_string();
+                for record in waiting_runs {
+                    let run_id = WorkflowRunId(
+                        uuid::Uuid::parse_str(&record.run_id)
+                            .map_err(|error| format!("Invalid workflow run ID: {error}"))?,
+                    );
+                    self.submit_run_signal(
+                        run_id,
+                        signal.clone(),
+                        payload.clone(),
+                        source.clone(),
+                        format!("{}:{}:{}", meta.definition_id, signal, record.run_id),
+                    )
+                    .await
+                    .map_err(|error| format!("{error}"))?;
+                }
+
+                Ok(ScheduleExecutionResult::default())
+            }
+        }
+    }
+
     fn workflows_dir(&self) -> PathBuf {
         self.config
             .workflows_dir
@@ -4616,151 +4810,34 @@ impl OpenFangKernel {
                         break;
                     }
 
-                    let due = kernel.cron_scheduler.due_jobs();
-                    for job in due {
-                        let job_id = job.id;
-                        let agent_id = job.agent_id;
-                        let job_name = job.name.clone();
+                    let due = kernel.cron_scheduler.due_job_metas();
+                    for meta in due {
+                        let job_id = meta.job.id;
+                        let job_name = meta.job.name.clone();
 
-                        match &job.action {
-                            openfang_types::scheduler::CronAction::SystemEvent { text } => {
-                                tracing::debug!(job = %job_name, "Cron: firing system event");
-                                let payload_bytes = serde_json::to_vec(&serde_json::json!({
-                                    "type": format!("cron.{}", job_name),
-                                    "text": text,
-                                    "job_id": job_id.to_string(),
-                                }))
-                                .unwrap_or_default();
-                                let event = Event::new(
-                                    AgentId::new(), // system-originated
-                                    EventTarget::Broadcast,
-                                    EventPayload::Custom(payload_bytes),
+                        tracing::debug!(
+                            schedule_id = %meta.definition_id,
+                            job = %job_name,
+                            "Cron: firing schedule"
+                        );
+
+                        match kernel.execute_schedule_now(&meta, None).await {
+                            Ok(_) => {
+                                tracing::info!(
+                                    schedule_id = %meta.definition_id,
+                                    job = %job_name,
+                                    "Cron schedule completed successfully"
                                 );
-                                kernel.publish_event(event).await;
                                 kernel.cron_scheduler.record_success(job_id);
                             }
-                            openfang_types::scheduler::CronAction::AgentTurn {
-                                message,
-                                timeout_secs,
-                                ..
-                            } => {
-                                tracing::debug!(job = %job_name, agent = %agent_id, "Cron: firing agent turn");
-                                let timeout_s = timeout_secs.unwrap_or(120);
-                                let timeout = std::time::Duration::from_secs(timeout_s);
-                                let delivery = job.delivery.clone();
-                                let kh: std::sync::Arc<
-                                    dyn openfang_runtime::kernel_handle::KernelHandle,
-                                > = kernel.clone();
-                                match tokio::time::timeout(
-                                    timeout,
-                                    kernel.send_message_with_handle(
-                                        agent_id,
-                                        message,
-                                        Some(kh),
-                                        None,
-                                        None,
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(result)) => {
-                                        match cron_deliver_response(
-                                            &kernel,
-                                            agent_id,
-                                            &result.response,
-                                            &delivery,
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {
-                                                tracing::info!(job = %job_name, "Cron job completed successfully");
-                                                kernel.cron_scheduler.record_success(job_id);
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(job = %job_name, error = %e, "Cron job delivery failed");
-                                                kernel.cron_scheduler.record_failure(job_id, &e);
-                                            }
-                                        }
-                                    }
-                                    Ok(Err(e)) => {
-                                        let err_msg = format!("{e}");
-                                        tracing::warn!(job = %job_name, error = %err_msg, "Cron job failed");
-                                        kernel.cron_scheduler.record_failure(job_id, &err_msg);
-                                    }
-                                    Err(_) => {
-                                        tracing::warn!(job = %job_name, timeout_s, "Cron job timed out");
-                                        kernel.cron_scheduler.record_failure(
-                                            job_id,
-                                            &format!("timed out after {timeout_s}s"),
-                                        );
-                                    }
-                                }
-                            }
-                            openfang_types::scheduler::CronAction::WorkflowRun {
-                                workflow_id,
-                                input,
-                                timeout_secs,
-                            } => {
-                                tracing::debug!(job = %job_name, workflow = %workflow_id, "Cron: firing workflow run");
-                                let wf_input = input.clone().unwrap_or_default();
-                                let timeout_s = timeout_secs.unwrap_or(120);
-                                let timeout = std::time::Duration::from_secs(timeout_s);
-                                let delivery = job.delivery.clone();
-
-                                // Resolve workflow: try UUID first, then name
-                                let wf_id = match uuid::Uuid::parse_str(workflow_id) {
-                                    Ok(uuid) => crate::workflow::WorkflowId(uuid),
-                                    Err(_) => {
-                                        let all_wfs = kernel.workflows.list_workflows().await;
-                                        if let Some(wf) =
-                                            all_wfs.iter().find(|w| w.name == *workflow_id)
-                                        {
-                                            wf.id
-                                        } else {
-                                            let err_msg =
-                                                format!("workflow not found: {workflow_id}");
-                                            tracing::warn!(job = %job_name, %err_msg);
-                                            kernel.cron_scheduler.record_failure(job_id, &err_msg);
-                                            continue;
-                                        }
-                                    }
-                                };
-
-                                match tokio::time::timeout(
-                                    timeout,
-                                    kernel.run_workflow(wf_id, wf_input),
-                                )
-                                .await
-                                {
-                                    Ok(Ok((_run_id, output))) => {
-                                        match cron_deliver_response(
-                                            &kernel, agent_id, &output, &delivery,
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {
-                                                tracing::info!(job = %job_name, "Cron workflow completed");
-                                                kernel.cron_scheduler.record_success(job_id);
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(job = %job_name, error = %e, "Cron workflow delivery failed");
-                                                kernel.cron_scheduler.record_failure(job_id, &e);
-                                            }
-                                        }
-                                    }
-                                    Ok(Err(e)) => {
-                                        let err_msg = format!("{e}");
-                                        tracing::warn!(job = %job_name, error = %err_msg, "Cron workflow failed");
-                                        kernel.cron_scheduler.record_failure(job_id, &err_msg);
-                                    }
-                                    Err(_) => {
-                                        tracing::warn!(job = %job_name, timeout_s, "Cron workflow timed out");
-                                        kernel.cron_scheduler.record_failure(
-                                            job_id,
-                                            &format!("workflow timed out after {timeout_s}s"),
-                                        );
-                                    }
-                                }
+                            Err(error) => {
+                                tracing::warn!(
+                                    schedule_id = %meta.definition_id,
+                                    job = %job_name,
+                                    error = %error,
+                                    "Cron schedule failed"
+                                );
+                                kernel.cron_scheduler.record_failure(job_id, &error);
                             }
                         }
                     }
@@ -6282,6 +6359,37 @@ async fn cron_deliver_response(
             Ok(())
         }
     }
+}
+
+fn scheduled_agent_turn_message(
+    legacy_message: Option<&str>,
+    input: &openfang_types::scheduler::CronTextInputPayload,
+) -> Result<String, String> {
+    if !input.items.is_empty() {
+        let parts = input
+            .items
+            .iter()
+            .map(|item| {
+                if item.item_type != "text" {
+                    return Err(format!(
+                        "Unsupported scheduled input item type '{}'",
+                        item.item_type
+                    ));
+                }
+                item.text
+                    .clone()
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| "Scheduled input item is missing text".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(parts.join("\n\n"));
+    }
+
+    legacy_message
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "Scheduled agent turn input must not be empty".to_string())
 }
 
 #[async_trait]

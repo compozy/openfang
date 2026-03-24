@@ -473,7 +473,13 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         tz: None,
                     },
                     action: openfang_types::scheduler::CronAction::AgentTurn {
-                        message: message.clone(),
+                        message: None,
+                        input: openfang_types::scheduler::CronTextInputPayload {
+                            items: vec![openfang_types::scheduler::CronTextInputItem {
+                                item_type: "text".to_string(),
+                                text: Some(message.clone()),
+                            }],
+                        },
                         model_override: None,
                         timeout_secs: None,
                     },
@@ -537,11 +543,26 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         let j = matched[0];
                         let message = match &j.action {
                             openfang_types::scheduler::CronAction::AgentTurn {
-                                message, ..
-                            } => message.clone(),
-                            openfang_types::scheduler::CronAction::SystemEvent { text } => {
-                                text.clone()
+                                message,
+                                input,
+                                ..
+                            } => {
+                                let joined = input
+                                    .items
+                                    .iter()
+                                    .filter_map(|item| item.text.as_deref())
+                                    .map(ToOwned::to_owned)
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n");
+                                if joined.is_empty() {
+                                    message.clone().unwrap_or_default()
+                                } else {
+                                    joined
+                                }
                             }
+                            openfang_types::scheduler::CronAction::SystemEvent {
+                                event, ..
+                            } => event.clone(),
                             openfang_types::scheduler::CronAction::WorkflowRun {
                                 workflow_id,
                                 input,
@@ -550,9 +571,19 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                                 format!(
                                     "Run workflow {workflow_id}{}",
                                     input
-                                        .as_deref()
+                                        .as_ref()
                                         .map(|i| format!(" with input: {i}"))
                                         .unwrap_or_default()
+                                )
+                            }
+                            openfang_types::scheduler::CronAction::WorkflowSignal {
+                                signal,
+                                selector,
+                                ..
+                            } => {
+                                format!(
+                                    "Submit workflow signal {signal} for {}",
+                                    selector.workflow_id
                                 )
                             }
                         };

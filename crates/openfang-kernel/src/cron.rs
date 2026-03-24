@@ -14,7 +14,9 @@ use openfang_memory::{
 };
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use openfang_types::scheduler::{CronJob, CronJobId, CronSchedule};
+use openfang_types::scheduler::{
+    CronDefinitionForkedFrom, CronDefinitionOrigin, CronJob, CronJobId, CronSchedule,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -37,6 +39,21 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 pub struct JobMeta {
     /// The underlying job definition.
     pub job: CronJob,
+    /// Stable public schedule definition identifier.
+    #[serde(default)]
+    pub definition_id: String,
+    /// Stable public agent reference (definition ID or runtime name).
+    #[serde(default)]
+    pub agent_ref: String,
+    /// Public definition origin metadata.
+    #[serde(default = "CronDefinitionOrigin::user")]
+    pub origin: CronDefinitionOrigin,
+    /// Optional upstream provenance when this definition is forked.
+    #[serde(default)]
+    pub forked_from: Option<CronDefinitionForkedFrom>,
+    /// Last definition-level update timestamp (RFC 3339).
+    #[serde(default)]
+    pub updated_at: String,
     /// Whether this job should be removed after a single successful execution.
     pub one_shot: bool,
     /// Human-readable status of the last execution (e.g. `"ok"` or `"error: ..."`).
@@ -49,11 +66,29 @@ impl JobMeta {
     /// Wrap a `CronJob` with default metadata.
     pub fn new(job: CronJob, one_shot: bool) -> Self {
         Self {
+            definition_id: job.id.to_string(),
+            agent_ref: job.agent_id.to_string(),
+            origin: CronDefinitionOrigin::user(),
+            forked_from: None,
+            updated_at: job.created_at.to_rfc3339(),
             job,
             one_shot,
             last_status: None,
             consecutive_errors: 0,
         }
+    }
+
+    fn normalize(mut self) -> Self {
+        if self.definition_id.is_empty() {
+            self.definition_id = self.job.id.to_string();
+        }
+        if self.agent_ref.is_empty() {
+            self.agent_ref = self.job.agent_id.to_string();
+        }
+        if self.updated_at.is_empty() {
+            self.updated_at = self.job.created_at.to_rfc3339();
+        }
+        self
     }
 }
 
@@ -113,7 +148,7 @@ impl CronScheduler {
 
     fn schedule_runtime_record(meta: &JobMeta) -> ScheduleRuntimeRecord {
         ScheduleRuntimeRecord {
-            schedule_id: meta.job.id.to_string(),
+            schedule_id: meta.definition_id.clone(),
             enabled: meta.job.enabled,
             last_run: meta.job.last_run.map(|timestamp| timestamp.to_rfc3339()),
             next_run: meta.job.next_run.map(|timestamp| timestamp.to_rfc3339()),
@@ -131,18 +166,18 @@ impl CronScheduler {
 
         if let Err(error) = store.upsert_schedule_runtime(&Self::schedule_runtime_record(meta)) {
             warn!(
-                schedule_id = %meta.job.id,
+                schedule_id = %meta.definition_id,
                 "Failed to persist schedule runtime projection: {error}"
             );
         }
     }
 
-    fn remove_runtime_projection(&self, schedule_id: CronJobId) {
+    fn remove_runtime_projection(&self, schedule_id: &str) {
         let Some(store) = &self.schedule_runtime_store else {
             return;
         };
 
-        if let Err(error) = store.remove_schedule_runtime(&schedule_id.to_string()) {
+        if let Err(error) = store.remove_schedule_runtime(schedule_id) {
             warn!(
                 schedule_id = %schedule_id,
                 "Failed to remove schedule runtime projection: {error}"
@@ -150,7 +185,7 @@ impl CronScheduler {
         }
     }
 
-    fn record_execution_receipt(&self, schedule_id: CronJobId, status: &str, error: Option<&str>) {
+    fn record_execution_receipt(&self, schedule_id: &str, status: &str, error: Option<&str>) {
         let Some(store) = &self.schedule_execution_store else {
             return;
         };
@@ -180,7 +215,7 @@ impl CronScheduler {
         let live_schedule_ids: HashSet<String> = self
             .jobs
             .iter()
-            .map(|entry| entry.key().to_string())
+            .map(|entry| entry.value().definition_id.clone())
             .collect();
 
         match store.list_schedule_runtimes() {
@@ -225,7 +260,8 @@ impl CronScheduler {
             .map_err(|e| OpenFangError::Internal(format!("Failed to parse cron jobs: {e}")))?;
         let count = metas.len();
         for meta in metas {
-            self.jobs.insert(meta.job.id, meta);
+            let normalized = meta.normalize();
+            self.jobs.insert(normalized.job.id, normalized);
         }
         self.reconcile_runtime_projections();
         info!(count, "Loaded cron jobs from disk");
@@ -255,7 +291,15 @@ impl CronScheduler {
     ///
     /// `one_shot` controls whether the job is removed after a single
     /// successful execution.
-    pub fn add_job(&self, mut job: CronJob, one_shot: bool) -> OpenFangResult<CronJobId> {
+    pub fn add_job(&self, job: CronJob, one_shot: bool) -> OpenFangResult<CronJobId> {
+        let mut meta = JobMeta::new(job.clone(), one_shot);
+        meta.updated_at = Utc::now().to_rfc3339();
+        self.add_job_meta(meta)?;
+        Ok(job.id)
+    }
+
+    /// Add a new job with explicit metadata.
+    pub fn add_job_meta(&self, mut meta: JobMeta) -> OpenFangResult<CronJobId> {
         // Global limit
         let max_jobs = self.max_total_jobs.load(Ordering::Relaxed);
         if self.jobs.len() >= max_jobs {
@@ -269,18 +313,24 @@ impl CronScheduler {
         let agent_count = self
             .jobs
             .iter()
-            .filter(|r| r.value().job.agent_id == job.agent_id)
+            .filter(|r| r.value().job.agent_id == meta.job.agent_id)
             .count();
 
         // CronJob.validate returns Result<(), String>
-        job.validate(agent_count)
+        meta.job
+            .validate(agent_count)
             .map_err(OpenFangError::InvalidInput)?;
 
         // Compute initial next_run
-        job.next_run = Some(compute_next_run(&job.schedule));
+        meta = meta.normalize();
+        meta.job.next_run = if meta.job.enabled {
+            Some(compute_next_run(&meta.job.schedule))
+        } else {
+            None
+        };
 
-        let id = job.id;
-        self.jobs.insert(id, JobMeta::new(job, one_shot));
+        let id = meta.job.id;
+        self.jobs.insert(id, meta);
         if let Some(meta) = self.jobs.get(&id) {
             self.sync_runtime_projection(meta.value());
         }
@@ -292,9 +342,23 @@ impl CronScheduler {
         let removed = self
             .jobs
             .remove(&id)
-            .map(|(_, meta)| meta.job)
+            .map(|(_, meta)| meta)
             .ok_or_else(|| OpenFangError::Internal(format!("Cron job {id} not found")))?;
-        self.remove_runtime_projection(id);
+        self.remove_runtime_projection(&removed.definition_id);
+        Ok(removed.job)
+    }
+
+    /// Remove a job by its public schedule ID.
+    pub fn remove_job_by_definition_id(&self, definition_id: &str) -> OpenFangResult<JobMeta> {
+        let Some(id) = self.find_job_id_by_definition_id(definition_id) else {
+            return Err(OpenFangError::Internal(format!(
+                "Schedule {definition_id} not found"
+            )));
+        };
+        let removed = self.jobs.remove(&id).map(|(_, meta)| meta).ok_or_else(|| {
+            OpenFangError::Internal(format!("Schedule {definition_id} not found"))
+        })?;
+        self.remove_runtime_projection(&removed.definition_id);
         Ok(removed)
     }
 
@@ -307,7 +371,10 @@ impl CronScheduler {
                 if enabled {
                     meta.consecutive_errors = 0;
                     meta.job.next_run = Some(compute_next_run(&meta.job.schedule));
+                } else {
+                    meta.job.next_run = None;
                 }
+                meta.updated_at = Utc::now().to_rfc3339();
                 Some(meta.clone())
             }
             None => None,
@@ -319,6 +386,66 @@ impl CronScheduler {
 
         self.sync_runtime_projection(&updated_meta);
         Ok(())
+    }
+
+    /// Enable or disable a job by its public schedule ID.
+    pub fn set_enabled_by_definition_id(
+        &self,
+        definition_id: &str,
+        enabled: bool,
+    ) -> OpenFangResult<JobMeta> {
+        let Some(id) = self.find_job_id_by_definition_id(definition_id) else {
+            return Err(OpenFangError::Internal(format!(
+                "Schedule {definition_id} not found"
+            )));
+        };
+        self.set_enabled(id, enabled)?;
+        self.get_meta(id)
+            .ok_or_else(|| OpenFangError::Internal(format!("Schedule {definition_id} not found")))
+    }
+
+    /// Replace one job definition in place by public schedule ID.
+    pub fn replace_job_meta_by_definition_id(
+        &self,
+        definition_id: &str,
+        mut replacement: JobMeta,
+    ) -> OpenFangResult<JobMeta> {
+        let Some(job_id) = self.find_job_id_by_definition_id(definition_id) else {
+            return Err(OpenFangError::Internal(format!(
+                "Schedule {definition_id} not found"
+            )));
+        };
+
+        let existing = self.get_meta(job_id).ok_or_else(|| {
+            OpenFangError::Internal(format!("Schedule {definition_id} not found"))
+        })?;
+
+        replacement = replacement.normalize();
+        replacement.job.id = existing.job.id;
+        replacement.definition_id = existing.definition_id.clone();
+        replacement.job.created_at = existing.job.created_at;
+
+        let agent_count = self
+            .jobs
+            .iter()
+            .filter(|entry| {
+                entry.value().job.agent_id == replacement.job.agent_id && *entry.key() != job_id
+            })
+            .count();
+        replacement
+            .job
+            .validate(agent_count)
+            .map_err(OpenFangError::InvalidInput)?;
+        replacement.job.next_run = if replacement.job.enabled {
+            Some(compute_next_run(&replacement.job.schedule))
+        } else {
+            None
+        };
+        replacement.updated_at = Utc::now().to_rfc3339();
+
+        self.jobs.insert(job_id, replacement.clone());
+        self.sync_runtime_projection(&replacement);
+        Ok(replacement)
     }
 
     // -- Queries ------------------------------------------------------------
@@ -334,6 +461,12 @@ impl CronScheduler {
         self.jobs.get(&id).map(|r| r.value().clone())
     }
 
+    /// Get the full metadata for a job by its public schedule ID.
+    pub fn get_meta_by_definition_id(&self, definition_id: &str) -> Option<JobMeta> {
+        let id = self.find_job_id_by_definition_id(definition_id)?;
+        self.get_meta(id)
+    }
+
     /// List all jobs for a specific agent.
     pub fn list_jobs(&self, agent_id: AgentId) -> Vec<CronJob> {
         self.jobs
@@ -346,6 +479,14 @@ impl CronScheduler {
     /// List all jobs across all agents.
     pub fn list_all_jobs(&self) -> Vec<CronJob> {
         self.jobs.iter().map(|r| r.value().job.clone()).collect()
+    }
+
+    /// List full schedule metadata across all agents.
+    pub fn list_all_metas(&self) -> Vec<JobMeta> {
+        self.jobs
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     /// Reassign all cron jobs from `old_agent_id` to `new_agent_id`.
@@ -409,8 +550,9 @@ impl CronScheduler {
             .collect();
         let count = ids.len();
         for id in ids {
-            self.jobs.remove(&id);
-            self.remove_runtime_projection(id);
+            if let Some((_, meta)) = self.jobs.remove(&id) {
+                self.remove_runtime_projection(&meta.definition_id);
+            }
         }
         if count > 0 {
             info!(agent = %agent_id, count, "Removed cron jobs for deleted agent");
@@ -429,17 +571,26 @@ impl CronScheduler {
     /// next scheduled time. This prevents the same job from being returned as
     /// "due" on subsequent tick iterations while it's still executing.
     pub fn due_jobs(&self) -> Vec<CronJob> {
+        self.due_job_metas()
+            .into_iter()
+            .map(|meta| meta.job)
+            .collect()
+    }
+
+    /// Return full metadata for jobs whose `next_run` is at or before `now`.
+    pub fn due_job_metas(&self) -> Vec<JobMeta> {
         let now = Utc::now();
         let mut due = Vec::new();
         let mut updated = Vec::new();
         for mut entry in self.jobs.iter_mut() {
             let meta = entry.value_mut();
             if meta.job.enabled && meta.job.next_run.map(|t| t <= now).unwrap_or(false) {
-                due.push(meta.job.clone());
+                due.push(meta.clone());
                 // Pre-advance next_run so the job won't fire again on the next
                 // tick while it's still executing. Use `now` as the base so the
                 // next fire time is computed strictly after the current moment.
                 meta.job.next_run = Some(compute_next_run_after(&meta.job.schedule, now));
+                meta.updated_at = Utc::now().to_rfc3339();
                 updated.push(meta.clone());
             }
         }
@@ -462,6 +613,7 @@ impl CronScheduler {
                 meta.job.last_run = Some(Utc::now());
                 meta.last_status = Some("ok".to_string());
                 meta.consecutive_errors = 0;
+                meta.updated_at = Utc::now().to_rfc3339();
                 // one_shot jobs get removed; recurring jobs keep the next_run
                 // already pre-advanced by due_jobs() — no recompute needed.
                 (meta.one_shot, Some(meta.clone()))
@@ -469,11 +621,14 @@ impl CronScheduler {
                 return;
             }
         };
-        self.record_execution_receipt(id, "ok", None);
+        let Some(updated_meta) = updated_meta else {
+            return;
+        };
+        self.record_execution_receipt(&updated_meta.definition_id, "ok", None);
         if should_remove {
             self.jobs.remove(&id);
-            self.remove_runtime_projection(id);
-        } else if let Some(updated_meta) = updated_meta {
+            self.remove_runtime_projection(&updated_meta.definition_id);
+        } else {
             self.sync_runtime_projection(&updated_meta);
         }
     }
@@ -497,9 +652,11 @@ impl CronScheduler {
                     "Auto-disabling cron job after repeated failures"
                 );
                 meta.job.enabled = false;
+                meta.job.next_run = None;
             } else {
                 meta.job.next_run = Some(compute_next_run_after(&meta.job.schedule, Utc::now()));
             }
+            meta.updated_at = Utc::now().to_rfc3339();
             Some(meta.clone())
         } else {
             None
@@ -507,8 +664,15 @@ impl CronScheduler {
 
         if let Some(updated_meta) = updated_meta {
             self.sync_runtime_projection(&updated_meta);
-            self.record_execution_receipt(id, "error", Some(error_msg));
+            self.record_execution_receipt(&updated_meta.definition_id, "error", Some(error_msg));
         }
+    }
+
+    fn find_job_id_by_definition_id(&self, definition_id: &str) -> Option<CronJobId> {
+        self.jobs
+            .iter()
+            .find(|entry| entry.value().definition_id == definition_id)
+            .map(|entry| *entry.key())
     }
 }
 
@@ -614,7 +778,8 @@ mod tests {
             enabled: true,
             schedule: CronSchedule::Every { every_secs: 3600 },
             action: CronAction::SystemEvent {
-                text: "ping".into(),
+                event: "ping".into(),
+                payload: serde_json::Value::Null,
             },
             delivery: CronDelivery::None,
             created_at: Utc::now(),
@@ -855,6 +1020,7 @@ mod tests {
         sched.set_enabled(id, false).unwrap();
         let meta = sched.get_meta(id).unwrap();
         assert!(!meta.job.enabled);
+        assert!(meta.job.next_run.is_none());
 
         // Re-enable resets error count
         sched.record_failure(id, "ignored because disabled");

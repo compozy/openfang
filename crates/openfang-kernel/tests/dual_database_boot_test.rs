@@ -541,7 +541,8 @@ fn schedule_runtime_state_should_survive_restart() {
         enabled: true,
         schedule: CronSchedule::Every { every_secs: 600 },
         action: CronAction::SystemEvent {
-            text: "ping".to_string(),
+            event: "ping".to_string(),
+            payload: serde_json::Value::Null,
         },
         delivery: CronDelivery::None,
         created_at: chrono::Utc::now(),

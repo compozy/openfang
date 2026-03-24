@@ -6,6 +6,7 @@
 use crate::agent::AgentId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 /// Maximum number of scheduled jobs per agent.
@@ -37,6 +38,83 @@ const MAX_TIMEOUT_SECS: u64 = 600;
 
 /// Maximum webhook URL length.
 const MAX_WEBHOOK_URL_LEN: usize = 2048;
+
+/// Maximum serialized JSON payload length for schedule actions.
+const MAX_ACTION_PAYLOAD_LEN: usize = 16_384;
+
+/// Stable origin metadata for persisted schedule definitions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CronDefinitionOriginKind {
+    /// User-authored schedule definition.
+    User,
+    /// Pack-managed schedule definition.
+    Pack,
+}
+
+/// Origin metadata stored with a schedule definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CronDefinitionOrigin {
+    pub kind: CronDefinitionOriginKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl CronDefinitionOrigin {
+    /// Build user-owned origin metadata.
+    #[must_use]
+    pub fn user() -> Self {
+        Self {
+            kind: CronDefinitionOriginKind::User,
+            pack_id: None,
+            pack_version: None,
+            source: None,
+        }
+    }
+}
+
+/// Provenance metadata for a forked schedule definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CronDefinitionForkedFrom {
+    pub kind: CronDefinitionOriginKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_version: Option<String>,
+    pub resource_type: String,
+    pub resource_id: String,
+}
+
+/// Structured text input for scheduled agent turns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CronTextInputPayload {
+    #[serde(default)]
+    pub items: Vec<CronTextInputItem>,
+}
+
+/// One structured text input item for a scheduled agent turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CronTextInputItem {
+    #[serde(rename = "type")]
+    pub item_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Destination selector for scheduled workflow signals.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CronWorkflowSignalSelector {
+    pub workflow_id: String,
+}
 
 // ---------------------------------------------------------------------------
 // CronJobId
@@ -110,13 +188,21 @@ pub enum CronSchedule {
 pub enum CronAction {
     /// Publish a system event.
     SystemEvent {
-        /// Event text/payload (max 4096 chars).
-        text: String,
+        /// Event name published through the event bus.
+        #[serde(alias = "text")]
+        event: String,
+        /// Structured JSON payload carried with the event.
+        #[serde(default, skip_serializing_if = "JsonValue::is_null")]
+        payload: JsonValue,
     },
     /// Trigger an agent conversation turn.
     AgentTurn {
-        /// Message to send to the agent.
-        message: String,
+        /// Legacy single-message text preserved for backwards compatibility.
+        #[serde(default, skip_serializing)]
+        message: Option<String>,
+        /// Structured text input delivered to the agent runtime.
+        #[serde(default)]
+        input: CronTextInputPayload,
         /// Optional model override for this turn.
         model_override: Option<String>,
         /// Timeout in seconds (10..=600).
@@ -127,9 +213,19 @@ pub enum CronAction {
         /// Workflow UUID or name (resolved by name if not a valid UUID).
         workflow_id: String,
         /// Initial input to the workflow (default: empty).
-        input: Option<String>,
+        input: Option<JsonValue>,
         /// Timeout in seconds (10..=3600, default: 120).
         timeout_secs: Option<u64>,
+    },
+    /// Submit a durable workflow signal to waiting runs of one definition.
+    WorkflowSignal {
+        /// Signal name expected by the waiting workflow step.
+        signal: String,
+        /// Target workflow definition selector.
+        selector: CronWorkflowSignalSelector,
+        /// Structured signal payload.
+        #[serde(default, skip_serializing_if = "JsonValue::is_null")]
+        payload: JsonValue,
     },
 }
 
@@ -261,8 +357,13 @@ impl CronJob {
                     ));
                 }
             }
-            CronSchedule::Cron { expr, .. } => {
+            CronSchedule::Cron { expr, tz } => {
                 validate_cron_expr(expr)?;
+                if let Some(tz) = tz {
+                    if !tz.trim().is_empty() && tz.parse::<chrono_tz::Tz>().is_err() {
+                        return Err(format!("invalid timezone: {tz}"));
+                    }
+                }
             }
         }
         Ok(())
@@ -270,30 +371,59 @@ impl CronJob {
 
     fn validate_action(&self) -> Result<(), String> {
         match &self.action {
-            CronAction::SystemEvent { text } => {
-                if text.is_empty() {
-                    return Err("system event text must not be empty".into());
+            CronAction::SystemEvent { event, payload } => {
+                if event.trim().is_empty() {
+                    return Err("system event name must not be empty".into());
                 }
-                if text.len() > MAX_EVENT_TEXT_LEN {
+                if event.len() > MAX_EVENT_TEXT_LEN {
                     return Err(format!(
-                        "system event text too long ({} chars, max {MAX_EVENT_TEXT_LEN})",
-                        text.len()
+                        "system event name too long ({} chars, max {MAX_EVENT_TEXT_LEN})",
+                        event.len()
                     ));
                 }
+                validate_json_payload_len(payload, "system event payload")?;
             }
             CronAction::AgentTurn {
                 message,
+                input,
                 timeout_secs,
                 ..
             } => {
-                if message.is_empty() {
-                    return Err("agent turn message must not be empty".into());
+                let has_structured_input = !input.items.is_empty();
+                let has_legacy_message = message.as_deref().is_some_and(|value| !value.is_empty());
+
+                if !has_structured_input && !has_legacy_message {
+                    return Err("agent turn input must not be empty".into());
                 }
-                if message.len() > MAX_TURN_MESSAGE_LEN {
-                    return Err(format!(
-                        "agent turn message too long ({} chars, max {MAX_TURN_MESSAGE_LEN})",
-                        message.len()
-                    ));
+
+                if let Some(message) = message {
+                    if message.len() > MAX_TURN_MESSAGE_LEN {
+                        return Err(format!(
+                            "agent turn message too long ({} chars, max {MAX_TURN_MESSAGE_LEN})",
+                            message.len()
+                        ));
+                    }
+                }
+
+                for (index, item) in input.items.iter().enumerate() {
+                    if item.item_type != "text" {
+                        return Err(format!(
+                            "agent turn input item {index} has unsupported type '{}'",
+                            item.item_type
+                        ));
+                    }
+                    let Some(text) = item.text.as_deref() else {
+                        return Err(format!("agent turn input item {index} must include text"));
+                    };
+                    if text.is_empty() {
+                        return Err(format!("agent turn input item {index} must not be empty"));
+                    }
+                    if text.len() > MAX_TURN_MESSAGE_LEN {
+                        return Err(format!(
+                            "agent turn input item {index} too long ({} chars, max {MAX_TURN_MESSAGE_LEN})",
+                            text.len()
+                        ));
+                    }
                 }
                 if let Some(t) = timeout_secs {
                     if *t < MIN_TIMEOUT_SECS {
@@ -313,16 +443,11 @@ impl CronJob {
                 input,
                 timeout_secs,
             } => {
-                if workflow_id.is_empty() {
+                if workflow_id.trim().is_empty() {
                     return Err("workflow_id must not be empty".into());
                 }
                 if let Some(i) = input {
-                    if i.len() > MAX_TURN_MESSAGE_LEN {
-                        return Err(format!(
-                            "workflow input too long ({} chars, max {MAX_TURN_MESSAGE_LEN})",
-                            i.len()
-                        ));
-                    }
+                    validate_json_payload_len(i, "workflow input")?;
                 }
                 if let Some(t) = timeout_secs {
                     if *t < MIN_TIMEOUT_SECS {
@@ -335,6 +460,19 @@ impl CronJob {
                         return Err(format!("timeout_secs too large ({t}, max 3600)"));
                     }
                 }
+            }
+            CronAction::WorkflowSignal {
+                signal,
+                selector,
+                payload,
+            } => {
+                if signal.trim().is_empty() {
+                    return Err("workflow signal name must not be empty".into());
+                }
+                if selector.workflow_id.trim().is_empty() {
+                    return Err("workflow signal selector.workflow_id must not be empty".into());
+                }
+                validate_json_payload_len(payload, "workflow signal payload")?;
             }
         }
         Ok(())
@@ -371,8 +509,7 @@ impl CronJob {
 // Cron expression basic format validation
 // ---------------------------------------------------------------------------
 
-/// Basic cron expression format validation: must have exactly 5 whitespace-separated fields.
-/// Actual parsing and scheduling is done in the kernel crate.
+/// Basic cron expression validation for standard 5-field expressions.
 fn validate_cron_expr(expr: &str) -> Result<(), String> {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
@@ -400,6 +537,23 @@ fn validate_cron_expr(expr: &str) -> Result<(), String> {
             ));
         }
     }
+
+    let seven_field = format!("0 {trimmed} *");
+    seven_field
+        .parse::<cron::Schedule>()
+        .map_err(|error| format!("invalid cron expression: {error}"))?;
+    Ok(())
+}
+
+fn validate_json_payload_len(payload: &JsonValue, label: &str) -> Result<(), String> {
+    let serialized = serde_json::to_string(payload)
+        .map_err(|error| format!("failed to serialize {label}: {error}"))?;
+    if serialized.len() > MAX_ACTION_PAYLOAD_LEN {
+        return Err(format!(
+            "{label} too long ({} chars, max {MAX_ACTION_PAYLOAD_LEN})",
+            serialized.len()
+        ));
+    }
     Ok(())
 }
 
@@ -412,6 +566,15 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    fn text_input(text: &str) -> CronTextInputPayload {
+        CronTextInputPayload {
+            items: vec![CronTextInputItem {
+                item_type: "text".to_string(),
+                text: Some(text.to_string()),
+            }],
+        }
+    }
+
     /// Helper: build a minimal valid CronJob.
     fn valid_job() -> CronJob {
         CronJob {
@@ -421,7 +584,8 @@ mod tests {
             enabled: true,
             schedule: CronSchedule::Every { every_secs: 3600 },
             action: CronAction::SystemEvent {
-                text: "ping".into(),
+                event: "daily.report".into(),
+                payload: JsonValue::Null,
             },
             delivery: CronDelivery::None,
             created_at: Utc::now(),
@@ -623,7 +787,8 @@ mod tests {
     fn system_event_empty_text() {
         let mut job = valid_job();
         job.action = CronAction::SystemEvent {
-            text: String::new(),
+            event: String::new(),
+            payload: JsonValue::Null,
         };
         let err = job.validate(0).unwrap_err();
         assert!(err.contains("empty"), "{err}");
@@ -633,7 +798,8 @@ mod tests {
     fn system_event_text_too_long() {
         let mut job = valid_job();
         job.action = CronAction::SystemEvent {
-            text: "x".repeat(4097),
+            event: "x".repeat(4097),
+            payload: JsonValue::Null,
         };
         let err = job.validate(0).unwrap_err();
         assert!(err.contains("too long"), "{err}");
@@ -643,7 +809,8 @@ mod tests {
     fn system_event_max_text_ok() {
         let mut job = valid_job();
         job.action = CronAction::SystemEvent {
-            text: "x".repeat(4096),
+            event: "x".repeat(4096),
+            payload: JsonValue::Null,
         };
         assert!(job.validate(0).is_ok());
     }
@@ -654,7 +821,8 @@ mod tests {
     fn agent_turn_empty_message() {
         let mut job = valid_job();
         job.action = CronAction::AgentTurn {
-            message: String::new(),
+            message: Some(String::new()),
+            input: CronTextInputPayload::default(),
             model_override: None,
             timeout_secs: None,
         };
@@ -666,7 +834,8 @@ mod tests {
     fn agent_turn_message_too_long() {
         let mut job = valid_job();
         job.action = CronAction::AgentTurn {
-            message: "x".repeat(16_385),
+            message: Some("x".repeat(16_385)),
+            input: CronTextInputPayload::default(),
             model_override: None,
             timeout_secs: None,
         };
@@ -678,7 +847,8 @@ mod tests {
     fn agent_turn_timeout_too_small() {
         let mut job = valid_job();
         job.action = CronAction::AgentTurn {
-            message: "hello".into(),
+            message: None,
+            input: text_input("hello"),
             model_override: None,
             timeout_secs: Some(9),
         };
@@ -690,7 +860,8 @@ mod tests {
     fn agent_turn_timeout_too_large() {
         let mut job = valid_job();
         job.action = CronAction::AgentTurn {
-            message: "hello".into(),
+            message: None,
+            input: text_input("hello"),
             model_override: None,
             timeout_secs: Some(601),
         };
@@ -702,14 +873,16 @@ mod tests {
     fn agent_turn_timeout_boundaries_ok() {
         let mut job = valid_job();
         job.action = CronAction::AgentTurn {
-            message: "hello".into(),
+            message: None,
+            input: text_input("hello"),
             model_override: Some("claude-haiku-4-5-20251001".into()),
             timeout_secs: Some(10),
         };
         assert!(job.validate(0).is_ok());
 
         job.action = CronAction::AgentTurn {
-            message: "hello".into(),
+            message: None,
+            input: text_input("hello"),
             model_override: None,
             timeout_secs: Some(600),
         };
@@ -720,7 +893,8 @@ mod tests {
     fn agent_turn_no_timeout_ok() {
         let mut job = valid_job();
         job.action = CronAction::AgentTurn {
-            message: "hello".into(),
+            message: None,
+            input: text_input("hello"),
             model_override: None,
             timeout_secs: None,
         };
@@ -848,7 +1022,8 @@ mod tests {
     #[test]
     fn serde_action_tags() {
         let action = CronAction::AgentTurn {
-            message: "hi".into(),
+            message: None,
+            input: text_input("hi"),
             model_override: None,
             timeout_secs: Some(30),
         };
@@ -909,7 +1084,9 @@ mod tests {
         let mut job = valid_job();
         job.action = CronAction::WorkflowRun {
             workflow_id: "my-report-pipeline".into(),
-            input: Some("generate daily metrics".into()),
+            input: Some(serde_json::json!({
+                "prompt": "generate daily metrics",
+            })),
             timeout_secs: Some(300),
         };
         assert!(job.validate(0).is_ok());
@@ -932,7 +1109,7 @@ mod tests {
         let mut job = valid_job();
         job.action = CronAction::WorkflowRun {
             workflow_id: "test".into(),
-            input: Some("x".repeat(16_385)),
+            input: Some(JsonValue::String("x".repeat(16_385))),
             timeout_secs: None,
         };
         let err = job.validate(0).unwrap_err();
@@ -989,7 +1166,9 @@ mod tests {
     fn serde_workflow_run_tag() {
         let action = CronAction::WorkflowRun {
             workflow_id: "my-wf".into(),
-            input: Some("go".into()),
+            input: Some(serde_json::json!({
+                "text": "go",
+            })),
             timeout_secs: Some(60),
         };
         let json = serde_json::to_string(&action).unwrap();

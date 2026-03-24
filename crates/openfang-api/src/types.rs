@@ -4,6 +4,9 @@ use openfang_agent_definition::{
     AgentDefinition, AgentProductMetadata, ProviderBinding, ValidationIssue,
 };
 use openfang_types::agent::AgentManifest;
+use openfang_types::scheduler::{
+    CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDelivery, CronSchedule,
+};
 use openfang_types::workflow::{
     NormalizedWorkflow, ValidationIssue as WorkflowValidationIssue, WorkflowIr,
     WorkflowV2Definition,
@@ -256,6 +259,204 @@ pub type WorkflowOriginKind = AgentOriginKind;
 pub type WorkflowOrigin = AgentOrigin;
 /// Workflow fork provenance uses the same payload shape as agent provenance.
 pub type WorkflowForkedFrom = AgentForkedFrom;
+/// Schedule definition origin uses the typed scheduler metadata shape.
+pub type ScheduleOrigin = CronDefinitionOrigin;
+/// Schedule fork provenance uses the typed scheduler metadata shape.
+pub type ScheduleForkedFrom = CronDefinitionForkedFrom;
+
+fn default_schedule_enabled() -> bool {
+    true
+}
+
+fn default_schedule_delivery() -> CronDelivery {
+    CronDelivery::None
+}
+
+/// Normalized schedule definition payload accepted by create, update, and validate flows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleDefinition {
+    pub agent: String,
+    pub name: String,
+    #[serde(default = "default_schedule_enabled")]
+    pub enabled: bool,
+    pub schedule: CronSchedule,
+    pub action: CronAction,
+    #[serde(default = "default_schedule_delivery")]
+    pub delivery: CronDelivery,
+}
+
+/// Runtime summary embedded in full schedule resources.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleRuntimeStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    pub consecutive_errors: u32,
+    pub one_shot: bool,
+}
+
+/// Full public schedule resource response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleResponse {
+    pub id: String,
+    pub agent: String,
+    pub name: String,
+    pub enabled: bool,
+    pub schedule: CronSchedule,
+    pub action: CronAction,
+    pub delivery: CronDelivery,
+    pub origin: ScheduleOrigin,
+    pub forked_from: Option<ScheduleForkedFrom>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub runtime_status: ScheduleRuntimeStatus,
+}
+
+/// Runtime summary embedded in schedule list items.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleListRuntimeStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+}
+
+/// One schedule item returned by `/api/v1/schedules`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleListItem {
+    pub id: String,
+    pub agent: String,
+    pub name: String,
+    pub enabled: bool,
+    pub schedule: CronSchedule,
+    pub action: CronAction,
+    pub runtime_status: ScheduleListRuntimeStatus,
+    pub updated_at: String,
+}
+
+/// Paginated schedule list response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleListResponse {
+    pub items: Vec<ScheduleListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// Structured validation issue returned by schedule validation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleValidationIssue {
+    pub severity: String,
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
+
+/// Request payload for schedule validation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleValidateRequest {
+    pub definition: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+}
+
+/// Response payload for schedule validation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleValidateResponse {
+    pub valid: bool,
+    pub issues: Vec<ScheduleValidationIssue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized: Option<ScheduleDefinition>,
+}
+
+/// Full runtime response for one schedule definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleRuntimeResponse {
+    pub schedule_id: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    pub consecutive_errors: u32,
+    pub one_shot: bool,
+}
+
+/// Request payload for schedule forks.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleForkRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// Request payload for schedule run-now operations.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleRunNowRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Accepted response for schedule operational actions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleAcceptedActionResponse {
+    pub accepted: bool,
+    pub resource_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// Resolved execution plan returned by schedule dry-run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleDryRunResolved {
+    pub schedule_id: String,
+    pub action: CronAction,
+}
+
+/// Estimated effects returned by schedule dry-run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleDryRunEffects {
+    pub schedule_fire: bool,
+}
+
+/// Explanation payload returned by schedule dry-run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleDryRunExplanation {
+    pub delivery: CronDelivery,
+}
+
+/// Dry-run response for schedule run-now simulation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScheduleDryRunResponse {
+    pub would_execute: bool,
+    pub resolved: ScheduleDryRunResolved,
+    pub effects: ScheduleDryRunEffects,
+    pub explanation: ScheduleDryRunExplanation,
+}
 
 /// Agent provider summary used in list responses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

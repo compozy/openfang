@@ -40,6 +40,8 @@ hex = { workspace = true }
 socket2 = { workspace = true }
 reqwest = { workspace = true }
 tempfile.workspace = true
+cron = "0.15.0"
+chrono-tz.workspace = true
 
 [dev-dependencies]
 tokio-test = { workspace = true }
