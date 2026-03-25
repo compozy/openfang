@@ -14,6 +14,10 @@ use openfang_types::task::{
     SortOrder, SubtaskId, SubtaskKind, SubtaskSortField, SubtaskStatus, TaskId, TaskReplanEffects,
     TaskSortField, TaskSource, TaskStatus,
 };
+use openfang_types::trigger::{
+    NormalizedTrigger, TriggerEvent, TriggerIr, TriggerTarget, TriggerV2Definition,
+    TriggerValidationIssue,
+};
 use openfang_types::workflow::{
     NormalizedWorkflow, ValidationIssue as WorkflowValidationIssue, WorkflowIr,
     WorkflowV2Definition,
@@ -637,6 +641,12 @@ pub type WorkflowOriginKind = AgentOriginKind;
 pub type WorkflowOrigin = AgentOrigin;
 /// Workflow fork provenance uses the same payload shape as agent provenance.
 pub type WorkflowForkedFrom = AgentForkedFrom;
+/// Trigger definition origin uses the same payload shape as agent origins.
+pub type TriggerOriginKind = AgentOriginKind;
+/// Trigger definition origin uses the same payload shape as agent origins.
+pub type TriggerOrigin = AgentOrigin;
+/// Trigger fork provenance uses the same payload shape as agent provenance.
+pub type TriggerForkedFrom = AgentForkedFrom;
 /// Schedule definition origin uses the typed scheduler metadata shape.
 pub type ScheduleOrigin = CronDefinitionOrigin;
 /// Schedule fork provenance uses the typed scheduler metadata shape.
@@ -938,6 +948,140 @@ pub struct WorkflowListItem {
 pub struct WorkflowListResponse {
     pub items: Vec<WorkflowListItem>,
     pub next_cursor: Option<String>,
+}
+
+/// Aggregated runtime status attached to trigger list items.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerListRuntimeStatus {
+    pub enabled: bool,
+    pub fire_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fired_at: Option<String>,
+}
+
+/// Full public trigger resource response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerResponse {
+    #[serde(flatten)]
+    pub definition: TriggerV2Definition,
+    pub origin: TriggerOrigin,
+    pub forked_from: Option<TriggerForkedFrom>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Trigger list item returned by `/api/v1/triggers`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerListItem {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    #[serde(rename = "match")]
+    pub trigger_match: openfang_types::trigger::TriggerMatch,
+    pub target: TriggerTarget,
+    pub runtime_status: TriggerListRuntimeStatus,
+    pub updated_at: String,
+}
+
+/// Paginated trigger definition list response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerListResponse {
+    pub items: Vec<TriggerListItem>,
+    pub next_cursor: Option<String>,
+}
+
+/// Request payload for trigger validation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerValidateRequest {
+    pub definition: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+}
+
+/// Response payload for trigger validation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerValidateResponse {
+    pub valid: bool,
+    pub issues: Vec<TriggerValidationIssue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized: Option<NormalizedTrigger>,
+}
+
+/// Request payload for trigger compilation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerCompileRequest {
+    pub definition: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+}
+
+/// Wrapper around the compiled trigger payload.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerCompiledPayload {
+    pub trigger_ir: TriggerIr,
+}
+
+/// Response payload for trigger compilation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerCompileResponse {
+    pub definition_id: String,
+    pub normalized: NormalizedTrigger,
+    pub compiled: TriggerCompiledPayload,
+}
+
+/// Response payload for fetching one compiled trigger definition.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerCompiledResponse {
+    pub definition_id: String,
+    pub normalized: NormalizedTrigger,
+    pub compiled: TriggerCompiledPayload,
+}
+
+/// Request payload for trigger forks.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerForkRequest {
+    pub mode: String,
+}
+
+/// Explanation payload returned by trigger dry-run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerTestExplanation {
+    pub r#match: String,
+    pub target_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<String>,
+}
+
+/// Request payload for trigger dry-run testing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerTestRequest {
+    pub event: TriggerEvent,
+}
+
+/// Response payload for trigger dry-run testing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct TriggerTestResponse {
+    pub matched: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_target: Option<TriggerTarget>,
+    pub would_dispatch: bool,
+    pub explanation: TriggerTestExplanation,
 }
 
 /// Full workflow runtime resource.

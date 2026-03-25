@@ -1,6 +1,7 @@
 //! Route handlers for the OpenFang API.
 
 use crate::agent_definitions::AgentDefinitionStore;
+use crate::trigger_definitions::{canonicalize_trigger_definition, TriggerDefinitionStore};
 use crate::types::*;
 use crate::workflow_definitions::{canonicalize_workflow_definition, WorkflowDefinitionStore};
 use axum::extract::{
@@ -20,6 +21,11 @@ use openfang_agent_definition::{
 use openfang_kernel::cron::JobMeta as ScheduleJobMeta;
 use openfang_kernel::kernel::ScheduleExecutionResult;
 use openfang_kernel::metering::MeteringEngine;
+use openfang_kernel::trigger_v2::{
+    compile_trigger_definition as compile_trigger_ir_definition, evaluate_compiled_trigger,
+    normalize_trigger_definition, validate_trigger_definition, validate_trigger_value,
+    TriggerCompileError, TriggerCompileRegistry, TriggerEngineError,
+};
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowRunId, WorkflowStep,
@@ -46,6 +52,7 @@ use openfang_types::task::{
     SortOrder, SubtaskId, SubtaskListQuery, SubtaskPatch, SubtaskRecord, SubtaskSortField,
     SubtaskStatus, TaskId, TaskListQuery, TaskRecord, TaskReplanRequest, TaskSortField, TaskSource,
 };
+use openfang_types::trigger::{NormalizedTrigger, TriggerRuntimeStatus, TriggerV2Definition};
 use openfang_types::workflow::{WorkflowIr, WorkflowIrStepKind};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -84,6 +91,7 @@ pub struct AgentSessionDetailQuery {
 const DEFAULT_PAGE_LIMIT: usize = 50;
 const MAX_PAGE_LIMIT: usize = 200;
 static WORKFLOW_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static TRIGGER_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SCHEDULE_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -100,6 +108,22 @@ pub struct WorkflowListQueryParams {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub tag: Option<String>,
+    #[serde(default, rename = "q")]
+    pub search: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct TriggerListQueryParams {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub event: Option<String>,
+    #[serde(default)]
+    pub target_kind: Option<String>,
     #[serde(default, rename = "q")]
     pub search: Option<String>,
 }
@@ -4604,6 +4628,233 @@ fn workflow_store_load_error_response(
     )
 }
 
+fn trigger_compile_error_response(
+    error: &TriggerCompileError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::BAD_REQUEST,
+        "validation_error",
+        "trigger definition is invalid",
+        Some(serde_json::to_value(error.issues()).unwrap_or(serde_json::Value::Null)),
+    )
+}
+
+fn trigger_definition_store(state: &AppState) -> TriggerDefinitionStore {
+    TriggerDefinitionStore::new(&state.kernel.config.home_dir)
+}
+
+fn trigger_definition_id_is_safe(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn ensure_safe_trigger_definition_id(
+    id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if trigger_definition_id_is_safe(id) {
+        return Ok(());
+    }
+
+    Err(workflow_v2_error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        "Trigger definition IDs may only contain ASCII letters, digits, `.`, `_`, or `-`",
+        Some(serde_json::json!([{
+            "path": "id",
+            "value": id,
+        }])),
+    ))
+}
+
+fn trigger_definition_not_found_response() -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Trigger definition not found",
+        None,
+    )
+}
+
+fn trigger_pack_conflict_response(id: &str) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::CONFLICT,
+        "managed_definition_conflict",
+        "Managed pack trigger definitions must be forked before modification",
+        Some(serde_json::json!([{
+            "path": "id",
+            "value": id,
+            "action": "fork",
+        }])),
+    )
+}
+
+fn trigger_store_load_error_response(
+    code: &str,
+    message: &str,
+    error: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        code,
+        message,
+        Some(serde_json::json!([{
+            "message": error.into(),
+        }])),
+    )
+}
+
+fn load_trigger_definition_resource(
+    state: &AppState,
+    definition_id: &str,
+) -> Result<Option<TriggerResponse>, (StatusCode, Json<serde_json::Value>)> {
+    trigger_definition_store(state)
+        .load(definition_id)
+        .map_err(|error| {
+            trigger_store_load_error_response(
+                "definition_load_failed",
+                "Failed to load trigger definition",
+                error,
+            )
+        })
+}
+
+fn load_all_trigger_definition_resources(
+    state: &AppState,
+) -> Result<Vec<TriggerResponse>, (StatusCode, Json<serde_json::Value>)> {
+    trigger_definition_store(state).list().map_err(|error| {
+        trigger_store_load_error_response(
+            "definition_load_failed",
+            "Failed to load trigger definitions",
+            error,
+        )
+    })
+}
+
+fn trigger_v2_is_valid(
+    issues: &[openfang_types::trigger::TriggerValidationIssue],
+    strict: bool,
+) -> bool {
+    if strict {
+        issues.is_empty()
+    } else {
+        !issues.iter().any(|issue| issue.severity.is_error())
+    }
+}
+
+fn trigger_definition_from_normalized(normalized: NormalizedTrigger) -> TriggerV2Definition {
+    TriggerV2Definition {
+        id: normalized.id,
+        name: normalized.name,
+        description: normalized.description,
+        enabled: normalized.enabled,
+        max_fires: normalized.max_fires,
+        cooldown_secs: normalized.cooldown_secs,
+        trigger_match: normalized.trigger_match,
+        target: normalized.target,
+    }
+}
+
+fn trigger_runtime_status_or_default(
+    state: &AppState,
+    definition: &TriggerV2Definition,
+) -> Result<TriggerRuntimeStatus, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .kernel
+        .runtime_stores
+        .trigger_runtime
+        .get_trigger_runtime(&definition.id)
+        .map(|record| {
+            record
+                .map(trigger_runtime_status_from_record)
+                .unwrap_or_else(|| TriggerRuntimeStatus {
+                    trigger_id: definition.id.clone(),
+                    enabled: definition.enabled,
+                    fire_count: 0,
+                    max_fires: definition.max_fires,
+                    cooldown_secs: definition.cooldown_secs,
+                    last_fired_at: None,
+                })
+        })
+        .map_err(|error| {
+            trigger_store_load_error_response(
+                "runtime_status_failed",
+                "Failed to load trigger runtime status",
+                error.to_string(),
+            )
+        })
+}
+
+fn trigger_runtime_status_from_record(
+    record: openfang_memory::TriggerRuntimeRecord,
+) -> TriggerRuntimeStatus {
+    TriggerRuntimeStatus {
+        trigger_id: record.trigger_id,
+        enabled: record.enabled,
+        fire_count: record.fire_count,
+        max_fires: record.max_fires,
+        cooldown_secs: record.cooldown_secs,
+        last_fired_at: record.last_fired_at,
+    }
+}
+
+fn trigger_list_item(resource: TriggerResponse, runtime: TriggerRuntimeStatus) -> TriggerListItem {
+    TriggerListItem {
+        id: resource.definition.id,
+        name: resource.definition.name,
+        enabled: resource.definition.enabled,
+        trigger_match: resource.definition.trigger_match,
+        target: resource.definition.target,
+        runtime_status: TriggerListRuntimeStatus {
+            enabled: runtime.enabled,
+            fire_count: runtime.fire_count,
+            last_fired_at: runtime.last_fired_at,
+        },
+        updated_at: resource.updated_at,
+    }
+}
+
+fn apply_trigger_engine_error(error: TriggerEngineError) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        TriggerEngineError::Compile(error) => trigger_compile_error_response(&error),
+        TriggerEngineError::Runtime(error) => trigger_store_load_error_response(
+            "definition_reload_failed",
+            "Failed to reload trigger definition into the runtime registry",
+            error.to_string(),
+        ),
+    }
+}
+
+fn trigger_target_kind_name(target: &openfang_types::trigger::TriggerTarget) -> &'static str {
+    target.kind()
+}
+
+fn trigger_runtime_response(runtime: TriggerRuntimeStatus) -> TriggerRuntimeStatus {
+    runtime
+}
+
+async fn trigger_compile_registry(
+    state: &AppState,
+) -> Result<TriggerCompileRegistry, (StatusCode, Json<serde_json::Value>)> {
+    let agents = agent_definition_store(state).list().map_err(|error| {
+        trigger_store_load_error_response(
+            "definition_load_failed",
+            "Failed to load agent definitions",
+            error,
+        )
+    })?;
+    let workflows = load_all_workflow_definition_resources(state)?;
+    let mut registry = TriggerCompileRegistry::new();
+    for agent in agents {
+        registry.insert_agent(agent.definition.id, Some(agent.definition.name));
+    }
+    for workflow in workflows {
+        registry.insert_workflow(workflow.definition.id, Some(workflow.definition.name));
+    }
+    Ok(registry)
+}
+
 fn workflow_run_summary(record: &openfang_memory::WorkflowRunRecord) -> serde_json::Value {
     serde_json::json!({
         "id": record.run_id,
@@ -7017,6 +7268,718 @@ pub async fn delete_workflow(
         ),
         Err(error) => workflow_internal_error("delete", Some(workflow_id), &error),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Trigger v1 control-plane routes
+// ---------------------------------------------------------------------------
+
+/// GET /api/v1/triggers — List typed trigger definitions.
+pub async fn list_trigger_definitions_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TriggerListQueryParams>,
+) -> impl IntoResponse {
+    let limit = match parse_pagination_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
+    let offset = match parse_cursor_offset(params.cursor.as_deref()) {
+        Ok(offset) => offset,
+        Err(response) => return response,
+    };
+    let runtime_statuses = match state
+        .kernel
+        .runtime_stores
+        .trigger_runtime
+        .list_trigger_runtimes()
+    {
+        Ok(records) => records
+            .into_iter()
+            .map(|record| {
+                let trigger_id = record.trigger_id.clone();
+                (trigger_id, trigger_runtime_status_from_record(record))
+            })
+            .collect::<HashMap<_, _>>(),
+        Err(error) => {
+            return trigger_store_load_error_response(
+                "runtime_status_failed",
+                "Failed to load trigger runtime status",
+                error.to_string(),
+            )
+        }
+    };
+
+    let search = params.search.map(|value| value.to_lowercase());
+    let items = match load_all_trigger_definition_resources(&state) {
+        Ok(resources) => resources,
+        Err(response) => return response,
+    }
+    .into_iter()
+    .filter(|resource| {
+        params
+            .enabled
+            .map(|enabled| resource.definition.enabled == enabled)
+            .unwrap_or(true)
+    })
+    .filter(|resource| {
+        params
+            .event
+            .as_ref()
+            .map(|event| resource.definition.trigger_match.event.as_deref() == Some(event.as_str()))
+            .unwrap_or(true)
+    })
+    .filter(|resource| {
+        params
+            .target_kind
+            .as_ref()
+            .map(|kind| trigger_target_kind_name(&resource.definition.target) == kind)
+            .unwrap_or(true)
+    })
+    .filter(|resource| {
+        search.as_ref().is_none_or(|needle| {
+            let haystack = format!(
+                "{} {} {} {} {}",
+                resource.definition.id,
+                resource.definition.name,
+                resource.definition.description,
+                serde_json::to_string(&resource.definition.trigger_match).unwrap_or_default(),
+                serde_json::to_string(&resource.definition.target).unwrap_or_default(),
+            )
+            .to_lowercase();
+            haystack.contains(needle)
+        })
+    })
+    .map(|resource| {
+        let runtime = runtime_statuses
+            .get(&resource.definition.id)
+            .cloned()
+            .unwrap_or_else(|| TriggerRuntimeStatus {
+                trigger_id: resource.definition.id.clone(),
+                enabled: resource.definition.enabled,
+                fire_count: 0,
+                max_fires: resource.definition.max_fires,
+                cooldown_secs: resource.definition.cooldown_secs,
+                last_fired_at: None,
+            });
+        trigger_list_item(resource, runtime)
+    })
+    .collect::<Vec<_>>();
+
+    let mut items = items;
+    items.sort_by(|left, right| {
+        left.updated_at
+            .cmp(&right.updated_at)
+            .then(left.id.cmp(&right.id))
+    });
+
+    let next_cursor = if offset + limit < items.len() {
+        Some((offset + limit).to_string())
+    } else {
+        None
+    };
+    let items = items
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(TriggerListResponse {
+            items,
+            next_cursor
+        })),
+    )
+}
+
+/// POST /api/v1/triggers — Create and persist a typed trigger definition.
+pub async fn create_trigger_definition_v1(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(body) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let _write_guard = TRIGGER_DEFINITION_WRITE_LOCK.lock().await;
+    let registry = match trigger_compile_registry(&state).await {
+        Ok(registry) => registry,
+        Err(response) => return response,
+    };
+    let definition = match validate_trigger_value(&body, &registry) {
+        Ok(definition) => definition,
+        Err(error) => return trigger_compile_error_response(&error),
+    };
+
+    if let Err(response) = ensure_safe_trigger_definition_id(&definition.id) {
+        return response;
+    }
+
+    let store = trigger_definition_store(&state);
+    match store.load(&definition.id) {
+        Ok(Some(_)) => {
+            return workflow_v2_error_response(
+                StatusCode::CONFLICT,
+                "definition_exists",
+                "Trigger definition already exists",
+                Some(serde_json::json!([{
+                    "path": "id",
+                    "value": definition.id,
+                }])),
+            )
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return trigger_store_load_error_response(
+                "definition_load_failed",
+                "Failed to load trigger definition",
+                error,
+            )
+        }
+    }
+
+    let normalized = match normalize_trigger_definition(&definition, &registry) {
+        Ok(normalized) => normalized,
+        Err(error) => return trigger_compile_error_response(&error),
+    };
+    let definition =
+        canonicalize_trigger_definition(trigger_definition_from_normalized(normalized));
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let resource = TriggerResponse {
+        definition,
+        origin: TriggerOrigin::user(),
+        forked_from: None,
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+
+    if let Err(error) = store.persist(&resource) {
+        return trigger_store_load_error_response(
+            "definition_persist_failed",
+            "Failed to persist trigger definition",
+            error,
+        );
+    }
+    if let Err(error) = state
+        .kernel
+        .trigger_v2
+        .upsert_definition(resource.definition.clone(), &registry)
+        .await
+    {
+        return apply_trigger_engine_error(error);
+    }
+
+    (StatusCode::CREATED, Json(serde_json::json!(resource)))
+}
+
+/// GET /api/v1/triggers/{id} — Load one persisted trigger definition.
+pub async fn get_trigger_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_trigger_definition_id(&id) {
+        return response;
+    }
+
+    match load_trigger_definition_resource(&state, &id) {
+        Ok(Some(resource)) => (StatusCode::OK, Json(serde_json::json!(resource))),
+        Ok(None) => trigger_definition_not_found_response(),
+        Err(response) => response,
+    }
+}
+
+/// PUT /api/v1/triggers/{id} — Replace one persisted trigger definition.
+pub async fn update_trigger_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_trigger_definition_id(&id) {
+        return response;
+    }
+
+    let Json(body) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let _write_guard = TRIGGER_DEFINITION_WRITE_LOCK.lock().await;
+    let registry = match trigger_compile_registry(&state).await {
+        Ok(registry) => registry,
+        Err(response) => return response,
+    };
+    let definition = match validate_trigger_value(&body, &registry) {
+        Ok(definition) => definition,
+        Err(error) => return trigger_compile_error_response(&error),
+    };
+
+    if definition.id != id {
+        return workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Path ID and body ID must match",
+            Some(serde_json::json!([{
+                "path": "id",
+                "expected": id,
+                "actual": definition.id,
+            }])),
+        );
+    }
+
+    let store = trigger_definition_store(&state);
+    let existing = match store.load(&id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return trigger_definition_not_found_response(),
+        Err(error) => {
+            return trigger_store_load_error_response(
+                "definition_load_failed",
+                "Failed to load trigger definition",
+                error,
+            )
+        }
+    };
+    if existing.origin.kind == TriggerOriginKind::Pack {
+        return trigger_pack_conflict_response(&id);
+    }
+
+    let normalized = match normalize_trigger_definition(&definition, &registry) {
+        Ok(normalized) => normalized,
+        Err(error) => return trigger_compile_error_response(&error),
+    };
+    let resource = TriggerResponse {
+        definition: canonicalize_trigger_definition(trigger_definition_from_normalized(normalized)),
+        origin: existing.origin,
+        forked_from: existing.forked_from,
+        created_at: existing.created_at,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    if let Err(error) = store.persist(&resource) {
+        return trigger_store_load_error_response(
+            "definition_persist_failed",
+            "Failed to persist trigger definition",
+            error,
+        );
+    }
+    if let Err(error) = state
+        .kernel
+        .trigger_v2
+        .upsert_definition(resource.definition.clone(), &registry)
+        .await
+    {
+        return apply_trigger_engine_error(error);
+    }
+
+    (StatusCode::OK, Json(serde_json::json!(resource)))
+}
+
+/// DELETE /api/v1/triggers/{id} — Delete one persisted trigger definition.
+pub async fn delete_trigger_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_trigger_definition_id(&id) {
+        return response.into_response();
+    }
+    let _write_guard = TRIGGER_DEFINITION_WRITE_LOCK.lock().await;
+
+    let store = trigger_definition_store(&state);
+    let existing = match store.load(&id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return trigger_definition_not_found_response().into_response(),
+        Err(error) => {
+            return trigger_store_load_error_response(
+                "definition_load_failed",
+                "Failed to load trigger definition",
+                error,
+            )
+            .into_response()
+        }
+    };
+    if existing.origin.kind == TriggerOriginKind::Pack {
+        return trigger_pack_conflict_response(&id).into_response();
+    }
+
+    match store.delete(&id) {
+        Ok(true) => {}
+        Ok(false) => return trigger_definition_not_found_response().into_response(),
+        Err(error) => {
+            return trigger_store_load_error_response(
+                "definition_delete_failed",
+                "Failed to delete trigger definition",
+                error,
+            )
+            .into_response()
+        }
+    }
+    if let Err(error) = state.kernel.trigger_v2.remove_definition(&id).await {
+        return trigger_store_load_error_response(
+            "definition_reload_failed",
+            "Failed to remove trigger definition from the runtime registry",
+            error.to_string(),
+        )
+        .into_response();
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// POST /api/v1/triggers/validate — Validate a trigger definition.
+pub async fn validate_trigger_definition_v1(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<TriggerValidateRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let registry = match trigger_compile_registry(&state).await {
+        Ok(registry) => registry,
+        Err(response) => return response,
+    };
+    let strict = request.strict.unwrap_or(false);
+
+    let (issues, normalized) = match validate_trigger_value(&request.definition, &registry) {
+        Ok(definition) => {
+            let issues = validate_trigger_definition(&definition, &registry);
+            let normalized = normalize_trigger_definition(&definition, &registry).ok();
+            (issues, normalized)
+        }
+        Err(error) => (error.issues().to_vec(), None),
+    };
+    let valid = trigger_v2_is_valid(&issues, strict);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(TriggerValidateResponse {
+            valid,
+            issues,
+            normalized,
+        })),
+    )
+}
+
+/// POST /api/v1/triggers/compile — Compile a trigger definition into IR.
+pub async fn compile_trigger_definition_v1(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<TriggerCompileRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let registry = match trigger_compile_registry(&state).await {
+        Ok(registry) => registry,
+        Err(response) => return response,
+    };
+    let definition = match validate_trigger_value(&request.definition, &registry) {
+        Ok(definition) => definition,
+        Err(error) => return trigger_compile_error_response(&error),
+    };
+    let normalized = match normalize_trigger_definition(&definition, &registry) {
+        Ok(normalized) => normalized,
+        Err(error) => return trigger_compile_error_response(&error),
+    };
+
+    match compile_trigger_ir_definition(&definition, &registry) {
+        Ok(trigger_ir) => (
+            StatusCode::OK,
+            Json(serde_json::json!(TriggerCompileResponse {
+                definition_id: definition.id,
+                normalized,
+                compiled: TriggerCompiledPayload { trigger_ir },
+            })),
+        ),
+        Err(error) => trigger_compile_error_response(&error),
+    }
+}
+
+/// GET /api/v1/triggers/{id}/compiled — Return the compiled IR for one persisted trigger definition.
+pub async fn get_trigger_compiled_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_trigger_definition_id(&id) {
+        return response;
+    }
+
+    let resource = match load_trigger_definition_resource(&state, &id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return trigger_definition_not_found_response(),
+        Err(response) => return response,
+    };
+    let registry = match trigger_compile_registry(&state).await {
+        Ok(registry) => registry,
+        Err(response) => return response,
+    };
+    let normalized = match normalize_trigger_definition(&resource.definition, &registry) {
+        Ok(normalized) => normalized,
+        Err(error) => return trigger_compile_error_response(&error),
+    };
+    match compile_trigger_ir_definition(&resource.definition, &registry) {
+        Ok(trigger_ir) => (
+            StatusCode::OK,
+            Json(serde_json::json!(TriggerCompiledResponse {
+                definition_id: resource.definition.id,
+                normalized,
+                compiled: TriggerCompiledPayload { trigger_ir },
+            })),
+        ),
+        Err(error) => trigger_compile_error_response(&error),
+    }
+}
+
+/// POST /api/v1/triggers/{id}/fork — Shadow a managed pack trigger with a user-owned copy.
+pub async fn fork_trigger_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<TriggerForkRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_trigger_definition_id(&id) {
+        return response;
+    }
+
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let _write_guard = TRIGGER_DEFINITION_WRITE_LOCK.lock().await;
+    if request.mode != "shadow" {
+        return workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Trigger forks currently support only `shadow` mode",
+            Some(serde_json::json!([{
+                "path": "mode",
+                "value": request.mode,
+            }])),
+        );
+    }
+
+    let store = trigger_definition_store(&state);
+    let existing = match store.load(&id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return trigger_definition_not_found_response(),
+        Err(error) => {
+            return trigger_store_load_error_response(
+                "definition_load_failed",
+                "Failed to load trigger definition",
+                error,
+            )
+        }
+    };
+    if existing.origin.kind != TriggerOriginKind::Pack {
+        return workflow_v2_error_response(
+            StatusCode::CONFLICT,
+            "invalid_fork_source",
+            "Only managed pack trigger definitions can be forked",
+            Some(serde_json::json!([{
+                "trigger_id": id,
+            }])),
+        );
+    }
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let resource = TriggerResponse {
+        definition: existing.definition.clone(),
+        origin: TriggerOrigin::user(),
+        forked_from: Some(TriggerForkedFrom {
+            kind: existing.origin.kind,
+            pack_id: existing.origin.pack_id.clone(),
+            pack_version: existing.origin.pack_version.clone(),
+            resource_type: "trigger".to_string(),
+            resource_id: id.clone(),
+        }),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+
+    if let Err(error) = store.persist(&resource) {
+        return trigger_store_load_error_response(
+            "definition_persist_failed",
+            "Failed to persist trigger definition",
+            error,
+        );
+    }
+    let registry = match trigger_compile_registry(&state).await {
+        Ok(registry) => registry,
+        Err(response) => return response,
+    };
+    if let Err(error) = state
+        .kernel
+        .trigger_v2
+        .upsert_definition(resource.definition.clone(), &registry)
+        .await
+    {
+        return apply_trigger_engine_error(error);
+    }
+
+    (StatusCode::OK, Json(serde_json::json!(resource)))
+}
+
+/// GET /api/v1/triggers/{id}/runtime — Load runtime state for one trigger definition.
+pub async fn get_trigger_runtime_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_trigger_definition_id(&id) {
+        return response;
+    }
+    let resource = match load_trigger_definition_resource(&state, &id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return trigger_definition_not_found_response(),
+        Err(response) => return response,
+    };
+    let runtime = match trigger_runtime_status_or_default(&state, &resource.definition) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(trigger_runtime_response(runtime))),
+    )
+}
+
+/// POST /api/v1/triggers/{id}/enable — Enable one trigger definition.
+pub async fn enable_trigger_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    set_trigger_definition_enabled(state, id, true).await
+}
+
+/// POST /api/v1/triggers/{id}/disable — Disable one trigger definition.
+pub async fn disable_trigger_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    set_trigger_definition_enabled(state, id, false).await
+}
+
+async fn set_trigger_definition_enabled(
+    state: Arc<AppState>,
+    id: String,
+    enabled: bool,
+) -> axum::response::Response {
+    if let Err(response) = ensure_safe_trigger_definition_id(&id) {
+        return response.into_response();
+    }
+    let _write_guard = TRIGGER_DEFINITION_WRITE_LOCK.lock().await;
+    let store = trigger_definition_store(&state);
+    let mut resource = match store.load(&id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return trigger_definition_not_found_response().into_response(),
+        Err(error) => {
+            return trigger_store_load_error_response(
+                "definition_load_failed",
+                "Failed to load trigger definition",
+                error,
+            )
+            .into_response()
+        }
+    };
+    if resource.origin.kind == TriggerOriginKind::Pack {
+        return trigger_pack_conflict_response(&id).into_response();
+    }
+
+    resource.definition.enabled = enabled;
+    resource.updated_at = chrono::Utc::now().to_rfc3339();
+    if let Err(error) = store.persist(&resource) {
+        return trigger_store_load_error_response(
+            "definition_persist_failed",
+            "Failed to persist trigger definition",
+            error,
+        )
+        .into_response();
+    }
+    let registry = match trigger_compile_registry(&state).await {
+        Ok(registry) => registry,
+        Err(response) => return response.into_response(),
+    };
+    if let Err(error) = state
+        .kernel
+        .trigger_v2
+        .upsert_definition(resource.definition.clone(), &registry)
+        .await
+    {
+        return apply_trigger_engine_error(error).into_response();
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!(AcceptedActionResponse {
+            accepted: true,
+            resource_id: id,
+            status: "accepted".to_string(),
+            session_id: None,
+        })),
+    )
+        .into_response()
+}
+
+/// POST /api/v1/triggers/{id}/test — Evaluate a trigger against a synthetic event without dispatching.
+pub async fn test_trigger_definition_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<TriggerTestRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_trigger_definition_id(&id) {
+        return response;
+    }
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let resource = match load_trigger_definition_resource(&state, &id) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return trigger_definition_not_found_response(),
+        Err(response) => return response,
+    };
+
+    let evaluation = match state
+        .kernel
+        .trigger_v2
+        .evaluate_trigger(&id, &request.event)
+        .await
+    {
+        Ok(Some(evaluation)) => evaluation,
+        Ok(None) => {
+            let registry = match trigger_compile_registry(&state).await {
+                Ok(registry) => registry,
+                Err(response) => return response,
+            };
+            let compiled = match compile_trigger_ir_definition(&resource.definition, &registry) {
+                Ok(compiled) => compiled,
+                Err(error) => return trigger_compile_error_response(&error),
+            };
+            let runtime = match trigger_runtime_status_or_default(&state, &resource.definition) {
+                Ok(runtime) => runtime,
+                Err(response) => return response,
+            };
+            evaluate_compiled_trigger(&compiled, &runtime, &request.event, chrono::Utc::now())
+        }
+        Err(error) => {
+            return trigger_store_load_error_response(
+                "runtime_status_failed",
+                "Failed to evaluate trigger",
+                error.to_string(),
+            )
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(TriggerTestResponse {
+            matched: evaluation.matched,
+            resolved_target: evaluation.resolved_target,
+            would_dispatch: evaluation.would_dispatch,
+            explanation: TriggerTestExplanation {
+                r#match: evaluation.explanation.match_summary,
+                target_kind: evaluation.explanation.target_kind,
+                blocked_by: evaluation.explanation.blocked_by,
+            },
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -19701,6 +20664,272 @@ mod agent_definition_route_tests {
             .expect("runtime projection should exist");
         assert!(!runtime.enabled);
         assert!(runtime.next_run.is_none());
+    }
+}
+
+#[cfg(test)]
+mod trigger_definition_route_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use openfang_types::config::{DefaultModelConfig, KernelConfig};
+    use serde_json::{json, Value};
+    use tempfile::TempDir;
+
+    struct RouteTestContext {
+        state: Arc<AppState>,
+        _tmp: TempDir,
+    }
+
+    impl Drop for RouteTestContext {
+        fn drop(&mut self) {
+            self.state.kernel.shutdown();
+        }
+    }
+
+    async fn route_test_context() -> RouteTestContext {
+        let tmp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = KernelConfig {
+            home_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().join("data"),
+            default_model: DefaultModelConfig {
+                provider: "ollama".to_string(),
+                model: "test-model".to_string(),
+                api_key_env: "OLLAMA_API_KEY".to_string(),
+                base_url: None,
+            },
+            ..KernelConfig::default()
+        };
+
+        let kernel =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel should boot"));
+        kernel.set_self_handle();
+        kernel.bootstrap_workflow_definitions().await;
+
+        let state = Arc::new(AppState {
+            kernel,
+            started_at: Instant::now(),
+            peer_registry: None,
+            bridge_manager: tokio::sync::Mutex::new(None),
+            channels_config: tokio::sync::RwLock::new(Default::default()),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            clawhub_cache: DashMap::new(),
+            provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        });
+
+        RouteTestContext { state, _tmp: tmp }
+    }
+
+    async fn json_response(response: impl IntoResponse) -> (StatusCode, Value) {
+        let response = response.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let json = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body should be valid JSON")
+        };
+        (status, json)
+    }
+
+    fn noop_workflow_definition(id: &str) -> Value {
+        json!({
+            "id": id,
+            "name": format!("Workflow {id}"),
+            "version": "1.0.0",
+            "description": "Trigger route test workflow",
+            "enabled": true,
+            "input": {
+                "kind": "object",
+                "required": [],
+                "open": true,
+                "fields": {}
+            },
+            "output": {
+                "kind": "object",
+                "required": ["result"],
+                "open": false,
+                "fields": {
+                    "result": { "kind": "string" }
+                }
+            },
+            "steps": [{
+                "id": "noop-step",
+                "name": "Noop Step",
+                "kind": "noop",
+                "save_as": "result",
+                "flow": { "mode": "sequential" }
+            }],
+            "outputs": {
+                "result": "{{ vars.result }}"
+            }
+        })
+    }
+
+    async fn create_workflow_definition(context: &RouteTestContext, id: &str) {
+        let (status, body) = json_response(
+            create_workflow_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(noop_workflow_definition(id))),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["id"], json!(id));
+    }
+
+    fn workflow_start_trigger(id: &str, workflow_id: &str) -> Value {
+        json!({
+            "id": id,
+            "name": format!("Trigger {id}"),
+            "description": "Trigger route test definition",
+            "enabled": true,
+            "max_fires": 3,
+            "cooldown_secs": 15,
+            "match": {
+                "event": "issue.created"
+            },
+            "target": {
+                "kind": "workflow_start",
+                "workflow": workflow_id,
+                "input": {
+                    "source": "tests"
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn validate_trigger_definition_should_treat_warnings_as_invalid_when_strict() {
+        let context = route_test_context().await;
+        create_workflow_definition(&context, "trigger-validate-workflow").await;
+
+        let mut definition =
+            workflow_start_trigger("broad-match-trigger", "trigger-validate-workflow");
+        definition["match"] = json!({});
+
+        let (status, body) = json_response(
+            validate_trigger_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(TriggerValidateRequest {
+                    definition,
+                    strict: Some(true),
+                    context: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["valid"], json!(false));
+        assert!(body["issues"]
+            .as_array()
+            .expect("issues should be an array")
+            .iter()
+            .any(|issue| issue["code"] == json!("broad_match")));
+    }
+
+    #[tokio::test]
+    async fn compile_trigger_definition_should_return_trigger_ir_payload() {
+        let context = route_test_context().await;
+        create_workflow_definition(&context, "trigger-compile-workflow").await;
+
+        let (status, body) = json_response(
+            compile_trigger_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(TriggerCompileRequest {
+                    definition: workflow_start_trigger(
+                        "compile-trigger",
+                        "trigger-compile-workflow",
+                    ),
+                    context: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["definition_id"], json!("compile-trigger"));
+        assert_eq!(body["normalized"]["id"], json!("compile-trigger"));
+        assert_eq!(
+            body["compiled"]["trigger_ir"]["trigger_id"],
+            json!("compile-trigger")
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_disable_trigger_definition_should_update_active_matching_set() {
+        let context = route_test_context().await;
+        create_workflow_definition(&context, "trigger-enable-workflow").await;
+
+        let (create_status, _) = json_response(
+            create_trigger_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(workflow_start_trigger(
+                    "toggle-trigger",
+                    "trigger-enable-workflow",
+                ))),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(create_status, StatusCode::CREATED);
+        assert_eq!(
+            context
+                .state
+                .kernel
+                .trigger_v2
+                .list_active_trigger_ids()
+                .await,
+            vec!["toggle-trigger".to_string()]
+        );
+
+        let (disable_status, disable_body) = json_response(
+            disable_trigger_definition_v1(
+                State(Arc::clone(&context.state)),
+                Path("toggle-trigger".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(disable_status, StatusCode::ACCEPTED);
+        assert_eq!(disable_body["accepted"], json!(true));
+        assert!(context
+            .state
+            .kernel
+            .trigger_v2
+            .list_active_trigger_ids()
+            .await
+            .is_empty());
+
+        let (enable_status, enable_body) = json_response(
+            enable_trigger_definition_v1(
+                State(Arc::clone(&context.state)),
+                Path("toggle-trigger".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(enable_status, StatusCode::ACCEPTED);
+        assert_eq!(enable_body["accepted"], json!(true));
+        assert_eq!(
+            context
+                .state
+                .kernel
+                .trigger_v2
+                .list_active_trigger_ids()
+                .await,
+            vec!["toggle-trigger".to_string()]
+        );
     }
 }
 

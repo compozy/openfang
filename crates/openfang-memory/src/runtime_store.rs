@@ -20,6 +20,10 @@ pub const AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL: &str =
 pub const SCHEDULE_RUNTIME_CORE_MIGRATION_SQL: &str =
     include_str!("../migrations/runtime/20260321_004_schedule_runtime_core.sql");
 
+/// SQL for migration `0005_trigger_runtime_core`.
+pub const TRIGGER_RUNTIME_CORE_MIGRATION_SQL: &str =
+    include_str!("../migrations/runtime/20260325_005_trigger_runtime_core.sql");
+
 /// Shared runtime.db store handles.
 #[derive(Clone)]
 pub struct RuntimeStoreSet {
@@ -33,6 +37,8 @@ pub struct RuntimeStoreSet {
     pub schedule_runtime: ScheduleRuntimeStore,
     /// Store for schedule execution receipts.
     pub schedule_execution: ScheduleExecutionStore,
+    /// Store for trigger runtime projections.
+    pub trigger_runtime: TriggerRuntimeStore,
 }
 
 impl RuntimeStoreSet {
@@ -43,6 +49,7 @@ impl RuntimeStoreSet {
             agent_session: AgentSessionStore::new(Arc::clone(&conn)),
             agent_message: AgentMessageStore::new(Arc::clone(&conn)),
             schedule_runtime: ScheduleRuntimeStore::new(Arc::clone(&conn)),
+            trigger_runtime: TriggerRuntimeStore::new(Arc::clone(&conn)),
             schedule_execution: ScheduleExecutionStore::new(conn),
         }
     }
@@ -153,6 +160,25 @@ pub struct ScheduleExecutionRecord {
     pub error: Option<String>,
 }
 
+/// Durable trigger runtime projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerRuntimeRecord {
+    /// Stable trigger definition identifier.
+    pub trigger_id: String,
+    /// Whether the trigger is enabled for active matching.
+    pub enabled: bool,
+    /// Number of successful dispatches recorded so far.
+    pub fire_count: u64,
+    /// Maximum number of fires before auto-disable. Zero means unlimited.
+    pub max_fires: u64,
+    /// Cooldown window in seconds between dispatches.
+    pub cooldown_secs: u64,
+    /// Timestamp of the last successful fire, if any.
+    pub last_fired_at: Option<String>,
+    /// Last projection update timestamp (RFC 3339).
+    pub updated_at: String,
+}
+
 /// Store for `agent_runtime`.
 #[derive(Clone)]
 pub struct AgentRuntimeStore {
@@ -180,6 +206,12 @@ pub struct ScheduleRuntimeStore {
 /// Store for `schedule_execution`.
 #[derive(Clone)]
 pub struct ScheduleExecutionStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+/// Store for `trigger_runtime`.
+#[derive(Clone)]
+pub struct TriggerRuntimeStore {
     conn: Arc<Mutex<Connection>>,
 }
 
@@ -775,6 +807,111 @@ impl ScheduleExecutionStore {
     }
 }
 
+impl TriggerRuntimeStore {
+    /// Create a trigger runtime store from a shared runtime.db connection.
+    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    /// Insert or update one trigger runtime projection.
+    pub fn upsert_trigger_runtime(&self, record: &TriggerRuntimeRecord) -> OpenFangResult<()> {
+        let conn = lock_conn(&self.conn)?;
+        conn.execute(
+            "INSERT INTO trigger_runtime (
+                trigger_id,
+                enabled,
+                fire_count,
+                max_fires,
+                cooldown_secs,
+                last_fired_at,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(trigger_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                fire_count = excluded.fire_count,
+                max_fires = excluded.max_fires,
+                cooldown_secs = excluded.cooldown_secs,
+                last_fired_at = excluded.last_fired_at,
+                updated_at = excluded.updated_at",
+            params![
+                record.trigger_id.as_str(),
+                bool_to_sql(record.enabled),
+                u64_to_i64(record.fire_count)?,
+                u64_to_i64(record.max_fires)?,
+                u64_to_i64(record.cooldown_secs)?,
+                record.last_fired_at.as_deref(),
+                record.updated_at.as_str(),
+            ],
+        )
+        .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    /// Load one trigger runtime projection by ID.
+    pub fn get_trigger_runtime(
+        &self,
+        trigger_id: &str,
+    ) -> OpenFangResult<Option<TriggerRuntimeRecord>> {
+        let conn = lock_conn(&self.conn)?;
+        conn.prepare(
+            "SELECT
+                trigger_id,
+                enabled,
+                fire_count,
+                max_fires,
+                cooldown_secs,
+                last_fired_at,
+                updated_at
+             FROM trigger_runtime
+             WHERE trigger_id = ?1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row([trigger_id], read_trigger_runtime_row)
+                .optional()
+        })
+        .map_err(sqlite_err)
+    }
+
+    /// List all trigger runtime projections.
+    pub fn list_trigger_runtimes(&self) -> OpenFangResult<Vec<TriggerRuntimeRecord>> {
+        let conn = lock_conn(&self.conn)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    trigger_id,
+                    enabled,
+                    fire_count,
+                    max_fires,
+                    cooldown_secs,
+                    last_fired_at,
+                    updated_at
+                 FROM trigger_runtime
+                 ORDER BY trigger_id",
+            )
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([], read_trigger_runtime_row)
+            .map_err(sqlite_err)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(sqlite_err)?);
+        }
+        Ok(records)
+    }
+
+    /// Delete one trigger runtime projection.
+    pub fn remove_trigger_runtime(&self, trigger_id: &str) -> OpenFangResult<()> {
+        let conn = lock_conn(&self.conn)?;
+        conn.execute(
+            "DELETE FROM trigger_runtime WHERE trigger_id = ?1",
+            [trigger_id],
+        )
+        .map_err(sqlite_err)?;
+        Ok(())
+    }
+}
+
 fn lock_conn(conn: &Arc<Mutex<Connection>>) -> OpenFangResult<MutexGuard<'_, Connection>> {
     conn.lock().map_err(|error| {
         OpenFangError::Internal(format!(
@@ -832,6 +969,24 @@ fn i64_to_u32(value: i64) -> Result<u32, rusqlite::Error> {
             rusqlite::types::Type::Integer,
             Box::new(error),
         )
+    })
+}
+
+fn i64_to_u64(value: i64) -> Result<u64, rusqlite::Error> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+fn u64_to_i64(value: u64) -> OpenFangResult<i64> {
+    i64::try_from(value).map_err(|error| {
+        OpenFangError::Internal(format!(
+            "runtime.db integer overflow while storing unsigned value: {error}"
+        ))
     })
 }
 
@@ -967,6 +1122,20 @@ fn read_schedule_execution_row(
     })
 }
 
+fn read_trigger_runtime_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<TriggerRuntimeRecord, rusqlite::Error> {
+    Ok(TriggerRuntimeRecord {
+        trigger_id: row.get(0)?,
+        enabled: sql_to_bool(row.get::<_, i64>(1)?),
+        fire_count: i64_to_u64(row.get(2)?)?,
+        max_fires: i64_to_u64(row.get(3)?)?,
+        cooldown_secs: i64_to_u64(row.get(4)?)?,
+        last_fired_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,6 +1149,8 @@ mod tests {
             .expect("apply agent session/message schema");
         conn.execute_batch(SCHEDULE_RUNTIME_CORE_MIGRATION_SQL)
             .expect("apply schedule runtime schema");
+        conn.execute_batch(TRIGGER_RUNTIME_CORE_MIGRATION_SQL)
+            .expect("apply trigger runtime schema");
         Arc::new(Mutex::new(conn))
     }
 
@@ -1185,5 +1356,50 @@ mod tests {
             .expect("list execution receipts");
 
         assert_eq!(executions, vec![first, second]);
+    }
+
+    #[test]
+    fn trigger_runtime_store_should_round_trip_records() {
+        let stores = RuntimeStoreSet::new(runtime_conn());
+        let initial = TriggerRuntimeRecord {
+            trigger_id: "nightly-build-failed".to_string(),
+            enabled: true,
+            fire_count: 1,
+            max_fires: 5,
+            cooldown_secs: 60,
+            last_fired_at: Some("2026-03-25T01:00:00Z".to_string()),
+            updated_at: "2026-03-25T01:00:01Z".to_string(),
+        };
+        let updated = TriggerRuntimeRecord {
+            trigger_id: initial.trigger_id.clone(),
+            enabled: false,
+            fire_count: 2,
+            max_fires: 5,
+            cooldown_secs: 300,
+            last_fired_at: Some("2026-03-25T02:00:00Z".to_string()),
+            updated_at: "2026-03-25T02:00:01Z".to_string(),
+        };
+
+        stores
+            .trigger_runtime
+            .upsert_trigger_runtime(&initial)
+            .expect("store initial trigger runtime");
+        stores
+            .trigger_runtime
+            .upsert_trigger_runtime(&updated)
+            .expect("store updated trigger runtime");
+
+        let loaded = stores
+            .trigger_runtime
+            .get_trigger_runtime(&initial.trigger_id)
+            .expect("load trigger runtime")
+            .expect("trigger runtime exists");
+        let listed = stores
+            .trigger_runtime
+            .list_trigger_runtimes()
+            .expect("list trigger runtimes");
+
+        assert_eq!(loaded, updated);
+        assert_eq!(listed, vec![updated]);
     }
 }

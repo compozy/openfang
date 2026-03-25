@@ -13,6 +13,7 @@ use crate::metering::MeteringEngine;
 use crate::registry::AgentRegistry;
 use crate::scheduler::AgentScheduler;
 use crate::supervisor::Supervisor;
+use crate::trigger_v2::TriggerV2Engine;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{
     HitlAnswerDisposition, HitlResumeContext, Workflow, WorkflowAgentDispatchOutcome,
@@ -172,6 +173,8 @@ pub struct OpenFangKernel {
     pub workflows: WorkflowEngine,
     /// Event-driven trigger engine.
     pub triggers: TriggerEngine,
+    /// Trigger v2 definition registry and active matching set.
+    pub trigger_v2: TriggerV2Engine,
     /// Background agent executor.
     pub background: BackgroundExecutor,
     /// Merkle hash chain audit trail.
@@ -1224,6 +1227,7 @@ impl OpenFangKernel {
                 workflow_stores.clone(),
             ),
             triggers: TriggerEngine::new(),
+            trigger_v2: TriggerV2Engine::new(runtime_stores.trigger_runtime.clone()),
             background,
             audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
             metering,
@@ -10194,7 +10198,7 @@ mod tests {
             schema_migration_exists(&runtime_db),
             "runtime.db migrations should complete before compozy.db migration starts"
         );
-        assert_eq!(schema_migration_rows(&runtime_db).len(), 4);
+        assert_eq!(schema_migration_rows(&runtime_db).len(), 5);
     }
 
     #[test]
@@ -10319,7 +10323,7 @@ mod tests {
         let runtime_rows = schema_migration_rows(&runtime_db);
         let compozy_rows = schema_migration_rows(&compozy_db);
 
-        assert_eq!(runtime_rows.len(), 4);
+        assert_eq!(runtime_rows.len(), 5);
         assert_eq!(compozy_rows.len(), 11);
         assert_eq!(runtime_rows[0].0, 1);
         assert_eq!(compozy_rows[0].0, 1);
@@ -10327,6 +10331,7 @@ mod tests {
         assert_eq!(runtime_rows[1].1, "0002_agent_runtime_core");
         assert_eq!(runtime_rows[2].1, "0003_agent_sessions_and_messages");
         assert_eq!(runtime_rows[3].1, "0004_schedule_runtime_core");
+        assert_eq!(runtime_rows[4].1, "0005_trigger_runtime_core");
         assert_eq!(compozy_rows[0].1, "schema_migrations_bootstrap");
         assert_eq!(compozy_rows[1].1, "0002_workflow_run_core");
         assert_eq!(compozy_rows[2].1, "0003_workflow_checkpoint");

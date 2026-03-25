@@ -260,7 +260,7 @@ fn migration_status_is_queryable_after_boot() {
     let runtime_rows = schema_migration_rows(&runtime_db);
     let compozy_rows = schema_migration_rows(&compozy_db);
 
-    assert_eq!(runtime_rows.len(), 4);
+    assert_eq!(runtime_rows.len(), 5);
     assert_eq!(compozy_rows.len(), 11);
     assert_eq!(runtime_rows[0].0, 1);
     assert_eq!(compozy_rows[0].0, 1);
@@ -268,6 +268,7 @@ fn migration_status_is_queryable_after_boot() {
     assert_eq!(runtime_rows[1].1, "0002_agent_runtime_core");
     assert_eq!(runtime_rows[2].1, "0003_agent_sessions_and_messages");
     assert_eq!(runtime_rows[3].1, "0004_schedule_runtime_core");
+    assert_eq!(runtime_rows[4].1, "0005_trigger_runtime_core");
     assert_eq!(compozy_rows[0].1, "schema_migrations_bootstrap");
     assert_eq!(compozy_rows[1].1, "0002_workflow_run_core");
     assert_eq!(compozy_rows[2].1, "0003_workflow_checkpoint");

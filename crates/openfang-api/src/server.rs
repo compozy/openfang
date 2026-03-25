@@ -1,12 +1,16 @@
 //! OpenFang daemon server — boots the kernel and serves the HTTP API.
 
+use crate::agent_definitions::AgentDefinitionStore;
 use crate::channel_bridge;
 use crate::middleware;
 use crate::rate_limiter;
 use crate::routes::{self, AppState};
+use crate::trigger_definitions::TriggerDefinitionStore;
 use crate::webchat;
+use crate::workflow_definitions::WorkflowDefinitionStore;
 use crate::ws;
 use axum::Router;
+use openfang_kernel::trigger_v2::TriggerCompileRegistry;
 use openfang_kernel::OpenFangKernel;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -15,7 +19,7 @@ use std::time::Instant;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Daemon info written to `~/.openfang/daemon.json` so the CLI can find us.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -359,14 +363,49 @@ pub async fn build_router(
                 .put(routes::set_agent_kv_key)
                 .delete(routes::delete_agent_kv_key),
         )
-        // Trigger endpoints
+        // Trigger v1 control-plane endpoints
         .route(
-            "/api/triggers",
-            axum::routing::get(routes::list_triggers).post(routes::create_trigger),
+            "/api/v1/triggers",
+            axum::routing::get(routes::list_trigger_definitions_v1)
+                .post(routes::create_trigger_definition_v1),
         )
         .route(
-            "/api/triggers/{id}",
-            axum::routing::delete(routes::delete_trigger).put(routes::update_trigger),
+            "/api/v1/triggers/{id}",
+            axum::routing::get(routes::get_trigger_definition_v1)
+                .put(routes::update_trigger_definition_v1)
+                .delete(routes::delete_trigger_definition_v1),
+        )
+        .route(
+            "/api/v1/triggers/validate",
+            axum::routing::post(routes::validate_trigger_definition_v1),
+        )
+        .route(
+            "/api/v1/triggers/compile",
+            axum::routing::post(routes::compile_trigger_definition_v1),
+        )
+        .route(
+            "/api/v1/triggers/{id}/compiled",
+            axum::routing::get(routes::get_trigger_compiled_v1),
+        )
+        .route(
+            "/api/v1/triggers/{id}/fork",
+            axum::routing::post(routes::fork_trigger_definition_v1),
+        )
+        .route(
+            "/api/v1/triggers/{id}/runtime",
+            axum::routing::get(routes::get_trigger_runtime_v1),
+        )
+        .route(
+            "/api/v1/triggers/{id}/enable",
+            axum::routing::post(routes::enable_trigger_definition_v1),
+        )
+        .route(
+            "/api/v1/triggers/{id}/disable",
+            axum::routing::post(routes::disable_trigger_definition_v1),
+        )
+        .route(
+            "/api/v1/triggers/{id}/test",
+            axum::routing::post(routes::test_trigger_definition_v1),
         )
         // Schedule v1 control-plane endpoints
         .route(
@@ -963,6 +1002,64 @@ pub async fn build_router(
     (app, state)
 }
 
+async fn bootstrap_trigger_definitions(kernel: &Arc<OpenFangKernel>) {
+    let trigger_store = TriggerDefinitionStore::new(&kernel.config.home_dir);
+    let trigger_resources = match trigger_store.list() {
+        Ok(resources) => resources,
+        Err(error) => {
+            warn!("Trigger bootstrap skipped because trigger definitions could not be loaded: {error}");
+            return;
+        }
+    };
+
+    let agent_resources = match AgentDefinitionStore::new(&kernel.config.home_dir).list() {
+        Ok(resources) => resources,
+        Err(error) => {
+            warn!(
+                "Trigger bootstrap skipped because agent definitions could not be loaded: {error}"
+            );
+            return;
+        }
+    };
+    let workflow_resources = match WorkflowDefinitionStore::new(&kernel.config.home_dir).list() {
+        Ok(resources) => resources,
+        Err(error) => {
+            warn!(
+                "Trigger bootstrap skipped because workflow definitions could not be loaded: {error}"
+            );
+            return;
+        }
+    };
+
+    let mut registry = TriggerCompileRegistry::new();
+    for agent in agent_resources {
+        registry.insert_agent(agent.definition.id, Some(agent.definition.name));
+    }
+    for workflow in workflow_resources {
+        registry.insert_workflow(workflow.definition.id, Some(workflow.definition.name));
+    }
+
+    let definitions = trigger_resources
+        .iter()
+        .map(|resource| resource.definition.clone())
+        .collect::<Vec<_>>();
+    match kernel
+        .trigger_v2
+        .replace_definitions(definitions, &registry)
+        .await
+    {
+        Ok(()) => {
+            info!(
+                loaded = trigger_resources.len(),
+                "Trigger bootstrap completed"
+            );
+        }
+        Err(error) => {
+            warn!("Trigger bootstrap completed with recoverable errors: {error}");
+        }
+    }
+}
+
 /// Start the OpenFang daemon: boot kernel + HTTP API server.
 ///
 /// This function blocks until Ctrl+C or a shutdown request.
@@ -976,6 +1073,7 @@ pub async fn run_daemon(
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
     kernel.bootstrap_workflow_definitions().await;
+    bootstrap_trigger_definitions(&kernel).await;
     kernel.recover_looper_runs_on_startup().await?;
     kernel.start_background_agents();
 

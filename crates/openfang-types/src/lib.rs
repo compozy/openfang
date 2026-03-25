@@ -24,6 +24,7 @@ pub mod taint;
 pub mod task;
 pub mod tool;
 pub mod tool_compat;
+pub mod trigger;
 pub mod webhook;
 pub mod workflow;
 
