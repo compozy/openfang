@@ -10324,7 +10324,7 @@ mod tests {
         let compozy_rows = schema_migration_rows(&compozy_db);
 
         assert_eq!(runtime_rows.len(), 5);
-        assert_eq!(compozy_rows.len(), 11);
+        assert_eq!(compozy_rows.len(), 12);
         assert_eq!(runtime_rows[0].0, 1);
         assert_eq!(compozy_rows[0].0, 1);
         assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -10343,6 +10343,7 @@ mod tests {
         assert_eq!(compozy_rows[8].1, "0009_hitl_request");
         assert_eq!(compozy_rows[9].1, "0010_task_subtask");
         assert_eq!(compozy_rows[10].1, "0011_looper_runtime");
+        assert_eq!(compozy_rows[11].1, "0012_artifact_doc_versioning");
 
         kernel.shutdown();
     }

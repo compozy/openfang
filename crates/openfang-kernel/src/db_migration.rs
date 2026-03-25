@@ -5,12 +5,12 @@
 
 use openfang_memory::{
     AGENT_DISPATCH_MIGRATION_SQL, AGENT_RUNTIME_CORE_MIGRATION_SQL,
-    AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL, HITL_REQUEST_MIGRATION_SQL,
-    LOOPER_RUNTIME_MIGRATION_SQL, SCHEDULE_RUNTIME_CORE_MIGRATION_SQL, TASK_SUBTASK_MIGRATION_SQL,
-    TRIGGER_RUNTIME_CORE_MIGRATION_SQL, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
-    WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL, WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL,
-    WORKFLOW_RUN_CORE_MIGRATION_SQL, WORKFLOW_SIGNAL_MIGRATION_SQL,
-    WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
+    AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL, ARTIFACT_DOC_VERSIONING_MIGRATION_SQL,
+    HITL_REQUEST_MIGRATION_SQL, LOOPER_RUNTIME_MIGRATION_SQL, SCHEDULE_RUNTIME_CORE_MIGRATION_SQL,
+    TASK_SUBTASK_MIGRATION_SQL, TRIGGER_RUNTIME_CORE_MIGRATION_SQL,
+    WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
+    WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
+    WORKFLOW_SIGNAL_MIGRATION_SQL, WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
@@ -175,6 +175,11 @@ const COMPOZY_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[
     MigrationStep::new(9, "0009_hitl_request", HITL_REQUEST_MIGRATION_SQL),
     MigrationStep::new(10, "0010_task_subtask", TASK_SUBTASK_MIGRATION_SQL),
     MigrationStep::new(11, "0011_looper_runtime", LOOPER_RUNTIME_MIGRATION_SQL),
+    MigrationStep::new(
+        12,
+        "0012_artifact_doc_versioning",
+        ARTIFACT_DOC_VERSIONING_MIGRATION_SQL,
+    ),
 ];
 
 /// Returns the current `runtime.db` migration slice.
@@ -757,6 +762,16 @@ mod tests {
             "idx_hitl_dispatch",
             "idx_hitl_status",
             "idx_hitl_run_step_sequence",
+            "idx_artifact_created_at",
+            "idx_artifact_type_created_at",
+            "idx_artifact_version_artifact_id_version_no",
+            "idx_artifact_version_content_hash",
+            "idx_artifact_version_created_at",
+            "idx_doc_created_at",
+            "idx_doc_type_created_at",
+            "idx_doc_version_doc_id_version_no",
+            "idx_doc_version_content_hash",
+            "idx_doc_version_created_at",
         ] {
             assert!(
                 index_exists(&conn, index_name),
@@ -780,6 +795,9 @@ mod tests {
             "task",
             "subtask",
             "artifact",
+            "artifact_version",
+            "doc",
+            "doc_version",
             "looper_run",
         ] {
             assert!(
@@ -813,8 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn compozy_db_migration_should_not_include_later_phase_tables_beyond_looper_or_cross_database_sql(
-    ) {
+    fn compozy_db_migration_should_not_include_cross_database_sql_or_pack_tables() {
         let compozy_sql = compozy_migration_steps()
             .iter()
             .map(|step| step.sql)
@@ -822,10 +839,8 @@ mod tests {
             .join("\n");
 
         for disallowed_fragment in [
-            "CREATE TABLE artifact",
-            "CREATE TABLE IF NOT EXISTS artifact",
-            "CREATE TABLE doc",
-            "CREATE TABLE IF NOT EXISTS doc",
+            "CREATE TABLE pack",
+            "CREATE TABLE IF NOT EXISTS pack",
             "ATTACH DATABASE",
             "attach database",
         ] {
@@ -849,6 +864,10 @@ mod tests {
         assert!(table_exists(&conn, "subtask"));
         assert!(table_exists(&conn, "looper_run"));
         assert!(table_exists(&conn, "looper_subtask"));
+        assert!(table_exists(&conn, "artifact"));
+        assert!(table_exists(&conn, "artifact_version"));
+        assert!(table_exists(&conn, "doc"));
+        assert!(table_exists(&conn, "doc_version"));
         for index_name in [
             "idx_dispatch_run",
             "idx_dispatch_parent",
@@ -866,6 +885,16 @@ mod tests {
             "idx_looper_run_status",
             "idx_looper_subtask_looper_run_id",
             "idx_looper_subtask_status",
+            "idx_artifact_created_at",
+            "idx_artifact_type_created_at",
+            "idx_artifact_version_artifact_id_version_no",
+            "idx_artifact_version_content_hash",
+            "idx_artifact_version_created_at",
+            "idx_doc_created_at",
+            "idx_doc_type_created_at",
+            "idx_doc_version_doc_id_version_no",
+            "idx_doc_version_content_hash",
+            "idx_doc_version_created_at",
         ] {
             assert!(
                 index_exists(&conn, index_name),
@@ -878,11 +907,11 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("query schema_migration row count");
-        assert_eq!(migration_count, 11);
+        assert_eq!(migration_count, 12);
     }
 
     #[test]
-    fn compozy_db_file_migration_should_bootstrap_task_subtask_schema_idempotently() {
+    fn compozy_db_file_migration_should_bootstrap_domain_schema_idempotently() {
         let dir = tempdir().expect("create temp dir");
         let db_path = dir.path().join("compozy.db");
         let conn = Connection::open(&db_path).expect("open file-backed compozy.db");
@@ -896,6 +925,10 @@ mod tests {
         assert!(table_exists(&conn, "subtask"));
         assert!(table_exists(&conn, "looper_run"));
         assert!(table_exists(&conn, "looper_subtask"));
+        assert!(table_exists(&conn, "artifact"));
+        assert!(table_exists(&conn, "artifact_version"));
+        assert!(table_exists(&conn, "doc"));
+        assert!(table_exists(&conn, "doc_version"));
         assert_eq!(
             table_columns(&conn, "task"),
             vec![
@@ -944,6 +977,54 @@ mod tests {
                 "created_at",
                 "updated_at",
                 "completed_at",
+            ]
+        );
+        assert_eq!(
+            table_columns(&conn, "artifact"),
+            vec![
+                "artifact_id",
+                "type",
+                "current_version_id",
+                "metadata_json",
+                "created_at",
+                "updated_at",
+            ]
+        );
+        assert_eq!(
+            table_columns(&conn, "artifact_version"),
+            vec![
+                "artifact_version_id",
+                "artifact_id",
+                "version_no",
+                "content_json",
+                "content_hash",
+                "created_by_kind",
+                "created_by_ref",
+                "created_at",
+            ]
+        );
+        assert_eq!(
+            table_columns(&conn, "doc"),
+            vec![
+                "doc_id",
+                "type",
+                "current_version_id",
+                "metadata_json",
+                "created_at",
+                "updated_at",
+            ]
+        );
+        assert_eq!(
+            table_columns(&conn, "doc_version"),
+            vec![
+                "doc_version_id",
+                "doc_id",
+                "version_no",
+                "content_json",
+                "content_hash",
+                "created_by_kind",
+                "created_by_ref",
+                "created_at",
             ]
         );
     }

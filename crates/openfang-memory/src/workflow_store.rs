@@ -1,9 +1,11 @@
 //! Typed `compozy.db` repositories for durable workflow runtime state.
 
+use crate::artifact::ArtifactRepository;
 use crate::dispatch::{
     list_dispatch_summaries_by_run, resolve_update_conflict as resolve_dispatch_update_conflict,
     update_dispatch_row, DispatchRecord, DispatchSummaryRecord, SqliteDispatchRepository,
 };
+use crate::doc::DocRepository;
 use crate::hitl::{
     ensure_pending_transition, insert_hitl_request, load_required_hitl_request, next_sequence_no,
     HitlRecord, HitlStatus, NewHitlRequest, SqliteHitlRepository,
@@ -62,6 +64,10 @@ pub struct WorkflowStoreSet {
     pub task: TaskRepository,
     /// Repository for durable subtask state.
     pub subtask: SubtaskRepository,
+    /// Repository for durable artifact state.
+    pub artifact: ArtifactRepository,
+    /// Repository for durable document state.
+    pub doc: DocRepository,
 }
 
 impl WorkflowStoreSet {
@@ -78,6 +84,8 @@ impl WorkflowStoreSet {
             looper_subtask: LooperSubtaskRepository::new(Arc::clone(&conn)),
             task: TaskRepository::new(Arc::clone(&conn)),
             subtask: SubtaskRepository::new(Arc::clone(&conn)),
+            artifact: ArtifactRepository::new(Arc::clone(&conn)),
+            doc: DocRepository::new(Arc::clone(&conn)),
             workflow_signal: WorkflowSignalRepository::new(conn),
         }
     }
@@ -1820,6 +1828,8 @@ mod tests {
             .expect("apply workflow control-plane migration");
         conn.execute_batch(crate::dispatch::AGENT_DISPATCH_MIGRATION_SQL)
             .expect("apply agent_dispatch migration");
+        conn.execute_batch(crate::artifact::ARTIFACT_DOC_VERSIONING_MIGRATION_SQL)
+            .expect("apply artifact/doc migration");
         Arc::new(Mutex::new(conn))
     }
 

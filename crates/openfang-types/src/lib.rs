@@ -5,10 +5,12 @@
 
 pub mod agent;
 pub mod approval;
+pub mod artifact;
 pub mod capability;
 pub mod comms;
 pub mod config;
 pub mod contract;
+pub mod doc;
 pub mod error;
 pub mod event;
 pub mod looper;
