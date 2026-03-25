@@ -546,6 +546,24 @@ pub enum SortOrder {
     Desc,
 }
 
+/// Supported task list sort fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSortField {
+    /// Sort by the stable task position.
+    #[default]
+    Position,
+}
+
+/// Supported subtask list sort fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubtaskSortField {
+    /// Sort by the stable subtask position.
+    #[default]
+    Position,
+}
+
 /// Durable task record used by the repository layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskRecord {
@@ -640,6 +658,9 @@ pub struct TaskListQuery {
     /// Opaque pagination cursor returned by the previous page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Stable sort field.
+    #[serde(default)]
+    pub sort: TaskSortField,
     /// Sort direction for `position`.
     #[serde(default)]
     pub order: SortOrder,
@@ -671,6 +692,7 @@ impl Default for TaskListQuery {
         Self {
             limit: 50,
             cursor: None,
+            sort: TaskSortField::Position,
             order: SortOrder::Asc,
             status: None,
             priority: None,
@@ -693,8 +715,22 @@ pub struct TaskListPage {
 }
 
 /// Filter set for listing subtasks inside one parent task.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtaskListQuery {
+    /// Maximum number of items to return.
+    pub limit: usize,
+    /// Opaque pagination cursor returned by the previous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Stable sort field.
+    #[serde(default)]
+    pub sort: SubtaskSortField,
+    /// Sort direction for the selected sort field.
+    #[serde(default)]
+    pub order: SortOrder,
+    /// Optional owning task filter for global lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
     /// Optional lifecycle-state filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<SubtaskStatus>,
@@ -713,6 +749,33 @@ pub struct SubtaskListQuery {
     /// Optional blocked filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<bool>,
+}
+
+impl Default for SubtaskListQuery {
+    fn default() -> Self {
+        Self {
+            limit: 50,
+            cursor: None,
+            sort: SubtaskSortField::Position,
+            order: SortOrder::Asc,
+            task_id: None,
+            status: None,
+            assignee_kind: None,
+            assignee_ref: None,
+            kind: None,
+            ready: None,
+            blocked: None,
+        }
+    }
+}
+
+/// Cursor-backed subtask list response used by repository callers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubtaskListPage {
+    /// Page of subtask records.
+    pub items: Vec<SubtaskRecord>,
+    /// Cursor for the next page, or `None` when exhausted.
+    pub next_cursor: Option<String>,
 }
 
 /// Replan request applied atomically to one task.
@@ -752,7 +815,12 @@ pub enum TaskReplanOperation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlannedSubtask {
     /// Optional explicit subtask identifier. When absent, the caller generates one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "id",
+        alias = "subtask_id"
+    )]
     pub subtask_id: Option<SubtaskId>,
     /// Human-facing title.
     pub title: String,

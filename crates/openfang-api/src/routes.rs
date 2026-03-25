@@ -3,7 +3,10 @@
 use crate::agent_definitions::AgentDefinitionStore;
 use crate::types::*;
 use crate::workflow_definitions::{canonicalize_workflow_definition, WorkflowDefinitionStore};
-use axum::extract::{rejection::JsonRejection, Path, Query, State};
+use axum::extract::{
+    rejection::{JsonRejection, QueryRejection},
+    Path, Query, State,
+};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -26,7 +29,9 @@ use openfang_kernel::workflow_compiler::{
     validate_workflow_value, WorkflowCompileError,
 };
 use openfang_kernel::{AgentMessageDispatch, OpenFangKernel};
-use openfang_memory::{AgentRuntimeRecord, AgentSessionRecord, ScheduleRuntimeRecord};
+use openfang_memory::{
+    now_timestamp, AgentRuntimeRecord, AgentSessionRecord, ScheduleRuntimeRecord, TaskStoreError,
+};
 use openfang_memory::{WorkflowRunListQuery, WorkflowRunStatus, WorkflowSignalRecord};
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
@@ -34,6 +39,10 @@ use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest, AgentState, S
 use openfang_types::scheduler::{
     CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDelivery, CronJob, CronJobId,
     CronSchedule, CronTextInputItem, CronTextInputPayload, CronWorkflowSignalSelector,
+};
+use openfang_types::task::{
+    SortOrder, SubtaskId, SubtaskListQuery, SubtaskPatch, SubtaskRecord, SubtaskSortField,
+    SubtaskStatus, TaskId, TaskListQuery, TaskRecord, TaskReplanRequest, TaskSortField, TaskSource,
 };
 use openfang_types::workflow::{WorkflowIr, WorkflowIrStepKind};
 use std::cmp::Ordering;
@@ -435,6 +444,806 @@ fn agent_json_rejection(rejection: JsonRejection) -> (StatusCode, Json<serde_jso
             format!("Invalid request body: {rejection}"),
             None,
         ),
+    }
+}
+
+fn task_query_rejection(rejection: QueryRejection) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        format!("Invalid query string: {rejection}"),
+        None,
+    )
+}
+
+fn task_summary_source(source: &TaskSource) -> TaskSummarySource {
+    match source {
+        TaskSource::Workflow { run_id, .. } => TaskSummarySource::Workflow {
+            run_id: run_id.clone(),
+        },
+        TaskSource::Manual => TaskSummarySource::Manual,
+        TaskSource::Api => TaskSummarySource::Api,
+    }
+}
+
+fn task_summary_from_record(record: &TaskRecord) -> TaskSummaryResponse {
+    TaskSummaryResponse {
+        id: record.task_id.clone(),
+        slug: record.slug.clone(),
+        title: record.title.clone(),
+        status: record.status,
+        priority: record.priority,
+        position: record.position,
+        source: task_summary_source(&record.source),
+        updated_at: record.updated_at.clone(),
+    }
+}
+
+fn subtask_summary_from_record(record: &SubtaskRecord) -> SubtaskSummaryResponse {
+    SubtaskSummaryResponse {
+        id: record.subtask_id.clone(),
+        task_id: record.task_id.clone(),
+        title: record.title.clone(),
+        status: record.status,
+        assignee: record.assignee.clone(),
+        updated_at: record.updated_at.clone(),
+    }
+}
+
+fn task_list_query_from_params(
+    params: TaskListQueryParams,
+) -> Result<TaskListQuery, (StatusCode, Json<serde_json::Value>)> {
+    Ok(TaskListQuery {
+        limit: parse_pagination_limit(params.limit)?,
+        cursor: params.cursor,
+        sort: params.sort.unwrap_or(TaskSortField::Position),
+        order: params.order.unwrap_or(SortOrder::Asc),
+        status: params.status,
+        priority: params.priority,
+        created_by: params.created_by,
+        source_kind: params.source_kind,
+        label: params.label,
+        repository: params.repository,
+        search: params.search,
+    })
+}
+
+fn subtask_list_query_from_params(
+    params: SubtaskListQueryParams,
+    scoped_task_id: Option<TaskId>,
+) -> Result<SubtaskListQuery, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(path_task_id) = scoped_task_id.as_ref() {
+        if let Some(query_task_id) = params.task_id.as_ref() {
+            if query_task_id != path_task_id {
+                return Err(workflow_v2_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "`task_id` query parameter must match the path task ID",
+                    Some(serde_json::json!([{
+                        "path": "task_id",
+                        "expected": path_task_id,
+                        "actual": query_task_id,
+                    }])),
+                ));
+            }
+        }
+    }
+
+    Ok(SubtaskListQuery {
+        limit: parse_pagination_limit(params.limit)?,
+        cursor: params.cursor,
+        sort: params.sort.unwrap_or(SubtaskSortField::Position),
+        order: params.order.unwrap_or(SortOrder::Asc),
+        task_id: scoped_task_id.or(params.task_id),
+        status: params.status,
+        assignee_kind: params.assignee_kind,
+        assignee_ref: params.assignee_ref,
+        kind: params.kind,
+        ready: params.ready,
+        blocked: params.blocked,
+    })
+}
+
+fn apply_task_update(
+    current: &TaskRecord,
+    request: &UpdateTaskRequest,
+    updated_at: &str,
+) -> TaskRecord {
+    let mut next = current.clone();
+    if let Some(slug) = request.slug.as_ref() {
+        next.slug = slug.clone();
+    }
+    if let Some(title) = request.title.as_ref() {
+        next.title = title.clone();
+    }
+    if let Some(description) = request.description.as_ref() {
+        next.description = description.clone();
+    }
+    if let Some(source) = request.source.as_ref() {
+        next.source = source.clone();
+    }
+    if let Some(owner) = request.owner.as_ref() {
+        next.owner = owner.clone();
+    }
+    if let Some(created_by) = request.created_by.as_ref() {
+        next.created_by = created_by.clone();
+    }
+    if let Some(status) = request.status {
+        next.status = status;
+    }
+    if let Some(priority) = request.priority {
+        next.priority = priority;
+    }
+    if let Some(complexity) = request.complexity {
+        next.complexity = complexity;
+    }
+    if let Some(position) = request.position {
+        next.position = position;
+    }
+    if let Some(repository_refs) = request.repository_refs.as_ref() {
+        next.repository_refs = repository_refs.clone();
+    }
+    if let Some(label_refs) = request.label_refs.as_ref() {
+        next.label_refs = label_refs.clone();
+    }
+    if let Some(artifact_refs) = request.artifact_refs.as_ref() {
+        next.artifact_refs = artifact_refs.clone();
+    }
+    if let Some(doc_refs) = request.doc_refs.as_ref() {
+        next.doc_refs = doc_refs.clone();
+    }
+    if let Some(file_refs) = request.file_refs.as_ref() {
+        next.file_refs = file_refs.clone();
+    }
+    if let Some(metadata) = request.metadata.as_ref() {
+        next.metadata = metadata.clone();
+    }
+    next.updated_at = updated_at.to_string();
+    next.completed_at = match (
+        current.status.is_terminal(),
+        next.status.is_terminal(),
+        current.completed_at.as_ref(),
+    ) {
+        (false, true, _) => Some(updated_at.to_string()),
+        (true, true, Some(existing_completed_at)) => Some(existing_completed_at.clone()),
+        (true, true, None) => Some(updated_at.to_string()),
+        (_, false, _) => None,
+    };
+    next
+}
+
+fn create_subtask_record(
+    task_id: &TaskId,
+    request: CreateSubtaskRequest,
+    timestamp: &str,
+) -> SubtaskRecord {
+    let status = request.status.unwrap_or(SubtaskStatus::Planned);
+    SubtaskRecord {
+        subtask_id: request.id.unwrap_or_else(|| {
+            SubtaskId::new(format!("subtask_{}", uuid::Uuid::new_v4().simple()))
+        }),
+        task_id: task_id.clone(),
+        title: request.title,
+        description: request.description,
+        kind: request.kind,
+        status,
+        complexity: request.complexity.unwrap_or_default(),
+        position: request.position,
+        assignee: request.assignee,
+        depends_on: request.depends_on,
+        parallelizable: request.parallelizable,
+        input: request.input,
+        result: request.result,
+        metadata: request.metadata,
+        created_at: timestamp.to_string(),
+        updated_at: timestamp.to_string(),
+        completed_at: if status.is_terminal() {
+            Some(timestamp.to_string())
+        } else {
+            None
+        },
+    }
+}
+
+fn apply_subtask_update(
+    current: &SubtaskRecord,
+    request: UpdateSubtaskRequest,
+    updated_at: &str,
+) -> SubtaskRecord {
+    let patch = SubtaskPatch {
+        id: current.subtask_id.clone(),
+        title: request.title,
+        description: request.description,
+        kind: request.kind,
+        status: request.status,
+        complexity: request.complexity,
+        position: request.position,
+        assignee: request.assignee,
+        depends_on: request.depends_on,
+        parallelizable: request.parallelizable,
+        input: request.input,
+        result: request.result,
+        metadata: request.metadata,
+    };
+    let mut next = current.clone();
+    if let Some(title) = patch.title.as_ref() {
+        next.title = title.clone();
+    }
+    if let Some(description) = patch.description.as_ref() {
+        next.description = description.clone();
+    }
+    if let Some(kind) = patch.kind {
+        next.kind = kind;
+    }
+    if let Some(status) = patch.status {
+        next.status = status;
+    }
+    if let Some(complexity) = patch.complexity {
+        next.complexity = complexity;
+    }
+    if let Some(position) = patch.position {
+        next.position = position;
+    }
+    if let Some(assignee) = patch.assignee.as_ref() {
+        next.assignee = assignee.clone();
+    }
+    if let Some(depends_on) = patch.depends_on.as_ref() {
+        next.depends_on = depends_on.clone();
+    }
+    if let Some(parallelizable) = patch.parallelizable {
+        next.parallelizable = parallelizable;
+    }
+    if let Some(input) = patch.input.as_ref() {
+        next.input = input.clone();
+    }
+    if let Some(result) = patch.result.as_ref() {
+        next.result = result.clone();
+    }
+    if let Some(metadata) = patch.metadata.as_ref() {
+        next.metadata = metadata.clone();
+    }
+    next.updated_at = updated_at.to_string();
+    next.completed_at = match (
+        current.status.is_terminal(),
+        next.status.is_terminal(),
+        current.completed_at.as_ref(),
+    ) {
+        (false, true, _) => Some(updated_at.to_string()),
+        (true, true, Some(existing_completed_at)) => Some(existing_completed_at.clone()),
+        (true, true, None) => Some(updated_at.to_string()),
+        (_, false, _) => None,
+    };
+    next
+}
+
+fn task_store_error_response(error: TaskStoreError) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        TaskStoreError::TaskNotFound { task_id } => workflow_v2_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Task not found",
+            Some(serde_json::json!([{ "task_id": task_id }])),
+        ),
+        TaskStoreError::SubtaskNotFound { subtask_id } => workflow_v2_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Subtask not found",
+            Some(serde_json::json!([{ "subtask_id": subtask_id }])),
+        ),
+        TaskStoreError::SubtaskOutsideTask {
+            subtask_id,
+            task_id,
+            actual_task_id,
+        } => workflow_v2_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_subtask_reference",
+            "Subtask does not belong to the requested task",
+            Some(serde_json::json!([{
+                "subtask_id": subtask_id,
+                "task_id": task_id,
+                "actual_task_id": actual_task_id,
+            }])),
+        ),
+        TaskStoreError::DuplicateSlug { slug } => workflow_v2_error_response(
+            StatusCode::CONFLICT,
+            "already_exists",
+            "Task slug already exists",
+            Some(serde_json::json!([{ "slug": slug }])),
+        ),
+        TaskStoreError::TaskAlreadyExists { task_id } => workflow_v2_error_response(
+            StatusCode::CONFLICT,
+            "already_exists",
+            "Task already exists",
+            Some(serde_json::json!([{ "task_id": task_id }])),
+        ),
+        TaskStoreError::SubtaskAlreadyExists { subtask_id } => workflow_v2_error_response(
+            StatusCode::CONFLICT,
+            "already_exists",
+            "Subtask already exists",
+            Some(serde_json::json!([{ "subtask_id": subtask_id }])),
+        ),
+        TaskStoreError::InvalidCursor { cursor } => workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Invalid cursor",
+            Some(serde_json::json!([{ "path": "cursor", "value": cursor }])),
+        ),
+        TaskStoreError::SelfDependency { subtask_id } => workflow_v2_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_dependency",
+            "A subtask cannot depend on itself",
+            Some(serde_json::json!([{ "subtask_id": subtask_id }])),
+        ),
+        TaskStoreError::DependencyNotFound {
+            subtask_id,
+            dependency_id,
+        } => workflow_v2_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_dependency",
+            "A dependency subtask was not found",
+            Some(serde_json::json!([{
+                "subtask_id": subtask_id,
+                "dependency_id": dependency_id,
+            }])),
+        ),
+        TaskStoreError::DependencyOutsideTask {
+            subtask_id,
+            task_id,
+            dependency_id,
+            dependency_task_id,
+        } => workflow_v2_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_dependency",
+            "A dependency subtask belongs to a different task",
+            Some(serde_json::json!([{
+                "subtask_id": subtask_id,
+                "task_id": task_id,
+                "dependency_id": dependency_id,
+                "dependency_task_id": dependency_task_id,
+            }])),
+        ),
+        TaskStoreError::InvalidMetadataShape { field } => workflow_v2_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            "Metadata fields must be JSON objects",
+            Some(serde_json::json!([{ "field": field }])),
+        ),
+        TaskStoreError::ReservedMetadataKey { field, key } => workflow_v2_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            "Metadata contains a reserved key",
+            Some(serde_json::json!([{ "field": field, "key": key }])),
+        ),
+        TaskStoreError::ConnectionLock(error) => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_store_failed",
+            "Task store operation failed",
+            Some(serde_json::json!([{ "message": error }])),
+        ),
+        TaskStoreError::InvalidTaskStatus { status } => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_store_failed",
+            "Task store operation failed",
+            Some(serde_json::json!([{ "message": status }])),
+        ),
+        TaskStoreError::InvalidSubtaskStatus { status } => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_store_failed",
+            "Task store operation failed",
+            Some(serde_json::json!([{ "message": status }])),
+        ),
+        TaskStoreError::InvalidSubtaskKind { kind } => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_store_failed",
+            "Task store operation failed",
+            Some(serde_json::json!([{ "message": kind }])),
+        ),
+        TaskStoreError::InvalidPriority { priority } => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_store_failed",
+            "Task store operation failed",
+            Some(serde_json::json!([{ "message": priority }])),
+        ),
+        TaskStoreError::InvalidComplexity { complexity } => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_store_failed",
+            "Task store operation failed",
+            Some(serde_json::json!([{ "message": complexity }])),
+        ),
+        TaskStoreError::InvalidActorKind { kind } => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_store_failed",
+            "Task store operation failed",
+            Some(serde_json::json!([{ "message": kind }])),
+        ),
+        TaskStoreError::InvalidJsonField { message, .. } => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_store_failed",
+            "Task store operation failed",
+            Some(serde_json::json!([{ "message": message }])),
+        ),
+        TaskStoreError::InvalidSourceEncoding { reason, .. } => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_store_failed",
+            "Task store operation failed",
+            Some(serde_json::json!([{ "message": reason }])),
+        ),
+        TaskStoreError::Sqlite(error) => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_store_failed",
+            "Task store operation failed",
+            Some(serde_json::json!([{ "message": error.to_string() }])),
+        ),
+        TaskStoreError::Json(error) => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_store_failed",
+            "Task store operation failed",
+            Some(serde_json::json!([{ "message": error.to_string() }])),
+        ),
+    }
+}
+
+/// GET /api/v1/tasks — List durable tasks.
+pub async fn list_tasks_v1(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<TaskListQueryParams>, QueryRejection>,
+) -> impl IntoResponse {
+    let Query(params) = match query {
+        Ok(query) => query,
+        Err(rejection) => return task_query_rejection(rejection),
+    };
+    let query = match task_list_query_from_params(params) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+
+    match state.kernel.workflow_stores.task.list(&query) {
+        Ok(page) => (
+            StatusCode::OK,
+            Json(serde_json::json!(TaskListResponse {
+                items: page.items.iter().map(task_summary_from_record).collect(),
+                next_cursor: page.next_cursor,
+            })),
+        ),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// POST /api/v1/tasks — Create a durable task.
+pub async fn create_task_v1(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<CreateTaskRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let timestamp = now_timestamp();
+    let task_id = request
+        .id
+        .unwrap_or_else(|| TaskId::new(format!("task_{}", uuid::Uuid::new_v4().simple())));
+    let record = TaskRecord {
+        task_id,
+        slug: request.slug,
+        title: request.title,
+        description: request.description,
+        status: request.status,
+        priority: request.priority,
+        complexity: request.complexity,
+        position: request.position,
+        source: request.source,
+        owner: request.owner,
+        created_by: request.created_by,
+        repository_refs: request.repository_refs,
+        label_refs: request.label_refs,
+        artifact_refs: request.artifact_refs,
+        doc_refs: request.doc_refs,
+        file_refs: request.file_refs,
+        metadata: request.metadata,
+        created_at: timestamp.clone(),
+        updated_at: timestamp.clone(),
+        completed_at: if request.status.is_terminal() {
+            Some(timestamp.clone())
+        } else {
+            None
+        },
+    };
+
+    match state.kernel.workflow_stores.task.create(&record) {
+        Ok(record) => (StatusCode::CREATED, Json(serde_json::json!(record))),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/tasks/{id} — Load one durable task.
+pub async fn get_task_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .workflow_stores
+        .task
+        .find_by_id(&TaskId::new(id.clone()))
+    {
+        Ok(Some(task)) => (StatusCode::OK, Json(serde_json::json!(task))),
+        Ok(None) => task_store_error_response(TaskStoreError::TaskNotFound { task_id: id }),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// PUT /api/v1/tasks/{id} — Update one durable task.
+pub async fn update_task_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<UpdateTaskRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let task_id = TaskId::new(id.clone());
+    let current = match state.kernel.workflow_stores.task.find_by_id(&task_id) {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            return task_store_error_response(TaskStoreError::TaskNotFound { task_id: id });
+        }
+        Err(error) => return task_store_error_response(error),
+    };
+    let next = apply_task_update(&current, &request, &now_timestamp());
+
+    match state.kernel.workflow_stores.task.update(&next) {
+        Ok(task) => (StatusCode::OK, Json(serde_json::json!(task))),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// DELETE /api/v1/tasks/{id} — Delete one durable task.
+pub async fn delete_task_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .workflow_stores
+        .task
+        .delete(&TaskId::new(id.clone()))
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => task_store_error_response(error).into_response(),
+    }
+}
+
+/// GET /api/v1/tasks/{id}/subtasks — List subtasks for one task.
+pub async fn list_task_subtasks_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    query: Result<Query<SubtaskListQueryParams>, QueryRejection>,
+) -> impl IntoResponse {
+    let Query(params) = match query {
+        Ok(query) => query,
+        Err(rejection) => return task_query_rejection(rejection),
+    };
+    let task_id = TaskId::new(id);
+    let query = match subtask_list_query_from_params(params, Some(task_id.clone())) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+
+    match state
+        .kernel
+        .workflow_stores
+        .subtask
+        .list_for_task(&task_id, &query)
+    {
+        Ok(page) => (
+            StatusCode::OK,
+            Json(serde_json::json!(SubtaskListResponse {
+                items: page.items.iter().map(subtask_summary_from_record).collect(),
+                next_cursor: page.next_cursor,
+            })),
+        ),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// POST /api/v1/tasks/{id}/subtasks — Create a durable subtask under one task.
+pub async fn create_task_subtask_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<CreateSubtaskRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let task_id = TaskId::new(id);
+    let timestamp = now_timestamp();
+    let record = create_subtask_record(&task_id, request, &timestamp);
+
+    match state.kernel.workflow_stores.subtask.create(&record) {
+        Ok(record) => (StatusCode::CREATED, Json(serde_json::json!(record))),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/subtasks — List durable subtasks globally.
+pub async fn list_subtasks_v1(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<SubtaskListQueryParams>, QueryRejection>,
+) -> impl IntoResponse {
+    let Query(params) = match query {
+        Ok(query) => query,
+        Err(rejection) => return task_query_rejection(rejection),
+    };
+    let query = match subtask_list_query_from_params(params, None) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+
+    match state.kernel.workflow_stores.subtask.list(&query) {
+        Ok(page) => (
+            StatusCode::OK,
+            Json(serde_json::json!(SubtaskListResponse {
+                items: page.items.iter().map(subtask_summary_from_record).collect(),
+                next_cursor: page.next_cursor,
+            })),
+        ),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/subtasks/{id} — Load one durable subtask.
+pub async fn get_subtask_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .workflow_stores
+        .subtask
+        .find_by_id(&SubtaskId::new(id.clone()))
+    {
+        Ok(Some(subtask)) => (StatusCode::OK, Json(serde_json::json!(subtask))),
+        Ok(None) => task_store_error_response(TaskStoreError::SubtaskNotFound { subtask_id: id }),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// PUT /api/v1/subtasks/{id} — Update one durable subtask.
+pub async fn update_subtask_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<UpdateSubtaskRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let subtask_id = SubtaskId::new(id.clone());
+    let current = match state.kernel.workflow_stores.subtask.find_by_id(&subtask_id) {
+        Ok(Some(subtask)) => subtask,
+        Ok(None) => {
+            return task_store_error_response(TaskStoreError::SubtaskNotFound { subtask_id: id });
+        }
+        Err(error) => return task_store_error_response(error),
+    };
+    let next = apply_subtask_update(&current, request, &now_timestamp());
+
+    match state.kernel.workflow_stores.subtask.update(&next) {
+        Ok(subtask) => (StatusCode::OK, Json(serde_json::json!(subtask))),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// DELETE /api/v1/subtasks/{id} — Delete one durable subtask.
+pub async fn delete_subtask_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .workflow_stores
+        .subtask
+        .delete(&SubtaskId::new(id.clone()))
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => task_store_error_response(error).into_response(),
+    }
+}
+
+/// POST /api/v1/tasks/{id}/replan — Atomically change one task's subtask plan.
+pub async fn replan_task_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<TaskReplanRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let task_id = TaskId::new(id.clone());
+
+    match state.kernel.workflow_stores.task.replan(&task_id, &request) {
+        Ok(effects) => (
+            StatusCode::OK,
+            Json(serde_json::json!(TaskReplanAcceptedResponse {
+                accepted: true,
+                resource_id: task_id,
+                status: "accepted".to_string(),
+                effects,
+            })),
+        ),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/tasks/{id}/artifacts — Project task-linked artifacts.
+pub async fn get_task_artifacts_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .workflow_stores
+        .task
+        .find_by_id(&TaskId::new(id.clone()))
+    {
+        Ok(Some(task)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": task.artifact_refs,
+                "next_cursor": serde_json::Value::Null,
+            })),
+        ),
+        Ok(None) => task_store_error_response(TaskStoreError::TaskNotFound { task_id: id }),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/tasks/{id}/docs — Project task-linked docs.
+pub async fn get_task_docs_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .workflow_stores
+        .task
+        .find_by_id(&TaskId::new(id.clone()))
+    {
+        Ok(Some(task)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": task.doc_refs,
+                "next_cursor": serde_json::Value::Null,
+            })),
+        ),
+        Ok(None) => task_store_error_response(TaskStoreError::TaskNotFound { task_id: id }),
+        Err(error) => task_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/tasks/{id}/files — Project task-linked files.
+pub async fn get_task_files_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .workflow_stores
+        .task
+        .find_by_id(&TaskId::new(id.clone()))
+    {
+        Ok(Some(task)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": task.file_refs,
+                "next_cursor": serde_json::Value::Null,
+            })),
+        ),
+        Ok(None) => task_store_error_response(TaskStoreError::TaskNotFound { task_id: id }),
+        Err(error) => task_store_error_response(error),
     }
 }
 
@@ -18253,5 +19062,336 @@ mod skill_v1_route_tests {
         let final_page = paginate_skill_summaries(items, 2, 4);
         assert_eq!(final_page.items.len(), 1);
         assert!(final_page.next_cursor.is_none());
+    }
+}
+
+#[cfg(test)]
+mod task_control_plane_route_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use openfang_types::config::{DefaultModelConfig, KernelConfig};
+    use serde_json::{json, Value};
+    use tempfile::TempDir;
+
+    struct RouteTestContext {
+        state: Arc<AppState>,
+        _tmp: TempDir,
+    }
+
+    impl Drop for RouteTestContext {
+        fn drop(&mut self) {
+            self.state.kernel.shutdown();
+        }
+    }
+
+    async fn route_test_context() -> RouteTestContext {
+        let tmp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = KernelConfig {
+            home_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().join("data"),
+            default_model: DefaultModelConfig {
+                provider: "ollama".to_string(),
+                model: "test-model".to_string(),
+                api_key_env: "OLLAMA_API_KEY".to_string(),
+                base_url: None,
+            },
+            ..KernelConfig::default()
+        };
+
+        let kernel =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel should boot"));
+        kernel.set_self_handle();
+        kernel.bootstrap_workflow_definitions().await;
+
+        let state = Arc::new(AppState {
+            kernel,
+            started_at: Instant::now(),
+            peer_registry: None,
+            bridge_manager: tokio::sync::Mutex::new(None),
+            channels_config: tokio::sync::RwLock::new(Default::default()),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            clawhub_cache: DashMap::new(),
+            provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        });
+
+        RouteTestContext { state, _tmp: tmp }
+    }
+
+    async fn json_response(response: impl IntoResponse) -> (StatusCode, Value) {
+        let response = response.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let json = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body should be valid JSON")
+        };
+        (status, json)
+    }
+
+    fn sample_task(id: &str, slug: &str) -> TaskRecord {
+        TaskRecord {
+            task_id: TaskId::new(id),
+            slug: slug.to_string(),
+            title: format!("Task {id}"),
+            description: "Task description".to_string(),
+            status: openfang_types::task::TaskStatus::Planned,
+            priority: openfang_types::task::Priority::High,
+            complexity: openfang_types::task::Complexity::Medium,
+            position: 1,
+            source: TaskSource::Manual,
+            owner: openfang_types::task::OwnerRef {
+                kind: openfang_types::task::ActorKind::AgentGroup,
+                ref_id: "sdlc".to_string(),
+            },
+            created_by: openfang_types::task::OwnerRef {
+                kind: openfang_types::task::ActorKind::Agent,
+                ref_id: "planner".to_string(),
+            },
+            repository_refs: vec![],
+            label_refs: vec![],
+            artifact_refs: vec![],
+            doc_refs: vec![],
+            file_refs: vec![],
+            metadata: json!({}),
+            created_at: "2026-03-25T12:00:00Z".to_string(),
+            updated_at: "2026-03-25T12:00:00Z".to_string(),
+            completed_at: None,
+        }
+    }
+
+    fn sample_subtask(id: &str, task_id: &TaskId, position: i64) -> SubtaskRecord {
+        SubtaskRecord {
+            subtask_id: SubtaskId::new(id),
+            task_id: task_id.clone(),
+            title: format!("Subtask {id}"),
+            description: "Subtask description".to_string(),
+            kind: openfang_types::task::SubtaskKind::DocChange,
+            status: SubtaskStatus::Planned,
+            complexity: openfang_types::task::Complexity::Medium,
+            position,
+            assignee: Some(openfang_types::task::AssigneeRef {
+                kind: openfang_types::task::ActorKind::Agent,
+                ref_id: "prd-writer".to_string(),
+            }),
+            depends_on: Vec::new(),
+            parallelizable: false,
+            input: json!({}),
+            result: None,
+            metadata: json!({}),
+            created_at: "2026-03-25T12:01:00Z".to_string(),
+            updated_at: "2026-03-25T12:01:00Z".to_string(),
+            completed_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn replan_task_v1_should_return_structured_422_for_foreign_cancel() {
+        let context = route_test_context().await;
+        let task = sample_task("task_local", "task-local");
+        let other_task = sample_task("task_other", "task-other");
+        context
+            .state
+            .kernel
+            .workflow_stores
+            .task
+            .create(&task)
+            .expect("task should be created");
+        context
+            .state
+            .kernel
+            .workflow_stores
+            .task
+            .create(&other_task)
+            .expect("other task should be created");
+
+        let foreign_subtask = sample_subtask("subtask_foreign", &other_task.task_id, 1);
+        context
+            .state
+            .kernel
+            .workflow_stores
+            .subtask
+            .create(&foreign_subtask)
+            .expect("foreign subtask should be created");
+
+        let (status, body) = json_response(
+            replan_task_v1(
+                State(Arc::clone(&context.state)),
+                Path(task.task_id.to_string()),
+                Ok(Json(TaskReplanRequest {
+                    reason: "cancel the wrong subtask".to_string(),
+                    operations: vec![openfang_types::task::TaskReplanOperation::CancelSubtasks {
+                        subtask_ids: vec![foreign_subtask.subtask_id.clone()],
+                    }],
+                    metadata: json!({}),
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], json!("invalid_subtask_reference"));
+        assert_eq!(
+            body["error"]["details"][0]["subtask_id"],
+            json!("subtask_foreign")
+        );
+    }
+
+    #[tokio::test]
+    async fn replan_task_v1_should_return_structured_422_for_missing_dependency_without_writes() {
+        let context = route_test_context().await;
+        let task = sample_task("task_missing_dep", "task-missing-dep");
+        context
+            .state
+            .kernel
+            .workflow_stores
+            .task
+            .create(&task)
+            .expect("task should be created");
+
+        let (status, body) = json_response(
+            replan_task_v1(
+                State(Arc::clone(&context.state)),
+                Path(task.task_id.to_string()),
+                Ok(Json(TaskReplanRequest {
+                    reason: "introduce an invalid dependency".to_string(),
+                    operations: vec![openfang_types::task::TaskReplanOperation::CreateSubtasks {
+                        items: vec![openfang_types::task::PlannedSubtask {
+                            subtask_id: Some(SubtaskId::new("subtask_new")),
+                            title: "Invalid dependency".to_string(),
+                            description: "Should fail".to_string(),
+                            kind: openfang_types::task::SubtaskKind::ReviewItem,
+                            status: None,
+                            complexity: None,
+                            position: 1,
+                            assignee: None,
+                            depends_on: vec![SubtaskId::new("missing_dependency")],
+                            parallelizable: false,
+                            input: json!({}),
+                            result: None,
+                            metadata: json!({}),
+                        }],
+                    }],
+                    metadata: json!({}),
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], json!("invalid_dependency"));
+
+        let page = context
+            .state
+            .kernel
+            .workflow_stores
+            .subtask
+            .list_for_task(&task.task_id, &SubtaskListQuery::default())
+            .expect("subtask list should load");
+        assert_eq!(page.items.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_subtasks_v1_should_filter_ready_and_blocked() {
+        let context = route_test_context().await;
+        let task = sample_task("task_filters", "task-filters");
+        context
+            .state
+            .kernel
+            .workflow_stores
+            .task
+            .create(&task)
+            .expect("task should be created");
+
+        let mut completed = sample_subtask("subtask_completed", &task.task_id, 1);
+        completed.status = SubtaskStatus::Completed;
+        completed.updated_at = "2026-03-25T12:02:00Z".to_string();
+        completed.completed_at = Some("2026-03-25T12:02:00Z".to_string());
+        context
+            .state
+            .kernel
+            .workflow_stores
+            .subtask
+            .create(&completed)
+            .expect("completed subtask should be created");
+
+        let mut ready = sample_subtask("subtask_ready", &task.task_id, 2);
+        ready.depends_on = vec![completed.subtask_id.clone()];
+        context
+            .state
+            .kernel
+            .workflow_stores
+            .subtask
+            .create(&ready)
+            .expect("ready subtask should be created");
+
+        let pending = sample_subtask("subtask_pending", &task.task_id, 3);
+        context
+            .state
+            .kernel
+            .workflow_stores
+            .subtask
+            .create(&pending)
+            .expect("pending subtask should be created");
+
+        let mut blocked = sample_subtask("subtask_blocked", &task.task_id, 4);
+        blocked.depends_on = vec![pending.subtask_id.clone()];
+        context
+            .state
+            .kernel
+            .workflow_stores
+            .subtask
+            .create(&blocked)
+            .expect("blocked subtask should be created");
+
+        let (ready_status, ready_body) = json_response(
+            list_task_subtasks_v1(
+                State(Arc::clone(&context.state)),
+                Path(task.task_id.to_string()),
+                Ok(Query(SubtaskListQueryParams {
+                    ready: Some(true),
+                    ..SubtaskListQueryParams::default()
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(ready_status, StatusCode::OK);
+        assert_eq!(
+            ready_body["items"]
+                .as_array()
+                .expect("ready items should be an array")
+                .iter()
+                .map(|item| item["id"].as_str().expect("id should be a string"))
+                .collect::<Vec<_>>(),
+            vec!["subtask_completed", "subtask_ready", "subtask_pending"]
+        );
+
+        let (blocked_status, blocked_body) = json_response(
+            list_task_subtasks_v1(
+                State(Arc::clone(&context.state)),
+                Path(task.task_id.to_string()),
+                Ok(Query(SubtaskListQueryParams {
+                    blocked: Some(true),
+                    ..SubtaskListQueryParams::default()
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(blocked_status, StatusCode::OK);
+        assert_eq!(
+            blocked_body["items"]
+                .as_array()
+                .expect("blocked items should be an array")
+                .iter()
+                .map(|item| item["id"].as_str().expect("id should be a string"))
+                .collect::<Vec<_>>(),
+            vec!["subtask_blocked"]
+        );
     }
 }

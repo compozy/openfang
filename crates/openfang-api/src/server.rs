@@ -479,6 +479,46 @@ pub async fn build_router(
             "/api/v1/runs/{id}/cancel",
             axum::routing::post(routes::cancel_run_v1),
         )
+        .route(
+            "/api/v1/tasks",
+            axum::routing::get(routes::list_tasks_v1).post(routes::create_task_v1),
+        )
+        .route(
+            "/api/v1/tasks/{id}",
+            axum::routing::get(routes::get_task_v1)
+                .put(routes::update_task_v1)
+                .delete(routes::delete_task_v1),
+        )
+        .route(
+            "/api/v1/tasks/{id}/subtasks",
+            axum::routing::get(routes::list_task_subtasks_v1).post(routes::create_task_subtask_v1),
+        )
+        .route(
+            "/api/v1/tasks/{id}/replan",
+            axum::routing::post(routes::replan_task_v1),
+        )
+        .route(
+            "/api/v1/tasks/{id}/artifacts",
+            axum::routing::get(routes::get_task_artifacts_v1),
+        )
+        .route(
+            "/api/v1/tasks/{id}/docs",
+            axum::routing::get(routes::get_task_docs_v1),
+        )
+        .route(
+            "/api/v1/tasks/{id}/files",
+            axum::routing::get(routes::get_task_files_v1),
+        )
+        .route(
+            "/api/v1/subtasks",
+            axum::routing::get(routes::list_subtasks_v1),
+        )
+        .route(
+            "/api/v1/subtasks/{id}",
+            axum::routing::get(routes::get_subtask_v1)
+                .put(routes::update_subtask_v1)
+                .delete(routes::delete_subtask_v1),
+        )
         // Skills endpoints
         .route("/api/skills", axum::routing::get(routes::list_skills))
         .route(

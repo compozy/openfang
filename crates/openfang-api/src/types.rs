@@ -8,6 +8,11 @@ use openfang_types::scheduler::{
     CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDelivery, CronSchedule,
 };
 pub use openfang_types::skill::{SkillDetail, SkillSummary};
+use openfang_types::task::{
+    ActorKind, AssigneeRef, Complexity, FileRef, LabelRef, OwnerRef, Priority, RepositoryRef,
+    SortOrder, SubtaskId, SubtaskKind, SubtaskSortField, SubtaskStatus, TaskId, TaskReplanEffects,
+    TaskSortField, TaskSource, TaskStatus,
+};
 use openfang_types::workflow::{
     NormalizedWorkflow, ValidationIssue as WorkflowValidationIssue, WorkflowIr,
     WorkflowV2Definition,
@@ -198,6 +203,261 @@ pub struct SkillListResponse {
 
 /// Full detail response for one skill resource.
 pub type SkillResponse = SkillDetail;
+
+/// Summary payload returned by task list endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskSummarySource {
+    Workflow { run_id: String },
+    Manual,
+    Api,
+}
+
+/// Summary payload returned by task list endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct TaskSummaryResponse {
+    pub id: TaskId,
+    pub slug: String,
+    pub title: String,
+    pub status: TaskStatus,
+    pub priority: Priority,
+    pub position: i64,
+    pub source: TaskSummarySource,
+    pub updated_at: String,
+}
+
+/// Paginated task list response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct TaskListResponse {
+    pub items: Vec<TaskSummaryResponse>,
+    pub next_cursor: Option<String>,
+}
+
+/// Request payload for creating a durable task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateTaskRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<TaskId>,
+    pub slug: String,
+    pub title: String,
+    pub description: String,
+    pub source: TaskSource,
+    pub owner: OwnerRef,
+    pub created_by: OwnerRef,
+    #[serde(default = "default_task_status")]
+    pub status: TaskStatus,
+    #[serde(default)]
+    pub priority: Priority,
+    #[serde(default)]
+    pub complexity: Complexity,
+    pub position: i64,
+    #[serde(default)]
+    pub repository_refs: Vec<RepositoryRef>,
+    #[serde(default)]
+    pub label_refs: Vec<LabelRef>,
+    #[serde(default)]
+    pub artifact_refs: Vec<openfang_types::task::ArtifactRef>,
+    #[serde(default)]
+    pub doc_refs: Vec<openfang_types::task::DocRef>,
+    #[serde(default)]
+    pub file_refs: Vec<FileRef>,
+    #[serde(default = "default_empty_object")]
+    pub metadata: serde_json::Value,
+}
+
+/// Request payload for updating a durable task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct UpdateTaskRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<TaskSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<OwnerRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<OwnerRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Priority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<Complexity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_refs: Option<Vec<RepositoryRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_refs: Option<Vec<LabelRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_refs: Option<Vec<openfang_types::task::ArtifactRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_refs: Option<Vec<openfang_types::task::DocRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_refs: Option<Vec<FileRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Summary payload returned by subtask list endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct SubtaskSummaryResponse {
+    pub id: SubtaskId,
+    pub task_id: TaskId,
+    pub title: String,
+    pub status: SubtaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<AssigneeRef>,
+    pub updated_at: String,
+}
+
+/// Paginated subtask list response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct SubtaskListResponse {
+    pub items: Vec<SubtaskSummaryResponse>,
+    pub next_cursor: Option<String>,
+}
+
+/// Request payload for creating a durable subtask beneath a task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateSubtaskRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<SubtaskId>,
+    pub title: String,
+    pub description: String,
+    pub kind: SubtaskKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SubtaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<Complexity>,
+    pub position: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<AssigneeRef>,
+    #[serde(default)]
+    pub depends_on: Vec<SubtaskId>,
+    #[serde(default)]
+    pub parallelizable: bool,
+    #[serde(default = "default_empty_object")]
+    pub input: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default = "default_empty_object")]
+    pub metadata: serde_json::Value,
+}
+
+/// Request payload for updating one durable subtask.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct UpdateSubtaskRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SubtaskKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SubtaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<Complexity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<Option<AssigneeRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<SubtaskId>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallelizable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Option<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Accepted response returned after applying a task replan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct TaskReplanAcceptedResponse {
+    pub accepted: bool,
+    pub resource_id: TaskId,
+    pub status: String,
+    pub effects: TaskReplanEffects,
+}
+
+/// Query parameters accepted by task list endpoints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct TaskListQueryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<TaskSortField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<SortOrder>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Priority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<openfang_types::task::TaskSourceKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(default, rename = "q", skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+}
+
+/// Query parameters accepted by subtask list endpoints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct SubtaskListQueryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<SubtaskSortField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<SortOrder>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SubtaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee_kind: Option<ActorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SubtaskKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<bool>,
+}
+
+fn default_empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+fn default_task_status() -> TaskStatus {
+    TaskStatus::Planned
+}
 
 /// Request to update an agent's manifest.
 #[derive(Debug, Deserialize)]

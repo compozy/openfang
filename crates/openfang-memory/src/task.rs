@@ -4,8 +4,8 @@ use chrono::Utc;
 use openfang_types::error::OpenFangError;
 use openfang_types::task::{
     ActorKind, AssigneeRef, Complexity, OwnerRef, PlannedSubtask, Priority, SortOrder, SubtaskId,
-    SubtaskKind, SubtaskListQuery, SubtaskPatch, SubtaskRecord, SubtaskStatus, TaskId,
-    TaskListPage, TaskListQuery, TaskRecord, TaskReplanEffects, TaskReplanOperation,
+    SubtaskKind, SubtaskListPage, SubtaskListQuery, SubtaskPatch, SubtaskRecord, SubtaskStatus,
+    TaskId, TaskListPage, TaskListQuery, TaskRecord, TaskReplanEffects, TaskReplanOperation,
     TaskReplanRequest, TaskSource, TaskStatus,
 };
 use rusqlite::{
@@ -23,6 +23,7 @@ pub const TASK_SUBTASK_MIGRATION_SQL: &str =
     include_str!("../migrations/compozy/20260324_010_task_subtask.sql");
 
 const RESERVED_TASK_METADATA_KEY: &str = "__compozy_task";
+const LAST_REPLAN_METADATA_KEY: &str = "last_replan";
 
 /// Shared `compozy.db` repositories for durable task-domain state.
 #[derive(Clone)]
@@ -69,6 +70,15 @@ pub enum TaskStoreError {
     /// The requested subtask does not exist.
     #[error("subtask '{subtask_id}' was not found")]
     SubtaskNotFound { subtask_id: String },
+    /// The requested subtask exists but belongs to a different task.
+    #[error(
+        "subtask '{subtask_id}' does not belong to task '{task_id}' (found under task '{actual_task_id}')"
+    )]
+    SubtaskOutsideTask {
+        subtask_id: String,
+        task_id: String,
+        actual_task_id: String,
+    },
     /// A task with the same slug already exists.
     #[error("task slug '{slug}' already exists")]
     DuplicateSlug { slug: String },
@@ -148,6 +158,13 @@ impl From<TaskStoreError> for OpenFangError {
 struct TaskCursor {
     position: i64,
     task_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SubtaskCursor {
+    position: i64,
+    task_id: String,
+    subtask_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -286,7 +303,7 @@ impl TaskRepository {
 
         let mut conn = lock_conn(&self.conn)?;
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_required_task(&transaction, task_id.as_ref())?;
+        let current_task = load_required_task(&transaction, task_id.as_ref())?;
 
         let mut effects = TaskReplanEffects::default();
 
@@ -339,8 +356,10 @@ impl TaskRepository {
                     for patch in items {
                         let current = load_required_subtask(&transaction, patch.id.as_ref())?;
                         if current.task_id != *task_id {
-                            return Err(TaskStoreError::SubtaskNotFound {
+                            return Err(TaskStoreError::SubtaskOutsideTask {
                                 subtask_id: patch.id.to_string(),
+                                task_id: task_id.to_string(),
+                                actual_task_id: current.task_id.to_string(),
                             });
                         }
                         let next = apply_subtask_patch(&current, patch, &now);
@@ -357,6 +376,21 @@ impl TaskRepository {
                 }
             }
         }
+
+        let replan_at = now_timestamp();
+        let mut next_task = current_task;
+        next_task.updated_at = replan_at.clone();
+        let mut metadata = metadata_object_clone("task.metadata_json", &next_task.metadata)?;
+        metadata.insert(
+            LAST_REPLAN_METADATA_KEY.to_string(),
+            serde_json::json!({
+                "reason": request.reason,
+                "metadata": request.metadata,
+                "requested_at": replan_at,
+            }),
+        );
+        next_task.metadata = JsonValue::Object(metadata);
+        update_task_row(&transaction, &next_task)?;
 
         transaction.commit()?;
         Ok(effects)
@@ -399,10 +433,18 @@ impl SubtaskRepository {
         &self,
         task_id: &TaskId,
         query: &SubtaskListQuery,
-    ) -> Result<Vec<SubtaskRecord>, TaskStoreError> {
+    ) -> Result<SubtaskListPage, TaskStoreError> {
         let conn = lock_conn(&self.conn)?;
         load_required_task(&conn, task_id.as_ref())?;
-        list_subtasks_for_task(&conn, task_id, query)
+        let mut scoped_query = query.clone();
+        scoped_query.task_id = Some(task_id.clone());
+        list_subtasks(&conn, &scoped_query)
+    }
+
+    /// List subtasks globally using cursor pagination and SQL-backed filters.
+    pub fn list(&self, query: &SubtaskListQuery) -> Result<SubtaskListPage, TaskStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        list_subtasks(&conn, query)
     }
 
     /// Replace the durable subtask row with the full provided record.
@@ -891,11 +933,11 @@ fn load_required_subtask(
     })
 }
 
-fn list_subtasks_for_task(
+fn list_subtasks(
     conn: &Connection,
-    task_id: &TaskId,
     query: &SubtaskListQuery,
-) -> Result<Vec<SubtaskRecord>, TaskStoreError> {
+) -> Result<SubtaskListPage, TaskStoreError> {
+    let limit = query.limit.max(1);
     let mut sql = String::from(
         "SELECT
             subtask_id,
@@ -916,80 +958,138 @@ fn list_subtasks_for_task(
             created_at,
             updated_at,
             completed_at
-         FROM subtask
-         WHERE task_id = ?",
+         FROM subtask",
     );
-    let mut params = vec![SqlValue::from(task_id.to_string())];
+    let mut predicates = Vec::new();
+    let mut params = Vec::new();
+
+    if let Some(task_id) = query.task_id.as_ref() {
+        predicates.push("task_id = ?".to_string());
+        params.push(SqlValue::from(task_id.to_string()));
+    }
 
     if let Some(status) = query.status {
-        sql.push_str(" AND status = ?");
+        predicates.push("status = ?".to_string());
         params.push(SqlValue::from(status.to_string()));
     }
 
     if let Some(assignee_kind) = query.assignee_kind {
-        sql.push_str(" AND assignee_kind = ?");
+        predicates.push("assignee_kind = ?".to_string());
         params.push(SqlValue::from(assignee_kind.to_string()));
     }
 
     if let Some(assignee_ref) = query.assignee_ref.as_deref() {
-        sql.push_str(" AND assignee_ref = ?");
+        predicates.push("assignee_ref = ?".to_string());
         params.push(SqlValue::from(assignee_ref.to_string()));
     }
 
     if let Some(kind) = query.kind {
-        sql.push_str(" AND kind = ?");
+        predicates.push("kind = ?".to_string());
         params.push(SqlValue::from(kind.to_string()));
     }
 
     if let Some(ready) = query.ready {
         if ready {
-            sql.push_str(
-                " AND NOT EXISTS (
-                SELECT 1
-                FROM json_each(subtask.depends_on_json) AS dep
-                LEFT JOIN subtask AS dependency ON dependency.subtask_id = dep.value
-                WHERE dependency.subtask_id IS NULL OR dependency.status != 'completed'
-            )",
+            predicates.push(
+                "NOT EXISTS (
+                    SELECT 1
+                    FROM json_each(subtask.depends_on_json) AS dep
+                    LEFT JOIN subtask AS dependency ON dependency.subtask_id = dep.value
+                    WHERE dependency.subtask_id IS NULL OR dependency.status != 'completed'
+                )"
+                .to_string(),
             );
         } else {
-            sql.push_str(
-                " AND EXISTS (
-                SELECT 1
-                FROM json_each(subtask.depends_on_json) AS dep
-                LEFT JOIN subtask AS dependency ON dependency.subtask_id = dep.value
-                WHERE dependency.subtask_id IS NULL OR dependency.status != 'completed'
-            )",
+            predicates.push(
+                "EXISTS (
+                    SELECT 1
+                    FROM json_each(subtask.depends_on_json) AS dep
+                    LEFT JOIN subtask AS dependency ON dependency.subtask_id = dep.value
+                    WHERE dependency.subtask_id IS NULL OR dependency.status != 'completed'
+                )"
+                .to_string(),
             );
         }
     }
 
     if let Some(blocked) = query.blocked {
         if blocked {
-            sql.push_str(
-                " AND EXISTS (
-                SELECT 1
-                FROM json_each(subtask.depends_on_json) AS dep
-                LEFT JOIN subtask AS dependency ON dependency.subtask_id = dep.value
-                WHERE dependency.subtask_id IS NULL OR dependency.status != 'completed'
-            )",
+            predicates.push(
+                "EXISTS (
+                    SELECT 1
+                    FROM json_each(subtask.depends_on_json) AS dep
+                    LEFT JOIN subtask AS dependency ON dependency.subtask_id = dep.value
+                    WHERE dependency.subtask_id IS NULL OR dependency.status != 'completed'
+                )"
+                .to_string(),
             );
         } else {
-            sql.push_str(
-                " AND NOT EXISTS (
-                SELECT 1
-                FROM json_each(subtask.depends_on_json) AS dep
-                LEFT JOIN subtask AS dependency ON dependency.subtask_id = dep.value
-                WHERE dependency.subtask_id IS NULL OR dependency.status != 'completed'
-            )",
+            predicates.push(
+                "NOT EXISTS (
+                    SELECT 1
+                    FROM json_each(subtask.depends_on_json) AS dep
+                    LEFT JOIN subtask AS dependency ON dependency.subtask_id = dep.value
+                    WHERE dependency.subtask_id IS NULL OR dependency.status != 'completed'
+                )"
+                .to_string(),
             );
         }
     }
 
-    sql.push_str(" ORDER BY position ASC, subtask_id ASC");
+    if let Some(cursor) = query.cursor.as_deref() {
+        let cursor = decode_subtask_cursor(cursor)?;
+        match query.order {
+            SortOrder::Asc => predicates.push(
+                "(position > ? OR (position = ? AND task_id > ?) OR (position = ? AND task_id = ? AND subtask_id > ?))"
+                    .to_string(),
+            ),
+            SortOrder::Desc => predicates.push(
+                "(position < ? OR (position = ? AND task_id < ?) OR (position = ? AND task_id = ? AND subtask_id < ?))"
+                    .to_string(),
+            ),
+        }
+        params.push(SqlValue::from(cursor.position));
+        params.push(SqlValue::from(cursor.position));
+        params.push(SqlValue::from(cursor.task_id.clone()));
+        params.push(SqlValue::from(cursor.position));
+        params.push(SqlValue::from(cursor.task_id));
+        params.push(SqlValue::from(cursor.subtask_id));
+    }
+
+    if !predicates.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(
+            &predicates
+                .into_iter()
+                .map(|predicate| predicate.trim_start_matches(" AND ").to_string())
+                .collect::<Vec<_>>()
+                .join(" AND "),
+        );
+    }
+
+    let order_keyword = match query.order {
+        SortOrder::Asc => "ASC",
+        SortOrder::Desc => "DESC",
+    };
+    sql.push_str(&format!(
+        " ORDER BY position {order_keyword}, task_id {order_keyword}, subtask_id {order_keyword} LIMIT ?"
+    ));
+    params.push(SqlValue::from((limit + 1) as i64));
 
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
-    collect_subtask_rows(&mut rows)
+    let mut items = collect_subtask_rows(&mut rows)?;
+
+    let next_cursor = if items.len() > limit {
+        items.pop().ok_or_else(|| TaskStoreError::InvalidCursor {
+            cursor: "failed to build subtask next_cursor".to_string(),
+        })?;
+        items.last().map(encode_subtask_cursor).transpose()?
+    } else {
+        None
+    };
+
+    Ok(SubtaskListPage { items, next_cursor })
 }
 
 fn update_subtask_row(conn: &Connection, record: &SubtaskRecord) -> Result<usize, TaskStoreError> {
@@ -1052,8 +1152,10 @@ fn load_required_subtasks_for_task(
     for subtask_id in subtask_ids {
         let subtask = load_required_subtask(conn, subtask_id.as_ref())?;
         if subtask.task_id != *task_id {
-            return Err(TaskStoreError::SubtaskNotFound {
+            return Err(TaskStoreError::SubtaskOutsideTask {
                 subtask_id: subtask_id.to_string(),
+                task_id: task_id.to_string(),
+                actual_task_id: subtask.task_id.to_string(),
             });
         }
         subtasks.push(subtask);
@@ -1502,6 +1604,21 @@ fn decode_cursor(cursor: &str) -> Result<TaskCursor, TaskStoreError> {
     })
 }
 
+fn encode_subtask_cursor(record: &SubtaskRecord) -> Result<String, TaskStoreError> {
+    serde_json::to_string(&SubtaskCursor {
+        position: record.position,
+        task_id: record.task_id.to_string(),
+        subtask_id: record.subtask_id.to_string(),
+    })
+    .map_err(Into::into)
+}
+
+fn decode_subtask_cursor(cursor: &str) -> Result<SubtaskCursor, TaskStoreError> {
+    serde_json::from_str(cursor).map_err(|_| TaskStoreError::InvalidCursor {
+        cursor: cursor.to_string(),
+    })
+}
+
 fn is_unique_constraint_for(error: &rusqlite::Error, target: &str) -> bool {
     matches!(
         error,
@@ -1753,7 +1870,8 @@ mod tests {
                     ..SubtaskListQuery::default()
                 },
             )
-            .expect("list ready subtasks");
+            .expect("list ready subtasks")
+            .items;
 
         assert_eq!(
             items
@@ -1786,7 +1904,8 @@ mod tests {
                     ..SubtaskListQuery::default()
                 },
             )
-            .expect("list blocked subtasks");
+            .expect("list blocked subtasks")
+            .items;
 
         assert_eq!(
             items
@@ -2107,7 +2226,8 @@ mod tests {
         let subtasks = stores
             .subtask
             .list_for_task(&task.task_id, &SubtaskListQuery::default())
-            .expect("list subtasks");
+            .expect("list subtasks")
+            .items;
 
         assert_eq!(
             effects,
