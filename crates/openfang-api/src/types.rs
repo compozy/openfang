@@ -1084,6 +1084,109 @@ pub struct TriggerTestResponse {
     pub explanation: TriggerTestExplanation,
 }
 
+fn default_event_payload() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn default_event_metadata() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+/// Shared request payload for live and dry-run event ingress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct EventIngressRequest {
+    pub event: String,
+    pub source: String,
+    #[serde(default = "default_event_payload")]
+    pub payload: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
+    #[serde(default = "default_event_metadata")]
+    pub metadata: serde_json::Value,
+}
+
+impl EventIngressRequest {
+    /// Returns the event payload shape consumed by the trigger matcher.
+    #[must_use]
+    pub fn trigger_event(&self) -> TriggerEvent {
+        TriggerEvent {
+            event: self.event.clone(),
+            source: self.source.clone(),
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+/// Aggregate side effects returned by the live event ingress endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct EventIngressEffects {
+    pub workflow_starts: usize,
+    pub workflow_signals: usize,
+    pub agent_messages: usize,
+}
+
+/// Per-trigger dispatch failure captured during live event ingress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct EventIngressFailure {
+    pub trigger_id: String,
+    pub target_kind: String,
+    pub message: String,
+}
+
+/// Live event ingress response payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct EventIngressResponse {
+    pub accepted: bool,
+    pub resource_id: String,
+    pub status: String,
+    pub event_id: String,
+    pub matched_triggers: Vec<String>,
+    pub effects: EventIngressEffects,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<EventIngressFailure>,
+}
+
+/// Resolved event identity returned by dry-run ingress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct EventIngressResolved {
+    pub event: String,
+    pub source: String,
+}
+
+/// Aggregate side effects returned by the dry-run event ingress endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct EventIngressDryRunEffects {
+    pub matched_triggers: Vec<String>,
+    pub workflow_starts: usize,
+    pub workflow_signals: usize,
+    pub agent_messages: usize,
+}
+
+/// Structured explanation for event ingress dry-run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct EventIngressDryRunExplanation {
+    pub matching_mode: String,
+}
+
+/// Dry-run event ingress response payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct EventIngressDryRunResponse {
+    pub would_execute: bool,
+    pub resolved: EventIngressResolved,
+    pub effects: EventIngressDryRunEffects,
+    pub explanation: EventIngressDryRunExplanation,
+}
+
 /// Full workflow runtime resource.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

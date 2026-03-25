@@ -42,6 +42,8 @@ pub async fn build_router(
     kernel: Arc<OpenFangKernel>,
     listen_addr: SocketAddr,
 ) -> (Router<()>, Arc<AppState>) {
+    bootstrap_trigger_definitions(&kernel).await;
+
     // Start channel bridges (Telegram, etc.)
     let bridge = channel_bridge::start_channel_bridge(kernel.clone()).await;
 
@@ -406,6 +408,14 @@ pub async fn build_router(
         .route(
             "/api/v1/triggers/{id}/test",
             axum::routing::post(routes::test_trigger_definition_v1),
+        )
+        .route(
+            "/api/v1/events",
+            axum::routing::post(routes::post_event_ingress_v1),
+        )
+        .route(
+            "/api/v1/events/dry-run",
+            axum::routing::post(routes::dry_run_event_ingress_v1),
         )
         // Schedule v1 control-plane endpoints
         .route(
@@ -1073,7 +1083,6 @@ pub async fn run_daemon(
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
     kernel.bootstrap_workflow_definitions().await;
-    bootstrap_trigger_definitions(&kernel).await;
     kernel.recover_looper_runs_on_startup().await?;
     kernel.start_background_agents();
 

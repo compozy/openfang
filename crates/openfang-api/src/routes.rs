@@ -11,6 +11,7 @@ use axum::extract::{
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use openfang_agent_definition::{
     compile as compile_agent_ir, stage1_schema_validate, stage2_reference_validate,
@@ -24,7 +25,7 @@ use openfang_kernel::metering::MeteringEngine;
 use openfang_kernel::trigger_v2::{
     compile_trigger_definition as compile_trigger_ir_definition, evaluate_compiled_trigger,
     normalize_trigger_definition, validate_trigger_definition, validate_trigger_value,
-    TriggerCompileError, TriggerCompileRegistry, TriggerEngineError,
+    TriggerCompileError, TriggerCompileRegistry, TriggerEngineError, TriggerMatchOutcome,
 };
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
@@ -52,7 +53,9 @@ use openfang_types::task::{
     SortOrder, SubtaskId, SubtaskListQuery, SubtaskPatch, SubtaskRecord, SubtaskSortField,
     SubtaskStatus, TaskId, TaskListQuery, TaskRecord, TaskReplanRequest, TaskSortField, TaskSource,
 };
-use openfang_types::trigger::{NormalizedTrigger, TriggerRuntimeStatus, TriggerV2Definition};
+use openfang_types::trigger::{
+    NormalizedTrigger, TriggerRuntimeStatus, TriggerTarget, TriggerV2Definition,
+};
 use openfang_types::workflow::{WorkflowIr, WorkflowIrStepKind};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -7977,6 +7980,521 @@ pub async fn test_trigger_definition_v1(
                 r#match: evaluation.explanation.match_summary,
                 target_kind: evaluation.explanation.target_kind,
                 blocked_by: evaluation.explanation.blocked_by,
+            },
+        })),
+    )
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct EventEffectAccumulator {
+    workflow_starts: usize,
+    workflow_signals: usize,
+    agent_messages: usize,
+}
+
+impl EventEffectAccumulator {
+    fn record_target(&mut self, target: &TriggerTarget) {
+        match target {
+            TriggerTarget::AgentMessage { .. } => self.agent_messages += 1,
+            TriggerTarget::WorkflowStart { .. } => self.workflow_starts += 1,
+            TriggerTarget::WorkflowSignal { .. } => self.workflow_signals += 1,
+        }
+    }
+
+    fn into_live_effects(self) -> EventIngressEffects {
+        EventIngressEffects {
+            workflow_starts: self.workflow_starts,
+            workflow_signals: self.workflow_signals,
+            agent_messages: self.agent_messages,
+        }
+    }
+
+    fn into_dry_run_effects(self, matched_triggers: Vec<String>) -> EventIngressDryRunEffects {
+        EventIngressDryRunEffects {
+            matched_triggers,
+            workflow_starts: self.workflow_starts,
+            workflow_signals: self.workflow_signals,
+            agent_messages: self.agent_messages,
+        }
+    }
+}
+
+fn parse_event_occurred_at(
+    occurred_at: Option<&str>,
+) -> Result<DateTime<Utc>, (StatusCode, Json<serde_json::Value>)> {
+    match occurred_at {
+        Some(value) => DateTime::parse_from_rfc3339(value)
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .map_err(|_| {
+                workflow_v2_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "`occurred_at` must be a valid RFC 3339 timestamp",
+                    Some(serde_json::json!([{
+                        "path": "occurred_at",
+                        "value": value,
+                    }])),
+                )
+            }),
+        None => Ok(Utc::now()),
+    }
+}
+
+fn event_dispatch_error_message(response: (StatusCode, Json<serde_json::Value>)) -> String {
+    response
+        .1
+         .0
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "dispatch failed".to_string())
+}
+
+fn resolve_trigger_message_text(
+    input: &openfang_types::trigger::TriggerInputPayload,
+) -> Result<String, String> {
+    if input.items.is_empty() {
+        return Err("trigger agent_message input must include at least one item".to_string());
+    }
+
+    let mut parts = Vec::with_capacity(input.items.len());
+    for (index, item) in input.items.iter().enumerate() {
+        if item.item_type != "text" {
+            return Err(format!(
+                "trigger agent_message input item {index} must use type `text`"
+            ));
+        }
+        let Some(text) = item.text.as_deref() else {
+            return Err(format!(
+                "trigger agent_message input item {index} must include text"
+            ));
+        };
+        if !text.trim().is_empty() {
+            parts.push(text.trim().to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        return Err("trigger agent_message input must include non-empty text".to_string());
+    }
+
+    Ok(parts.join("\n"))
+}
+
+fn event_dispatch_metadata(
+    request: &EventIngressRequest,
+    trigger_id: &str,
+    event_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "source": "event_ingress",
+        "event_id": event_id,
+        "trigger_id": trigger_id,
+        "event": {
+            "event": request.event,
+            "source": request.source,
+            "idempotency_key": request.idempotency_key,
+            "occurred_at": request.occurred_at,
+            "metadata": request.metadata,
+        }
+    })
+}
+
+fn signal_dispatch_idempotency_key(
+    request: &EventIngressRequest,
+    event_id: &str,
+    trigger_id: &str,
+    run_id: &str,
+) -> String {
+    let seed = request.idempotency_key.as_deref().unwrap_or(event_id);
+    format!("{seed}:{trigger_id}:{run_id}")
+}
+
+fn ensure_event_dispatch_session(
+    state: &AppState,
+    definition_id: &str,
+    agent_id: AgentId,
+) -> Result<SessionId, String> {
+    if let Some(entry) = find_runtime_agent_for_definition(state, definition_id) {
+        match state
+            .kernel
+            .runtime_stores
+            .agent_session
+            .get_agent_session(entry.session_id)
+        {
+            Ok(Some(record)) if record.agent_id == agent_id => return Ok(record.session_id),
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => {
+                return Err(format!("failed to load agent session: {error}"));
+            }
+        }
+    }
+
+    let created = state
+        .kernel
+        .create_agent_session(agent_id, Some("event-ingress"))
+        .map_err(|error| format!("failed to create agent session: {error}"))?;
+    let session_id = created
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "created agent session did not include session_id".to_string())?;
+    session_id
+        .parse::<uuid::Uuid>()
+        .map(SessionId)
+        .map_err(|error| format!("created session id was invalid: {error}"))
+}
+
+async fn dispatch_event_agent_message(
+    state: &Arc<AppState>,
+    trigger_id: &str,
+    event_id: &str,
+    agent: &str,
+    input: &openfang_types::trigger::TriggerInputPayload,
+) -> Result<(), String> {
+    let agent_id =
+        ensure_runtime_agent_present(state, agent).map_err(event_dispatch_error_message)?;
+    state
+        .kernel
+        .set_agent_state(agent_id, AgentState::Running)
+        .map_err(|error| format!("failed to start agent runtime: {error}"))?;
+    let session_id = ensure_event_dispatch_session(state, agent, agent_id)?;
+    let message = resolve_trigger_message_text(input)?;
+    let kernel = Arc::clone(&state.kernel);
+    let definition_id = agent.to_string();
+    let event_id = event_id.to_string();
+    let trigger_id = trigger_id.to_string();
+    let spawned_event_id = event_id.clone();
+    let spawned_trigger_id = trigger_id.clone();
+
+    tokio::spawn(async move {
+        let kernel_handle: Arc<dyn KernelHandle> = kernel.clone() as Arc<dyn KernelHandle>;
+        if let Err(error) = kernel
+            .send_message_with_handle_and_blocks_for_session(AgentMessageDispatch {
+                agent_id,
+                session_id: Some(session_id),
+                message: &message,
+                kernel_handle: Some(kernel_handle),
+                content_blocks: None,
+                sender_id: Some(spawned_event_id.clone()),
+                sender_name: Some(format!("trigger:{spawned_trigger_id}")),
+            })
+            .await
+        {
+            tracing::warn!(
+                trigger_id = %spawned_trigger_id,
+                definition_id = %definition_id,
+                agent_id = %agent_id,
+                session_id = %session_id,
+                error = %error,
+                "Event ingress agent message dispatch failed after acceptance"
+            );
+        }
+    });
+
+    tracing::info!(
+        trigger_id = %trigger_id,
+        event_id = %event_id,
+        agent = %agent,
+        "Event ingress dispatched agent_message trigger"
+    );
+    Ok(())
+}
+
+async fn dispatch_event_workflow_start(
+    state: &Arc<AppState>,
+    trigger_id: &str,
+    event_id: &str,
+    request: &EventIngressRequest,
+    workflow_id: &str,
+    input: &serde_json::Value,
+) -> Result<(), String> {
+    let resource = load_workflow_definition_resource(state, workflow_id)
+        .map_err(event_dispatch_error_message)?
+        .ok_or_else(|| format!("workflow definition not found: {workflow_id}"))?;
+    let workflow_ir = compile_workflow_resource(state, &resource)
+        .await
+        .map_err(event_dispatch_error_message)?;
+    let input_json = serde_json::to_string(input)
+        .map_err(|error| format!("failed to encode workflow input: {error}"))?;
+    let metadata = event_dispatch_metadata(request, trigger_id, event_id);
+    let run_id = state
+        .kernel
+        .workflows
+        .create_run_from_compiled_workflow(
+            workflow_ir.workflow_id.clone(),
+            resource.definition.name.clone(),
+            workflow_ir.workflow_version.clone(),
+            input_json,
+            Vec::new(),
+            metadata,
+        )
+        .await
+        .map_err(|error| format!("failed to create workflow run: {error}"))?;
+
+    let workflow_ir_for_task = workflow_ir.clone();
+    let kernel = Arc::clone(&state.kernel);
+    let definition_id = workflow_id.to_string();
+    let trigger_id = trigger_id.to_string();
+    let spawned_trigger_id = trigger_id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = kernel
+            .execute_compiled_workflow_run(run_id, workflow_ir_for_task)
+            .await
+        {
+            tracing::warn!(
+                trigger_id = %spawned_trigger_id,
+                workflow_id = %definition_id,
+                run_id = %run_id,
+                error = %error,
+                "Event ingress workflow execution failed after acceptance"
+            );
+        }
+    });
+
+    tracing::info!(
+        trigger_id = %trigger_id,
+        event_id = %event_id,
+        workflow_id = %workflow_id,
+        "Event ingress dispatched workflow_start trigger"
+    );
+    Ok(())
+}
+
+async fn dispatch_event_workflow_signal(
+    state: &Arc<AppState>,
+    trigger_id: &str,
+    event_id: &str,
+    request: &EventIngressRequest,
+    signal: &str,
+    selector: &openfang_types::trigger::TriggerWorkflowSignalSelector,
+    payload: &serde_json::Value,
+) -> Result<(), String> {
+    let runs = state
+        .kernel
+        .workflow_stores
+        .workflow_run
+        .list_for_workflow(&selector.workflow_id)
+        .map_err(|error| format!("failed to list workflow runs: {error}"))?;
+    let waiting_runs = runs
+        .into_iter()
+        .filter(|record| record.status == WorkflowRunStatus::WaitingSignal)
+        .collect::<Vec<_>>();
+    if waiting_runs.is_empty() {
+        return Err(format!(
+            "no waiting workflow runs found for {}",
+            selector.workflow_id
+        ));
+    }
+
+    for record in waiting_runs {
+        let run_id = record
+            .run_id
+            .parse::<uuid::Uuid>()
+            .map(WorkflowRunId)
+            .map_err(|error| format!("invalid workflow run id '{}': {error}", record.run_id))?;
+        state
+            .kernel
+            .submit_run_signal(
+                run_id,
+                signal.to_string(),
+                payload.clone(),
+                "event".to_string(),
+                signal_dispatch_idempotency_key(request, event_id, trigger_id, &record.run_id),
+            )
+            .await
+            .map_err(|error| format!("failed to submit workflow signal: {error}"))?;
+    }
+
+    tracing::info!(
+        trigger_id = %trigger_id,
+        event_id = %event_id,
+        workflow_id = %selector.workflow_id,
+        signal = %signal,
+        "Event ingress dispatched workflow_signal trigger"
+    );
+    Ok(())
+}
+
+async fn dispatch_event_trigger(
+    state: &Arc<AppState>,
+    request: &EventIngressRequest,
+    event_id: &str,
+    matched: &TriggerMatchOutcome,
+) -> Result<(), String> {
+    let target = matched
+        .resolved_target
+        .as_ref()
+        .ok_or_else(|| "matched trigger had no resolved target".to_string())?;
+
+    match target {
+        TriggerTarget::AgentMessage { agent, input, .. } => {
+            dispatch_event_agent_message(state, &matched.trigger_id, event_id, agent, input).await
+        }
+        TriggerTarget::WorkflowStart { workflow, input } => {
+            dispatch_event_workflow_start(
+                state,
+                &matched.trigger_id,
+                event_id,
+                request,
+                workflow,
+                input,
+            )
+            .await
+        }
+        TriggerTarget::WorkflowSignal {
+            signal,
+            selector,
+            payload,
+        } => {
+            dispatch_event_workflow_signal(
+                state,
+                &matched.trigger_id,
+                event_id,
+                request,
+                signal,
+                selector,
+                payload,
+            )
+            .await
+        }
+    }
+}
+
+/// POST /api/v1/events — Evaluate all active triggers and dispatch their targets.
+pub async fn post_event_ingress_v1(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<EventIngressRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let occurred_at = match parse_event_occurred_at(request.occurred_at.as_deref()) {
+        Ok(timestamp) => timestamp,
+        Err(response) => return response,
+    };
+    let matcher = match state.kernel.trigger_v2.match_engine_snapshot().await {
+        Ok(matcher) => matcher,
+        Err(error) => {
+            return workflow_v2_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "event_match_failed",
+                "Failed to build trigger match engine snapshot",
+                Some(serde_json::json!([{
+                    "message": error.to_string(),
+                }])),
+            )
+        }
+    };
+
+    let trigger_event = request.trigger_event();
+    let report = matcher.evaluate_event(&trigger_event, occurred_at);
+    let matched = report.dispatchable_matches();
+    let matched_triggers = report.matched_trigger_ids();
+    let event_id = format!("evt_{}", uuid::Uuid::new_v4());
+    let mut effects = EventEffectAccumulator::default();
+    let mut failures = Vec::new();
+
+    for matched_trigger in matched {
+        let Some(target) = matched_trigger.resolved_target.clone() else {
+            failures.push(EventIngressFailure {
+                trigger_id: matched_trigger.trigger_id.clone(),
+                target_kind: "unknown".to_string(),
+                message: "matched trigger had no resolved target".to_string(),
+            });
+            continue;
+        };
+
+        match dispatch_event_trigger(&state, &request, &event_id, &matched_trigger).await {
+            Ok(()) => {
+                effects.record_target(&target);
+                if let Err(error) = state
+                    .kernel
+                    .trigger_v2
+                    .record_successful_fire(&matched_trigger.trigger_id, occurred_at)
+                    .await
+                {
+                    failures.push(EventIngressFailure {
+                        trigger_id: matched_trigger.trigger_id.clone(),
+                        target_kind: target.kind().to_string(),
+                        message: format!(
+                            "trigger dispatch succeeded but fire state update failed: {error}"
+                        ),
+                    });
+                }
+            }
+            Err(error) => failures.push(EventIngressFailure {
+                trigger_id: matched_trigger.trigger_id.clone(),
+                target_kind: target.kind().to_string(),
+                message: error,
+            }),
+        }
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!(EventIngressResponse {
+            accepted: true,
+            resource_id: event_id.clone(),
+            status: "accepted".to_string(),
+            event_id,
+            matched_triggers,
+            effects: effects.into_live_effects(),
+            failures,
+        })),
+    )
+}
+
+/// POST /api/v1/events/dry-run — Evaluate all active triggers without dispatching targets.
+pub async fn dry_run_event_ingress_v1(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<EventIngressRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let occurred_at = match parse_event_occurred_at(request.occurred_at.as_deref()) {
+        Ok(timestamp) => timestamp,
+        Err(response) => return response,
+    };
+    let matcher = match state.kernel.trigger_v2.match_engine_snapshot().await {
+        Ok(matcher) => matcher,
+        Err(error) => {
+            return workflow_v2_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "event_match_failed",
+                "Failed to build trigger match engine snapshot",
+                Some(serde_json::json!([{
+                    "message": error.to_string(),
+                }])),
+            )
+        }
+    };
+
+    let trigger_event = request.trigger_event();
+    let report = matcher.evaluate_event(&trigger_event, occurred_at);
+    let matched = report.dispatchable_matches();
+    let matched_triggers = report.matched_trigger_ids();
+    let mut effects = EventEffectAccumulator::default();
+    for matched_trigger in &matched {
+        if let Some(target) = matched_trigger.resolved_target.as_ref() {
+            effects.record_target(target);
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(EventIngressDryRunResponse {
+            would_execute: report.would_dispatch(),
+            resolved: EventIngressResolved {
+                event: request.event,
+                source: request.source,
+            },
+            effects: effects.into_dry_run_effects(matched_triggers),
+            explanation: EventIngressDryRunExplanation {
+                matching_mode: "trigger_engine".to_string(),
             },
         })),
     )

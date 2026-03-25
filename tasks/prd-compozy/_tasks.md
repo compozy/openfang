@@ -20,24 +20,24 @@
 - [x] [_task_16.md](_task_16.md) — Task 16.0: Durable Workflow Run Repository And Transition Writer
 - [x] [_task_17.md](_task_17.md) — Task 17.0: Workflow Signal Persistence And Waiting-State Integration
 - [x] [_task_18.md](_task_18.md) — Task 18.0: Agent Definition Validation And Compile Pipeline
-- [ ] [_task_19.md](_task_19.md) — Task 19.0: Restart Recovery And Durable Run Control Surfaces
-- [ ] [_task_20.md](_task_20.md) — Task 20.0: Agent Definition CRUD And Compile Routes
-- [ ] [_task_21.md](_task_21.md) — Task 21.0: Agent Runtime Operational Sub-Resources
-- [ ] [_task_22.md](_task_22.md) — Task 22.0: Agent Sessions Messages And SSE Streaming
-- [ ] [_task_23.md](_task_23.md) — Task 23.0: agent_dispatch Schema And Persistence Layer
-- [ ] [_task_24.md](_task_24.md) — Task 24.0: hitl_request Schema And Persistence Layer
-- [ ] [_task_25.md](_task_25.md) — Task 25.0: Workflow Definition CRUD Control-Plane Surfaces
-- [ ] [_task_26.md](_task_26.md) — Task 26.0: Schedule Control-Plane Surfaces
-- [ ] [_task_27.md](_task_27.md) — Task 27.0: Skills Listing Endpoint
-- [ ] [_task_28.md](_task_28.md) — Task 28.0: Task And Subtask Domain Schema And Repositories
-- [ ] [_task_29.md](_task_29.md) — Task 29.0: Dispatch Runtime Integration With Provider-Native Sessions
-- [ ] [_task_30.md](_task_30.md) — Task 30.0: HITL Single-Turn Live Pause And Resume
-- [ ] [_task_31.md](_task_31.md) — Task 31.0: HITL Post-Restart Reconstruction
-- [ ] [_task_32.md](_task_32.md) — Task 32.0: Task And Subtask Control-Plane Plus Replanning
-- [ ] [_task_33.md](_task_33.md) — Task 33.0: Dispatch And HITL Control-Plane Surfaces
-- [ ] [_task_34.md](_task_34.md) — Task 34.0: Looper Durable Schema And Runtime
-- [ ] [_task_35.md](_task_35.md) — Task 35.0: Trigger v2 Types And Definition CRUD
-- [ ] [_task_36.md](_task_36.md) — Task 36.0: Event Ingress Pipeline And Match Engine
+- [x] [_task_19.md](_task_19.md) — Task 19.0: Restart Recovery And Durable Run Control Surfaces
+- [x] [_task_20.md](_task_20.md) — Task 20.0: Agent Definition CRUD And Compile Routes
+- [x] [_task_21.md](_task_21.md) — Task 21.0: Agent Runtime Operational Sub-Resources
+- [x] [_task_22.md](_task_22.md) — Task 22.0: Agent Sessions Messages And SSE Streaming
+- [x] [_task_23.md](_task_23.md) — Task 23.0: agent_dispatch Schema And Persistence Layer
+- [x] [_task_24.md](_task_24.md) — Task 24.0: hitl_request Schema And Persistence Layer
+- [x] [_task_25.md](_task_25.md) — Task 25.0: Workflow Definition CRUD Control-Plane Surfaces
+- [x] [_task_26.md](_task_26.md) — Task 26.0: Schedule Control-Plane Surfaces
+- [x] [_task_27.md](_task_27.md) — Task 27.0: Skills Listing Endpoint
+- [x] [_task_28.md](_task_28.md) — Task 28.0: Task And Subtask Domain Schema And Repositories
+- [x] [_task_29.md](_task_29.md) — Task 29.0: Dispatch Runtime Integration With Provider-Native Sessions
+- [x] [_task_30.md](_task_30.md) — Task 30.0: HITL Single-Turn Live Pause And Resume
+- [x] [_task_31.md](_task_31.md) — Task 31.0: HITL Post-Restart Reconstruction
+- [x] [_task_32.md](_task_32.md) — Task 32.0: Task And Subtask Control-Plane Plus Replanning
+- [x] [_task_33.md](_task_33.md) — Task 33.0: Dispatch And HITL Control-Plane Surfaces
+- [x] [_task_34.md](_task_34.md) — Task 34.0: Looper Durable Schema And Runtime
+- [x] [_task_35.md](_task_35.md) — Task 35.0: Trigger v2 Types And Definition CRUD
+- [x] [_task_36.md](_task_36.md) — Task 36.0: Event Ingress Pipeline And Match Engine
 - [ ] [_task_37.md](_task_37.md) — Task 37.0: Artifact And Doc Versioning
 - [ ] [_task_38.md](_task_38.md) — Task 38.0: Artifact And Doc Standalone Read Endpoints
 - [ ] [_task_39.md](_task_39.md) — Task 39.0: Looper Control-Plane And SSE Surfaces

@@ -11,8 +11,8 @@ use openfang_memory::{TriggerRuntimeRecord, TriggerRuntimeStore};
 use openfang_types::error::OpenFangError;
 use openfang_types::error::OpenFangResult;
 use openfang_types::trigger::{
-    NormalizedTrigger, TriggerEvent, TriggerIr, TriggerRuntimeStatus, TriggerTarget,
-    TriggerV2Definition, TriggerValidationIssue, TriggerWorkflowSignalSelector,
+    NormalizedTrigger, TriggerDispatchAction, TriggerEvent, TriggerIr, TriggerRuntimeStatus,
+    TriggerTarget, TriggerV2Definition, TriggerValidationIssue, TriggerWorkflowSignalSelector,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -144,6 +144,113 @@ pub struct TriggerEvaluation {
     pub would_dispatch: bool,
     /// Structured explanation for UI/API responses.
     pub explanation: TriggerEvaluationExplanation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TriggerMatchCandidate {
+    compiled: TriggerIr,
+    runtime: TriggerRuntimeStatus,
+}
+
+/// One per-trigger evaluation result from the snapshot match engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriggerMatchOutcome {
+    /// Trigger definition identifier.
+    pub trigger_id: String,
+    /// Whether the trigger matched and passed runtime guards.
+    pub matched: bool,
+    /// Canonical target selected for the trigger.
+    pub resolved_target: Option<TriggerTarget>,
+    /// Dispatch action selected from the target kind.
+    pub dispatch_action: TriggerDispatchAction,
+    /// Whether the runtime should dispatch the target.
+    pub would_dispatch: bool,
+    /// Structured explanation for logs and dry-run responses.
+    pub explanation: TriggerEvaluationExplanation,
+}
+
+/// Ordered event match report for a snapshot of active trigger definitions.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TriggerMatchReport {
+    /// Per-trigger evaluations in definition order.
+    pub evaluations: Vec<TriggerMatchOutcome>,
+}
+
+impl TriggerMatchReport {
+    /// Returns the trigger IDs that matched and should dispatch.
+    #[must_use]
+    pub fn matched_trigger_ids(&self) -> Vec<String> {
+        self.evaluations
+            .iter()
+            .filter(|evaluation| evaluation.would_dispatch)
+            .map(|evaluation| evaluation.trigger_id.clone())
+            .collect()
+    }
+
+    /// Returns the dispatchable matches in definition order.
+    #[must_use]
+    pub fn dispatchable_matches(&self) -> Vec<TriggerMatchOutcome> {
+        self.evaluations
+            .iter()
+            .filter(|evaluation| evaluation.would_dispatch)
+            .cloned()
+            .collect()
+    }
+
+    /// Returns `true` when at least one trigger would dispatch.
+    #[must_use]
+    pub fn would_dispatch(&self) -> bool {
+        self.evaluations
+            .iter()
+            .any(|evaluation| evaluation.would_dispatch)
+    }
+}
+
+/// Snapshot-based trigger matcher used by event ingress.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TriggerMatchEngine {
+    candidates: Vec<TriggerMatchCandidate>,
+}
+
+impl TriggerMatchEngine {
+    /// Creates a match engine from a fixed ordered trigger snapshot.
+    #[must_use]
+    fn new(candidates: Vec<TriggerMatchCandidate>) -> Self {
+        Self { candidates }
+    }
+
+    /// Evaluates every trigger in order and returns the full report.
+    #[must_use]
+    pub fn evaluate_event(&self, event: &TriggerEvent, now: DateTime<Utc>) -> TriggerMatchReport {
+        let evaluations = self
+            .candidates
+            .iter()
+            .map(|candidate| {
+                let evaluation =
+                    evaluate_compiled_trigger(&candidate.compiled, &candidate.runtime, event, now);
+                TriggerMatchOutcome {
+                    trigger_id: candidate.compiled.trigger_id.clone(),
+                    matched: evaluation.matched,
+                    resolved_target: evaluation.resolved_target,
+                    dispatch_action: candidate.compiled.dispatch_action,
+                    would_dispatch: evaluation.would_dispatch,
+                    explanation: evaluation.explanation,
+                }
+            })
+            .collect();
+
+        TriggerMatchReport { evaluations }
+    }
+
+    /// Evaluates every trigger in order and returns only the dispatchable matches.
+    #[must_use]
+    pub fn match_event(
+        &self,
+        event: &TriggerEvent,
+        now: DateTime<Utc>,
+    ) -> Vec<TriggerMatchOutcome> {
+        self.evaluate_event(event, now).dispatchable_matches()
+    }
 }
 
 /// Durable trigger v2 registry and active matching set.
@@ -289,6 +396,66 @@ impl TriggerV2Engine {
             .map(default_runtime_status))
     }
 
+    /// Builds an ordered snapshot matcher from the current active trigger set.
+    pub async fn match_engine_snapshot(&self) -> OpenFangResult<TriggerMatchEngine> {
+        let compiled = self
+            .active_compiled
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let runtime_records = self
+            .runtime_store
+            .list_trigger_runtimes()?
+            .into_iter()
+            .map(|record| (record.trigger_id.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+
+        let candidates = compiled
+            .into_iter()
+            .map(|compiled_trigger| {
+                let runtime = runtime_records
+                    .get(&compiled_trigger.trigger_id)
+                    .cloned()
+                    .map(runtime_status_from_record)
+                    .unwrap_or_else(|| default_runtime_status_from_compiled(&compiled_trigger));
+                TriggerMatchCandidate {
+                    compiled: compiled_trigger,
+                    runtime,
+                }
+            })
+            .collect();
+
+        Ok(TriggerMatchEngine::new(candidates))
+    }
+
+    /// Records one successful trigger fire in the durable runtime projection.
+    pub async fn record_successful_fire(
+        &self,
+        trigger_id: &str,
+        fired_at: DateTime<Utc>,
+    ) -> OpenFangResult<TriggerRuntimeStatus> {
+        let mut runtime = match self.get_runtime_status(trigger_id).await? {
+            Some(runtime) => runtime,
+            None => {
+                let Some(compiled) = self.get_compiled_trigger(trigger_id).await else {
+                    return Err(OpenFangError::Internal(format!(
+                        "Trigger runtime state was missing for unknown trigger '{trigger_id}'"
+                    )));
+                };
+                default_runtime_status_from_compiled(&compiled)
+            }
+        };
+
+        runtime.fire_count = runtime.fire_count.saturating_add(1);
+        runtime.last_fired_at = Some(fired_at.to_rfc3339());
+        self.runtime_store
+            .upsert_trigger_runtime(&runtime_record_from_status(&runtime, fired_at.to_rfc3339()))?;
+
+        Ok(runtime)
+    }
+
     /// Evaluates one trigger definition against a synthetic event.
     pub async fn evaluate_trigger(
         &self,
@@ -397,6 +564,21 @@ fn runtime_status_from_record(record: TriggerRuntimeRecord) -> TriggerRuntimeSta
     }
 }
 
+fn runtime_record_from_status(
+    runtime: &TriggerRuntimeStatus,
+    updated_at: String,
+) -> TriggerRuntimeRecord {
+    TriggerRuntimeRecord {
+        trigger_id: runtime.trigger_id.clone(),
+        enabled: runtime.enabled,
+        fire_count: runtime.fire_count,
+        max_fires: runtime.max_fires,
+        cooldown_secs: runtime.cooldown_secs,
+        last_fired_at: runtime.last_fired_at.clone(),
+        updated_at,
+    }
+}
+
 fn default_runtime_status(definition: &TriggerV2Definition) -> TriggerRuntimeStatus {
     TriggerRuntimeStatus {
         trigger_id: definition.id.clone(),
@@ -404,6 +586,17 @@ fn default_runtime_status(definition: &TriggerV2Definition) -> TriggerRuntimeSta
         fire_count: 0,
         max_fires: definition.max_fires,
         cooldown_secs: definition.cooldown_secs,
+        last_fired_at: None,
+    }
+}
+
+fn default_runtime_status_from_compiled(compiled: &TriggerIr) -> TriggerRuntimeStatus {
+    TriggerRuntimeStatus {
+        trigger_id: compiled.trigger_id.clone(),
+        enabled: compiled.enabled,
+        fire_count: 0,
+        max_fires: compiled.max_fires,
+        cooldown_secs: compiled.cooldown_secs,
         last_fired_at: None,
     }
 }
@@ -695,25 +888,30 @@ pub fn evaluate_compiled_trigger(
     event: &TriggerEvent,
     now: DateTime<Utc>,
 ) -> TriggerEvaluation {
-    let mut details = Vec::new();
-    let matched = match_trigger(&compiled.trigger_match, event, &mut details);
-    let mut blocked_by = None;
-    let mut would_dispatch = matched;
-
-    if matched && !runtime.enabled {
-        blocked_by = Some("disabled".to_string());
-        would_dispatch = false;
-    } else if matched && runtime.max_fires > 0 && runtime.fire_count >= runtime.max_fires {
-        blocked_by = Some("max_fires_reached".to_string());
-        would_dispatch = false;
-    } else if matched
-        && runtime.cooldown_secs > 0
-        && cooldown_active(runtime.last_fired_at.as_deref(), runtime.cooldown_secs, now)
-    {
-        blocked_by = Some("cooldown_active".to_string());
-        would_dispatch = false;
+    if !runtime.enabled {
+        return blocked_trigger_evaluation(compiled, "disabled", "trigger is disabled");
     }
 
+    if runtime.max_fires > 0 && runtime.fire_count >= runtime.max_fires {
+        return blocked_trigger_evaluation(
+            compiled,
+            "max_fires_reached",
+            "trigger reached its max_fires limit",
+        );
+    }
+
+    if runtime.cooldown_secs > 0
+        && cooldown_active(runtime.last_fired_at.as_deref(), runtime.cooldown_secs, now)
+    {
+        return blocked_trigger_evaluation(
+            compiled,
+            "cooldown_active",
+            "trigger is inside its cooldown window",
+        );
+    }
+
+    let mut details = Vec::new();
+    let matched = match_trigger(&compiled.trigger_match, event, &mut details);
     if matched {
         details.push("all configured match clauses satisfied".to_string());
     }
@@ -721,11 +919,28 @@ pub fn evaluate_compiled_trigger(
     TriggerEvaluation {
         matched,
         resolved_target: matched.then_some(compiled.target.clone()),
-        would_dispatch,
+        would_dispatch: matched,
         explanation: TriggerEvaluationExplanation {
             match_summary: details.join("; "),
             target_kind: compiled.target.kind().to_string(),
-            blocked_by,
+            blocked_by: None,
+        },
+    }
+}
+
+fn blocked_trigger_evaluation(
+    compiled: &TriggerIr,
+    blocked_by: &str,
+    summary: &str,
+) -> TriggerEvaluation {
+    TriggerEvaluation {
+        matched: false,
+        resolved_target: Some(compiled.target.clone()),
+        would_dispatch: false,
+        explanation: TriggerEvaluationExplanation {
+            match_summary: summary.to_string(),
+            target_kind: compiled.target.kind().to_string(),
+            blocked_by: Some(blocked_by.to_string()),
         },
     }
 }
@@ -1091,7 +1306,7 @@ mod tests {
         compile_trigger_definition, evaluate_compiled_trigger, validate_trigger_definition,
         validate_trigger_value, TriggerCompileRegistry, TriggerV2Engine,
     };
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use openfang_memory::TRIGGER_RUNTIME_CORE_MIGRATION_SQL;
     use openfang_types::trigger::{
         TriggerEvent, TriggerInputItem, TriggerInputPayload, TriggerTarget, TriggerV2Definition,
@@ -1126,6 +1341,48 @@ mod tests {
             target: TriggerTarget::WorkflowStart {
                 workflow: "sdlc".to_string(),
                 input: json!({ "from": "trigger" }),
+            },
+        }
+    }
+
+    fn wildcard_definition() -> TriggerV2Definition {
+        TriggerV2Definition {
+            id: "wildcard-trigger".to_string(),
+            name: "Wildcard".to_string(),
+            description: "Matches any event".to_string(),
+            enabled: true,
+            max_fires: 0,
+            cooldown_secs: 0,
+            trigger_match: openfang_types::trigger::TriggerMatch {
+                event: None,
+                source: None,
+                contains: None,
+                filters: BTreeMap::new(),
+            },
+            target: TriggerTarget::WorkflowStart {
+                workflow: "sdlc".to_string(),
+                input: json!({}),
+            },
+        }
+    }
+
+    fn contains_definition() -> TriggerV2Definition {
+        TriggerV2Definition {
+            id: "contains-trigger".to_string(),
+            name: "Contains".to_string(),
+            description: "Matches payload text".to_string(),
+            enabled: true,
+            max_fires: 0,
+            cooldown_secs: 0,
+            trigger_match: openfang_types::trigger::TriggerMatch {
+                event: Some("issue.created".to_string()),
+                source: Some("api".to_string()),
+                contains: Some("ISSUE-123".to_string()),
+                filters: BTreeMap::new(),
+            },
+            target: TriggerTarget::WorkflowStart {
+                workflow: "sdlc".to_string(),
+                input: json!({}),
             },
         }
     }
@@ -1264,11 +1521,216 @@ mod tests {
 
         let evaluation = evaluate_compiled_trigger(&compiled, &runtime, &event, Utc::now());
 
-        assert!(evaluation.matched);
+        assert!(!evaluation.matched);
         assert!(!evaluation.would_dispatch);
         assert_eq!(
             evaluation.explanation.blocked_by,
             Some("disabled".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn match_engine_should_match_exact_event_name() {
+        let engine = TriggerV2Engine::new(runtime_store());
+        let registry = registry();
+        let definition = sample_definition();
+        engine
+            .upsert_definition(definition, &registry)
+            .await
+            .expect("definition should load");
+        let matcher = engine
+            .match_engine_snapshot()
+            .await
+            .expect("match engine snapshot should build");
+
+        let matching_event = TriggerEvent {
+            event: "issue.created".to_string(),
+            source: "api".to_string(),
+            payload: json!({
+                "issue": { "priority": "high" }
+            }),
+        };
+        let non_matching_event = TriggerEvent {
+            event: "issue.updated".to_string(),
+            source: "api".to_string(),
+            payload: json!({
+                "issue": { "priority": "high" }
+            }),
+        };
+
+        let matching = matcher.match_event(&matching_event, Utc::now());
+        let non_matching = matcher.match_event(&non_matching_event, Utc::now());
+
+        assert_eq!(matching.len(), 1);
+        assert!(non_matching.is_empty());
+    }
+
+    #[tokio::test]
+    async fn match_engine_should_match_contains_substring() {
+        let engine = TriggerV2Engine::new(runtime_store());
+        let registry = registry();
+        engine
+            .upsert_definition(contains_definition(), &registry)
+            .await
+            .expect("definition should load");
+        let matcher = engine
+            .match_engine_snapshot()
+            .await
+            .expect("match engine snapshot should build");
+
+        let matching_event = TriggerEvent {
+            event: "issue.created".to_string(),
+            source: "api".to_string(),
+            payload: json!({
+                "issue_id": "ISSUE-123"
+            }),
+        };
+        let non_matching_event = TriggerEvent {
+            event: "issue.created".to_string(),
+            source: "api".to_string(),
+            payload: json!({
+                "issue_id": "ISSUE-999"
+            }),
+        };
+
+        let matching = matcher.match_event(&matching_event, Utc::now());
+        let non_matching = matcher.match_event(&non_matching_event, Utc::now());
+
+        assert_eq!(matching.len(), 1);
+        assert!(non_matching.is_empty());
+    }
+
+    #[tokio::test]
+    async fn match_engine_should_treat_missing_event_as_wildcard() {
+        let engine = TriggerV2Engine::new(runtime_store());
+        let registry = registry();
+        engine
+            .upsert_definition(wildcard_definition(), &registry)
+            .await
+            .expect("definition should load");
+        let matcher = engine
+            .match_engine_snapshot()
+            .await
+            .expect("match engine snapshot should build");
+
+        let event = TriggerEvent {
+            event: "anything.happened".to_string(),
+            source: "worker".to_string(),
+            payload: json!({
+                "message": "wildcard"
+            }),
+        };
+
+        let matches = matcher.match_event(&event, Utc::now());
+
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn match_engine_should_skip_trigger_after_max_fires_reached() {
+        let engine = TriggerV2Engine::new(runtime_store());
+        let registry = registry();
+        let definition = sample_definition();
+        engine
+            .upsert_definition(definition.clone(), &registry)
+            .await
+            .expect("definition should load");
+        engine
+            .runtime_store
+            .upsert_trigger_runtime(&openfang_memory::TriggerRuntimeRecord {
+                trigger_id: definition.id.clone(),
+                enabled: true,
+                fire_count: 3,
+                max_fires: 3,
+                cooldown_secs: 0,
+                last_fired_at: None,
+                updated_at: Utc::now().to_rfc3339(),
+            })
+            .expect("runtime should update");
+
+        let matcher = engine
+            .match_engine_snapshot()
+            .await
+            .expect("match engine snapshot should build");
+        let event = TriggerEvent {
+            event: "issue.created".to_string(),
+            source: "api".to_string(),
+            payload: json!({
+                "issue": { "priority": "high" }
+            }),
+        };
+
+        let report = matcher.evaluate_event(&event, Utc::now());
+
+        assert!(report.dispatchable_matches().is_empty());
+        assert_eq!(
+            report.evaluations[0].explanation.blocked_by.as_deref(),
+            Some("max_fires_reached")
+        );
+    }
+
+    #[tokio::test]
+    async fn match_engine_should_skip_trigger_with_active_cooldown() {
+        let engine = TriggerV2Engine::new(runtime_store());
+        let registry = registry();
+        let definition = sample_definition();
+        engine
+            .upsert_definition(definition.clone(), &registry)
+            .await
+            .expect("definition should load");
+        let last_fired_at = (Utc::now() - Duration::seconds(30)).to_rfc3339();
+        engine
+            .runtime_store
+            .upsert_trigger_runtime(&openfang_memory::TriggerRuntimeRecord {
+                trigger_id: definition.id.clone(),
+                enabled: true,
+                fire_count: 1,
+                max_fires: 3,
+                cooldown_secs: 60,
+                last_fired_at: Some(last_fired_at),
+                updated_at: Utc::now().to_rfc3339(),
+            })
+            .expect("runtime should update");
+
+        let matcher = engine
+            .match_engine_snapshot()
+            .await
+            .expect("match engine snapshot should build");
+        let event = TriggerEvent {
+            event: "issue.created".to_string(),
+            source: "api".to_string(),
+            payload: json!({
+                "issue": { "priority": "high" }
+            }),
+        };
+
+        let report = matcher.evaluate_event(&event, Utc::now());
+
+        assert!(report.dispatchable_matches().is_empty());
+        assert_eq!(
+            report.evaluations[0].explanation.blocked_by.as_deref(),
+            Some("cooldown_active")
+        );
+    }
+
+    #[tokio::test]
+    async fn record_successful_fire_should_increment_fire_count_and_timestamp() {
+        let engine = TriggerV2Engine::new(runtime_store());
+        let registry = registry();
+        let definition = sample_definition();
+        let trigger_id = definition.id.clone();
+        engine
+            .upsert_definition(definition, &registry)
+            .await
+            .expect("definition should load");
+        let fired_at = Utc::now();
+
+        let runtime = engine
+            .record_successful_fire(&trigger_id, fired_at)
+            .await
+            .expect("fire state should persist");
+
+        assert_eq!(runtime.fire_count, 1);
+        assert_eq!(runtime.last_fired_at, Some(fired_at.to_rfc3339()));
     }
 }
