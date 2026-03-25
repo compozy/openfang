@@ -11,7 +11,7 @@ use crate::hitl::{
 use crate::task::{SubtaskRepository, TaskRepository};
 use chrono::Utc;
 use openfang_types::error::OpenFangError;
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
 use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
@@ -941,6 +941,62 @@ impl WorkflowRunRepository {
             status: HitlStatus::Cancelled,
             ..current_hitl
         })
+    }
+
+    /// Cancel one dispatch, cascade any linked pending HITL requests, and
+    /// optionally update the owning workflow run inside one SQLite transaction.
+    pub fn persist_dispatch_cancel(
+        &self,
+        current_dispatch: &DispatchRecord,
+        next_dispatch: &DispatchRecord,
+        pending_hitl_request_ids: &[String],
+        run_transition: Option<(&WorkflowRunRecord, &WorkflowRunRecord)>,
+    ) -> Result<(), WorkflowStoreError> {
+        let mut conn = lock_conn(&self.conn)?;
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        for hitl_request_id in pending_hitl_request_ids {
+            let current_hitl = load_required_hitl_request(&transaction, hitl_request_id)?;
+            ensure_pending_transition(&current_hitl, HitlStatus::Cancelled)?;
+            let rows = transaction.execute(
+                "UPDATE hitl_request
+                 SET status = ?1
+                 WHERE hitl_request_id = ?2",
+                params![HitlStatus::Cancelled.as_str(), hitl_request_id.as_str()],
+            )?;
+            if rows == 0 {
+                return Err(WorkflowStoreError::Hitl(
+                    crate::hitl::HitlStoreError::HitlRequestNotFound {
+                        hitl_request_id: hitl_request_id.clone(),
+                    },
+                ));
+            }
+        }
+
+        let dispatch_rows = update_dispatch_row(&transaction, current_dispatch, next_dispatch)?;
+        if dispatch_rows == 0 {
+            return Err(resolve_dispatch_update_conflict(
+                &transaction,
+                &current_dispatch.dispatch_id,
+                current_dispatch.status,
+            )
+            .into());
+        }
+
+        if let Some((current_run, next_run)) = run_transition {
+            let run_rows =
+                update_workflow_run_record(&transaction, next_run, Some(current_run.status))?;
+            if run_rows == 0 {
+                return Err(resolve_update_conflict(
+                    &transaction,
+                    &current_run.run_id,
+                    Some(current_run.status),
+                ));
+            }
+        }
+
+        transaction.commit()?;
+        Ok(())
     }
 }
 

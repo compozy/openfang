@@ -22,13 +22,13 @@ pub mod workflow_store;
 
 mod substrate;
 pub use dispatch::{
-    DispatchKind, DispatchRecord, DispatchRepository, DispatchStatus, DispatchStore,
-    DispatchStoreError, DispatchSummaryRecord, SqliteDispatchRepository,
-    AGENT_DISPATCH_MIGRATION_SQL,
+    DispatchKind, DispatchListPage, DispatchListQuery, DispatchRecord, DispatchRepository,
+    DispatchStatus, DispatchStore, DispatchStoreError, DispatchSummaryRecord,
+    SqliteDispatchRepository, AGENT_DISPATCH_MIGRATION_SQL,
 };
 pub use hitl::{
-    HitlKind, HitlRecord, HitlRepository, HitlStatus, HitlStore, HitlStoreError, NewHitlRequest,
-    SqliteHitlRepository, HITL_REQUEST_MIGRATION_SQL,
+    HitlKind, HitlListPage, HitlListQuery, HitlRecord, HitlRepository, HitlStatus, HitlStore,
+    HitlStoreError, NewHitlRequest, SqliteHitlRepository, HITL_REQUEST_MIGRATION_SQL,
 };
 pub use runtime_store::{
     AgentMessageRecord, AgentMessageStore, AgentRuntimeRecord, AgentRuntimeStore,

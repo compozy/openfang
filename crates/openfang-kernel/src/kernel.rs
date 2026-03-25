@@ -25,7 +25,7 @@ use openfang_agent_definition::{
 };
 use openfang_memory::{
     AgentRuntimeRecord, AgentSessionRecord, DispatchRepository, DispatchStatus, HitlRecord,
-    MemorySubstrate, RuntimeStoreSet, WorkflowSignalRecord, WorkflowStoreSet,
+    HitlRepository, MemorySubstrate, RuntimeStoreSet, WorkflowSignalRecord, WorkflowStoreSet,
 };
 use openfang_provider_binding::binding_to_driver_with_placeholder_install_and_session_store;
 use openfang_runtime::agent_loop::{
@@ -225,6 +225,8 @@ pub struct OpenFangKernel {
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// Tracked background workflow dispatch tasks.
     workflow_dispatch_tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// Per-dispatch cancellation handles for live background workflow dispatches.
+    workflow_dispatch_tokens: dashmap::DashMap<String, CancellationToken>,
     /// Cooperative cancellation token shared by background workflow dispatches.
     workflow_dispatch_cancel: CancellationToken,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
@@ -1224,6 +1226,7 @@ impl OpenFangKernel {
             default_model_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
             workflow_dispatch_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            workflow_dispatch_tokens: dashmap::DashMap::new(),
             workflow_dispatch_cancel: CancellationToken::new(),
             self_handle: OnceLock::new(),
         };
@@ -4556,6 +4559,9 @@ impl OpenFangKernel {
         reason: &str,
     ) -> Result<openfang_memory::DispatchRecord, String> {
         let current = self.load_dispatch_record(dispatch_id).await?;
+        if current.status == DispatchStatus::Cancelled {
+            return Ok(current);
+        }
         let mut next = current.clone();
         next.status = DispatchStatus::Cancelled;
         next.error_json = Some(serde_json::json!({
@@ -4590,6 +4596,14 @@ impl OpenFangKernel {
             .update_status(&current, &next)
             .await
             .map_err(|error| format!("Failed to complete spawn dispatch '{dispatch_id}': {error}"))
+    }
+
+    fn dispatch_input_prompt(input_json: &JsonValue) -> Result<String, String> {
+        match input_json {
+            JsonValue::String(prompt) => Ok(prompt.clone()),
+            value => serde_json::to_string(value)
+                .map_err(|error| format!("Failed to encode dispatch input for retry: {error}")),
+        }
     }
 
     fn aggregate_dispatch_result_json(
@@ -5020,16 +5034,22 @@ impl OpenFangKernel {
             let background_kernel_handle = kernel_handle.clone();
             let tracked_kernel = background_kernel.clone();
             let task_kernel = background_kernel.clone();
+            let dispatch_id = background_request.dispatch_id.clone();
+            tracked_kernel
+                .workflow_dispatch_tokens
+                .insert(dispatch_id.clone(), cancel_token.clone());
             tracked_kernel
                 .track_workflow_dispatch_task(async move {
                     tokio::select! {
                         _ = cancel_token.cancelled() => {
-                            let _ = task_kernel
-                                .cancel_dispatch(
-                                    &background_request.dispatch_id,
-                                    "workflow dispatch cancelled during shutdown",
-                                )
-                                .await;
+                            if task_kernel.workflow_dispatch_cancel.is_cancelled() {
+                                let _ = task_kernel
+                                    .cancel_dispatch(
+                                        &background_request.dispatch_id,
+                                        "workflow dispatch cancelled during shutdown",
+                                    )
+                                    .await;
+                            }
                         }
                         result = async {
                             if uses_arky_runtime {
@@ -5064,6 +5084,7 @@ impl OpenFangKernel {
                             }
                         }
                     }
+                    task_kernel.workflow_dispatch_tokens.remove(&dispatch_id);
                 })
                 .await;
 
@@ -5470,6 +5491,208 @@ impl OpenFangKernel {
                 Ok(record)
             }
         }
+    }
+
+    pub async fn cancel_dispatch_control_plane(
+        self: &Arc<Self>,
+        dispatch_id: &str,
+        reason: &str,
+    ) -> Result<openfang_memory::DispatchRecord, String> {
+        let current = self.load_dispatch_record(dispatch_id).await?;
+        if !matches!(
+            current.status,
+            DispatchStatus::Pending | DispatchStatus::Running | DispatchStatus::WaitingHitl
+        ) {
+            return Err(format!(
+                "Dispatch '{dispatch_id}' cannot be cancelled from status '{}'",
+                current.status
+            ));
+        }
+
+        let timestamp = openfang_memory::now_timestamp();
+        let mut next = current.clone();
+        next.status = DispatchStatus::Cancelled;
+        next.error_json = Some(serde_json::json!({
+            "message": reason,
+        }));
+        next.updated_at = timestamp.clone();
+        next.completed_at = Some(timestamp.clone());
+
+        let pending_hitl_request_ids = self
+            .workflow_stores
+            .hitl
+            .find_by_dispatch(dispatch_id)
+            .await
+            .map_err(|error| {
+                format!("Failed to list HITL requests for dispatch '{dispatch_id}': {error}")
+            })?
+            .into_iter()
+            .filter(|record| record.status == openfang_memory::HitlStatus::Pending)
+            .map(|record| record.hitl_request_id)
+            .collect::<Vec<_>>();
+
+        let run_transition = if current.status == DispatchStatus::WaitingHitl {
+            let current_run = self
+                .workflow_stores
+                .workflow_run
+                .find_by_id(&current.run_id)
+                .map_err(|error| {
+                    format!(
+                        "Failed to load workflow run '{}' during dispatch cancel: {error}",
+                        current.run_id
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "Workflow run '{}' not found during dispatch cancel",
+                        current.run_id
+                    )
+                })?;
+
+            if current_run.status == openfang_memory::WorkflowRunStatus::WaitingHitl {
+                let mut next_run = current_run.clone();
+                next_run.status = openfang_memory::WorkflowRunStatus::Running;
+                next_run.waiting_kind = None;
+                next_run.waiting_ref = None;
+                next_run.active_dispatch_id = None;
+                next_run.active_hitl_request_id = None;
+                next_run.updated_at = timestamp.clone();
+
+                Some((current_run, next_run))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.workflow_stores
+            .workflow_run
+            .persist_dispatch_cancel(
+                &current,
+                &next,
+                &pending_hitl_request_ids,
+                run_transition
+                    .as_ref()
+                    .map(|(current_run, next_run)| (current_run, next_run)),
+            )
+            .map_err(|error| {
+                format!("Failed to persist dispatch cancel for '{dispatch_id}': {error}")
+            })?;
+
+        if let Some(cancel_token) = self
+            .workflow_dispatch_tokens
+            .get(dispatch_id)
+            .map(|entry| entry.value().clone())
+        {
+            cancel_token.cancel();
+        }
+
+        for hitl_request_id in &pending_hitl_request_ids {
+            self.workflows.detach_hitl_waiter(hitl_request_id).await;
+        }
+
+        Ok(next)
+    }
+
+    pub async fn retry_dispatch_control_plane(
+        self: &Arc<Self>,
+        dispatch_id: &str,
+    ) -> Result<openfang_memory::DispatchRecord, String> {
+        let current = self.load_dispatch_record(dispatch_id).await?;
+        if !matches!(
+            current.status,
+            DispatchStatus::Failed | DispatchStatus::Cancelled
+        ) {
+            return Err(format!(
+                "Dispatch '{dispatch_id}' cannot be retried from status '{}'",
+                current.status
+            ));
+        }
+
+        self.workflow_stores
+            .workflow_run
+            .find_by_id(&current.run_id)
+            .map_err(|error| {
+                format!(
+                    "Failed to load workflow run '{}' during dispatch retry: {error}",
+                    current.run_id
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "Workflow run '{}' not found during dispatch retry",
+                    current.run_id
+                )
+            })?;
+
+        let run_id = WorkflowRunId(uuid::Uuid::parse_str(&current.run_id).map_err(|error| {
+            format!(
+                "Stored workflow run id '{}' for dispatch '{}' is invalid: {error}",
+                current.run_id, current.dispatch_id
+            )
+        })?);
+        let step_id = current.step_id.clone().ok_or_else(|| {
+            format!(
+                "Dispatch '{}' is missing a step_id required for retry",
+                current.dispatch_id
+            )
+        })?;
+        let prompt = Self::dispatch_input_prompt(&current.input_json)?;
+        let (agent_id, agent_name) = self.resolve_workflow_agent_target(&current.target_agent)?;
+
+        let mut next = current.clone();
+        next.status = DispatchStatus::Pending;
+        next.attempt += 1;
+        next.result_json = None;
+        next.error_json = None;
+        next.spawned_agent_id = None;
+        next.provider_driver = None;
+        next.session_id = None;
+        next.provider_resume_token = None;
+        next.updated_at = openfang_memory::now_timestamp();
+        next.completed_at = None;
+
+        self.workflow_stores
+            .dispatch
+            .update_status(&current, &next)
+            .await
+            .map_err(|error| {
+                format!("Failed to persist dispatch retry for '{dispatch_id}': {error}")
+            })?;
+
+        let request = WorkflowAgentDispatchRequest {
+            run_id,
+            step_id,
+            target_agent: next.target_agent.clone(),
+            agent_id,
+            agent_name,
+            prompt,
+            dispatch_id: next.dispatch_id.clone(),
+            kind: next.kind,
+            continuation: None,
+        };
+        let kernel = Arc::clone(self);
+        let kernel_handle: Option<Arc<dyn KernelHandle>> =
+            Some(Arc::clone(self) as Arc<dyn KernelHandle>);
+        let retry_request = request.clone();
+        self.track_workflow_dispatch_task(async move {
+            if let Err(error) = kernel
+                .execute_workflow_dispatch(request, kernel_handle, Some(Arc::clone(&kernel)))
+                .await
+            {
+                let _ = kernel
+                    .fail_dispatch(&retry_request.dispatch_id, &error, None)
+                    .await;
+                warn!(
+                    dispatch_id = %retry_request.dispatch_id,
+                    "Control-plane dispatch retry failed: {error}"
+                );
+            }
+        })
+        .await;
+
+        Ok(next)
     }
 
     pub async fn submit_run_signal(

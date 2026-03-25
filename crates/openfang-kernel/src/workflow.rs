@@ -2876,6 +2876,10 @@ impl WorkflowEngine {
         Ok(record)
     }
 
+    pub async fn detach_hitl_waiter(&self, hitl_request_id: &str) {
+        let _ = self.hitl_registry.remove(hitl_request_id).await;
+    }
+
     async fn record_run_failed_transition(
         &self,
         run_id: WorkflowRunId,

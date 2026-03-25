@@ -30,7 +30,9 @@ use openfang_kernel::workflow_compiler::{
 };
 use openfang_kernel::{AgentMessageDispatch, OpenFangKernel};
 use openfang_memory::{
-    now_timestamp, AgentRuntimeRecord, AgentSessionRecord, ScheduleRuntimeRecord, TaskStoreError,
+    now_timestamp, AgentRuntimeRecord, AgentSessionRecord, DispatchListQuery, DispatchRecord,
+    DispatchRepository, DispatchStatus, HitlListQuery, HitlRecord, HitlRepository, HitlStatus,
+    ScheduleRuntimeRecord, TaskStoreError,
 };
 use openfang_memory::{WorkflowRunListQuery, WorkflowRunStatus, WorkflowSignalRecord};
 use openfang_runtime::kernel_handle::KernelHandle;
@@ -261,20 +263,6 @@ fn signal_record_to_json(
     }))
 }
 
-fn dispatch_summary_record_to_json(
-    record: &openfang_memory::WorkflowDispatchSummaryRecord,
-) -> serde_json::Value {
-    serde_json::json!({
-        "id": record.dispatch_id,
-        "run_id": record.run_id,
-        "step_id": record.step_id,
-        "kind": record.kind,
-        "target_agent": record.target_agent,
-        "status": record.status,
-        "updated_at": record.updated_at,
-    })
-}
-
 fn run_not_found_response() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::NOT_FOUND,
@@ -334,6 +322,23 @@ fn invalid_run_transition_response(
     )
 }
 
+fn ensure_durable_run_exists(
+    state: &AppState,
+    run_id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match state.kernel.workflow_stores.workflow_run.find_by_id(run_id) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(run_not_found_response()),
+        Err(error) => {
+            tracing::warn!("Failed to load durable run {run_id}: {error}");
+            Err(run_internal_error_response(
+                "run_load_failed",
+                "Failed to load run",
+            ))
+        }
+    }
+}
+
 fn run_action_accepted_response(
     run_id: &str,
     status: WorkflowRunStatus,
@@ -360,6 +365,20 @@ fn agent_action_accepted_response(
             resource_id: resource_id.to_owned(),
             status: "accepted".to_owned(),
             session_id,
+        })),
+    )
+}
+
+fn operational_action_accepted_response(
+    resource_id: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!(AcceptedActionResponse {
+            accepted: true,
+            resource_id: resource_id.to_owned(),
+            status: "accepted".to_owned(),
+            session_id: None,
         })),
     )
 }
@@ -464,6 +483,137 @@ fn task_summary_source(source: &TaskSource) -> TaskSummarySource {
         TaskSource::Manual => TaskSummarySource::Manual,
         TaskSource::Api => TaskSummarySource::Api,
     }
+}
+
+fn dispatch_record_to_summary_response(record: &DispatchRecord) -> DispatchSummaryResponse {
+    DispatchSummaryResponse {
+        id: record.dispatch_id.clone(),
+        run_id: record.run_id.clone(),
+        step_id: record.step_id.clone(),
+        kind: record.kind,
+        target_agent: record.target_agent.clone(),
+        status: record.status,
+        updated_at: record.updated_at.clone(),
+    }
+}
+
+fn dispatch_record_to_detail_response(record: &DispatchRecord) -> DispatchDetailResponse {
+    DispatchDetailResponse {
+        id: record.dispatch_id.clone(),
+        run_id: record.run_id.clone(),
+        step_id: record.step_id.clone(),
+        kind: record.kind,
+        target_agent: record.target_agent.clone(),
+        status: record.status,
+        input: record.input_json.clone(),
+        result: record.result_json.clone(),
+        error: record.error_json.clone(),
+        attempt: record.attempt,
+        parent_dispatch_id: record.parent_dispatch_id.clone(),
+        spawned_agent_id: record.spawned_agent_id.clone(),
+        started_at: record.started_at.clone(),
+        updated_at: record.updated_at.clone(),
+        completed_at: record.completed_at.clone(),
+    }
+}
+
+fn hitl_record_to_detail_response(record: &HitlRecord) -> HitlDetailResponse {
+    HitlDetailResponse {
+        id: record.hitl_request_id.clone(),
+        run_id: record.run_id.clone(),
+        step_id: record.step_id.clone(),
+        dispatch_id: record.dispatch_id.clone(),
+        kind: record.kind,
+        status: record.status,
+        question: record.question.clone(),
+        context: record.context_json.clone(),
+        response: record.response_json.clone(),
+        sequence_no: record.sequence_no,
+        created_at: record.created_at.to_rfc3339(),
+        answered_at: record
+            .answered_at
+            .as_ref()
+            .map(chrono::DateTime::to_rfc3339),
+        timeout_at: record.timeout_at.as_ref().map(chrono::DateTime::to_rfc3339),
+    }
+}
+
+fn dispatch_not_found_response() -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Dispatch not found",
+        None,
+    )
+}
+
+fn hitl_not_found_response() -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "HITL request not found",
+        None,
+    )
+}
+
+fn dispatch_internal_error_response(
+    code: &str,
+    message: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(StatusCode::INTERNAL_SERVER_ERROR, code, message, None)
+}
+
+fn hitl_internal_error_response(
+    code: &str,
+    message: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(StatusCode::INTERNAL_SERVER_ERROR, code, message, None)
+}
+
+fn invalid_dispatch_transition_response(
+    action: &str,
+    current_status: DispatchStatus,
+    allowed_statuses: &[DispatchStatus],
+) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::CONFLICT,
+        "invalid_dispatch_transition",
+        format!(
+            "Dispatch cannot be {action} from status '{}'",
+            current_status.as_str()
+        ),
+        Some(serde_json::json!([{
+            "action": action,
+            "current_status": current_status.as_str(),
+            "allowed_statuses": allowed_statuses
+                .iter()
+                .map(|status| status.as_str())
+                .collect::<Vec<_>>(),
+        }])),
+    )
+}
+
+fn invalid_hitl_transition_response(
+    action: &str,
+    current_status: HitlStatus,
+    allowed_statuses: &[HitlStatus],
+) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::CONFLICT,
+        "invalid_hitl_transition",
+        format!(
+            "HITL request cannot be {action} from status '{}'",
+            current_status.as_str()
+        ),
+        Some(serde_json::json!([{
+            "action": action,
+            "current_status": current_status.as_str(),
+            "allowed_statuses": allowed_statuses
+                .iter()
+                .map(|status| status.as_str())
+                .collect::<Vec<_>>(),
+        }])),
+    )
 }
 
 fn task_summary_from_record(record: &TaskRecord) -> TaskSummaryResponse {
@@ -4588,6 +4738,66 @@ fn parse_cursor_offset(
         })
 }
 
+fn dispatch_list_query_from_params(
+    params: DispatchListQueryParams,
+    scoped_run_id: Option<&str>,
+    parent_dispatch_id: Option<&str>,
+) -> Result<DispatchListQuery, (StatusCode, Json<serde_json::Value>)> {
+    if let (Some(path_run_id), Some(query_run_id)) = (scoped_run_id, params.run_id.as_deref()) {
+        if path_run_id != query_run_id {
+            return Err(workflow_v2_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "`run_id` query parameter must match the path run ID",
+                Some(serde_json::json!([{
+                    "path": "run_id",
+                    "expected": path_run_id,
+                    "actual": query_run_id,
+                }])),
+            ));
+        }
+    }
+
+    Ok(DispatchListQuery {
+        limit: parse_pagination_limit(params.limit)?,
+        offset: parse_cursor_offset(params.cursor.as_deref())?,
+        run_id: scoped_run_id.map(ToOwned::to_owned).or(params.run_id),
+        parent_dispatch_id: parent_dispatch_id.map(ToOwned::to_owned),
+        status: params.status,
+        target_agent: params.target_agent,
+        step_id: params.step_id,
+    })
+}
+
+fn hitl_list_query_from_params(
+    params: HitlListQueryParams,
+    scoped_run_id: Option<&str>,
+) -> Result<HitlListQuery, (StatusCode, Json<serde_json::Value>)> {
+    if let (Some(path_run_id), Some(query_run_id)) = (scoped_run_id, params.run_id.as_deref()) {
+        if path_run_id != query_run_id {
+            return Err(workflow_v2_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "`run_id` query parameter must match the path run ID",
+                Some(serde_json::json!([{
+                    "path": "run_id",
+                    "expected": path_run_id,
+                    "actual": query_run_id,
+                }])),
+            ));
+        }
+    }
+
+    Ok(HitlListQuery {
+        limit: parse_pagination_limit(params.limit)?,
+        offset: parse_cursor_offset(params.cursor.as_deref())?,
+        run_id: scoped_run_id.map(ToOwned::to_owned).or(params.run_id),
+        dispatch_id: params.dispatch_id,
+        status: params.status,
+        kind: params.kind,
+    })
+}
+
 fn parse_sort_order(
     order: Option<&str>,
 ) -> Result<Ordering, (StatusCode, Json<serde_json::Value>)> {
@@ -5869,34 +6079,390 @@ pub async fn get_run_checkpoints_v1(
     }
 }
 
-/// GET /api/v1/runs/{id}/dispatches — List durable dispatches for one run.
-pub async fn get_run_dispatches_v1(
+/// GET /api/v1/dispatches — List durable dispatches.
+pub async fn get_dispatches_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<DispatchListQueryParams>,
+) -> impl IntoResponse {
+    let query = match dispatch_list_query_from_params(params, None, None) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+
+    match state.kernel.workflow_stores.dispatch.list(&query).await {
+        Ok(page) => (
+            StatusCode::OK,
+            Json(serde_json::json!(DispatchListResponse {
+                items: page
+                    .items
+                    .iter()
+                    .map(dispatch_record_to_summary_response)
+                    .collect(),
+                next_cursor: page.next_cursor,
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!("Failed to list dispatches: {error}");
+            dispatch_internal_error_response("dispatch_list_failed", "Failed to list dispatches")
+        }
+    }
+}
+
+/// GET /api/v1/dispatches/{id} — Load one durable dispatch.
+pub async fn get_dispatch_v1(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.kernel.workflow_stores.workflow_run.find_by_id(&id) {
-        Ok(Some(_)) => {}
-        Ok(None) => return run_not_found_response(),
+    match state.kernel.workflow_stores.dispatch.find_by_id(&id).await {
+        Ok(Some(record)) => (
+            StatusCode::OK,
+            Json(serde_json::json!(dispatch_record_to_detail_response(
+                &record
+            ))),
+        ),
+        Ok(None) => dispatch_not_found_response(),
         Err(error) => {
-            tracing::warn!("Failed to load durable run {id} before listing dispatches: {error}");
-            return run_internal_error_response("run_load_failed", "Failed to load run");
+            tracing::warn!("Failed to load dispatch {id}: {error}");
+            dispatch_internal_error_response("dispatch_load_failed", "Failed to load dispatch")
         }
+    }
+}
+
+/// GET /api/v1/dispatches/{id}/children — List child dispatches for one parent.
+pub async fn get_dispatch_children_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<DispatchListQueryParams>,
+) -> impl IntoResponse {
+    match state.kernel.workflow_stores.dispatch.find_by_id(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return dispatch_not_found_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load dispatch {id} before listing children: {error}");
+            return dispatch_internal_error_response(
+                "dispatch_load_failed",
+                "Failed to load dispatch",
+            );
+        }
+    }
+
+    let query = match dispatch_list_query_from_params(params, None, Some(&id)) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+
+    match state.kernel.workflow_stores.dispatch.list(&query).await {
+        Ok(page) => (
+            StatusCode::OK,
+            Json(serde_json::json!(DispatchListResponse {
+                items: page
+                    .items
+                    .iter()
+                    .map(dispatch_record_to_summary_response)
+                    .collect(),
+                next_cursor: page.next_cursor,
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!("Failed to list child dispatches for {id}: {error}");
+            dispatch_internal_error_response(
+                "dispatch_children_failed",
+                "Failed to list child dispatches",
+            )
+        }
+    }
+}
+
+/// POST /api/v1/dispatches/{id}/retry — Retry one durable dispatch.
+pub async fn post_dispatch_retry_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let current = match state.kernel.workflow_stores.dispatch.find_by_id(&id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return dispatch_not_found_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load dispatch {id} before retry: {error}");
+            return dispatch_internal_error_response(
+                "dispatch_load_failed",
+                "Failed to load dispatch",
+            );
+        }
+    };
+
+    if !matches!(
+        current.status,
+        DispatchStatus::Failed | DispatchStatus::Cancelled
+    ) {
+        return invalid_dispatch_transition_response(
+            "retried",
+            current.status,
+            &[DispatchStatus::Failed, DispatchStatus::Cancelled],
+        );
+    }
+
+    match state.kernel.retry_dispatch_control_plane(&id).await {
+        Ok(_) => operational_action_accepted_response(&id),
+        Err(error) => {
+            tracing::warn!("Failed to retry dispatch {id}: {error}");
+            match state.kernel.workflow_stores.dispatch.find_by_id(&id).await {
+                Ok(Some(latest))
+                    if !matches!(
+                        latest.status,
+                        DispatchStatus::Failed | DispatchStatus::Cancelled
+                    ) =>
+                {
+                    invalid_dispatch_transition_response(
+                        "retried",
+                        latest.status,
+                        &[DispatchStatus::Failed, DispatchStatus::Cancelled],
+                    )
+                }
+                _ => dispatch_internal_error_response(
+                    "dispatch_retry_failed",
+                    "Failed to retry dispatch",
+                ),
+            }
+        }
+    }
+}
+
+/// POST /api/v1/dispatches/{id}/cancel — Cancel one durable dispatch.
+pub async fn post_dispatch_cancel_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let current = match state.kernel.workflow_stores.dispatch.find_by_id(&id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return dispatch_not_found_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load dispatch {id} before cancel: {error}");
+            return dispatch_internal_error_response(
+                "dispatch_load_failed",
+                "Failed to load dispatch",
+            );
+        }
+    };
+
+    if !matches!(
+        current.status,
+        DispatchStatus::Pending | DispatchStatus::Running | DispatchStatus::WaitingHitl
+    ) {
+        return invalid_dispatch_transition_response(
+            "cancelled",
+            current.status,
+            &[
+                DispatchStatus::Pending,
+                DispatchStatus::Running,
+                DispatchStatus::WaitingHitl,
+            ],
+        );
     }
 
     match state
         .kernel
-        .workflow_stores
-        .workflow_run
-        .list_dispatches_for_run(&id)
+        .cancel_dispatch_control_plane(&id, "Dispatch cancelled via API")
+        .await
     {
-        Ok(records) => (
+        Ok(_) => operational_action_accepted_response(&id),
+        Err(error) => {
+            tracing::warn!("Failed to cancel dispatch {id}: {error}");
+            match state.kernel.workflow_stores.dispatch.find_by_id(&id).await {
+                Ok(Some(latest))
+                    if !matches!(
+                        latest.status,
+                        DispatchStatus::Pending
+                            | DispatchStatus::Running
+                            | DispatchStatus::WaitingHitl
+                    ) =>
+                {
+                    invalid_dispatch_transition_response(
+                        "cancelled",
+                        latest.status,
+                        &[
+                            DispatchStatus::Pending,
+                            DispatchStatus::Running,
+                            DispatchStatus::WaitingHitl,
+                        ],
+                    )
+                }
+                _ => dispatch_internal_error_response(
+                    "dispatch_cancel_failed",
+                    "Failed to cancel dispatch",
+                ),
+            }
+        }
+    }
+}
+
+/// GET /api/v1/hitl-requests — List durable HITL requests.
+pub async fn get_hitl_requests_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HitlListQueryParams>,
+) -> impl IntoResponse {
+    let query = match hitl_list_query_from_params(params, None) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+
+    match state.kernel.workflow_stores.hitl.list(&query).await {
+        Ok(page) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "items": records
+            Json(serde_json::json!(HitlListResponse {
+                items: page
+                    .items
                     .iter()
-                    .map(dispatch_summary_record_to_json)
-                    .collect::<Vec<_>>(),
-                "next_cursor": serde_json::Value::Null,
+                    .map(hitl_record_to_detail_response)
+                    .collect(),
+                next_cursor: page.next_cursor,
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!("Failed to list HITL requests: {error}");
+            hitl_internal_error_response("hitl_list_failed", "Failed to list HITL requests")
+        }
+    }
+}
+
+/// GET /api/v1/hitl-requests/{id} — Load one durable HITL request.
+pub async fn get_hitl_request_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.workflow_stores.hitl.find_by_id(&id).await {
+        Ok(Some(record)) => (
+            StatusCode::OK,
+            Json(serde_json::json!(hitl_record_to_detail_response(&record))),
+        ),
+        Ok(None) => hitl_not_found_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load HITL request {id}: {error}");
+            hitl_internal_error_response("hitl_load_failed", "Failed to load HITL request")
+        }
+    }
+}
+
+/// POST /api/v1/hitl-requests/{id}/answer — Answer one pending HITL request.
+pub async fn post_hitl_answer_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<HitlAnswerRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+
+    let current = match state.kernel.workflow_stores.hitl.find_by_id(&id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return hitl_not_found_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load HITL request {id} before answer: {error}");
+            return hitl_internal_error_response("hitl_load_failed", "Failed to load HITL request");
+        }
+    };
+
+    if current.status != HitlStatus::Pending {
+        return invalid_hitl_transition_response(
+            "answered",
+            current.status,
+            &[HitlStatus::Pending],
+        );
+    }
+
+    match state
+        .kernel
+        .answer_hitl_request(&id, request.response, request.metadata)
+        .await
+    {
+        Ok(_) => operational_action_accepted_response(&id),
+        Err(error) => {
+            tracing::warn!("Failed to answer HITL request {id}: {error}");
+            match state.kernel.workflow_stores.hitl.find_by_id(&id).await {
+                Ok(Some(latest)) if latest.status != HitlStatus::Pending => {
+                    invalid_hitl_transition_response(
+                        "answered",
+                        latest.status,
+                        &[HitlStatus::Pending],
+                    )
+                }
+                _ => hitl_internal_error_response(
+                    "hitl_answer_failed",
+                    "Failed to answer HITL request",
+                ),
+            }
+        }
+    }
+}
+
+/// POST /api/v1/hitl-requests/{id}/cancel — Cancel one pending HITL request.
+pub async fn post_hitl_cancel_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let current = match state.kernel.workflow_stores.hitl.find_by_id(&id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return hitl_not_found_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load HITL request {id} before cancel: {error}");
+            return hitl_internal_error_response("hitl_load_failed", "Failed to load HITL request");
+        }
+    };
+
+    if current.status != HitlStatus::Pending {
+        return invalid_hitl_transition_response(
+            "cancelled",
+            current.status,
+            &[HitlStatus::Pending],
+        );
+    }
+
+    match state.kernel.workflows.cancel_hitl_request(&id).await {
+        Ok(_) => operational_action_accepted_response(&id),
+        Err(error) => {
+            tracing::warn!("Failed to cancel HITL request {id}: {error}");
+            match state.kernel.workflow_stores.hitl.find_by_id(&id).await {
+                Ok(Some(latest)) if latest.status != HitlStatus::Pending => {
+                    invalid_hitl_transition_response(
+                        "cancelled",
+                        latest.status,
+                        &[HitlStatus::Pending],
+                    )
+                }
+                _ => hitl_internal_error_response(
+                    "hitl_cancel_failed",
+                    "Failed to cancel HITL request",
+                ),
+            }
+        }
+    }
+}
+
+/// GET /api/v1/runs/{id}/dispatches — List durable dispatches for one run.
+pub async fn get_run_dispatches_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<DispatchListQueryParams>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_durable_run_exists(&state, &id) {
+        return response;
+    }
+
+    let query = match dispatch_list_query_from_params(params, Some(&id), None) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+
+    match state.kernel.workflow_stores.dispatch.list(&query).await {
+        Ok(page) => (
+            StatusCode::OK,
+            Json(serde_json::json!(DispatchListResponse {
+                items: page
+                    .items
+                    .iter()
+                    .map(dispatch_record_to_summary_response)
+                    .collect(),
+                next_cursor: page.next_cursor,
             })),
         ),
         Err(error) => {
@@ -5904,6 +6470,133 @@ pub async fn get_run_dispatches_v1(
             run_internal_error_response("dispatch_list_failed", "Failed to list run dispatches")
         }
     }
+}
+
+/// GET /api/v1/runs/{id}/hitl-requests — List durable HITL requests for one run.
+pub async fn get_run_hitl_requests_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<HitlListQueryParams>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_durable_run_exists(&state, &id) {
+        return response;
+    }
+
+    let query = match hitl_list_query_from_params(params, Some(&id)) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+
+    match state.kernel.workflow_stores.hitl.list(&query).await {
+        Ok(page) => (
+            StatusCode::OK,
+            Json(serde_json::json!(HitlListResponse {
+                items: page
+                    .items
+                    .iter()
+                    .map(hitl_record_to_detail_response)
+                    .collect(),
+                next_cursor: page.next_cursor,
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!("Failed to list HITL requests for run {id}: {error}");
+            run_internal_error_response("hitl_list_failed", "Failed to list run HITL requests")
+        }
+    }
+}
+
+/// GET /api/v1/dispatches/{id}/events — Stream a snapshot + keepalive heartbeat.
+pub async fn stream_dispatch_events_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::stream::{self, StreamExt};
+
+    let record = match state.kernel.workflow_stores.dispatch.find_by_id(&id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return dispatch_not_found_response().into_response(),
+        Err(error) => {
+            tracing::warn!("Failed to load dispatch {id} before streaming events: {error}");
+            return dispatch_internal_error_response(
+                "dispatch_load_failed",
+                "Failed to load dispatch",
+            )
+            .into_response();
+        }
+    };
+
+    let snapshot = dispatch_record_to_detail_response(&record);
+    let snapshot_json = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
+    let sse_stream = stream::once(async move {
+        Ok::<Event, std::convert::Infallible>(
+            Event::default()
+                .event("stream.snapshot")
+                .data(snapshot_json),
+        )
+    })
+    .chain(stream::pending::<Result<Event, std::convert::Infallible>>());
+
+    Sse::new(sse_stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(1))
+                .event(Event::default().event("keepalive").data("{}")),
+        )
+        .into_response()
+}
+
+/// GET /api/v1/hitl-requests/stream — Stream a snapshot + keepalive heartbeat.
+pub async fn stream_hitl_requests_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HitlListQueryParams>,
+) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::stream::{self, StreamExt};
+
+    let query = match hitl_list_query_from_params(params, None) {
+        Ok(query) => query,
+        Err(response) => return response.into_response(),
+    };
+
+    let page = match state.kernel.workflow_stores.hitl.list(&query).await {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::warn!("Failed to list HITL requests before streaming: {error}");
+            return hitl_internal_error_response(
+                "hitl_list_failed",
+                "Failed to list HITL requests",
+            )
+            .into_response();
+        }
+    };
+
+    let snapshot = HitlListResponse {
+        items: page
+            .items
+            .iter()
+            .map(hitl_record_to_detail_response)
+            .collect(),
+        next_cursor: page.next_cursor,
+    };
+    let snapshot_json = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
+    let sse_stream = stream::once(async move {
+        Ok::<Event, std::convert::Infallible>(
+            Event::default()
+                .event("stream.snapshot")
+                .data(snapshot_json),
+        )
+    })
+    .chain(stream::pending::<Result<Event, std::convert::Infallible>>());
+
+    Sse::new(sse_stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(1))
+                .event(Event::default().event("keepalive").data("{}")),
+        )
+        .into_response()
 }
 
 /// GET /api/v1/runs/{id}/signals — List durable signals for one run.

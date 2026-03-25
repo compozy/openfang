@@ -3,6 +3,7 @@
 use openfang_agent_definition::{
     AgentDefinition, AgentProductMetadata, ProviderBinding, ValidationIssue,
 };
+use openfang_memory::{DispatchKind, DispatchStatus, HitlKind, HitlStatus};
 use openfang_types::agent::AgentManifest;
 use openfang_types::scheduler::{
     CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDelivery, CronSchedule,
@@ -449,6 +450,111 @@ pub struct SubtaskListQueryParams {
     pub ready: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<bool>,
+}
+
+/// Query parameters accepted by dispatch list endpoints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct DispatchListQueryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<DispatchStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+}
+
+/// Query parameters accepted by HITL list endpoints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct HitlListQueryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<HitlStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<HitlKind>,
+}
+
+/// Summary payload returned by dispatch list endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct DispatchSummaryResponse {
+    pub id: String,
+    pub run_id: String,
+    pub step_id: Option<String>,
+    pub kind: DispatchKind,
+    pub target_agent: String,
+    pub status: DispatchStatus,
+    pub updated_at: String,
+}
+
+/// Full payload returned by dispatch detail endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct DispatchDetailResponse {
+    pub id: String,
+    pub run_id: String,
+    pub step_id: Option<String>,
+    pub kind: DispatchKind,
+    pub target_agent: String,
+    pub status: DispatchStatus,
+    pub input: serde_json::Value,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<serde_json::Value>,
+    pub attempt: u32,
+    pub parent_dispatch_id: Option<String>,
+    pub spawned_agent_id: Option<String>,
+    pub started_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+/// Paginated dispatch list response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct DispatchListResponse {
+    pub items: Vec<DispatchSummaryResponse>,
+    pub next_cursor: Option<String>,
+}
+
+/// Full payload returned by HITL request endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct HitlDetailResponse {
+    pub id: String,
+    pub run_id: String,
+    pub step_id: String,
+    pub dispatch_id: Option<String>,
+    pub kind: HitlKind,
+    pub status: HitlStatus,
+    pub question: String,
+    pub context: serde_json::Value,
+    pub response: Option<serde_json::Value>,
+    pub sequence_no: u32,
+    pub created_at: String,
+    pub answered_at: Option<String>,
+    pub timeout_at: Option<String>,
+}
+
+/// Paginated HITL list response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct HitlListResponse {
+    pub items: Vec<HitlDetailResponse>,
+    pub next_cursor: Option<String>,
 }
 
 fn default_empty_object() -> serde_json::Value {
@@ -1012,6 +1118,15 @@ pub struct AcceptedActionResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+}
+
+/// Request payload for answering a pending HITL request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct HitlAnswerRequest {
+    pub response: serde_json::Value,
+    #[serde(default = "default_empty_object")]
+    pub metadata: serde_json::Value,
 }
 
 /// Request to change an agent's operational mode.

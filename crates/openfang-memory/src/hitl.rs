@@ -176,6 +176,45 @@ pub struct HitlRecord {
     pub timeout_at: Option<DateTime<Utc>>,
 }
 
+/// Filter + pagination input for HITL list surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HitlListQuery {
+    /// Maximum number of items to return.
+    pub limit: usize,
+    /// Cursor offset encoded as a row offset.
+    pub offset: usize,
+    /// Optional workflow run filter.
+    pub run_id: Option<String>,
+    /// Optional dispatch filter.
+    pub dispatch_id: Option<String>,
+    /// Optional status filter.
+    pub status: Option<HitlStatus>,
+    /// Optional kind filter.
+    pub kind: Option<HitlKind>,
+}
+
+impl Default for HitlListQuery {
+    fn default() -> Self {
+        Self {
+            limit: 50,
+            offset: 0,
+            run_id: None,
+            dispatch_id: None,
+            status: None,
+            kind: None,
+        }
+    }
+}
+
+/// Paginated durable HITL list page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HitlListPage {
+    /// Page items in durable sort order.
+    pub items: Vec<HitlRecord>,
+    /// Next cursor offset, if more items exist.
+    pub next_cursor: Option<String>,
+}
+
 /// Typed failures from the durable HITL repository.
 #[derive(Debug, Error)]
 pub enum HitlStoreError {
@@ -253,6 +292,9 @@ pub trait HitlRepository: Send + Sync {
 
     /// Lists all HITL requests linked to one dispatch.
     async fn find_by_dispatch(&self, dispatch_id: &str) -> Result<Vec<HitlRecord>, HitlStoreError>;
+
+    /// Lists HITL rows matching the provided filters and pagination.
+    async fn list(&self, query: &HitlListQuery) -> Result<HitlListPage, HitlStoreError>;
 
     /// Marks a request answered and writes the response atomically.
     async fn answer(
@@ -334,6 +376,11 @@ impl HitlRepository for SqliteHitlRepository {
     async fn find_by_dispatch(&self, dispatch_id: &str) -> Result<Vec<HitlRecord>, HitlStoreError> {
         let conn = lock_conn(&self.conn)?;
         list_hitl_requests_by_dispatch(&conn, dispatch_id)
+    }
+
+    async fn list(&self, query: &HitlListQuery) -> Result<HitlListPage, HitlStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        list_hitl_requests(&conn, query)
     }
 
     async fn answer(
@@ -550,6 +597,53 @@ fn list_hitl_requests_by_dispatch(
     )?;
     let rows = stmt.query_map([dispatch_id], read_hitl_row)?;
     collect_rows(rows)
+}
+
+fn list_hitl_requests(
+    conn: &Connection,
+    query: &HitlListQuery,
+) -> Result<HitlListPage, HitlStoreError> {
+    let run_id = query.run_id.as_deref();
+    let dispatch_id = query.dispatch_id.as_deref();
+    let status = query.status.map(HitlStatus::as_str);
+    let kind = query.kind.map(HitlKind::as_str);
+    let limit = query.limit.saturating_add(1) as i64;
+    let offset = query.offset as i64;
+    let mut stmt = conn.prepare(
+        "SELECT
+            hitl_request_id,
+            run_id,
+            step_id,
+            dispatch_id,
+            kind,
+            status,
+            question,
+            context_json,
+            response_json,
+            sequence_no,
+            created_at,
+            answered_at,
+            timeout_at
+         FROM hitl_request
+         WHERE (?1 IS NULL OR run_id = ?1)
+           AND (?2 IS NULL OR dispatch_id = ?2)
+           AND (?3 IS NULL OR status = ?3)
+           AND (?4 IS NULL OR kind = ?4)
+         ORDER BY created_at ASC, step_id ASC, sequence_no ASC, hitl_request_id ASC
+         LIMIT ?5 OFFSET ?6",
+    )?;
+    let rows = stmt.query_map(
+        params![run_id, dispatch_id, status, kind, limit, offset],
+        read_hitl_row,
+    )?;
+    let mut items = collect_rows(rows)?;
+    let next_cursor = if items.len() > query.limit {
+        items.truncate(query.limit);
+        Some((query.offset + query.limit).to_string())
+    } else {
+        None
+    };
+    Ok(HitlListPage { items, next_cursor })
 }
 
 pub(crate) fn next_sequence_no(

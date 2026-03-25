@@ -453,6 +453,50 @@ pub async fn build_router(
             "/api/v1/workflows/{id}/runtime",
             axum::routing::get(routes::get_workflow_runtime_v1),
         )
+        .route(
+            "/api/v1/dispatches",
+            axum::routing::get(routes::get_dispatches_v1),
+        )
+        .route(
+            "/api/v1/dispatches/{id}",
+            axum::routing::get(routes::get_dispatch_v1),
+        )
+        .route(
+            "/api/v1/dispatches/{id}/children",
+            axum::routing::get(routes::get_dispatch_children_v1),
+        )
+        .route(
+            "/api/v1/dispatches/{id}/retry",
+            axum::routing::post(routes::post_dispatch_retry_v1),
+        )
+        .route(
+            "/api/v1/dispatches/{id}/cancel",
+            axum::routing::post(routes::post_dispatch_cancel_v1),
+        )
+        .route(
+            "/api/v1/dispatches/{id}/events",
+            axum::routing::get(routes::stream_dispatch_events_v1),
+        )
+        .route(
+            "/api/v1/hitl-requests",
+            axum::routing::get(routes::get_hitl_requests_v1),
+        )
+        .route(
+            "/api/v1/hitl-requests/stream",
+            axum::routing::get(routes::stream_hitl_requests_v1),
+        )
+        .route(
+            "/api/v1/hitl-requests/{id}",
+            axum::routing::get(routes::get_hitl_request_v1),
+        )
+        .route(
+            "/api/v1/hitl-requests/{id}/answer",
+            axum::routing::post(routes::post_hitl_answer_v1),
+        )
+        .route(
+            "/api/v1/hitl-requests/{id}/cancel",
+            axum::routing::post(routes::post_hitl_cancel_v1),
+        )
         .route("/api/v1/runs", axum::routing::get(routes::list_runs_v1))
         .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))
         .route(
@@ -462,6 +506,10 @@ pub async fn build_router(
         .route(
             "/api/v1/runs/{id}/dispatches",
             axum::routing::get(routes::get_run_dispatches_v1),
+        )
+        .route(
+            "/api/v1/runs/{id}/hitl-requests",
+            axum::routing::get(routes::get_run_hitl_requests_v1),
         )
         .route(
             "/api/v1/runs/{id}/signals",

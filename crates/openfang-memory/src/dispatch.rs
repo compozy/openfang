@@ -198,6 +198,48 @@ impl From<&DispatchRecord> for DispatchSummaryRecord {
     }
 }
 
+/// Filter + pagination input for dispatch list surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchListQuery {
+    /// Maximum number of items to return.
+    pub limit: usize,
+    /// Cursor offset encoded as a row offset.
+    pub offset: usize,
+    /// Optional workflow run filter.
+    pub run_id: Option<String>,
+    /// Optional parent dispatch filter for child traversal.
+    pub parent_dispatch_id: Option<String>,
+    /// Optional status filter.
+    pub status: Option<DispatchStatus>,
+    /// Optional target agent filter.
+    pub target_agent: Option<String>,
+    /// Optional workflow step filter.
+    pub step_id: Option<String>,
+}
+
+impl Default for DispatchListQuery {
+    fn default() -> Self {
+        Self {
+            limit: 50,
+            offset: 0,
+            run_id: None,
+            parent_dispatch_id: None,
+            status: None,
+            target_agent: None,
+            step_id: None,
+        }
+    }
+}
+
+/// Paginated durable dispatch list page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DispatchListPage {
+    /// Page items in durable sort order.
+    pub items: Vec<DispatchRecord>,
+    /// Next cursor offset, if more items exist.
+    pub next_cursor: Option<String>,
+}
+
 /// Typed failures from the durable dispatch repository.
 #[derive(Debug, Error)]
 pub enum DispatchStoreError {
@@ -315,6 +357,10 @@ pub trait DispatchRepository: Send + Sync {
         parent_dispatch_id: &str,
     ) -> Result<Vec<DispatchRecord>, DispatchStoreError>;
 
+    /// Lists dispatch rows matching the provided filters and pagination.
+    async fn list(&self, query: &DispatchListQuery)
+        -> Result<DispatchListPage, DispatchStoreError>;
+
     /// Returns run-scoped summary rows for operational list surfaces.
     async fn list_summaries_by_run(
         &self,
@@ -419,6 +465,14 @@ impl DispatchRepository for SqliteDispatchRepository {
     ) -> Result<Vec<DispatchRecord>, DispatchStoreError> {
         let conn = lock_conn(&self.conn)?;
         list_child_dispatches(&conn, parent_dispatch_id)
+    }
+
+    async fn list(
+        &self,
+        query: &DispatchListQuery,
+    ) -> Result<DispatchListPage, DispatchStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        list_dispatches(&conn, query)
     }
 
     async fn list_summaries_by_run(
@@ -709,6 +763,68 @@ fn list_child_dispatches(
     )?;
     let rows = stmt.query_map([parent_dispatch_id], read_dispatch_row)?;
     collect_rows(rows)
+}
+
+fn list_dispatches(
+    conn: &Connection,
+    query: &DispatchListQuery,
+) -> Result<DispatchListPage, DispatchStoreError> {
+    let run_id = query.run_id.as_deref();
+    let parent_dispatch_id = query.parent_dispatch_id.as_deref();
+    let status = query.status.map(DispatchStatus::as_str);
+    let target_agent = query.target_agent.as_deref();
+    let step_id = query.step_id.as_deref();
+    let limit = query.limit.saturating_add(1) as i64;
+    let offset = query.offset as i64;
+    let mut stmt = conn.prepare(
+        "SELECT
+            dispatch_id,
+            run_id,
+            step_id,
+            kind,
+            target_agent,
+            status,
+            input_json,
+            result_json,
+            error_json,
+            attempt,
+            parent_dispatch_id,
+            spawned_agent_id,
+            provider_driver,
+            session_id,
+            provider_resume_token,
+            started_at,
+            updated_at,
+            completed_at
+         FROM agent_dispatch
+         WHERE (?1 IS NULL OR run_id = ?1)
+           AND (?2 IS NULL OR parent_dispatch_id = ?2)
+           AND (?3 IS NULL OR status = ?3)
+           AND (?4 IS NULL OR target_agent = ?4)
+           AND (?5 IS NULL OR step_id = ?5)
+         ORDER BY updated_at DESC, dispatch_id DESC
+         LIMIT ?6 OFFSET ?7",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            run_id,
+            parent_dispatch_id,
+            status,
+            target_agent,
+            step_id,
+            limit,
+            offset,
+        ],
+        read_dispatch_row,
+    )?;
+    let mut items = collect_rows(rows)?;
+    let next_cursor = if items.len() > query.limit {
+        items.truncate(query.limit);
+        Some((query.offset + query.limit).to_string())
+    } else {
+        None
+    };
+    Ok(DispatchListPage { items, next_cursor })
 }
 
 pub(crate) fn list_dispatch_summaries_by_run(
