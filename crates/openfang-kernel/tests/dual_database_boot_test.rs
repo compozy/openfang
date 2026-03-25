@@ -261,7 +261,7 @@ fn migration_status_is_queryable_after_boot() {
     let compozy_rows = schema_migration_rows(&compozy_db);
 
     assert_eq!(runtime_rows.len(), 4);
-    assert_eq!(compozy_rows.len(), 10);
+    assert_eq!(compozy_rows.len(), 11);
     assert_eq!(runtime_rows[0].0, 1);
     assert_eq!(compozy_rows[0].0, 1);
     assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -278,6 +278,7 @@ fn migration_status_is_queryable_after_boot() {
     assert_eq!(compozy_rows[7].1, "0008_agent_dispatch");
     assert_eq!(compozy_rows[8].1, "0009_hitl_request");
     assert_eq!(compozy_rows[9].1, "0010_task_subtask");
+    assert_eq!(compozy_rows[10].1, "0011_looper_runtime");
 
     kernel.shutdown();
 }
@@ -308,7 +309,7 @@ fn boot_should_create_runtime_db_with_all_initial_tables() {
 }
 
 #[test]
-fn boot_should_create_compozy_db_with_all_phase_1_tables() {
+fn boot_should_create_compozy_db_with_all_durable_runtime_tables() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let config = boot_test_config(tmp.path());
     let compozy_db = config.persistence.resolve_compozy_db(&config.data_dir);
@@ -320,6 +321,12 @@ fn boot_should_create_compozy_db_with_all_phase_1_tables() {
         "workflow_run",
         "workflow_checkpoint",
         "workflow_signal",
+        "agent_dispatch",
+        "hitl_request",
+        "task",
+        "subtask",
+        "looper_run",
+        "looper_subtask",
     ] {
         assert!(
             table_exists(&compozy_db, table_name),

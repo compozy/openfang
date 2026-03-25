@@ -11,6 +11,7 @@ pub mod consolidation;
 pub mod dispatch;
 pub mod hitl;
 pub mod knowledge;
+pub mod looper;
 pub mod migration;
 pub mod runtime_store;
 pub mod semantic;
@@ -29,6 +30,10 @@ pub use dispatch::{
 pub use hitl::{
     HitlKind, HitlListPage, HitlListQuery, HitlRecord, HitlRepository, HitlStatus, HitlStore,
     HitlStoreError, NewHitlRequest, SqliteHitlRepository, HITL_REQUEST_MIGRATION_SQL,
+};
+pub use looper::{
+    LooperRunRepository, LooperStoreError, LooperSubtaskRepository, NewLooperRun,
+    LOOPER_RUNTIME_MIGRATION_SQL,
 };
 pub use runtime_store::{
     AgentMessageRecord, AgentMessageStore, AgentRuntimeRecord, AgentRuntimeStore,

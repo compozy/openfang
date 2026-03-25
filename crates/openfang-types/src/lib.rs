@@ -11,6 +11,7 @@ pub mod config;
 pub mod contract;
 pub mod error;
 pub mod event;
+pub mod looper;
 pub mod manifest_signing;
 pub mod media;
 pub mod memory;

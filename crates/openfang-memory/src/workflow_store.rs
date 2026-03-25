@@ -8,6 +8,7 @@ use crate::hitl::{
     ensure_pending_transition, insert_hitl_request, load_required_hitl_request, next_sequence_no,
     HitlRecord, HitlStatus, NewHitlRequest, SqliteHitlRepository,
 };
+use crate::looper::{LooperRunRepository, LooperSubtaskRepository};
 use crate::task::{SubtaskRepository, TaskRepository};
 use chrono::Utc;
 use openfang_types::error::OpenFangError;
@@ -53,6 +54,10 @@ pub struct WorkflowStoreSet {
     pub dispatch: SqliteDispatchRepository,
     /// Repository for durable HITL request state.
     pub hitl: SqliteHitlRepository,
+    /// Repository for durable looper runs.
+    pub looper_run: LooperRunRepository,
+    /// Repository for durable looper subtask execution views.
+    pub looper_subtask: LooperSubtaskRepository,
     /// Repository for durable task state.
     pub task: TaskRepository,
     /// Repository for durable subtask state.
@@ -69,6 +74,8 @@ impl WorkflowStoreSet {
             workflow_checkpoint: WorkflowCheckpointRepository::new(Arc::clone(&conn)),
             dispatch: SqliteDispatchRepository::new(Arc::clone(&conn)),
             hitl: SqliteHitlRepository::new(Arc::clone(&conn)),
+            looper_run: LooperRunRepository::new(Arc::clone(&conn)),
+            looper_subtask: LooperSubtaskRepository::new(Arc::clone(&conn)),
             task: TaskRepository::new(Arc::clone(&conn)),
             subtask: SubtaskRepository::new(Arc::clone(&conn)),
             workflow_signal: WorkflowSignalRepository::new(conn),

@@ -6,7 +6,7 @@
 use openfang_memory::{
     AGENT_DISPATCH_MIGRATION_SQL, AGENT_RUNTIME_CORE_MIGRATION_SQL,
     AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL, HITL_REQUEST_MIGRATION_SQL,
-    SCHEDULE_RUNTIME_CORE_MIGRATION_SQL, TASK_SUBTASK_MIGRATION_SQL,
+    LOOPER_RUNTIME_MIGRATION_SQL, SCHEDULE_RUNTIME_CORE_MIGRATION_SQL, TASK_SUBTASK_MIGRATION_SQL,
     WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
     WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
     WORKFLOW_SIGNAL_MIGRATION_SQL, WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
@@ -168,6 +168,7 @@ const COMPOZY_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[
     MigrationStep::new(8, "0008_agent_dispatch", AGENT_DISPATCH_MIGRATION_SQL),
     MigrationStep::new(9, "0009_hitl_request", HITL_REQUEST_MIGRATION_SQL),
     MigrationStep::new(10, "0010_task_subtask", TASK_SUBTASK_MIGRATION_SQL),
+    MigrationStep::new(11, "0011_looper_runtime", LOOPER_RUNTIME_MIGRATION_SQL),
 ];
 
 /// Returns the current `runtime.db` migration slice.
@@ -806,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn compozy_db_migration_should_not_include_later_phase_tables_beyond_task_subtask_or_cross_database_sql(
+    fn compozy_db_migration_should_not_include_later_phase_tables_beyond_looper_or_cross_database_sql(
     ) {
         let compozy_sql = compozy_migration_steps()
             .iter()
@@ -815,10 +816,6 @@ mod tests {
             .join("\n");
 
         for disallowed_fragment in [
-            "CREATE TABLE looper_run",
-            "CREATE TABLE IF NOT EXISTS looper_run",
-            "CREATE TABLE looper_subtask",
-            "CREATE TABLE IF NOT EXISTS looper_subtask",
             "CREATE TABLE artifact",
             "CREATE TABLE IF NOT EXISTS artifact",
             "CREATE TABLE doc",
@@ -844,6 +841,8 @@ mod tests {
         assert!(table_exists(&conn, "hitl_request"));
         assert!(table_exists(&conn, "task"));
         assert!(table_exists(&conn, "subtask"));
+        assert!(table_exists(&conn, "looper_run"));
+        assert!(table_exists(&conn, "looper_subtask"));
         for index_name in [
             "idx_dispatch_run",
             "idx_dispatch_parent",
@@ -857,6 +856,10 @@ mod tests {
             "idx_task_source_run",
             "idx_subtask_task_id",
             "idx_subtask_status",
+            "idx_looper_run_task_id",
+            "idx_looper_run_status",
+            "idx_looper_subtask_looper_run_id",
+            "idx_looper_subtask_status",
         ] {
             assert!(
                 index_exists(&conn, index_name),
@@ -869,7 +872,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("query schema_migration row count");
-        assert_eq!(migration_count, 10);
+        assert_eq!(migration_count, 11);
     }
 
     #[test]
@@ -885,6 +888,8 @@ mod tests {
 
         assert!(table_exists(&conn, "task"));
         assert!(table_exists(&conn, "subtask"));
+        assert!(table_exists(&conn, "looper_run"));
+        assert!(table_exists(&conn, "looper_subtask"));
         assert_eq!(
             table_columns(&conn, "task"),
             vec![

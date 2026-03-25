@@ -8,6 +8,7 @@ use crate::db::DatabaseManager;
 use crate::db_migration::{self, DatabaseIdentity, MigrationStep};
 use crate::error::{KernelError, KernelResult};
 use crate::event_bus::EventBus;
+use crate::looper::{LooperDispatchExecutor, LooperRuntime};
 use crate::metering::MeteringEngine;
 use crate::registry::AgentRegistry;
 use crate::scheduler::AgentScheduler;
@@ -25,7 +26,8 @@ use openfang_agent_definition::{
 };
 use openfang_memory::{
     AgentRuntimeRecord, AgentSessionRecord, DispatchRepository, DispatchStatus, HitlRecord,
-    HitlRepository, MemorySubstrate, RuntimeStoreSet, WorkflowSignalRecord, WorkflowStoreSet,
+    HitlRepository, MemorySubstrate, NewLooperRun, RuntimeStoreSet, WorkflowSignalRecord,
+    WorkflowStoreSet,
 };
 use openfang_provider_binding::binding_to_driver_with_placeholder_install_and_session_store;
 use openfang_runtime::agent_loop::{
@@ -46,7 +48,12 @@ use openfang_types::capability::Capability;
 use openfang_types::config::{KernelConfig, OutputFormat};
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
+use openfang_types::looper::{
+    LooperExecutionPolicy, LooperRunId, LooperRunListQuery, LooperRunRecord, LooperRunStatus,
+    LooperSubtaskRecord,
+};
 use openfang_types::memory::Memory;
+use openfang_types::task::{ActorKind, SubtaskRecord, TaskId};
 use openfang_types::tool::ToolDefinition;
 use openfang_types::workflow::WorkflowIr;
 
@@ -115,6 +122,31 @@ enum WorkflowDispatchCallState {
         turn_iterations: u32,
         provider_resume_token: Option<String>,
     },
+}
+
+#[derive(Clone)]
+struct KernelLooperDispatchExecutor {
+    kernel: Arc<OpenFangKernel>,
+}
+
+impl KernelLooperDispatchExecutor {
+    fn new(kernel: Arc<OpenFangKernel>) -> Self {
+        Self { kernel }
+    }
+}
+
+#[async_trait]
+impl LooperDispatchExecutor for KernelLooperDispatchExecutor {
+    async fn execute_dispatch(
+        &self,
+        looper_run: &LooperRunRecord,
+        subtask: &SubtaskRecord,
+        dispatch_id: &str,
+    ) -> Result<JsonValue, String> {
+        self.kernel
+            .execute_looper_subtask_dispatch(looper_run, subtask, dispatch_id)
+            .await
+    }
 }
 
 pub struct OpenFangKernel {
@@ -229,6 +261,12 @@ pub struct OpenFangKernel {
     workflow_dispatch_tokens: dashmap::DashMap<String, CancellationToken>,
     /// Cooperative cancellation token shared by background workflow dispatches.
     workflow_dispatch_cancel: CancellationToken,
+    /// Tracked background looper runtime tasks.
+    looper_runtime_tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// Per-looper-run cancellation handles for live looper runtimes.
+    looper_runtime_tokens: dashmap::DashMap<String, CancellationToken>,
+    /// Cooperative cancellation token shared by background looper runtimes.
+    looper_runtime_cancel: CancellationToken,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -1228,6 +1266,9 @@ impl OpenFangKernel {
             workflow_dispatch_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
             workflow_dispatch_tokens: dashmap::DashMap::new(),
             workflow_dispatch_cancel: CancellationToken::new(),
+            looper_runtime_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            looper_runtime_tokens: dashmap::DashMap::new(),
+            looper_runtime_cancel: CancellationToken::new(),
             self_handle: OnceLock::new(),
         };
 
@@ -4692,6 +4733,260 @@ impl OpenFangKernel {
         tasks.spawn(task);
     }
 
+    async fn reap_looper_runtime_tasks(&self) {
+        let mut tasks = self.looper_runtime_tasks.lock().await;
+        while tasks.try_join_next().is_some() {}
+    }
+
+    async fn track_looper_runtime_task(
+        self: &Arc<Self>,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        self.reap_looper_runtime_tasks().await;
+        let mut tasks = self.looper_runtime_tasks.lock().await;
+        tasks.spawn(task);
+    }
+
+    fn looper_run_request_id(looper_run: &LooperRunRecord) -> WorkflowRunId {
+        looper_run
+            .source_run_id
+            .as_deref()
+            .and_then(|run_id| uuid::Uuid::parse_str(run_id).ok())
+            .map(WorkflowRunId)
+            .unwrap_or_else(|| {
+                WorkflowRunId(uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_URL,
+                    looper_run.looper_run_id.as_ref().as_bytes(),
+                ))
+            })
+    }
+
+    fn looper_subtask_prompt(
+        looper_run: &LooperRunRecord,
+        subtask: &SubtaskRecord,
+    ) -> Result<String, String> {
+        let input_section = match &subtask.input {
+            JsonValue::String(value) => value.clone(),
+            value => serde_json::to_string_pretty(value)
+                .map_err(|error| format!("Failed to encode looper subtask input: {error}"))?,
+        };
+        let metadata_section =
+            match &subtask.metadata {
+                JsonValue::Null => None,
+                JsonValue::Object(map) if map.is_empty() => None,
+                value => Some(serde_json::to_string_pretty(value).map_err(|error| {
+                    format!("Failed to encode looper subtask metadata: {error}")
+                })?),
+            };
+
+        let mut prompt = format!(
+            "Execute the following subtask.\n\nLooper Run ID: {}\nTask ID: {}\nSubtask ID: {}\nTitle: {}\nDescription:\n{}\n\nInput:\n{}",
+            looper_run.looper_run_id,
+            looper_run.task_id,
+            subtask.subtask_id,
+            subtask.title,
+            subtask.description,
+            input_section,
+        );
+        if let Some(metadata_section) = metadata_section {
+            prompt.push_str("\n\nMetadata:\n");
+            prompt.push_str(&metadata_section);
+        }
+        Ok(prompt)
+    }
+
+    async fn execute_looper_subtask_dispatch(
+        &self,
+        looper_run: &LooperRunRecord,
+        subtask: &SubtaskRecord,
+        dispatch_id: &str,
+    ) -> Result<JsonValue, String> {
+        let assignee = subtask.assignee.as_ref().ok_or_else(|| {
+            format!(
+                "Subtask '{}' does not have an assignee for looper execution",
+                subtask.subtask_id
+            )
+        })?;
+        if assignee.kind == ActorKind::User {
+            return Err(format!(
+                "Subtask '{}' targets a user assignee, which the looper runtime cannot execute",
+                subtask.subtask_id
+            ));
+        }
+
+        let (agent_id, agent_name) = self.resolve_workflow_agent_target(&assignee.ref_id)?;
+        let prompt = Self::looper_subtask_prompt(looper_run, subtask)?;
+        let kernel_handle = self
+            .self_handle
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .map(|kernel| kernel as Arc<dyn KernelHandle>);
+        let request = WorkflowAgentDispatchRequest {
+            run_id: Self::looper_run_request_id(looper_run),
+            step_id: subtask.subtask_id.to_string(),
+            target_agent: assignee.ref_id.clone(),
+            agent_id,
+            agent_name,
+            prompt,
+            dispatch_id: dispatch_id.to_string(),
+            kind: openfang_memory::DispatchKind::Call,
+            continuation: None,
+        };
+
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            format!(
+                "Agent '{}' is no longer registered for looper subtask '{}'",
+                assignee.ref_id, subtask.subtask_id
+            )
+        })?;
+        let uses_arky_runtime = self.compiled_definition_for_entry(&entry)?.is_some();
+        let call_state = if uses_arky_runtime {
+            self.run_arky_workflow_dispatch_call_state_inner(
+                &request,
+                kernel_handle,
+                None,
+                None,
+                None,
+            )
+            .await?
+        } else {
+            self.run_legacy_workflow_dispatch_call_state_inner(&request, kernel_handle, None)
+                .await?
+        };
+
+        match call_state {
+            WorkflowDispatchCallState::Completed(result) => {
+                self.finalize_completed_workflow_dispatch_call(dispatch_id, &result)
+                    .await?;
+                Ok(Self::aggregate_dispatch_result_json(
+                    &result.response,
+                    result.total_usage,
+                    result.iterations,
+                    result.silent,
+                ))
+            }
+            WorkflowDispatchCallState::HitlRequested {
+                provider_resume_token,
+                ..
+            } => {
+                let message = format!(
+                    "Looper subtask '{}' requested HITL, which is not supported",
+                    subtask.subtask_id
+                );
+                let _ = self
+                    .fail_dispatch(dispatch_id, &message, provider_resume_token)
+                    .await;
+                Err(message)
+            }
+        }
+    }
+
+    fn load_looper_run_record(
+        &self,
+        looper_run_id: &LooperRunId,
+    ) -> Result<LooperRunRecord, String> {
+        self.workflow_stores
+            .looper_run
+            .find_by_id(looper_run_id)
+            .map_err(|error| format!("Failed to load looper run '{looper_run_id}': {error}"))?
+            .ok_or_else(|| format!("Looper run '{looper_run_id}' not found"))
+    }
+
+    async fn start_looper_runtime_with_executor(
+        self: &Arc<Self>,
+        looper_run_id: &LooperRunId,
+        executor: Arc<dyn LooperDispatchExecutor>,
+    ) -> Result<LooperRunRecord, String> {
+        self.reap_looper_runtime_tasks().await;
+        if self
+            .looper_runtime_tokens
+            .contains_key(looper_run_id.as_ref())
+        {
+            return self.load_looper_run_record(looper_run_id);
+        }
+
+        let current = self.load_looper_run_record(looper_run_id)?;
+        if current.status.is_terminal() {
+            return Err(format!(
+                "Looper run '{}' cannot start from terminal status '{}'",
+                looper_run_id, current.status
+            ));
+        }
+        if current.status == LooperRunStatus::Paused {
+            return Err(format!(
+                "Looper run '{}' must be resumed before it can start dispatching again",
+                looper_run_id
+            ));
+        }
+
+        let started_at = openfang_memory::now_timestamp();
+        let running_record = if current.status == LooperRunStatus::Pending {
+            self.workflow_stores
+                .looper_run
+                .update_status(
+                    looper_run_id,
+                    LooperRunStatus::Running,
+                    None,
+                    &started_at,
+                    None,
+                )
+                .map_err(|error| {
+                    format!("Failed to mark looper run '{looper_run_id}' running: {error}")
+                })?
+        } else {
+            current
+        };
+
+        let runtime = LooperRuntime::new(self.workflow_stores.clone(), executor);
+        let cancel_token = self.looper_runtime_cancel.child_token();
+        let tracked_kernel = Arc::clone(self);
+        let task_kernel = Arc::clone(self);
+        let run_id = running_record.looper_run_id.clone();
+        tracked_kernel
+            .looper_runtime_tokens
+            .insert(run_id.to_string(), cancel_token.clone());
+        tracked_kernel
+            .track_looper_runtime_task(async move {
+                let result = runtime.run(&run_id, cancel_token).await;
+                if let Err(error) = result {
+                    let failed_at = openfang_memory::now_timestamp();
+                    let error_json = serde_json::json!({
+                        "message": error.to_string(),
+                    });
+                    let _ = task_kernel.workflow_stores.looper_run.update_status(
+                        &run_id,
+                        LooperRunStatus::Failed,
+                        Some(&error_json),
+                        &failed_at,
+                        Some(&failed_at),
+                    );
+                    let _ = task_kernel
+                        .workflow_stores
+                        .looper_run
+                        .set_current_subtask(&run_id, None, &failed_at);
+                    warn!(
+                        looper_run_id = %run_id,
+                        "Looper runtime task failed: {error}"
+                    );
+                }
+                task_kernel.looper_runtime_tokens.remove(run_id.as_ref());
+            })
+            .await;
+
+        self.load_looper_run_record(looper_run_id)
+    }
+
+    async fn start_looper_runtime(
+        self: &Arc<Self>,
+        looper_run_id: &LooperRunId,
+    ) -> Result<LooperRunRecord, String> {
+        self.start_looper_runtime_with_executor(
+            looper_run_id,
+            Arc::new(KernelLooperDispatchExecutor::new(Arc::clone(self))),
+        )
+        .await
+    }
+
     async fn run_legacy_workflow_dispatch_call(
         &self,
         request: &WorkflowAgentDispatchRequest,
@@ -5293,6 +5588,199 @@ impl OpenFangKernel {
     ) -> KernelResult<(WorkflowRunId, String)> {
         self.run_workflow_with_context(workflow_id, input, Vec::new(), serde_json::json!({}))
             .await
+    }
+
+    /// Create and start a durable looper run for one task.
+    pub async fn create_looper_run(
+        self: &Arc<Self>,
+        task_id: TaskId,
+        source_run_id: Option<String>,
+        execution_policy: LooperExecutionPolicy,
+    ) -> Result<LooperRunRecord, String> {
+        let timestamp = openfang_memory::now_timestamp();
+        let looper_run_id = LooperRunId::new(uuid::Uuid::new_v4().to_string());
+        let created = self
+            .workflow_stores
+            .looper_run
+            .create(&NewLooperRun {
+                looper_run_id: looper_run_id.clone(),
+                task_id,
+                source_run_id,
+                status: LooperRunStatus::Pending,
+                execution_policy_json: serde_json::to_value(&execution_policy).map_err(
+                    |error| format!("Failed to encode looper execution policy: {error}"),
+                )?,
+                current_subtask_id: None,
+                progress_json: serde_json::json!({
+                    "total": 0,
+                    "completed": 0,
+                    "failed": 0,
+                }),
+                error_json: None,
+                started_at: timestamp.clone(),
+                updated_at: timestamp,
+                completed_at: None,
+            })
+            .map_err(|error| format!("Failed to create looper run: {error}"))?;
+
+        self.start_looper_runtime(&created.looper_run_id).await
+    }
+
+    /// List durable looper runs using the repository-backed filters.
+    pub fn list_looper_runs(
+        &self,
+        query: &LooperRunListQuery,
+    ) -> Result<Vec<LooperRunRecord>, String> {
+        self.workflow_stores
+            .looper_run
+            .list(query)
+            .map_err(|error| format!("Failed to list looper runs: {error}"))
+    }
+
+    /// Load one durable looper run by id.
+    pub fn get_looper_run(
+        &self,
+        looper_run_id: &LooperRunId,
+    ) -> Result<Option<LooperRunRecord>, String> {
+        self.workflow_stores
+            .looper_run
+            .find_by_id(looper_run_id)
+            .map_err(|error| format!("Failed to load looper run '{looper_run_id}': {error}"))
+    }
+
+    /// Load the looper-subtask execution view for one run.
+    pub fn list_looper_subtasks(
+        &self,
+        looper_run_id: &LooperRunId,
+    ) -> Result<Vec<LooperSubtaskRecord>, String> {
+        self.workflow_stores
+            .looper_subtask
+            .find_by_looper_run(looper_run_id)
+            .map_err(|error| {
+                format!("Failed to list looper subtasks for run '{looper_run_id}': {error}")
+            })
+    }
+
+    /// Pause a live looper run without interrupting in-flight dispatches.
+    pub async fn pause_looper_run_control_plane(
+        self: &Arc<Self>,
+        looper_run_id: &LooperRunId,
+    ) -> Result<LooperRunRecord, String> {
+        let timestamp = openfang_memory::now_timestamp();
+        let record = self
+            .workflow_stores
+            .looper_run
+            .pause(looper_run_id, &timestamp)
+            .map_err(|error| format!("Failed to pause looper run '{looper_run_id}': {error}"))?;
+        if !self
+            .looper_runtime_tokens
+            .contains_key(looper_run_id.as_ref())
+        {
+            return self
+                .workflow_stores
+                .looper_run
+                .set_current_subtask(looper_run_id, None, &timestamp)
+                .map_err(|error| {
+                    format!("Failed to clear looper run '{looper_run_id}' current subtask: {error}")
+                });
+        }
+        Ok(record)
+    }
+
+    /// Resume a paused looper run and continue selecting pending subtasks.
+    pub async fn resume_looper_run_control_plane(
+        self: &Arc<Self>,
+        looper_run_id: &LooperRunId,
+    ) -> Result<LooperRunRecord, String> {
+        let timestamp = openfang_memory::now_timestamp();
+        self.workflow_stores
+            .looper_run
+            .resume(looper_run_id, &timestamp)
+            .map_err(|error| format!("Failed to resume looper run '{looper_run_id}': {error}"))?;
+        self.start_looper_runtime(looper_run_id).await
+    }
+
+    /// Cancel a live looper run and stop selecting any new subtasks.
+    pub async fn cancel_looper_run_control_plane(
+        self: &Arc<Self>,
+        looper_run_id: &LooperRunId,
+        reason: &str,
+    ) -> Result<LooperRunRecord, String> {
+        let timestamp = openfang_memory::now_timestamp();
+        let error_json = serde_json::json!({
+            "message": reason,
+        });
+        let record = self
+            .workflow_stores
+            .looper_run
+            .cancel(looper_run_id, Some(&error_json), &timestamp)
+            .map_err(|error| format!("Failed to cancel looper run '{looper_run_id}': {error}"))?;
+        if let Some(cancel_token) = self
+            .looper_runtime_tokens
+            .get(looper_run_id.as_ref())
+            .map(|entry| entry.value().clone())
+        {
+            cancel_token.cancel();
+            return Ok(record);
+        }
+
+        self.workflow_stores
+            .looper_run
+            .set_current_subtask(looper_run_id, None, &timestamp)
+            .map_err(|error| {
+                format!("Failed to finalize cancelled looper run '{looper_run_id}': {error}")
+            })
+    }
+
+    /// Reattach runtime workers to durable looper runs that were active before restart.
+    pub async fn recover_looper_runs_on_startup(self: &Arc<Self>) -> KernelResult<usize> {
+        self.recover_looper_runs_on_startup_with_executor(Arc::new(
+            KernelLooperDispatchExecutor::new(Arc::clone(self)),
+        ))
+        .await
+    }
+
+    async fn recover_looper_runs_on_startup_with_executor(
+        self: &Arc<Self>,
+        executor: Arc<dyn LooperDispatchExecutor>,
+    ) -> KernelResult<usize> {
+        let running_runs = self
+            .workflow_stores
+            .looper_run
+            .list(&LooperRunListQuery {
+                status: Some(LooperRunStatus::Running),
+                ..LooperRunListQuery::default()
+            })
+            .map_err(|error| {
+                KernelError::BootFailed(format!(
+                    "Failed to list durable looper runs during boot recovery: {error}"
+                ))
+            })?;
+        if running_runs.is_empty() {
+            return Ok(0);
+        }
+
+        for record in &running_runs {
+            self.start_looper_runtime_with_executor(&record.looper_run_id, Arc::clone(&executor))
+                .await
+                .map_err(|error| {
+                    KernelError::BootFailed(format!(
+                        "Failed to recover looper run '{}': {error}",
+                        record.looper_run_id
+                    ))
+                })?;
+            debug!(
+                looper_run_id = %record.looper_run_id,
+                task_id = %record.task_id,
+                "Recovered durable looper run during boot"
+            );
+        }
+        info!(
+            recovered_looper_runs = running_runs.len(),
+            "Recovered durable looper runs before serving requests"
+        );
+
+        Ok(running_runs.len())
     }
 
     async fn resume_workflow_signal_context(
@@ -6574,6 +7062,7 @@ impl OpenFangKernel {
 
         self.supervisor.shutdown();
         self.workflow_dispatch_cancel.cancel();
+        self.looper_runtime_cancel.cancel();
 
         // Update agent states to Suspended in persistent storage (not delete)
         for entry in self.registry.list() {
@@ -8526,10 +9015,16 @@ mod tests {
     };
     use openfang_runtime::llm_driver::CompletionMetadata;
     use openfang_types::config::PersistenceConfig;
+    use openfang_types::looper::{LooperProgress, LooperSubtaskStatus};
     use openfang_types::message::{ContentBlock, StopReason, TokenUsage};
+    use openfang_types::task::{
+        AssigneeRef, Complexity, OwnerRef, Priority as TaskPriority, SubtaskId, SubtaskKind,
+        SubtaskStatus, TaskSource, TaskStatus,
+    };
     use rusqlite::{Connection, OptionalExtension};
     use std::collections::HashMap;
     use std::path::Path;
+    use tokio::sync::Mutex as TokioMutex;
 
     fn boot_test_config(root: &Path) -> KernelConfig {
         KernelConfig {
@@ -8819,6 +9314,118 @@ mod tests {
             }],
             created_at: Utc::now(),
         }
+    }
+
+    fn sample_looper_task(task_id: &str) -> openfang_types::task::TaskRecord {
+        openfang_types::task::TaskRecord {
+            task_id: TaskId::new(task_id),
+            slug: format!("slug-{task_id}"),
+            source: TaskSource::Workflow {
+                workflow_id: "sdlc".to_string(),
+                run_id: "run_123".to_string(),
+            },
+            title: format!("Task {task_id}"),
+            description: "Recover the looper".to_string(),
+            status: TaskStatus::Planned,
+            priority: TaskPriority::High,
+            complexity: Complexity::Medium,
+            position: 1,
+            owner: OwnerRef {
+                kind: ActorKind::AgentGroup,
+                ref_id: "sdlc".to_string(),
+            },
+            created_by: OwnerRef {
+                kind: ActorKind::Agent,
+                ref_id: "planner".to_string(),
+            },
+            repository_refs: vec![],
+            label_refs: vec![],
+            artifact_refs: vec![],
+            doc_refs: vec![],
+            file_refs: vec![],
+            metadata: serde_json::json!({}),
+            created_at: "2026-03-25T10:00:00Z".to_string(),
+            updated_at: "2026-03-25T10:00:00Z".to_string(),
+            completed_at: None,
+        }
+    }
+
+    fn sample_looper_subtask(task_id: &TaskId, subtask_id: &str, position: i64) -> SubtaskRecord {
+        SubtaskRecord {
+            subtask_id: SubtaskId::new(subtask_id),
+            task_id: task_id.clone(),
+            title: format!("Subtask {subtask_id}"),
+            description: format!("Execute {subtask_id}"),
+            kind: SubtaskKind::CodeChange,
+            status: SubtaskStatus::Ready,
+            complexity: Complexity::Medium,
+            position,
+            assignee: Some(AssigneeRef {
+                kind: ActorKind::Agent,
+                ref_id: "looper-agent".to_string(),
+            }),
+            depends_on: vec![],
+            parallelizable: true,
+            input: serde_json::json!({ "subtask_id": subtask_id }),
+            result: None,
+            metadata: serde_json::json!({}),
+            created_at: "2026-03-25T10:01:00Z".to_string(),
+            updated_at: "2026-03-25T10:01:00Z".to_string(),
+            completed_at: None,
+        }
+    }
+
+    struct RecordingLooperExecutor {
+        started: TokioMutex<Vec<String>>,
+    }
+
+    impl RecordingLooperExecutor {
+        fn new() -> Self {
+            Self {
+                started: TokioMutex::new(Vec::new()),
+            }
+        }
+
+        async fn started_order(&self) -> Vec<String> {
+            self.started.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl LooperDispatchExecutor for RecordingLooperExecutor {
+        async fn execute_dispatch(
+            &self,
+            _looper_run: &LooperRunRecord,
+            subtask: &SubtaskRecord,
+            _dispatch_id: &str,
+        ) -> Result<JsonValue, String> {
+            self.started
+                .lock()
+                .await
+                .push(subtask.subtask_id.to_string());
+            Ok(serde_json::json!({
+                "subtask_id": subtask.subtask_id.to_string(),
+            }))
+        }
+    }
+
+    async fn wait_for_looper_run_terminal(
+        kernel: &OpenFangKernel,
+        looper_run_id: &LooperRunId,
+    ) -> LooperRunRecord {
+        for _ in 0..200 {
+            let record = kernel
+                .workflow_stores
+                .looper_run
+                .find_by_id(looper_run_id)
+                .expect("looper run lookup should succeed")
+                .expect("looper run should exist");
+            if record.status.is_terminal() {
+                return record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for looper run terminal state");
     }
 
     fn schema_migration_exists(path: &Path) -> bool {
@@ -9261,6 +9868,151 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn looper_recovery_hook_should_resume_running_runs_without_reexecuting_completed_subtasks(
+    ) {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let config = boot_test_config(tmp.path());
+        let looper_run_id = {
+            let first_kernel =
+                Arc::new(OpenFangKernel::boot_with_config(config.clone()).expect("first boot"));
+            first_kernel.set_self_handle();
+
+            let task = sample_looper_task("task-looper-recovery");
+            first_kernel
+                .workflow_stores
+                .task
+                .create(&task)
+                .expect("task should persist");
+            let subtasks = (1..=5)
+                .map(|index| {
+                    sample_looper_subtask(
+                        &task.task_id,
+                        &format!("subtask-{index}"),
+                        i64::from(index),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for subtask in &subtasks {
+                first_kernel
+                    .workflow_stores
+                    .subtask
+                    .create(subtask)
+                    .expect("subtask should persist");
+            }
+            let looper_run = first_kernel
+                .workflow_stores
+                .looper_run
+                .create(&NewLooperRun {
+                    looper_run_id: LooperRunId::new("loop-recovery"),
+                    task_id: task.task_id.clone(),
+                    source_run_id: Some("run_123".to_string()),
+                    status: LooperRunStatus::Running,
+                    execution_policy_json: serde_json::json!({
+                        "mode": "sequential",
+                        "max_parallelism": 1,
+                        "selection": "priority",
+                    }),
+                    current_subtask_id: None,
+                    progress_json: serde_json::json!({
+                        "total": 0,
+                        "completed": 0,
+                        "failed": 0,
+                    }),
+                    error_json: None,
+                    started_at: "2026-03-25T10:02:00Z".to_string(),
+                    updated_at: "2026-03-25T10:02:00Z".to_string(),
+                    completed_at: None,
+                })
+                .expect("looper run should persist");
+            for subtask in &subtasks {
+                first_kernel
+                    .workflow_stores
+                    .looper_subtask
+                    .create_for_run(&looper_run, subtask)
+                    .expect("looper execution row should persist");
+            }
+            for subtask_id in [
+                "subtask-1",
+                "subtask-2",
+                "subtask-3",
+                "subtask-4",
+                "subtask-5",
+            ] {
+                let looper_subtask = first_kernel
+                    .workflow_stores
+                    .looper_subtask
+                    .find_by_looper_run(&looper_run.looper_run_id)
+                    .expect("execution view query should succeed")
+                    .into_iter()
+                    .find(|record| record.subtask_id.as_ref() == subtask_id)
+                    .expect("looper subtask should exist");
+                first_kernel
+                    .workflow_stores
+                    .looper_subtask
+                    .update_status(
+                        &looper_subtask.looper_subtask_id,
+                        LooperSubtaskStatus::Completed,
+                        Some(&serde_json::json!({ "subtask_id": subtask_id })),
+                        None,
+                        "2026-03-25T10:03:00Z",
+                    )
+                    .expect("looper subtask should complete");
+
+                let mut canonical = first_kernel
+                    .workflow_stores
+                    .subtask
+                    .find_by_id(&SubtaskId::new(subtask_id))
+                    .expect("canonical subtask lookup should succeed")
+                    .expect("canonical subtask should exist");
+                canonical.status = SubtaskStatus::Completed;
+                canonical.result = Some(serde_json::json!({ "subtask_id": subtask_id }));
+                canonical.updated_at = "2026-03-25T10:03:00Z".to_string();
+                canonical.completed_at = Some("2026-03-25T10:03:00Z".to_string());
+                first_kernel
+                    .workflow_stores
+                    .subtask
+                    .update(&canonical)
+                    .expect("canonical subtask should update");
+            }
+            first_kernel
+                .workflow_stores
+                .looper_run
+                .update_progress(
+                    &looper_run.looper_run_id,
+                    LooperProgress {
+                        total: 5,
+                        completed: 5,
+                        failed: 0,
+                    },
+                    "2026-03-25T10:03:00Z",
+                )
+                .expect("progress should update");
+            let looper_run_id = looper_run.looper_run_id.clone();
+            first_kernel.shutdown();
+            looper_run_id
+        };
+
+        let restarted =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("second boot should succeed"));
+        restarted.set_self_handle();
+        let executor = Arc::new(RecordingLooperExecutor::new());
+
+        let recovered = restarted
+            .recover_looper_runs_on_startup_with_executor(executor.clone())
+            .await
+            .expect("recovery should succeed");
+        assert_eq!(recovered, 1);
+
+        let completed = wait_for_looper_run_terminal(&restarted, &looper_run_id).await;
+        assert_eq!(completed.status, LooperRunStatus::Completed);
+        assert_eq!(completed.progress.total, 5);
+        assert_eq!(completed.progress.completed, 5);
+        assert_eq!(executor.started_order().await, Vec::<String>::new());
+
+        restarted.shutdown();
+    }
+
     fn schema_migration_rows(path: &Path) -> Vec<(u32, String, String)> {
         let conn = Connection::open(path).expect("open sqlite file");
         let mut stmt = conn
@@ -9568,7 +10320,7 @@ mod tests {
         let compozy_rows = schema_migration_rows(&compozy_db);
 
         assert_eq!(runtime_rows.len(), 4);
-        assert_eq!(compozy_rows.len(), 10);
+        assert_eq!(compozy_rows.len(), 11);
         assert_eq!(runtime_rows[0].0, 1);
         assert_eq!(compozy_rows[0].0, 1);
         assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -9585,6 +10337,7 @@ mod tests {
         assert_eq!(compozy_rows[7].1, "0008_agent_dispatch");
         assert_eq!(compozy_rows[8].1, "0009_hitl_request");
         assert_eq!(compozy_rows[9].1, "0010_task_subtask");
+        assert_eq!(compozy_rows[10].1, "0011_looper_runtime");
 
         kernel.shutdown();
     }
