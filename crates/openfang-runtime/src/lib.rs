@@ -56,3 +56,6 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod workspace_context;
 pub mod workspace_sandbox;
+
+#[cfg(test)]
+pub(crate) mod test_support;

@@ -5,6 +5,15 @@ use openfang_agent_definition::{
 };
 use openfang_memory::{DispatchKind, DispatchStatus, HitlKind, HitlStatus};
 use openfang_types::agent::AgentManifest;
+use openfang_types::artifact::ArtifactType;
+pub use openfang_types::artifact::{
+    ArtifactDetail, ArtifactListPage, ArtifactSummary, ArtifactVersionListPage,
+    ArtifactVersionSummary,
+};
+use openfang_types::doc::DocType;
+pub use openfang_types::doc::{
+    DocDetail, DocListPage, DocSummary, DocVersionListPage, DocVersionSummary,
+};
 use openfang_types::scheduler::{
     CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDelivery, CronSchedule,
 };
@@ -454,6 +463,48 @@ pub struct SubtaskListQueryParams {
     pub ready: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<bool>,
+}
+
+/// Query parameters accepted by standalone artifact list endpoints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct ArtifactListQueryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<ArtifactType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, rename = "q", skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+}
+
+/// Query parameters accepted by standalone doc list endpoints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct DocListQueryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_type: Option<DocType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, rename = "q", skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+}
+
+/// Generic cursor-based pagination query accepted by version history endpoints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct CursorPageQueryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// Query parameters accepted by dispatch list endpoints.

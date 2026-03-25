@@ -2,10 +2,11 @@
 
 use openfang_types::artifact::{content_hash, ContentHash, ProvenanceKind, ProvenanceRef};
 use openfang_types::doc::{
-    DocId, DocListPage, DocListQuery, DocRecord, DocType, DocVersionId, DocVersionRecord, NewDoc,
-    NewDocVersion,
+    DocDetail, DocId, DocListPage, DocListQuery, DocRecord, DocSummary, DocType, DocVersionId,
+    DocVersionListPage, DocVersionRecord, DocVersionSummary, NewDoc, NewDocVersion,
 };
 use openfang_types::error::OpenFangError;
+use openfang_types::task::TaskId;
 use rusqlite::{
     params, params_from_iter, types::Value as SqlValue, Connection, ErrorCode, OptionalExtension,
     TransactionBehavior,
@@ -22,6 +23,12 @@ const MAX_PAGE_SIZE: usize = 200;
 struct DocCursor {
     created_at: String,
     doc_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DocVersionCursor {
+    version_number: i64,
+    doc_version_id: String,
 }
 
 /// Typed failures from the document repository layer.
@@ -251,10 +258,35 @@ impl DocRepository {
         collect_doc_version_rows(&mut rows)
     }
 
-    /// List documents using cursor pagination and an optional type filter.
+    /// List standalone doc summaries using cursor pagination and SQL-backed
+    /// filters.
     pub fn list(&self, query: &DocListQuery) -> Result<DocListPage, DocStoreError> {
         let conn = lock_conn(&self.conn)?;
         list_docs(&conn, query)
+    }
+
+    /// Alias for the standalone doc list surface used by the API layer.
+    pub fn list_docs(&self, query: &DocListQuery) -> Result<DocListPage, DocStoreError> {
+        self.list(query)
+    }
+
+    /// Load one standalone doc detail with its current version projected
+    /// inline.
+    pub fn get_doc(&self, doc_id: &DocId) -> Result<Option<DocDetail>, DocStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        load_doc_detail(&conn, doc_id.as_ref())
+    }
+
+    /// List doc versions in descending `version_number` order using cursor
+    /// pagination.
+    pub fn list_doc_versions(
+        &self,
+        doc_id: &DocId,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<DocVersionListPage, DocStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        list_doc_versions(&conn, doc_id.as_ref(), limit, cursor)
     }
 }
 
@@ -331,13 +363,44 @@ fn list_docs(conn: &Connection, query: &DocListQuery) -> Result<DocListPage, Doc
     let mut params = Vec::new();
 
     if let Some(doc_type) = query.doc_type.as_ref() {
-        clauses.push("type = ?");
+        clauses.push("d.type = ?");
         params.push(SqlValue::from(doc_type.to_string()));
+    }
+
+    if let Some(task_id) = query.task_id.as_ref() {
+        clauses.push(
+            "EXISTS (
+                SELECT 1
+                FROM task AS t,
+                     json_each(t.doc_refs_json) AS doc_ref
+                WHERE t.task_id = ?
+                  AND json_extract(doc_ref.value, '$.doc_id') = d.doc_id
+            )",
+        );
+        params.push(SqlValue::from(task_id.to_string()));
+    }
+
+    if let Some(search) = query.search.as_deref() {
+        let needle = format!("%{}%", search.to_lowercase());
+        clauses.push(
+            "(lower(d.doc_id) LIKE ?
+              OR lower(d.type) LIKE ?
+              OR EXISTS (
+                    SELECT 1
+                    FROM task AS t,
+                         json_each(t.doc_refs_json) AS doc_ref
+                    WHERE json_extract(doc_ref.value, '$.doc_id') = d.doc_id
+                      AND lower(t.task_id) LIKE ?
+                ))",
+        );
+        params.push(SqlValue::from(needle.clone()));
+        params.push(SqlValue::from(needle.clone()));
+        params.push(SqlValue::from(needle));
     }
 
     if let Some(cursor) = query.cursor.as_deref() {
         let cursor = decode_cursor(cursor)?;
-        clauses.push("(created_at < ? OR (created_at = ? AND doc_id < ?))");
+        clauses.push("(d.created_at < ? OR (d.created_at = ? AND d.doc_id < ?))");
         params.push(SqlValue::from(cursor.created_at.clone()));
         params.push(SqlValue::from(cursor.created_at));
         params.push(SqlValue::from(cursor.doc_id));
@@ -345,27 +408,32 @@ fn list_docs(conn: &Connection, query: &DocListQuery) -> Result<DocListPage, Doc
 
     let mut sql = String::from(
         "SELECT
-            doc_id,
-            type,
-            current_version_id,
-            metadata_json,
-            created_at,
-            updated_at
-         FROM doc",
+            d.doc_id,
+            d.type,
+            (
+                SELECT MIN(t.task_id)
+                FROM task AS t,
+                     json_each(t.doc_refs_json) AS doc_ref
+                WHERE json_extract(doc_ref.value, '$.doc_id') = d.doc_id
+            ) AS task_id,
+            d.current_version_id,
+            d.created_at,
+            d.updated_at
+         FROM doc AS d",
     );
     if !clauses.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&clauses.join(" AND "));
     }
-    sql.push_str(" ORDER BY created_at DESC, doc_id DESC LIMIT ?");
+    sql.push_str(" ORDER BY d.created_at DESC, d.doc_id DESC LIMIT ?");
     params.push(SqlValue::from((limit + 1) as i64));
 
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
-    let mut items = collect_doc_rows(&mut rows)?;
+    let mut items = collect_doc_summary_rows(&mut rows)?;
     let next_cursor = if items.len() > limit {
         let _ = items.pop();
-        items.last().map(encode_cursor).transpose()?
+        items.last().map(encode_summary_cursor).transpose()?
     } else {
         None
     };
@@ -396,6 +464,37 @@ fn load_required_doc(conn: &Connection, doc_id: &str) -> Result<DocRecord, DocSt
     load_doc(conn, doc_id)?.ok_or_else(|| DocStoreError::DocNotFound {
         doc_id: doc_id.to_string(),
     })
+}
+
+fn load_doc_detail(conn: &Connection, doc_id: &str) -> Result<Option<DocDetail>, DocStoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            d.doc_id,
+            d.type,
+            (
+                SELECT MIN(t.task_id)
+                FROM task AS t,
+                     json_each(t.doc_refs_json) AS doc_ref
+                WHERE json_extract(doc_ref.value, '$.doc_id') = d.doc_id
+            ) AS task_id,
+            d.current_version_id,
+            d.created_at,
+            d.updated_at,
+            dv.version_no,
+            dv.content_hash,
+            dv.created_by_kind,
+            dv.created_by_ref,
+            dv.created_at
+         FROM doc AS d
+         LEFT JOIN doc_version AS dv
+           ON dv.doc_version_id = d.current_version_id
+         WHERE d.doc_id = ?1",
+    )?;
+    let mut rows = stmt.query([doc_id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(read_doc_detail_row(row)?)),
+        None => Ok(None),
+    }
 }
 
 fn load_doc_version(
@@ -429,6 +528,56 @@ fn load_required_doc_version(
     load_doc_version(conn, doc_version_id)?.ok_or_else(|| DocStoreError::DocVersionNotFound {
         doc_version_id: doc_version_id.to_string(),
     })
+}
+
+fn list_doc_versions(
+    conn: &Connection,
+    doc_id: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<DocVersionListPage, DocStoreError> {
+    if load_doc(conn, doc_id)?.is_none() {
+        return Err(DocStoreError::DocNotFound {
+            doc_id: doc_id.to_string(),
+        });
+    }
+
+    let limit = normalize_limit(limit);
+    let mut params = vec![SqlValue::from(doc_id.to_string())];
+    let mut sql = String::from(
+        "SELECT
+            doc_version_id,
+            version_no,
+            content_hash,
+            created_by_kind,
+            created_by_ref,
+            created_at
+         FROM doc_version
+         WHERE doc_id = ?",
+    );
+
+    if let Some(cursor) = cursor {
+        let cursor = decode_version_cursor(cursor)?;
+        sql.push_str(" AND (version_no < ? OR (version_no = ? AND doc_version_id < ?))");
+        params.push(SqlValue::from(cursor.version_number));
+        params.push(SqlValue::from(cursor.version_number));
+        params.push(SqlValue::from(cursor.doc_version_id));
+    }
+
+    sql.push_str(" ORDER BY version_no DESC, doc_version_id DESC LIMIT ?");
+    params.push(SqlValue::from((limit + 1) as i64));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params))?;
+    let mut items = collect_doc_version_summary_rows(&mut rows)?;
+    let next_cursor = if items.len() > limit {
+        let _ = items.pop();
+        items.last().map(encode_version_cursor).transpose()?
+    } else {
+        None
+    };
+
+    Ok(DocVersionListPage { items, next_cursor })
 }
 
 fn ensure_current_version_exists(conn: &Connection, doc: &DocRecord) -> Result<(), DocStoreError> {
@@ -467,34 +616,87 @@ fn read_doc_row(row: &rusqlite::Row<'_>) -> Result<DocRecord, DocStoreError> {
     })
 }
 
+fn read_doc_summary_row(row: &rusqlite::Row<'_>) -> Result<DocSummary, DocStoreError> {
+    Ok(DocSummary {
+        id: DocId::from(row.get::<_, String>(0)?),
+        doc_type: DocType::from(row.get::<_, String>(1)?),
+        task_id: row.get::<_, Option<String>>(2)?.map(TaskId::from),
+        current_version_id: DocVersionId::from(row.get::<_, String>(3)?),
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn read_doc_detail_row(row: &rusqlite::Row<'_>) -> Result<DocDetail, DocStoreError> {
+    let doc_id = DocId::from(row.get::<_, String>(0)?);
+    let current_version_id = DocVersionId::from(row.get::<_, String>(3)?);
+    let version_number =
+        row.get::<_, Option<i64>>(6)?
+            .ok_or_else(|| DocStoreError::MissingCurrentVersion {
+                doc_id: doc_id.to_string(),
+                current_version_id: current_version_id.to_string(),
+            })?;
+    let content_hash = row
+        .get::<_, Option<String>>(7)?
+        .map(ContentHash::from)
+        .ok_or_else(|| DocStoreError::MissingCurrentVersion {
+            doc_id: doc_id.to_string(),
+            current_version_id: current_version_id.to_string(),
+        })?;
+    let created_at =
+        row.get::<_, Option<String>>(10)?
+            .ok_or_else(|| DocStoreError::MissingCurrentVersion {
+                doc_id: doc_id.to_string(),
+                current_version_id: current_version_id.to_string(),
+            })?;
+
+    Ok(DocDetail {
+        id: doc_id,
+        doc_type: DocType::from(row.get::<_, String>(1)?),
+        task_id: row.get::<_, Option<String>>(2)?.map(TaskId::from),
+        current_version_id: current_version_id.clone(),
+        current_version: DocVersionSummary {
+            id: current_version_id,
+            version_number,
+            content_hash,
+            created_by: read_provenance(row, 8, 9)?,
+            created_at,
+        },
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
 fn read_doc_version_row(row: &rusqlite::Row<'_>) -> Result<DocVersionRecord, DocStoreError> {
-    let provenance_kind = row.get::<_, Option<String>>(5)?;
-    let provenance_ref = row.get::<_, Option<String>>(6)?;
-
-    let provenance = match (provenance_kind, provenance_ref) {
-        (Some(kind), Some(ref_id)) => Some(ProvenanceRef {
-            kind: ProvenanceKind::from_str(&kind)
-                .map_err(|_| DocStoreError::InvalidProvenanceKind { kind })?,
-            ref_id,
-        }),
-        _ => None,
-    };
-
     Ok(DocVersionRecord {
         doc_version_id: DocVersionId::from(row.get::<_, String>(0)?),
         doc_id: DocId::from(row.get::<_, String>(1)?),
         version_no: row.get(2)?,
         content: parse_json_field("doc_version.content_json", &row.get::<_, String>(3)?)?,
         content_hash: ContentHash::from(row.get::<_, String>(4)?),
-        provenance,
+        provenance: read_provenance(row, 5, 6)?,
         created_at: row.get(7)?,
     })
 }
 
-fn collect_doc_rows(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<DocRecord>, DocStoreError> {
+fn read_doc_version_summary_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<DocVersionSummary, DocStoreError> {
+    Ok(DocVersionSummary {
+        id: DocVersionId::from(row.get::<_, String>(0)?),
+        version_number: row.get(1)?,
+        content_hash: ContentHash::from(row.get::<_, String>(2)?),
+        created_by: read_provenance(row, 3, 4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+fn collect_doc_summary_rows(
+    rows: &mut rusqlite::Rows<'_>,
+) -> Result<Vec<DocSummary>, DocStoreError> {
     let mut items = Vec::new();
     while let Some(row) = rows.next()? {
-        items.push(read_doc_row(row)?);
+        items.push(read_doc_summary_row(row)?);
     }
     Ok(items)
 }
@@ -507,6 +709,34 @@ fn collect_doc_version_rows(
         items.push(read_doc_version_row(row)?);
     }
     Ok(items)
+}
+
+fn collect_doc_version_summary_rows(
+    rows: &mut rusqlite::Rows<'_>,
+) -> Result<Vec<DocVersionSummary>, DocStoreError> {
+    let mut items = Vec::new();
+    while let Some(row) = rows.next()? {
+        items.push(read_doc_version_summary_row(row)?);
+    }
+    Ok(items)
+}
+
+fn read_provenance(
+    row: &rusqlite::Row<'_>,
+    kind_index: usize,
+    ref_index: usize,
+) -> Result<Option<ProvenanceRef>, DocStoreError> {
+    let provenance_kind = row.get::<_, Option<String>>(kind_index)?;
+    let provenance_ref = row.get::<_, Option<String>>(ref_index)?;
+
+    match (provenance_kind, provenance_ref) {
+        (Some(kind), Some(ref_id)) => Ok(Some(ProvenanceRef {
+            kind: ProvenanceKind::from_str(&kind)
+                .map_err(|_| DocStoreError::InvalidProvenanceKind { kind })?,
+            ref_id,
+        })),
+        _ => Ok(None),
+    }
 }
 
 fn provenance_parts(provenance: Option<&ProvenanceRef>) -> (Option<&str>, Option<&str>) {
@@ -550,15 +780,29 @@ fn normalize_limit(limit: usize) -> usize {
     limit.clamp(1, MAX_PAGE_SIZE)
 }
 
-fn encode_cursor(record: &DocRecord) -> Result<String, DocStoreError> {
+fn encode_summary_cursor(record: &DocSummary) -> Result<String, DocStoreError> {
     serde_json::to_string(&DocCursor {
         created_at: record.created_at.clone(),
-        doc_id: record.doc_id.to_string(),
+        doc_id: record.id.to_string(),
     })
     .map_err(Into::into)
 }
 
 fn decode_cursor(cursor: &str) -> Result<DocCursor, DocStoreError> {
+    serde_json::from_str(cursor).map_err(|_| DocStoreError::InvalidCursor {
+        cursor: cursor.to_string(),
+    })
+}
+
+fn encode_version_cursor(record: &DocVersionSummary) -> Result<String, DocStoreError> {
+    serde_json::to_string(&DocVersionCursor {
+        version_number: record.version_number,
+        doc_version_id: record.id.to_string(),
+    })
+    .map_err(Into::into)
+}
+
+fn decode_version_cursor(cursor: &str) -> Result<DocVersionCursor, DocStoreError> {
     serde_json::from_str(cursor).map_err(|_| DocStoreError::InvalidCursor {
         cursor: cursor.to_string(),
     })
@@ -583,6 +827,9 @@ fn lock_conn<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openfang_types::task::{
+        ActorKind, Complexity, DocRef, OwnerRef, Priority, TaskRecord, TaskSource, TaskStatus,
+    };
     use pretty_assertions::assert_eq;
     use rusqlite::Connection;
     use std::path::Path;
@@ -604,6 +851,8 @@ mod tests {
     fn migrated_in_memory_connection() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().expect("open in-memory compozy.db");
         configure_test_connection(&conn);
+        conn.execute_batch(crate::task::TASK_SUBTASK_MIGRATION_SQL)
+            .expect("apply task/subtask migration");
         conn.execute_batch(crate::artifact::ARTIFACT_DOC_VERSIONING_MIGRATION_SQL)
             .expect("apply artifact/doc migration");
         Arc::new(Mutex::new(conn))
@@ -612,6 +861,8 @@ mod tests {
     fn migrated_file_connection(path: &Path) -> Arc<Mutex<Connection>> {
         let conn = Connection::open(path).expect("open file-backed compozy.db");
         configure_test_connection(&conn);
+        conn.execute_batch(crate::task::TASK_SUBTASK_MIGRATION_SQL)
+            .expect("apply task/subtask migration");
         conn.execute_batch(crate::artifact::ARTIFACT_DOC_VERSIONING_MIGRATION_SQL)
             .expect("apply artifact/doc migration");
         Arc::new(Mutex::new(conn))
@@ -619,6 +870,49 @@ mod tests {
 
     fn repository(conn: Arc<Mutex<Connection>>) -> DocRepository {
         DocRepository::new(conn)
+    }
+
+    fn create_task_link(
+        conn: Arc<Mutex<Connection>>,
+        task_id: &str,
+        doc_id: &str,
+        doc_type: &str,
+        current_version_id: &str,
+    ) {
+        crate::task::TaskRepository::new(conn)
+            .create(&TaskRecord {
+                task_id: TaskId::new(task_id),
+                slug: task_id.to_string(),
+                title: format!("Task {task_id}"),
+                description: format!("Task for {doc_id}"),
+                status: TaskStatus::Planned,
+                priority: Priority::Medium,
+                complexity: Complexity::Medium,
+                position: 1,
+                source: TaskSource::Manual,
+                owner: OwnerRef {
+                    kind: ActorKind::AgentGroup,
+                    ref_id: "sdlc".to_string(),
+                },
+                created_by: OwnerRef {
+                    kind: ActorKind::Agent,
+                    ref_id: "planner".to_string(),
+                },
+                repository_refs: vec![],
+                label_refs: vec![],
+                artifact_refs: vec![],
+                doc_refs: vec![DocRef {
+                    doc_id: doc_id.to_string(),
+                    type_name: doc_type.to_string(),
+                    current_version_id: Some(current_version_id.to_string()),
+                }],
+                file_refs: vec![],
+                metadata: serde_json::json!({}),
+                created_at: "2026-03-25T09:59:00Z".to_string(),
+                updated_at: "2026-03-25T09:59:00Z".to_string(),
+                completed_at: None,
+            })
+            .expect("task link should be created");
     }
 
     fn sample_new_doc(doc_id: &str, version_id: &str, created_at: &str) -> NewDoc {
@@ -717,7 +1011,8 @@ mod tests {
 
     #[test]
     fn doc_repository_should_filter_and_paginate() {
-        let repo = repository(migrated_in_memory_connection());
+        let conn = migrated_in_memory_connection();
+        let repo = repository(Arc::clone(&conn));
         let first = repo
             .create(&sample_new_doc(
                 "doc_010",
@@ -735,6 +1030,20 @@ mod tests {
                 "2026-03-25T10:02:00Z",
             ))
             .expect("create third doc");
+        create_task_link(
+            Arc::clone(&conn),
+            "task_doc_010",
+            first.doc_id.as_ref(),
+            first.type_name.as_ref(),
+            first.current_version_id.as_ref(),
+        );
+        create_task_link(
+            Arc::clone(&conn),
+            "task_doc_012",
+            third.doc_id.as_ref(),
+            third.type_name.as_ref(),
+            third.current_version_id.as_ref(),
+        );
 
         let first_page = repo
             .list(&DocListQuery {
@@ -748,11 +1057,182 @@ mod tests {
                 limit: 1,
                 cursor: first_page.next_cursor.clone(),
                 doc_type: Some(DocType::new("brief")),
+                ..DocListQuery::default()
             })
             .expect("list second page");
 
-        assert_eq!(first_page.items, vec![third]);
-        assert_eq!(second_page.items, vec![first]);
+        assert_eq!(first_page.items.len(), 1);
+        assert_eq!(first_page.items[0].id, DocId::new("doc_012"));
+        assert_eq!(
+            first_page.items[0].task_id,
+            Some(TaskId::new("task_doc_012"))
+        );
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].id, DocId::new("doc_010"));
+        assert_eq!(
+            second_page.items[0].task_id,
+            Some(TaskId::new("task_doc_010"))
+        );
+        assert_eq!(second_page.next_cursor, None);
+    }
+
+    #[test]
+    fn doc_repository_get_doc_should_inline_current_version_and_task_id() {
+        let conn = migrated_in_memory_connection();
+        let repo = repository(Arc::clone(&conn));
+        let created = repo
+            .create(&sample_new_doc(
+                "doc_detail",
+                "doc_detail_v1",
+                "2026-03-25T10:00:00Z",
+            ))
+            .expect("create doc");
+        let updated = repo
+            .append_version(
+                &created.doc_id,
+                &NewDocVersion {
+                    doc_version_id: DocVersionId::new("doc_detail_v2"),
+                    content: serde_json::json!({
+                        "summary": "Iteration one",
+                    }),
+                    provenance: Some(ProvenanceRef {
+                        kind: ProvenanceKind::Agent,
+                        ref_id: "writer".to_string(),
+                    }),
+                    created_at: "2026-03-25T10:01:00Z".to_string(),
+                },
+            )
+            .expect("append doc version");
+        create_task_link(
+            conn,
+            "task_doc_detail",
+            updated.doc_id.as_ref(),
+            updated.type_name.as_ref(),
+            updated.current_version_id.as_ref(),
+        );
+
+        let detail = repo
+            .get_doc(&updated.doc_id)
+            .expect("get doc detail")
+            .expect("doc detail should exist");
+
+        assert_eq!(detail.id, DocId::new("doc_detail"));
+        assert_eq!(detail.task_id, Some(TaskId::new("task_doc_detail")));
+        assert_eq!(
+            detail.current_version.id,
+            DocVersionId::new("doc_detail_v2")
+        );
+        assert_eq!(detail.current_version.version_number, 2);
+    }
+
+    #[test]
+    fn doc_repository_get_doc_should_surface_missing_current_version() {
+        let conn = migrated_in_memory_connection();
+        let repo = repository(Arc::clone(&conn));
+        let created = repo
+            .create(&sample_new_doc(
+                "doc_broken_head",
+                "doc_broken_head_v1",
+                "2026-03-25T10:00:00Z",
+            ))
+            .expect("create doc");
+
+        {
+            let guard = conn.lock().expect("lock sqlite connection");
+            guard
+                .execute_batch("PRAGMA foreign_keys = OFF;")
+                .expect("disable foreign key enforcement");
+            guard
+                .execute(
+                    "UPDATE doc
+                     SET current_version_id = ?1
+                     WHERE doc_id = ?2",
+                    ["doc_missing_version", created.doc_id.as_ref()],
+                )
+                .expect("corrupt current doc version pointer");
+            guard
+                .execute_batch("PRAGMA foreign_keys = ON;")
+                .expect("re-enable foreign key enforcement");
+        }
+
+        let error = repo
+            .get_doc(&created.doc_id)
+            .expect_err("missing current version should surface as a store error");
+
+        assert!(matches!(
+            error,
+            DocStoreError::MissingCurrentVersion {
+                doc_id,
+                current_version_id,
+            } if doc_id == "doc_broken_head"
+                && current_version_id == "doc_missing_version"
+        ));
+    }
+
+    #[test]
+    fn doc_repository_list_doc_versions_should_descend_and_paginate() {
+        let repo = repository(migrated_in_memory_connection());
+        let created = repo
+            .create(&sample_new_doc(
+                "doc_history",
+                "doc_history_v1",
+                "2026-03-25T10:00:00Z",
+            ))
+            .expect("create doc");
+        repo.append_version(
+            &created.doc_id,
+            &NewDocVersion {
+                doc_version_id: DocVersionId::new("doc_history_v2"),
+                content: serde_json::json!({
+                    "summary": "Iteration one",
+                }),
+                provenance: Some(ProvenanceRef {
+                    kind: ProvenanceKind::Dispatch,
+                    ref_id: "dispatch_1".to_string(),
+                }),
+                created_at: "2026-03-25T10:01:00Z".to_string(),
+            },
+        )
+        .expect("append doc v2");
+        repo.append_version(
+            &created.doc_id,
+            &NewDocVersion {
+                doc_version_id: DocVersionId::new("doc_history_v3"),
+                content: serde_json::json!({
+                    "summary": "Iteration two",
+                }),
+                provenance: Some(ProvenanceRef {
+                    kind: ProvenanceKind::Dispatch,
+                    ref_id: "dispatch_2".to_string(),
+                }),
+                created_at: "2026-03-25T10:02:00Z".to_string(),
+            },
+        )
+        .expect("append doc v3");
+
+        let first_page = repo
+            .list_doc_versions(&created.doc_id, 2, None)
+            .expect("load first doc version page");
+        let second_page = repo
+            .list_doc_versions(&created.doc_id, 2, first_page.next_cursor.as_deref())
+            .expect("load second doc version page");
+
+        assert_eq!(
+            first_page
+                .items
+                .iter()
+                .map(|item| item.id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["doc_history_v3".to_string(), "doc_history_v2".to_string()]
+        );
+        assert_eq!(
+            second_page
+                .items
+                .iter()
+                .map(|item| item.id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["doc_history_v1".to_string()]
+        );
         assert_eq!(second_page.next_cursor, None);
     }
 

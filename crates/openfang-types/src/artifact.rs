@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
 
+use crate::task::TaskId;
+
 macro_rules! string_newtype {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -200,6 +202,12 @@ pub struct ArtifactListQuery {
     /// Optional artifact type filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_type: Option<ArtifactType>,
+    /// Optional linked task filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    /// Optional fuzzy search needle.
+    #[serde(default, rename = "q", skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
 }
 
 impl Default for ArtifactListQuery {
@@ -208,15 +216,80 @@ impl Default for ArtifactListQuery {
             limit: 50,
             cursor: None,
             artifact_type: None,
+            task_id: None,
+            search: None,
         }
     }
+}
+
+/// Summary payload returned by standalone artifact list endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ArtifactSummary {
+    /// Stable artifact identifier.
+    pub id: ArtifactId,
+    /// Artifact classification.
+    pub artifact_type: ArtifactType,
+    /// Linked durable task identifier when one is known.
+    pub task_id: Option<TaskId>,
+    /// Current immutable head version identifier.
+    pub current_version_id: ArtifactVersionId,
+    /// Creation timestamp in RFC 3339 UTC format.
+    pub created_at: String,
+    /// Last head-update timestamp in RFC 3339 UTC format.
+    pub updated_at: String,
+}
+
+/// Summary payload returned by artifact version history endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ArtifactVersionSummary {
+    /// Stable artifact version identifier.
+    pub id: ArtifactVersionId,
+    /// Monotonic version number within one artifact.
+    pub version_number: i64,
+    /// Canonical SHA-256 hex digest of the version content.
+    pub content_hash: ContentHash,
+    /// Optional producing runtime provenance.
+    pub created_by: Option<ProvenanceRef>,
+    /// Version creation timestamp in RFC 3339 UTC format.
+    pub created_at: String,
+}
+
+/// Detail payload returned by standalone artifact detail endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ArtifactDetail {
+    /// Stable artifact identifier.
+    pub id: ArtifactId,
+    /// Artifact classification.
+    pub artifact_type: ArtifactType,
+    /// Linked durable task identifier when one is known.
+    pub task_id: Option<TaskId>,
+    /// Current immutable head version identifier.
+    pub current_version_id: ArtifactVersionId,
+    /// Current version summary projected inline.
+    pub current_version: ArtifactVersionSummary,
+    /// Creation timestamp in RFC 3339 UTC format.
+    pub created_at: String,
+    /// Last head-update timestamp in RFC 3339 UTC format.
+    pub updated_at: String,
 }
 
 /// Cursor-backed artifact list response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactListPage {
-    /// Page of artifact records.
-    pub items: Vec<ArtifactRecord>,
+    /// Page of artifact summaries.
+    pub items: Vec<ArtifactSummary>,
+    /// Cursor for the next page, or `None` when exhausted.
+    pub next_cursor: Option<String>,
+}
+
+/// Cursor-backed artifact version list response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactVersionListPage {
+    /// Page of artifact version summaries.
+    pub items: Vec<ArtifactVersionSummary>,
     /// Cursor for the next page, or `None` when exhausted.
     pub next_cursor: Option<String>,
 }
@@ -261,6 +334,65 @@ mod tests {
         assert_eq!(
             canonical_content_json(&first),
             canonical_content_json(&second)
+        );
+    }
+
+    #[test]
+    fn artifact_summary_should_serialize_expected_shape() {
+        let summary = ArtifactSummary {
+            id: ArtifactId::new("artifact_001"),
+            artifact_type: ArtifactType::new("prd"),
+            task_id: Some(TaskId::new("task_001")),
+            current_version_id: ArtifactVersionId::new("artifact_v3"),
+            created_at: "2026-03-21T14:00:00Z".to_string(),
+            updated_at: "2026-03-21T14:30:00Z".to_string(),
+        };
+
+        let json = serde_json::to_value(summary).expect("artifact summary should serialize");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "id": "artifact_001",
+                "artifact_type": "prd",
+                "task_id": "task_001",
+                "current_version_id": "artifact_v3",
+                "created_at": "2026-03-21T14:00:00Z",
+                "updated_at": "2026-03-21T14:30:00Z",
+            })
+        );
+    }
+
+    #[test]
+    fn artifact_detail_should_serialize_current_version_inline() {
+        let detail = ArtifactDetail {
+            id: ArtifactId::new("artifact_001"),
+            artifact_type: ArtifactType::new("prd"),
+            task_id: Some(TaskId::new("task_001")),
+            current_version_id: ArtifactVersionId::new("artifact_v3"),
+            current_version: ArtifactVersionSummary {
+                id: ArtifactVersionId::new("artifact_v3"),
+                version_number: 3,
+                content_hash: ContentHash::new("sha256:abc123"),
+                created_by: Some(ProvenanceRef {
+                    kind: ProvenanceKind::Agent,
+                    ref_id: "prd-writer".to_string(),
+                }),
+                created_at: "2026-03-21T14:30:00Z".to_string(),
+            },
+            created_at: "2026-03-21T14:00:00Z".to_string(),
+            updated_at: "2026-03-21T14:30:00Z".to_string(),
+        };
+
+        let json = serde_json::to_value(detail).expect("artifact detail should serialize");
+
+        assert_eq!(
+            json["current_version"]["version_number"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            json["current_version"]["content_hash"],
+            serde_json::json!("sha256:abc123")
         );
     }
 }

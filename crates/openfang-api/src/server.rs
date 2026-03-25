@@ -577,6 +577,24 @@ pub async fn build_router(
             axum::routing::post(routes::cancel_run_v1),
         )
         .route(
+            "/api/v1/artifacts",
+            axum::routing::get(routes::list_artifacts_v1),
+        )
+        .route(
+            "/api/v1/artifacts/{id}",
+            axum::routing::get(routes::get_artifact_v1),
+        )
+        .route(
+            "/api/v1/artifacts/{id}/versions",
+            axum::routing::get(routes::list_artifact_versions_v1),
+        )
+        .route("/api/v1/docs", axum::routing::get(routes::list_docs_v1))
+        .route("/api/v1/docs/{id}", axum::routing::get(routes::get_doc_v1))
+        .route(
+            "/api/v1/docs/{id}/versions",
+            axum::routing::get(routes::list_doc_versions_v1),
+        )
+        .route(
             "/api/v1/tasks",
             axum::routing::get(routes::list_tasks_v1).post(routes::create_task_v1),
         )

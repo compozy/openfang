@@ -227,6 +227,7 @@ impl TtsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{env_lock, EnvVarGuard};
 
     fn default_config() -> TtsConfig {
         TtsConfig::default()
@@ -285,21 +286,28 @@ mod tests {
 
     #[test]
     fn test_detect_provider_none() {
-        // In test env, likely no API keys set
-        let _ = TtsEngine::detect_provider(); // Just verify no panic
+        let _env_lock = env_lock();
+        let _openai_guard = EnvVarGuard::remove("OPENAI_API_KEY");
+        let _elevenlabs_guard = EnvVarGuard::remove("ELEVENLABS_API_KEY");
+
+        assert_eq!(TtsEngine::detect_provider(), None);
     }
 
-    #[tokio::test]
-    async fn test_synthesize_no_provider() {
+    #[test]
+    fn test_synthesize_no_provider() {
         let mut config = default_config();
         config.enabled = true;
         let engine = TtsEngine::new(config);
-        // This may or may not error depending on env vars
-        let result = engine.synthesize("Hello world", None, None).await;
-        // If no API keys are set, should error
-        if let Err(err) = result {
-            assert!(err.contains("No TTS provider") || err.contains("not set"));
-        }
+        let _env_lock = env_lock();
+        let _openai_guard = EnvVarGuard::remove("OPENAI_API_KEY");
+        let _elevenlabs_guard = EnvVarGuard::remove("ELEVENLABS_API_KEY");
+
+        let err = tokio_test::block_on(engine.synthesize("Hello world", None, None))
+            .expect_err("synthesizing without a configured provider should fail");
+        assert!(
+            err.contains("No TTS provider configured"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

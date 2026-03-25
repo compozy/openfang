@@ -37,14 +37,16 @@ use openfang_kernel::workflow_compiler::{
 };
 use openfang_kernel::{AgentMessageDispatch, OpenFangKernel};
 use openfang_memory::{
-    now_timestamp, AgentRuntimeRecord, AgentSessionRecord, DispatchListQuery, DispatchRecord,
-    DispatchRepository, DispatchStatus, HitlListQuery, HitlRecord, HitlRepository, HitlStatus,
-    ScheduleRuntimeRecord, TaskStoreError,
+    now_timestamp, AgentRuntimeRecord, AgentSessionRecord, ArtifactStoreError, DispatchListQuery,
+    DispatchRecord, DispatchRepository, DispatchStatus, DocStoreError, HitlListQuery, HitlRecord,
+    HitlRepository, HitlStatus, ScheduleRuntimeRecord, TaskStoreError,
 };
 use openfang_memory::{WorkflowRunListQuery, WorkflowRunStatus, WorkflowSignalRecord};
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest, AgentState, SessionId};
+use openfang_types::artifact::{ArtifactId, ArtifactListQuery};
+use openfang_types::doc::{DocId, DocListQuery};
 use openfang_types::scheduler::{
     CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDelivery, CronJob, CronJobId,
     CronSchedule, CronTextInputItem, CronTextInputPayload, CronWorkflowSignalSelector,
@@ -721,6 +723,36 @@ fn subtask_list_query_from_params(
     })
 }
 
+fn artifact_list_query_from_params(
+    params: ArtifactListQueryParams,
+) -> Result<ArtifactListQuery, (StatusCode, Json<serde_json::Value>)> {
+    Ok(ArtifactListQuery {
+        limit: parse_pagination_limit(params.limit)?,
+        cursor: params.cursor,
+        artifact_type: params.artifact_type,
+        task_id: params.task_id,
+        search: params.search,
+    })
+}
+
+fn doc_list_query_from_params(
+    params: DocListQueryParams,
+) -> Result<DocListQuery, (StatusCode, Json<serde_json::Value>)> {
+    Ok(DocListQuery {
+        limit: parse_pagination_limit(params.limit)?,
+        cursor: params.cursor,
+        doc_type: params.doc_type,
+        task_id: params.task_id,
+        search: params.search,
+    })
+}
+
+fn cursor_page_limit_and_cursor(
+    params: CursorPageQueryParams,
+) -> Result<(usize, Option<String>), (StatusCode, Json<serde_json::Value>)> {
+    Ok((parse_pagination_limit(params.limit)?, params.cursor))
+}
+
 fn apply_task_update(
     current: &TaskRecord,
     request: &UpdateTaskRequest,
@@ -1055,6 +1087,142 @@ fn task_store_error_response(error: TaskStoreError) -> (StatusCode, Json<serde_j
             StatusCode::INTERNAL_SERVER_ERROR,
             "task_store_failed",
             "Task store operation failed",
+            Some(serde_json::json!([{ "message": error.to_string() }])),
+        ),
+    }
+}
+
+fn artifact_store_error_response(
+    error: ArtifactStoreError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        ArtifactStoreError::ArtifactNotFound { artifact_id } => workflow_v2_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Artifact not found",
+            Some(serde_json::json!([{ "artifact_id": artifact_id }])),
+        ),
+        ArtifactStoreError::ArtifactVersionNotFound {
+            artifact_version_id,
+        } => workflow_v2_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Artifact version not found",
+            Some(serde_json::json!([{ "artifact_version_id": artifact_version_id }])),
+        ),
+        ArtifactStoreError::InvalidCursor { cursor } => workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Invalid cursor",
+            Some(serde_json::json!([{ "path": "cursor", "value": cursor }])),
+        ),
+        ArtifactStoreError::ArtifactAlreadyExists { artifact_id } => workflow_v2_error_response(
+            StatusCode::CONFLICT,
+            "already_exists",
+            "Artifact already exists",
+            Some(serde_json::json!([{ "artifact_id": artifact_id }])),
+        ),
+        ArtifactStoreError::ArtifactVersionAlreadyExists {
+            artifact_version_id,
+        } => workflow_v2_error_response(
+            StatusCode::CONFLICT,
+            "already_exists",
+            "Artifact version already exists",
+            Some(serde_json::json!([{ "artifact_version_id": artifact_version_id }])),
+        ),
+        ArtifactStoreError::InvalidMetadataShape { field } => workflow_v2_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            "Metadata fields must be JSON objects",
+            Some(serde_json::json!([{ "field": field }])),
+        ),
+        ArtifactStoreError::ConnectionLock(error)
+        | ArtifactStoreError::InvalidJsonField { message: error, .. }
+        | ArtifactStoreError::InvalidProvenanceKind { kind: error }
+        | ArtifactStoreError::MissingCurrentVersion {
+            artifact_id: _,
+            current_version_id: error,
+        } => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact_store_failed",
+            "Artifact store operation failed",
+            Some(serde_json::json!([{ "message": error }])),
+        ),
+        ArtifactStoreError::Sqlite(error) => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact_store_failed",
+            "Artifact store operation failed",
+            Some(serde_json::json!([{ "message": error.to_string() }])),
+        ),
+        ArtifactStoreError::Json(error) => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact_store_failed",
+            "Artifact store operation failed",
+            Some(serde_json::json!([{ "message": error.to_string() }])),
+        ),
+    }
+}
+
+fn doc_store_error_response(error: DocStoreError) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        DocStoreError::DocNotFound { doc_id } => workflow_v2_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Doc not found",
+            Some(serde_json::json!([{ "doc_id": doc_id }])),
+        ),
+        DocStoreError::DocVersionNotFound { doc_version_id } => workflow_v2_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Doc version not found",
+            Some(serde_json::json!([{ "doc_version_id": doc_version_id }])),
+        ),
+        DocStoreError::InvalidCursor { cursor } => workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Invalid cursor",
+            Some(serde_json::json!([{ "path": "cursor", "value": cursor }])),
+        ),
+        DocStoreError::DocAlreadyExists { doc_id } => workflow_v2_error_response(
+            StatusCode::CONFLICT,
+            "already_exists",
+            "Doc already exists",
+            Some(serde_json::json!([{ "doc_id": doc_id }])),
+        ),
+        DocStoreError::DocVersionAlreadyExists { doc_version_id } => workflow_v2_error_response(
+            StatusCode::CONFLICT,
+            "already_exists",
+            "Doc version already exists",
+            Some(serde_json::json!([{ "doc_version_id": doc_version_id }])),
+        ),
+        DocStoreError::InvalidMetadataShape { field } => workflow_v2_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            "Metadata fields must be JSON objects",
+            Some(serde_json::json!([{ "field": field }])),
+        ),
+        DocStoreError::ConnectionLock(error)
+        | DocStoreError::InvalidJsonField { message: error, .. }
+        | DocStoreError::InvalidProvenanceKind { kind: error }
+        | DocStoreError::MissingCurrentVersion {
+            doc_id: _,
+            current_version_id: error,
+        } => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "doc_store_failed",
+            "Doc store operation failed",
+            Some(serde_json::json!([{ "message": error }])),
+        ),
+        DocStoreError::Sqlite(error) => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "doc_store_failed",
+            "Doc store operation failed",
+            Some(serde_json::json!([{ "message": error.to_string() }])),
+        ),
+        DocStoreError::Json(error) => workflow_v2_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "doc_store_failed",
+            "Doc store operation failed",
             Some(serde_json::json!([{ "message": error.to_string() }])),
         ),
     }
@@ -1421,6 +1589,133 @@ pub async fn get_task_files_v1(
         ),
         Ok(None) => task_store_error_response(TaskStoreError::TaskNotFound { task_id: id }),
         Err(error) => task_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/artifacts — List standalone artifacts.
+pub async fn list_artifacts_v1(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<ArtifactListQueryParams>, QueryRejection>,
+) -> impl IntoResponse {
+    let Query(params) = match query {
+        Ok(query) => query,
+        Err(rejection) => return task_query_rejection(rejection),
+    };
+    let query = match artifact_list_query_from_params(params) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+
+    match state.kernel.workflow_stores.artifact.list_artifacts(&query) {
+        Ok(page) => (StatusCode::OK, Json(serde_json::json!(page))),
+        Err(error) => artifact_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/artifacts/{id} — Load one standalone artifact detail.
+pub async fn get_artifact_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .workflow_stores
+        .artifact
+        .get_artifact(&ArtifactId::new(id.clone()))
+    {
+        Ok(Some(artifact)) => (StatusCode::OK, Json(serde_json::json!(artifact))),
+        Ok(None) => {
+            artifact_store_error_response(ArtifactStoreError::ArtifactNotFound { artifact_id: id })
+        }
+        Err(error) => artifact_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/artifacts/{id}/versions — List artifact version history.
+pub async fn list_artifact_versions_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    query: Result<Query<CursorPageQueryParams>, QueryRejection>,
+) -> impl IntoResponse {
+    let Query(params) = match query {
+        Ok(query) => query,
+        Err(rejection) => return task_query_rejection(rejection),
+    };
+    let (limit, cursor) = match cursor_page_limit_and_cursor(params) {
+        Ok(values) => values,
+        Err(response) => return response,
+    };
+
+    match state
+        .kernel
+        .workflow_stores
+        .artifact
+        .list_artifact_versions(&ArtifactId::new(id), limit, cursor.as_deref())
+    {
+        Ok(page) => (StatusCode::OK, Json(serde_json::json!(page))),
+        Err(error) => artifact_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/docs — List standalone docs.
+pub async fn list_docs_v1(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<DocListQueryParams>, QueryRejection>,
+) -> impl IntoResponse {
+    let Query(params) = match query {
+        Ok(query) => query,
+        Err(rejection) => return task_query_rejection(rejection),
+    };
+    let query = match doc_list_query_from_params(params) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+
+    match state.kernel.workflow_stores.doc.list_docs(&query) {
+        Ok(page) => (StatusCode::OK, Json(serde_json::json!(page))),
+        Err(error) => doc_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/docs/{id} — Load one standalone doc detail.
+pub async fn get_doc_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .kernel
+        .workflow_stores
+        .doc
+        .get_doc(&DocId::new(id.clone()))
+    {
+        Ok(Some(doc)) => (StatusCode::OK, Json(serde_json::json!(doc))),
+        Ok(None) => doc_store_error_response(DocStoreError::DocNotFound { doc_id: id }),
+        Err(error) => doc_store_error_response(error),
+    }
+}
+
+/// GET /api/v1/docs/{id}/versions — List doc version history.
+pub async fn list_doc_versions_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    query: Result<Query<CursorPageQueryParams>, QueryRejection>,
+) -> impl IntoResponse {
+    let Query(params) = match query {
+        Ok(query) => query,
+        Err(rejection) => return task_query_rejection(rejection),
+    };
+    let (limit, cursor) = match cursor_page_limit_and_cursor(params) {
+        Ok(values) => values,
+        Err(response) => return response,
+    };
+
+    match state.kernel.workflow_stores.doc.list_doc_versions(
+        &DocId::new(id),
+        limit,
+        cursor.as_deref(),
+    ) {
+        Ok(page) => (StatusCode::OK, Json(serde_json::json!(page))),
+        Err(error) => doc_store_error_response(error),
     }
 }
 
@@ -21833,5 +22128,30 @@ mod task_control_plane_route_tests {
                 .collect::<Vec<_>>(),
             vec!["subtask_blocked"]
         );
+    }
+
+    #[test]
+    fn artifact_list_query_from_params_should_parse_artifact_type_filter() {
+        let query = artifact_list_query_from_params(ArtifactListQueryParams {
+            artifact_type: Some(openfang_types::artifact::ArtifactType::new("prd")),
+            ..ArtifactListQueryParams::default()
+        })
+        .expect("artifact query should parse");
+
+        assert_eq!(
+            query.artifact_type,
+            Some(openfang_types::artifact::ArtifactType::new("prd"))
+        );
+    }
+
+    #[test]
+    fn artifact_list_query_from_params_should_parse_task_id_filter() {
+        let query = artifact_list_query_from_params(ArtifactListQueryParams {
+            task_id: Some(TaskId::new("task_001")),
+            ..ArtifactListQueryParams::default()
+        })
+        .expect("artifact query should parse");
+
+        assert_eq!(query.task_id, Some(TaskId::new("task_001")));
     }
 }

@@ -557,44 +557,7 @@ pub fn known_providers() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock should not be poisoned")
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, original }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let original = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use crate::test_support::{env_lock, EnvVarGuard};
 
     #[test]
     fn test_provider_defaults_groq() {
