@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>api/agents/crud</domain>
@@ -56,12 +56,12 @@ endpoints are handled in Task 22.
 
 ## Subtasks
 
-- [ ] 20.1 Add new request and response types to `crates/openfang-api/src/types.rs` for definition CRUD and compile endpoints: `CreateAgentRequest`, `UpdateAgentRequest`, `AgentResponse`, `AgentListItem`, `AgentValidateRequest`, `AgentValidateResponse`, `AgentCompileRequest`, `AgentCompileResponse`, `AgentCompiledResponse`. All structs must match the `API-SPEC.md` payload shapes exactly.
-- [ ] 20.2 Implement the definition-management route handlers in `crates/openfang-api/src/routes.rs`: `list_agents`, `create_agent`, `get_agent`, `update_agent`, `delete_agent`. These handlers replace the existing `spawn_agent` handler for the new definition-first flow. The existing `spawn_agent` handler may be kept internally for backward-compatible agent boot but must not be promoted as the public definition API.
-- [ ] 20.3 Implement `validate_agent_definition` and `compile_agent_definition` route handlers that call the task 18 pipeline functions (`stage1_schema_validate`, `stage2_reference_validate`, `stage3_semantic_validate`, `stage4_normalize`, `compile`). The `ValidationContext` passed to stage 2 must be constructed from live kernel state (agent registry snapshot, known skill names from the skill registry).
-- [ ] 20.4 Implement `get_agent_compiled` route handler for `GET /api/v1/agents/{id}/compiled` that loads the stored definition, runs the full pipeline, and returns the compiled output without persisting it (compiled output is a derived artifact per ADR-040).
-- [ ] 20.5 Register all definition CRUD and compile routes in `crates/openfang-api/src/server.rs` under the `/api/v1/agents` prefix. Verify that existing routes under `/api/agents` (the old non-versioned prefix) are either migrated or remain as legacy aliases. The new routes must live under `/api/v1/`.
-- [ ] 20.6 Write unit and integration tests for all definition CRUD and compile endpoints.
+- [x] 20.1 Add new request and response types to `crates/openfang-api/src/types.rs` for definition CRUD and compile endpoints: `CreateAgentRequest`, `UpdateAgentRequest`, `AgentResponse`, `AgentListItem`, `AgentValidateRequest`, `AgentValidateResponse`, `AgentCompileRequest`, `AgentCompileResponse`, `AgentCompiledResponse`. All structs must match the `API-SPEC.md` payload shapes exactly.
+- [x] 20.2 Implement the definition-management route handlers in `crates/openfang-api/src/routes.rs`: `list_agents`, `create_agent`, `get_agent`, `update_agent`, `delete_agent`. These handlers replace the existing `spawn_agent` handler for the new definition-first flow. The existing `spawn_agent` handler may be kept internally for backward-compatible agent boot but must not be promoted as the public definition API.
+- [x] 20.3 Implement `validate_agent_definition` and `compile_agent_definition` route handlers that call the task 18 pipeline functions (`stage1_schema_validate`, `stage2_reference_validate`, `stage3_semantic_validate`, `stage4_normalize`, `compile`). The `ValidationContext` passed to stage 2 must be constructed from live kernel state (agent registry snapshot, known skill names from the skill registry).
+- [x] 20.4 Implement `get_agent_compiled` route handler for `GET /api/v1/agents/{id}/compiled` that loads the stored definition, runs the full pipeline, and returns the compiled output without persisting it (compiled output is a derived artifact per ADR-040).
+- [x] 20.5 Register all definition CRUD and compile routes in `crates/openfang-api/src/server.rs` under the `/api/v1/agents` prefix. Verify that existing routes under `/api/agents` (the old non-versioned prefix) are either migrated or remain as legacy aliases. The new routes must live under `/api/v1/`.
+- [x] 20.6 Write unit and integration tests for all definition CRUD and compile endpoints.
 
 ## Implementation Details
 

@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>api/agents/streaming</domain>
@@ -43,12 +43,12 @@ interaction surfaces for agent conversations.
 
 ## Subtasks
 
-- [ ] 22.1 Add new request and response types to `crates/openfang-api/src/types.rs` for message endpoints: `MessageRequest`, `MessageResponse`, `MessageDryRunResponse`, `StreamEvent`. All structs must match the `API-SPEC.md` payload shapes exactly.
-- [ ] 22.2 Implement `submit_agent_message` route handler: accepts a message request, dispatches to the agent execution loop, and returns the accepted response with `session_id` and `message_id`.
-- [ ] 22.3 Implement `stream_agent_message` route handler using SSE: initiates an SSE connection, streams events (`message.delta`, `message.completed`, `tool.started`, `tool.completed`, `error`, `keepalive`) as the agent processes the message. Must use Axum's SSE support.
-- [ ] 22.4 Implement `dry_run_agent_message` route handler: resolves the definition and session context without dispatching a message, and returns `{ would_execute, resolved, effects, explanation }`.
-- [ ] 22.5 Register all message routes in `crates/openfang-api/src/server.rs` under the `/api/v1/agents/{id}/messages` prefix.
-- [ ] 22.6 Write unit and integration tests for all message endpoints including SSE streaming verification.
+- [x] 22.1 Add new request and response types to `crates/openfang-api/src/types.rs` for message endpoints: `MessageRequest`, `MessageResponse`, `MessageDryRunResponse`, `StreamEvent`. All structs must match the `API-SPEC.md` payload shapes exactly.
+- [x] 22.2 Implement `submit_agent_message` route handler: accepts a message request, dispatches to the agent execution loop, and returns the accepted response with `session_id` and `message_id`.
+- [x] 22.3 Implement `stream_agent_message` route handler using SSE: initiates an SSE connection, streams events (`message.delta`, `message.completed`, `tool.started`, `tool.completed`, `error`, `keepalive`) as the agent processes the message. Must use Axum's SSE support.
+- [x] 22.4 Implement `dry_run_agent_message` route handler: resolves the definition and session context without dispatching a message, and returns `{ would_execute, resolved, effects, explanation }`.
+- [x] 22.5 Register all message routes in `crates/openfang-api/src/server.rs` under the `/api/v1/agents/{id}/messages` prefix.
+- [x] 22.6 Write unit and integration tests for all message endpoints including SSE streaming verification.
 
 ## Implementation Details
 
@@ -131,31 +131,31 @@ Per ADR-038, the `dry-run` handler must:
 
 ### Unit Tests (Required)
 
-- [ ] `submit_agent_message` returns `{ accepted: true, session_id, message_id }` for a valid request.
-- [ ] `dry_run_agent_message` returns `{ would_execute: true, resolved: {...}, effects: {...}, explanation: {...} }` without dispatching any message.
-- [ ] `submit_agent_message` returns `404` for an unknown agent ID.
-- [ ] `submit_agent_message` returns an error when the agent runtime is not started.
-- [ ] `dry_run_agent_message` works even when the agent runtime is stopped (it only resolves, does not dispatch).
+- [x] `submit_agent_message` returns `{ accepted: true, session_id, message_id }` for a valid request.
+- [x] `dry_run_agent_message` returns `{ would_execute: true, resolved: {...}, effects: {...}, explanation: {...} }` without dispatching any message.
+- [x] `submit_agent_message` returns `404` for an unknown agent ID.
+- [x] `submit_agent_message` returns an error when the agent runtime is not started.
+- [x] `dry_run_agent_message` works even when the agent runtime is stopped (it only resolves, does not dispatch).
 
 ### Integration Tests (Required)
 
-- [ ] `POST /api/v1/agents/{id}/messages/stream` initiates an SSE response with at least a `keepalive` event and does not return a plain JSON response.
-- [ ] Full message lifecycle: submit a message, verify the response includes a `message_id`, then verify the session's message count has increased.
-- [ ] SSE stream includes `message.delta` and `message.completed` events for a real agent dispatch (requires a running agent with a configured provider).
-- [ ] Dry-run returns resolved provider and model information without triggering any actual LLM call.
+- [x] `POST /api/v1/agents/{id}/messages/stream` initiates an SSE response with at least a `keepalive` event and does not return a plain JSON response.
+- [x] Full message lifecycle: submit a message, verify the response includes a `message_id`, then verify the session's message count has increased.
+- [x] SSE stream includes `message.delta` and `message.completed` events for a real agent dispatch (requires a running agent with a configured provider).
+- [x] Dry-run returns resolved provider and model information without triggering any actual LLM call.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] The `stream` handler must never return a plain JSON response — it must always use SSE content type (`text/event-stream`).
-- [ ] Message handlers must not modify the stored agent definition.
-- [ ] All error responses must use the `{ error: { code, message, details } }` envelope.
-- [ ] No message handler may bypass the session store to dispatch messages without session context.
+- [x] The `stream` handler must never return a plain JSON response — it must always use SSE content type (`text/event-stream`).
+- [x] Message handlers must not modify the stored agent definition.
+- [x] All error responses must use the `{ error: { code, message, details } }` envelope.
+- [x] No message handler may bypass the session store to dispatch messages without session context.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

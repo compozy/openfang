@@ -409,6 +409,25 @@ impl MemorySubstrate {
         .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
+    /// Return true when at least one semantic memory matches the filter.
+    pub async fn has_memories(&self, filter: Option<MemoryFilter>) -> OpenFangResult<bool> {
+        let store = self.semantic.clone();
+        tokio::task::spawn_blocking(move || store.has_memories(filter))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Return true when at least one semantic memory with an embedding matches the filter.
+    pub async fn has_embedded_memories(
+        &self,
+        filter: Option<MemoryFilter>,
+    ) -> OpenFangResult<bool> {
+        let store = self.semantic.clone();
+        tokio::task::spawn_blocking(move || store.has_embedded_memories(filter))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
     /// Async wrapper for `remember_with_embedding` — runs in a blocking thread.
     pub async fn remember_with_embedding_async(
         &self,
@@ -723,6 +742,10 @@ mod tests {
     async fn test_substrate_remember_recall() {
         let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
         let agent_id = AgentId::new();
+        assert!(!substrate
+            .has_memories(Some(MemoryFilter::agent(agent_id)))
+            .await
+            .unwrap());
         substrate
             .remember(
                 agent_id,
@@ -735,6 +758,14 @@ mod tests {
             .unwrap();
         let results = substrate.recall("Rust", 10, None).await.unwrap();
         assert_eq!(results.len(), 1);
+        assert!(substrate
+            .has_memories(Some(MemoryFilter::agent(agent_id)))
+            .await
+            .unwrap());
+        assert!(!substrate
+            .has_embedded_memories(Some(MemoryFilter::agent(agent_id)))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

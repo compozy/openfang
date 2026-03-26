@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>integration/e2e</domain>
@@ -51,7 +51,7 @@ completion flow works end-to-end.
 
 ## Subtasks
 
-- [ ] 43.1 Write the comprehensive E2E integration test spanning all seven steps listed in
+- [x] 43.1 Write the comprehensive E2E integration test spanning all seven steps listed in
       requirements. The test must be a `#[tokio::test]` that:
       1. Creates a temp directory with fresh `runtime.db` and `compozy.db` files.
       2. Bootstraps the kernel with a test config that includes a minimal SDLC-like workflow and
@@ -66,7 +66,7 @@ completion flow works end-to-end.
       7. Waits for `workflow_run.status = "completed"` and verifies the output includes an artifact
          reference with a populated `artifact_version` record.
 
-- [ ] 43.2 Write the restart recovery regression test. The test must:
+- [x] 43.2 Write the restart recovery regression test. The test must:
       1. Start a workflow run and advance it to a mid-flight state (e.g., one completed step, one
          in-progress dispatch).
       2. Drop the kernel (simulating a process crash).
@@ -75,7 +75,7 @@ completion flow works end-to-end.
       5. Verify the completed run is still queryable with all fields intact.
       6. For the mid-flight run, verify it resumes from the last checkpoint and reaches completion.
 
-- [ ] 43.3 Write a restart-during-HITL regression test. The test must:
+- [x] 43.3 Write a restart-during-HITL regression test. The test must:
       1. Start a workflow run and advance to a HITL pause.
       2. Drop the kernel.
       3. Re-initialize the kernel.
@@ -84,11 +84,11 @@ completion flow works end-to-end.
       6. Verify the step resumes (via post-restart reconstruction from Task 31) and the workflow
          completes.
 
-- [ ] 43.4 Verify all endpoint reachability. Every endpoint registered in Tasks 41 and 42 must
+- [x] 43.4 Verify all endpoint reachability. Every endpoint registered in Tasks 41 and 42 must
       be verified as reachable via the test router and returning correctly structured responses.
       This includes pack endpoints, SSE endpoints, and retention-related queries.
 
-- [ ] 43.5 Add regression assertions that verify no data loss across restart:
+- [x] 43.5 Add regression assertions that verify no data loss across restart:
       - All `workflow_run` records written before shutdown are readable after restart.
       - All `workflow_checkpoint` records are intact.
       - All `agent_dispatch` records are intact.
@@ -96,7 +96,7 @@ completion flow works end-to-end.
       - All `artifact_version` and `doc_version` records are intact.
       - Pack state in the `pack` table is intact.
 
-- [ ] 43.6 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 43.6 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass at zero warnings before marking this task complete.
 
 ## Implementation Details
@@ -156,36 +156,36 @@ all fallible calls must use `?` with a test-level `anyhow::Result` or
 
 ### Integration Tests (Required)
 
-- [ ] E2E flow test: event ingress -> trigger match -> workflow run creation -> step dispatch ->
+- [x] E2E flow test: event ingress -> trigger match -> workflow run creation -> step dispatch ->
       HITL pause -> HITL answer -> workflow completion -> output artifact with provenance. Each
       transition is verified with a repository or API query, not log inspection.
-- [ ] Restart mid-flow recovery: a workflow run in `running` status with one completed checkpoint
+- [x] Restart mid-flow recovery: a workflow run in `running` status with one completed checkpoint
       and one in-progress dispatch survives a kernel shutdown and re-initialization; after recovery
       the run resumes from the correct step, completes, and the final
       `workflow_run.status = "completed"`.
-- [ ] Restart during HITL: a workflow run paused on a HITL request survives a kernel shutdown;
+- [x] Restart during HITL: a workflow run paused on a HITL request survives a kernel shutdown;
       after restart, the HITL request is still pending; answering it triggers post-restart
       reconstruction and the workflow completes.
-- [ ] No data loss: all records written before kernel shutdown are readable after re-initialization,
+- [x] No data loss: all records written before kernel shutdown are readable after re-initialization,
       including workflow_run, workflow_checkpoint, agent_dispatch, hitl_request, artifact_version,
       doc_version, and pack records.
-- [ ] Full control-plane round-trip: every endpoint registered in Tasks 41 and 42 is reachable
+- [x] Full control-plane round-trip: every endpoint registered in Tasks 41 and 42 is reachable
       via the test router and returns non-empty, correctly structured responses.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Restart never loses committed state from prior tasks; all records written before a kernel
+- [x] Restart never loses committed state from prior tasks; all records written before a kernel
       shutdown must be readable after re-initialization.
-- [ ] The E2E test must use file-backed temp databases (not in-memory) to validate restart
+- [x] The E2E test must use file-backed temp databases (not in-memory) to validate restart
       semantics -- in-memory databases cannot survive a kernel drop/re-init.
-- [ ] All assertions use `pretty_assertions::assert_eq`, not `std::assert_eq`.
-- [ ] No `unwrap()` in test code -- all fallible calls use `?` with proper error return types.
+- [x] All assertions use `pretty_assertions::assert_eq`, not `std::assert_eq`.
+- [x] No `unwrap()` in test code -- all fallible calls use `?` with proper error return types.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

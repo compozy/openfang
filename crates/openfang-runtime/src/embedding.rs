@@ -10,8 +10,11 @@ use openfang_types::model_catalog::{
     OPENAI_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL,
 };
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
+
+const EMBEDDING_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 /// Error type for embedding operations.
 #[derive(Debug, thiserror::Error)]
@@ -91,12 +94,16 @@ impl OpenAIEmbeddingDriver {
     pub fn new(config: EmbeddingConfig) -> Result<Self, EmbeddingError> {
         // Infer dimensions from model name (common models)
         let dims = infer_dimensions(&config.model);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(EMBEDDING_REQUEST_TIMEOUT_SECS))
+            .build()
+            .map_err(|error| EmbeddingError::Http(error.to_string()))?;
 
         Ok(Self {
             api_key: Zeroizing::new(config.api_key),
             base_url: config.base_url,
             model: config.model,
-            client: reqwest::Client::new(),
+            client,
             dims,
         })
     }

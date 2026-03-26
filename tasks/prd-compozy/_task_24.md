@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/hitl/schema</domain>
@@ -66,35 +66,35 @@ This task delivers only the schema and repository. Runtime pause/resume semantic
 
 ## Subtasks
 
-- [ ] 24.1 Add a new `compozy.db` migration function that creates the `hitl_request` table with
+- [x] 24.1 Add a new `compozy.db` migration function that creates the `hitl_request` table with
       all required columns and the four indexes listed in the requirements. Record the migration in
       the migration log. Verify idempotency on repeat application and clean upgrade from earlier
       schema versions.
 
-- [ ] 24.2 Define `HitlStatus` enum (`Pending`, `Answered`, `Cancelled`, `TimedOut`) and
+- [x] 24.2 Define `HitlStatus` enum (`Pending`, `Answered`, `Cancelled`, `TimedOut`) and
       `HitlKind` enum (`Clarification`, and stubs for `Approval`, `Choice`, `Freeform`) in the
       appropriate types module. Implement `Display`, `FromStr`, and `serde` derives. The enums must
       serialize to/from the snake_case strings used in the API spec (`pending`, `answered`,
       `clarification`, etc.).
 
-- [ ] 24.3 Define `HitlRecord` struct covering all schema columns. JSON columns (`context_json`,
+- [x] 24.3 Define `HitlRecord` struct covering all schema columns. JSON columns (`context_json`,
       `response_json`) must use `serde_json::Value`. Timestamps must use `chrono::DateTime<Utc>` with
       RFC 3339 serialization consistent with API-SPEC.md conventions.
 
-- [ ] 24.4 Implement the `HitlRepository` async trait and its SQLite-backed implementation.
+- [x] 24.4 Implement the `HitlRepository` async trait and its SQLite-backed implementation.
       Follow the same structural pattern as `crates/openfang-memory/src/structured.rs` and the async
       trait pattern from `crates/arky-session/src/store.rs`. The `sequence_no` assignment must be
       atomic: use a `SELECT MAX(sequence_no) ... + 1` within the same write transaction as the insert.
 
-- [ ] 24.5 Implement the `answer` method as a transactional write: set `response_json`,
+- [x] 24.5 Implement the `answer` method as a transactional write: set `response_json`,
       `answered_at`, and `status = answered` in one SQLite transaction. If the request is not in
       `pending` state, the method must return a typed error rather than a silent no-op.
 
-- [ ] 24.6 Write unit tests using in-memory SQLite. Cover all repository operations, all status
+- [x] 24.6 Write unit tests using in-memory SQLite. Cover all repository operations, all status
       transitions (legal and illegal), sequence number ordering for multiple questions in one step,
       and the atomicity of the answer operation.
 
-- [ ] 24.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 24.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass at zero warnings before marking this task complete.
 
 ## Implementation Details
@@ -170,55 +170,55 @@ ADR-007, the approval system is a legacy mechanism that HITL does not inherit fr
 
 ### Unit Tests (Required)
 
-- [ ] `hitl_record_should_persist_all_required_fields` — create a HITL record and reload it;
+- [x] `hitl_record_should_persist_all_required_fields` — create a HITL record and reload it;
       verify every column round-trips including `context_json`, `response_json`, `sequence_no`,
       and all nullable timestamp fields.
-- [ ] `hitl_sequence_numbers_should_be_ordered_within_step` — create three HITL records for the
+- [x] `hitl_sequence_numbers_should_be_ordered_within_step` — create three HITL records for the
       same `(run_id, step_id, dispatch_id)` tuple and verify they receive `sequence_no` 1, 2, 3 in
       insertion order.
-- [ ] `hitl_sequence_numbers_should_restart_across_steps` — create HITL records for two different
+- [x] `hitl_sequence_numbers_should_restart_across_steps` — create HITL records for two different
       step IDs and verify each starts at `sequence_no = 1` independently.
-- [ ] `hitl_answer_should_write_response_and_timestamp_atomically` — create a pending request,
+- [x] `hitl_answer_should_write_response_and_timestamp_atomically` — create a pending request,
       call `answer`, and verify `response_json`, `answered_at`, and `status = answered` are all
       written together.
-- [ ] `hitl_answer_should_fail_on_non_pending_request` — attempt to answer a request that is
+- [x] `hitl_answer_should_fail_on_non_pending_request` — attempt to answer a request that is
       already `answered` or `cancelled` and verify a typed error is returned.
-- [ ] `hitl_status_terminal_states_should_not_transition` — attempt to cancel an `answered`
+- [x] `hitl_status_terminal_states_should_not_transition` — attempt to cancel an `answered`
       request and verify the repository rejects the transition.
-- [ ] `hitl_find_pending_for_run_should_return_only_pending` — insert a mix of pending and
+- [x] `hitl_find_pending_for_run_should_return_only_pending` — insert a mix of pending and
       answered HITL records for the same run; `find_pending_for_run` must return only pending ones.
-- [ ] `hitl_find_by_dispatch_should_scope_correctly` — insert records for two dispatch IDs;
+- [x] `hitl_find_by_dispatch_should_scope_correctly` — insert records for two dispatch IDs;
       `find_by_dispatch` must return only those belonging to the queried dispatch.
 
 ### Integration Tests (Required)
 
-- [ ] `compozy_db_migration_should_add_hitl_table_cleanly` — open an in-memory `compozy.db`,
+- [x] `compozy_db_migration_should_add_hitl_table_cleanly` — open an in-memory `compozy.db`,
       run all migrations, and verify the `hitl_request` table and all required indexes exist.
-- [ ] `compozy_db_migration_should_be_idempotent_with_hitl_table` — run migrations twice and
+- [x] `compozy_db_migration_should_be_idempotent_with_hitl_table` — run migrations twice and
       verify no error and no duplicate tables.
-- [ ] `hitl_repository_should_survive_connection_restart` — write a HITL record with a pending
+- [x] `hitl_repository_should_survive_connection_restart` — write a HITL record with a pending
       answer, drop and re-open the SQLite connection, and verify the record is still present with the
       same state.
-- [ ] `hitl_repository_sequence_assignment_should_be_race_safe` — simulate two concurrent inserts
+- [x] `hitl_repository_sequence_assignment_should_be_race_safe` — simulate two concurrent inserts
       for the same step and verify the resulting sequence numbers are distinct (1 and 2, not both 1).
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not model HITL using or extending the old `ApprovalManager` in
+- [x] Do not model HITL using or extending the old `ApprovalManager` in
       `crates/openfang-kernel/src/approval.rs` — they are different concepts with different semantics.
-- [ ] Do not bury HITL state only inside `workflow_checkpoint.data_json` or `agent_dispatch`
+- [x] Do not bury HITL state only inside `workflow_checkpoint.data_json` or `agent_dispatch`
       payload columns — `hitl_request` must exist as its own first-class table.
-- [ ] Do not lose the `dispatch_id` linkage — without it, task 30 cannot resume the correct
+- [x] Do not lose the `dispatch_id` linkage — without it, task 30 cannot resume the correct
       execution context after an answer is received.
-- [ ] Do not treat `sequence_no` as optional or auto-generated outside the repository — the
+- [x] Do not treat `sequence_no` as optional or auto-generated outside the repository — the
       atomic assignment in the repository is the sole authority.
-- [ ] Do not use `unwrap()` in repository code — all SQLite errors must propagate as typed errors.
+- [x] Do not use `unwrap()` in repository code — all SQLite errors must propagate as typed errors.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

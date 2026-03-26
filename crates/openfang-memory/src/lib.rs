@@ -15,6 +15,7 @@ pub mod hitl;
 pub mod knowledge;
 pub mod looper;
 pub mod migration;
+pub mod pack;
 pub mod runtime_store;
 pub mod semantic;
 pub mod session;
@@ -39,6 +40,7 @@ pub use looper::{
     LooperRunRepository, LooperStoreError, LooperSubtaskRepository, NewLooperRun,
     LOOPER_RUNTIME_MIGRATION_SQL,
 };
+pub use pack::{PackRepository, PackStoreError, PACK_MIGRATION_SQL};
 pub use runtime_store::{
     AgentMessageRecord, AgentMessageStore, AgentRuntimeRecord, AgentRuntimeStore,
     AgentSessionRecord, AgentSessionStore, RuntimeStoreSet, ScheduleExecutionRecord,
@@ -57,7 +59,8 @@ pub use workflow_store::{
     WorkflowDispatchSummaryRecord, WorkflowRunListQuery, WorkflowRunRecord,
     WorkflowRunRecoveryRecord, WorkflowRunRepository, WorkflowRunStatus, WorkflowRunStore,
     WorkflowSignalRecord, WorkflowSignalRepository, WorkflowSignalStore, WorkflowStoreError,
-    WorkflowStoreSet, WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
+    WorkflowStoreSet, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
+    WORKFLOW_CHECKPOINT_RETENTION_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
     WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
     WORKFLOW_SIGNAL_MIGRATION_SQL, WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
 };

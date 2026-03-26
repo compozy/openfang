@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/dispatch/runtime</domain>
@@ -70,36 +70,36 @@ and for the Arky-backed Claude Code and Codex provider paths.
 
 ## Subtasks
 
-- [ ] 29.1 Identify the exact call site in the workflow engine where a step's agent dispatch
+- [x] 29.1 Identify the exact call site in the workflow engine where a step's agent dispatch
       currently begins. In `crates/openfang-kernel/src/workflow.rs` and the surrounding step executor
       code, locate where `AgentManifest` is resolved and execution is handed to the agent loop. This
       is the injection point for dispatch record creation.
 
-- [ ] 29.2 Modify the step executor to create a `DispatchRecord` with `status = pending` before
+- [x] 29.2 Modify the step executor to create a `DispatchRecord` with `status = pending` before
       any provider interaction begins. The dispatch kind (`call`, `send`, or `spawn`) must be resolved
       from the workflow step definition. Store the `dispatch_id` in the step's execution context so it
       survives across the `await` boundary into provider setup.
 
-- [ ] 29.3 After the provider session is established via `ProviderBinding`, transition the dispatch
+- [x] 29.3 After the provider session is established via `ProviderBinding`, transition the dispatch
       record to `status = running` and write `provider_driver`, `session_id`, and
       `provider_resume_token` (if available from the provider) to the record. For Arky-backed
       providers, extract the `SessionId` from `arky_session::SessionStore` after the session is
       created or resumed in `crates/arky-session/src/sqlite.rs`.
 
-- [ ] 29.4 Implement the `call` execution path: await the agent loop result, write `result_json`
+- [x] 29.4 Implement the `call` execution path: await the agent loop result, write `result_json`
       and transition to `completed` on success, write `error_json` and transition to `failed` on
       error. Both writes must be transactional.
 
-- [ ] 29.5 Implement the `send` execution path: spawn the agent execution as a background
+- [x] 29.5 Implement the `send` execution path: spawn the agent execution as a background
       `tokio::task`, return the dispatch ID to the caller immediately, and wire the background task to
       write the final result or error when it completes. The dispatch record must not be left
       permanently in `running` state if the background task fails.
 
-- [ ] 29.6 Implement the `spawn` execution path: resolve or create the long-lived agent identity,
+- [x] 29.6 Implement the `spawn` execution path: resolve or create the long-lived agent identity,
       write `spawned_agent_id` to the dispatch record, transition to `completed`, and return. The
       spawned agent's ongoing execution is tracked separately through its own future dispatches.
 
-- [ ] 29.7 Add integration tests covering all three dispatch modes and both provider paths (Arky
+- [x] 29.7 Add integration tests covering all three dispatch modes and both provider paths (Arky
       and existing OpenFang LLM driver). Confirm that session identity is captured durably in the
       dispatch record and survives a simulated connection restart.
 
@@ -183,60 +183,60 @@ process shuts down while `send` tasks are in flight, they must be cancelled coop
 
 ### Unit Tests (Required)
 
-- [ ] `dispatch_record_should_have_session_id_after_provider_setup` — after the step executor
+- [x] `dispatch_record_should_have_session_id_after_provider_setup` — after the step executor
       establishes a provider session, the dispatch record in the database must have a non-null
       `session_id` and `provider_driver`.
-- [ ] `dispatch_call_should_complete_with_result_json` — run a `call` dispatch against a test
+- [x] `dispatch_call_should_complete_with_result_json` — run a `call` dispatch against a test
       double provider and verify the dispatch record ends in `status = completed` with `result_json`
       populated.
-- [ ] `dispatch_call_should_fail_with_error_json_on_provider_error` — simulate a provider error
+- [x] `dispatch_call_should_fail_with_error_json_on_provider_error` — simulate a provider error
       and verify the dispatch record ends in `status = failed` with a non-null `error_json`.
-- [ ] `dispatch_send_should_return_immediately_with_running_status` — invoke a `send` dispatch
+- [x] `dispatch_send_should_return_immediately_with_running_status` — invoke a `send` dispatch
       and verify the caller receives the `dispatch_id` before the background task completes; the
       record is `running` at that point.
-- [ ] `dispatch_spawn_should_write_spawned_agent_id` — invoke a `spawn` dispatch and verify the
+- [x] `dispatch_spawn_should_write_spawned_agent_id` — invoke a `spawn` dispatch and verify the
       dispatch record has a non-null `spawned_agent_id` after completion.
-- [ ] `dispatch_invalid_provider_binding_should_fail_cleanly` — pass a malformed or missing
+- [x] `dispatch_invalid_provider_binding_should_fail_cleanly` — pass a malformed or missing
       agent binding and verify the dispatch record transitions to `failed` with a descriptive error,
       not a panic.
 
 ### Integration Tests (Required)
 
-- [ ] `dispatch_call_end_to_end_with_arky_provider` — run a full `call` dispatch against the
+- [x] `dispatch_call_end_to_end_with_arky_provider` — run a full `call` dispatch against the
       Arky provider test infrastructure; verify the dispatch record is `completed` with session
       identity populated.
-- [ ] `dispatch_call_end_to_end_with_openfang_llm_driver` — run a full `call` dispatch against
+- [x] `dispatch_call_end_to_end_with_openfang_llm_driver` — run a full `call` dispatch against
       the existing OpenFang LLM driver; verify the dispatch record is `completed` with at least
       `provider_driver` populated.
-- [ ] `dispatch_session_identity_survives_reconnect` — write a dispatch record with `session_id`,
+- [x] `dispatch_session_identity_survives_reconnect` — write a dispatch record with `session_id`,
       simulate a connection drop and reconnect, and verify the session identity is still present and
       the Arky `SessionStore` can load the session by that ID.
-- [ ] `dispatch_send_background_task_should_complete_and_update_record` — invoke a `send`
+- [x] `dispatch_send_background_task_should_complete_and_update_record` — invoke a `send`
       dispatch with a fast test provider, wait for the background task to finish, and verify the
       record transitions to `completed`.
-- [ ] `dispatch_concurrent_call_dispatches_should_not_interfere` — run two `call` dispatches for
+- [x] `dispatch_concurrent_call_dispatches_should_not_interfere` — run two `call` dispatches for
       different agents concurrently from the same workflow run and verify both records end in
       `completed` with independent results.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not route durable dispatch through raw provider calls that bypass `ProviderBinding` —
+- [x] Do not route durable dispatch through raw provider calls that bypass `ProviderBinding` —
       the provider identity must come from the compiled binding, not from manifest fields read
       directly in the step executor.
-- [ ] Do not fake session resume by constructing a new session with a copied transcript instead
+- [x] Do not fake session resume by constructing a new session with a copied transcript instead
       of using the stored `SessionId` — task 30 depends on true session continuity.
-- [ ] Do not keep dispatch runtime state only in provider-local memory — every status transition
+- [x] Do not keep dispatch runtime state only in provider-local memory — every status transition
       must be written to `compozy.db` before execution resumes.
-- [ ] Do not hold a `Mutex` or `RwLock` across a `.await` point in the step executor — per
+- [x] Do not hold a `Mutex` or `RwLock` across a `.await` point in the step executor — per
       `CLAUDE.md` and Rust async conventions.
-- [ ] Do not let `send` mode dispatches become orphaned on process shutdown — wire
+- [x] Do not let `send` mode dispatches become orphaned on process shutdown — wire
       `CancellationToken` cancellation to the `JoinSet` tracking background tasks.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

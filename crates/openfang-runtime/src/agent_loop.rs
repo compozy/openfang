@@ -22,7 +22,7 @@ use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::agent::AgentManifest;
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use openfang_types::memory::{Memory, MemoryFilter, MemorySource};
+use openfang_types::memory::{Memory, MemoryFilter, MemoryFragment, MemorySource};
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
@@ -153,6 +153,8 @@ pub enum LoopPhase {
 /// Callback for agent lifecycle phase changes.
 /// Implementations should be non-blocking (fire-and-forget) to avoid slowing the loop.
 pub type PhaseCallback = Arc<dyn Fn(LoopPhase) + Send + Sync>;
+/// Callback fired after a session mutation has been durably persisted.
+pub type SessionPersistCallback<'a> = dyn Fn() + Send + Sync + 'a;
 
 /// Result of an agent loop execution.
 #[derive(Debug)]
@@ -171,6 +173,126 @@ pub struct AgentLoopResult {
     pub directives: openfang_types::message::ReplyDirectives,
     /// Provider/session metadata captured during the execution.
     pub provider_metadata: Option<CompletionMetadata>,
+}
+
+async fn persist_session_update(
+    memory: &MemorySubstrate,
+    session: &Session,
+    on_session_persisted: Option<&SessionPersistCallback<'_>>,
+) {
+    match memory.save_session_async(session).await {
+        Ok(()) => {
+            if let Some(callback) = on_session_persisted {
+                callback();
+            }
+        }
+        Err(error) => {
+            warn!("Failed to persist session update: {error}");
+        }
+    }
+}
+
+async fn recall_memories_for_turn(
+    memory: &MemorySubstrate,
+    session: &Session,
+    user_message: &str,
+    embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
+    is_streaming: bool,
+) -> Vec<MemoryFragment> {
+    let filter = Some(MemoryFilter {
+        agent_id: Some(session.agent_id),
+        ..Default::default()
+    });
+    let has_memories = memory.has_memories(filter).await.unwrap_or_else(|error| {
+        warn!(
+            agent_id = %session.agent_id,
+            error = %error,
+            "Failed to check memory availability, skipping recall"
+        );
+        false
+    });
+    if !has_memories {
+        debug!(
+            agent_id = %session.agent_id,
+            "Skipping memory recall because no candidate memories exist"
+        );
+        return Vec::new();
+    }
+
+    if let Some(emb) = embedding_driver {
+        let filter = Some(MemoryFilter {
+            agent_id: Some(session.agent_id),
+            ..Default::default()
+        });
+        let has_embedded_memories =
+            memory
+                .has_embedded_memories(filter)
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(
+                        agent_id = %session.agent_id,
+                        error = %error,
+                        "Failed to check embedded memory availability, falling back to text recall"
+                    );
+                    false
+                });
+        if has_embedded_memories {
+            let filter = Some(MemoryFilter {
+                agent_id: Some(session.agent_id),
+                ..Default::default()
+            });
+            match emb.embed_one(user_message).await {
+                Ok(query_vec) => {
+                    if is_streaming {
+                        debug!("Using vector recall (streaming, dims={})", query_vec.len());
+                    } else {
+                        debug!("Using vector recall (dims={})", query_vec.len());
+                    }
+                    memory
+                        .recall_with_embedding_async(user_message, 5, filter, Some(&query_vec))
+                        .await
+                        .unwrap_or_default()
+                }
+                Err(error) => {
+                    if is_streaming {
+                        warn!("Embedding recall failed (streaming), falling back to text search: {error}");
+                    } else {
+                        warn!("Embedding recall failed, falling back to text search: {error}");
+                    }
+                    let filter = Some(MemoryFilter {
+                        agent_id: Some(session.agent_id),
+                        ..Default::default()
+                    });
+                    memory
+                        .recall(user_message, 5, filter)
+                        .await
+                        .unwrap_or_default()
+                }
+            }
+        } else {
+            debug!(
+                agent_id = %session.agent_id,
+                "Skipping vector recall because no embedded memories exist"
+            );
+            let filter = Some(MemoryFilter {
+                agent_id: Some(session.agent_id),
+                ..Default::default()
+            });
+            memory
+                .recall(user_message, 5, filter)
+                .await
+                .unwrap_or_default()
+        }
+    } else {
+        let filter = Some(MemoryFilter {
+            agent_id: Some(session.agent_id),
+            ..Default::default()
+        });
+        memory
+            .recall(user_message, 5, filter)
+            .await
+            .unwrap_or_default()
+    }
 }
 
 /// Run the agent execution loop for a single user message.
@@ -193,6 +315,7 @@ pub async fn run_agent_loop(
     embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
     workspace_root: Option<&Path>,
     on_phase: Option<&PhaseCallback>,
+    on_session_persisted: Option<&SessionPersistCallback<'_>>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
     tts_engine: Option<&crate::tts::TtsEngine>,
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
@@ -211,51 +334,8 @@ pub async fn run_agent_loop(
         .unwrap_or_default();
 
     // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
-        match emb.embed_one(user_message).await {
-            Ok(query_vec) => {
-                debug!("Using vector recall (dims={})", query_vec.len());
-                memory
-                    .recall_with_embedding_async(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                        Some(&query_vec),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-            Err(e) => {
-                warn!("Embedding recall failed, falling back to text search: {e}");
-                memory
-                    .recall(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-        }
-    } else {
-        memory
-            .recall(
-                user_message,
-                5,
-                Some(MemoryFilter {
-                    agent_id: Some(session.agent_id),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap_or_default()
-    };
+    let memories =
+        recall_memories_for_turn(memory, session, user_message, embedding_driver, false).await;
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -322,6 +402,8 @@ pub async fn run_agent_loop(
             }
         }
     }
+
+    persist_session_update(memory, session, on_session_persisted).await;
 
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
@@ -1216,6 +1298,7 @@ pub async fn run_agent_loop_streaming(
     embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
     workspace_root: Option<&Path>,
     on_phase: Option<&PhaseCallback>,
+    on_session_persisted: Option<&SessionPersistCallback<'_>>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
     tts_engine: Option<&crate::tts::TtsEngine>,
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
@@ -1234,51 +1317,8 @@ pub async fn run_agent_loop_streaming(
         .unwrap_or_default();
 
     // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
-        match emb.embed_one(user_message).await {
-            Ok(query_vec) => {
-                debug!("Using vector recall (streaming, dims={})", query_vec.len());
-                memory
-                    .recall_with_embedding_async(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                        Some(&query_vec),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-            Err(e) => {
-                warn!("Embedding recall failed (streaming), falling back to text search: {e}");
-                memory
-                    .recall(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap_or_default()
-            }
-        }
-    } else {
-        memory
-            .recall(
-                user_message,
-                5,
-                Some(MemoryFilter {
-                    agent_id: Some(session.agent_id),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap_or_default()
-    };
+    let memories =
+        recall_memories_for_turn(memory, session, user_message, embedding_driver, true).await;
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -1341,6 +1381,8 @@ pub async fn run_agent_loop_streaming(
             }
         }
     }
+
+    persist_session_update(memory, session, on_session_persisted).await;
 
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
@@ -3014,6 +3056,7 @@ mod tests {
             None,
             None,
             None, // on_phase
+            None, // on_session_persisted
             None, // media_engine
             None, // tts_engine
             None, // docker_config
@@ -3067,6 +3110,7 @@ mod tests {
             None,
             None,
             None, // on_phase
+            None, // on_session_persisted
             None, // media_engine
             None, // tts_engine
             None, // docker_config
@@ -3122,6 +3166,7 @@ mod tests {
             None,
             None,
             None, // on_phase
+            None, // on_session_persisted
             None, // media_engine
             None, // tts_engine
             None, // docker_config
@@ -3175,6 +3220,7 @@ mod tests {
             None,
             None,
             None, // on_phase
+            None, // on_session_persisted
             None, // media_engine
             None, // tts_engine
             None, // docker_config
@@ -3221,6 +3267,7 @@ mod tests {
             None,
             None,
             None, // on_phase
+            None, // on_session_persisted
             None, // media_engine
             None, // tts_engine
             None, // docker_config
@@ -3352,6 +3399,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
@@ -3387,6 +3435,7 @@ mod tests {
             &memory,
             driver,
             &[],
+            None,
             None,
             None,
             None,
@@ -3450,6 +3499,7 @@ mod tests {
             None,
             None,
             None, // on_phase
+            None, // on_session_persisted
             None, // media_engine
             None, // tts_engine
             None, // docker_config
@@ -4340,6 +4390,7 @@ mod tests {
             None,
             None,
             None, // on_phase
+            None, // on_session_persisted
             None, // media_engine
             None, // tts_engine
             None, // docker_config
@@ -4413,6 +4464,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             None, // user_content_blocks
         )
         .await
@@ -4470,6 +4522,7 @@ mod tests {
             None,
             None,
             None, // on_phase
+            None, // on_session_persisted
             None, // media_engine
             None, // tts_engine
             None, // docker_config

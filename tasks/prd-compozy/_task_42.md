@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/retention</domain>
@@ -58,7 +58,7 @@ sustained workload and provides operators with live observability.
 
 ## Subtasks
 
-- [ ] 42.1 Add indexes to `workflow_checkpoint`, `artifact_version`, and `doc_version` in new
+- [x] 42.1 Add indexes to `workflow_checkpoint`, `artifact_version`, and `doc_version` in new
       migrations in `migrations/compozy/`. Indexes:
       - `workflow_checkpoint (run_id, created_at)`
       - `artifact_version (artifact_id, version_no)`
@@ -66,7 +66,7 @@ sustained workload and provides operators with live observability.
       - `doc_version (doc_id, version_no)`
       - `doc_version (content_hash)`
 
-- [ ] 42.2 Implement the retention policy background job: a `tokio` task that runs on a
+- [x] 42.2 Implement the retention policy background job: a `tokio` task that runs on a
       configurable interval (default: every hour) and deletes `workflow_checkpoint` records for
       completed runs older than the configured age threshold, using a batched DELETE to avoid
       locking the database for large prunes. Retention rules:
@@ -78,7 +78,7 @@ sustained workload and provides operators with live observability.
         immutability is a product guarantee). No pruning for these tables in this task, but indexes
         must be in place.
 
-- [ ] 42.3 Implement `GET /api/v1/runs/{id}/events` SSE endpoint. Emit at minimum:
+- [x] 42.3 Implement `GET /api/v1/runs/{id}/events` SSE endpoint. Emit at minimum:
       `stream.snapshot` (current run state), `run.updated` (on any run status or step change),
       `dispatch.updated` (on dispatch status changes within this run), `hitl.requested` (when a
       new HITL request is created for this run), `stream.reset` + `stream.snapshot` fallback on
@@ -86,26 +86,26 @@ sustained workload and provides operators with live observability.
       must emit composite events that aggregate progress across the run's dispatches and HITL
       requests.
 
-- [ ] 42.4 Implement `GET /api/v1/dispatches/{id}/events` SSE endpoint. Emit at minimum:
+- [x] 42.4 Implement `GET /api/v1/dispatches/{id}/events` SSE endpoint. Emit at minimum:
       `stream.snapshot` (current dispatch state), `dispatch.updated` (on status changes),
       `hitl.requested` (when an in-step HITL request is created for this dispatch), and
       `keepalive` heartbeat every 15 seconds.
 
-- [ ] 42.5 Implement `GET /api/v1/hitl-requests/stream` SSE endpoint (global stream, not per-ID).
+- [x] 42.5 Implement `GET /api/v1/hitl-requests/stream` SSE endpoint (global stream, not per-ID).
       Emit `hitl.requested` for every new HITL request created across all runs, and `hitl.answered`
       when any request is answered. This is the surface operators use to monitor pending human
       interaction needs without polling individual run endpoints. The global stream must be bounded
       by a global ring buffer of 200 events. It must support optional `run_id` and `status` query
       filters on the query string.
 
-- [ ] 42.6 Ensure all three SSE endpoints follow the bounded replay pattern: ring buffer of 50
+- [x] 42.6 Ensure all three SSE endpoints follow the bounded replay pattern: ring buffer of 50
       events per resource (per run for `/runs`, per dispatch for `/dispatches`, global 200 for
       `/hitl-requests/stream`), `Last-Event-ID` for best-effort resume, `stream.reset` +
       `stream.snapshot` fallback, and `keepalive` every 15 seconds.
 
-- [ ] 42.7 Add tests for retention policies and SSE endpoints. See the Tests section below.
+- [x] 42.7 Add tests for retention policies and SSE endpoints. See the Tests section below.
 
-- [ ] 42.8 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 42.8 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass at zero warnings before marking this task complete.
 
 ## Implementation Details
@@ -179,47 +179,47 @@ still per-stream.
 
 ### Unit Tests (Required)
 
-- [ ] Retention policy enforcement: after writing 1200 `workflow_checkpoint` rows for a single
+- [x] Retention policy enforcement: after writing 1200 `workflow_checkpoint` rows for a single
       completed run older than the configured age threshold, one pruning cycle deletes rows in
       batches until the count is below the configured maximum, without touching checkpoints for
       runs below the threshold.
-- [ ] `GET /api/v1/runs/{id}/events` SSE serialization: a `run.updated` event for a running
+- [x] `GET /api/v1/runs/{id}/events` SSE serialization: a `run.updated` event for a running
       workflow run produces correctly formatted `text/event-stream` output with `id`, `event`, and
       `data` fields; the `data` field deserializes to a valid run summary shape matching API-SPEC.md
       section 9.
-- [ ] `GET /api/v1/hitl-requests/stream` emits a `hitl.requested` event when a new `hitl_request`
+- [x] `GET /api/v1/hitl-requests/stream` emits a `hitl.requested` event when a new `hitl_request`
       record is created in any run; the event includes the HITL request ID, run ID, and question
       fields.
-- [ ] `GET /api/v1/dispatches/{id}/events` with `Last-Event-ID` beyond the ring buffer emits
+- [x] `GET /api/v1/dispatches/{id}/events` with `Last-Event-ID` beyond the ring buffer emits
       `stream.reset` then `stream.snapshot` before continuing with live events.
 
 ### Integration Tests (Required)
 
-- [ ] Retention pruning integration: create a workflow run, write 600 checkpoints, mark the run
+- [x] Retention pruning integration: create a workflow run, write 600 checkpoints, mark the run
       completed with a timestamp 60 days in the past, run one pruning cycle, and verify the
       checkpoint count for that run is below the configured maximum.
-- [ ] SSE memory stability: hold a connection to `GET /api/v1/runs/{id}/events` open for 60
+- [x] SSE memory stability: hold a connection to `GET /api/v1/runs/{id}/events` open for 60
       seconds while the run advances through 5 state changes; verify all 5 `run.updated` events
       are received and the connection remains alive via `keepalive` events.
-- [ ] Global HITL stream with filters: subscribe to `GET /api/v1/hitl-requests/stream?status=pending`,
+- [x] Global HITL stream with filters: subscribe to `GET /api/v1/hitl-requests/stream?status=pending`,
       create both a pending and an answered HITL request, verify only the pending request event is
       delivered.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No append-only table (`workflow_checkpoint`, `artifact_version`, `doc_version`) grows
+- [x] No append-only table (`workflow_checkpoint`, `artifact_version`, `doc_version`) grows
       unboundedly under sustained workload; the retention job must run and reduce checkpoint counts
       for eligible completed runs.
-- [ ] All SSE endpoints stream without memory leaks over long connections; the ring buffer must
+- [x] All SSE endpoints stream without memory leaks over long connections; the ring buffer must
       have a fixed maximum size and must not grow with connection duration.
-- [ ] The retention job must not block the main event loop or hold database locks for extended
+- [x] The retention job must not block the main event loop or hold database locks for extended
       periods; batched deletes enforce this.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

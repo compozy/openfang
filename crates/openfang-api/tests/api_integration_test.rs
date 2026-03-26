@@ -85,10 +85,16 @@ async fn start_test_server_with_provider(
     kernel.bootstrap_workflow_definitions().await;
 
     let state = Arc::new(AppState {
+        pack_registry: kernel.pack_registry.clone(),
         kernel,
         started_at: Instant::now(),
         peer_registry: None,
         looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
+        run_event_stream_registry: Arc::new(openfang_api::routes::RunEventStreamRegistry::default()),
+        dispatch_event_stream_registry: Arc::new(
+            openfang_api::routes::DispatchEventStreamRegistry::default(),
+        ),
+        hitl_stream_event_handle: Arc::new(openfang_api::routes::HitlStreamEventHandle::new()),
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -782,9 +788,12 @@ async fn test_workflow_crud() {
     assert_eq!(resp.status(), 200);
     let workflows: serde_json::Value = resp.json().await.unwrap();
     let items = workflows["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["name"], "test-workflow");
-    assert_eq!(items[0]["steps"], 1);
+    let created_workflow = items
+        .iter()
+        .find(|item| item["id"] == workflow_id)
+        .expect("created workflow should be listed");
+    assert_eq!(created_workflow["name"], "test-workflow");
+    assert_eq!(created_workflow["steps"], 1);
 }
 
 #[tokio::test]
@@ -1070,10 +1079,16 @@ async fn test_v1_recovered_run_is_paused_after_restart() {
     kernel.set_self_handle();
     kernel.bootstrap_workflow_definitions().await;
     let state = Arc::new(AppState {
+        pack_registry: kernel.pack_registry.clone(),
         kernel: Arc::clone(&kernel),
         started_at: Instant::now(),
         peer_registry: None,
         looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
+        run_event_stream_registry: Arc::new(openfang_api::routes::RunEventStreamRegistry::default()),
+        dispatch_event_stream_registry: Arc::new(
+            openfang_api::routes::DispatchEventStreamRegistry::default(),
+        ),
+        hitl_stream_event_handle: Arc::new(openfang_api::routes::HitlStreamEventHandle::new()),
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -1187,10 +1202,16 @@ async fn get_run_list_reflects_recovered_state() {
     kernel.set_self_handle();
     kernel.bootstrap_workflow_definitions().await;
     let state = Arc::new(AppState {
+        pack_registry: kernel.pack_registry.clone(),
         kernel: Arc::clone(&kernel),
         started_at: Instant::now(),
         peer_registry: None,
         looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
+        run_event_stream_registry: Arc::new(openfang_api::routes::RunEventStreamRegistry::default()),
+        dispatch_event_stream_registry: Arc::new(
+            openfang_api::routes::DispatchEventStreamRegistry::default(),
+        ),
+        hitl_stream_event_handle: Arc::new(openfang_api::routes::HitlStreamEventHandle::new()),
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -1572,10 +1593,16 @@ async fn restart_preserves_waiting_state_and_outstanding_signals() {
     kernel.set_self_handle();
     kernel.bootstrap_workflow_definitions().await;
     let state = Arc::new(AppState {
+        pack_registry: kernel.pack_registry.clone(),
         kernel: Arc::clone(&kernel),
         started_at: Instant::now(),
         peer_registry: None,
         looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
+        run_event_stream_registry: Arc::new(openfang_api::routes::RunEventStreamRegistry::default()),
+        dispatch_event_stream_registry: Arc::new(
+            openfang_api::routes::DispatchEventStreamRegistry::default(),
+        ),
+        hitl_stream_event_handle: Arc::new(openfang_api::routes::HitlStreamEventHandle::new()),
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -1758,10 +1785,16 @@ async fn waiting_signal_run_still_accepts_signal_after_restart() {
         .expect("workflow definition should be re-registered after restart");
 
     let state = Arc::new(AppState {
+        pack_registry: kernel.pack_registry.clone(),
         kernel: Arc::clone(&kernel),
         started_at: Instant::now(),
         peer_registry: None,
         looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
+        run_event_stream_registry: Arc::new(openfang_api::routes::RunEventStreamRegistry::default()),
+        dispatch_event_stream_registry: Arc::new(
+            openfang_api::routes::DispatchEventStreamRegistry::default(),
+        ),
+        hitl_stream_event_handle: Arc::new(openfang_api::routes::HitlStreamEventHandle::new()),
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -2171,10 +2204,16 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
     kernel.bootstrap_workflow_definitions().await;
 
     let state = Arc::new(AppState {
+        pack_registry: kernel.pack_registry.clone(),
         kernel,
         started_at: Instant::now(),
         peer_registry: None,
         looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
+        run_event_stream_registry: Arc::new(openfang_api::routes::RunEventStreamRegistry::default()),
+        dispatch_event_stream_registry: Arc::new(
+            openfang_api::routes::DispatchEventStreamRegistry::default(),
+        ),
+        hitl_stream_event_handle: Arc::new(openfang_api::routes::HitlStreamEventHandle::new()),
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),

@@ -1,6 +1,7 @@
 //! Route handlers for the OpenFang API.
 
 use crate::agent_definitions::AgentDefinitionStore;
+use crate::sse::{BoundedSseHandle, BufferedSseEvent, ResourceSseRegistry};
 use crate::trigger_definitions::{canonicalize_trigger_definition, TriggerDefinitionStore};
 use crate::types::*;
 use crate::workflow_definitions::{canonicalize_workflow_definition, WorkflowDefinitionStore};
@@ -23,6 +24,8 @@ use openfang_kernel::cron::JobMeta as ScheduleJobMeta;
 use openfang_kernel::kernel::ScheduleExecutionResult;
 use openfang_kernel::looper::{LooperRuntimeRegistry, LooperStreamEvent};
 use openfang_kernel::metering::MeteringEngine;
+use openfang_kernel::pack_installer::{PackInstaller, PackInstallerError};
+use openfang_kernel::pack_registry::InstalledPack;
 use openfang_kernel::trigger_v2::{
     compile_trigger_definition as compile_trigger_ir_definition, evaluate_compiled_trigger,
     normalize_trigger_definition, validate_trigger_definition, validate_trigger_value,
@@ -52,9 +55,11 @@ use openfang_types::looper::{
     LooperExecutionMode, LooperExecutionPolicy, LooperRunId, LooperRunListQuery, LooperRunRecord,
     LooperRunResource, LooperRunStatus, LooperSelectionStrategy, LooperSubtaskView,
 };
+use openfang_types::message::TokenUsage;
 use openfang_types::scheduler::{
-    CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDelivery, CronJob, CronJobId,
-    CronSchedule, CronTextInputItem, CronTextInputPayload, CronWorkflowSignalSelector,
+    CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDefinitionOriginKind,
+    CronDelivery, CronJob, CronJobId, CronSchedule, CronTextInputItem, CronTextInputPayload,
+    CronWorkflowSignalSelector,
 };
 use openfang_types::task::{
     SortOrder, SubtaskId, SubtaskListQuery, SubtaskPatch, SubtaskRecord, SubtaskSortField,
@@ -63,9 +68,11 @@ use openfang_types::task::{
 use openfang_types::trigger::{
     NormalizedTrigger, TriggerRuntimeStatus, TriggerTarget, TriggerV2Definition,
 };
-use openfang_types::workflow::{WorkflowIr, WorkflowIrStepKind};
+use openfang_types::workflow::{WorkflowIr, WorkflowIrStepKind, WorkflowV2Definition};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -136,10 +143,14 @@ mod looper_control_plane_route_tests {
         let looper_runtime_registry = kernel.looper_runtime_registry();
 
         let state = Arc::new(AppState {
+            pack_registry: state_kernel_pack_registry(&kernel),
             kernel,
             started_at: Instant::now(),
             peer_registry: None,
             looper_runtime_registry,
+            run_event_stream_registry: Arc::new(RunEventStreamRegistry::default()),
+            dispatch_event_stream_registry: Arc::new(DispatchEventStreamRegistry::default()),
+            hitl_stream_event_handle: Arc::new(HitlStreamEventHandle::new()),
             bridge_manager: tokio::sync::Mutex::new(None),
             channels_config: tokio::sync::RwLock::new(Default::default()),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -509,11 +520,20 @@ pub struct AgentSessionDetailQuery {
 
 const DEFAULT_PAGE_LIMIT: usize = 50;
 const MAX_PAGE_LIMIT: usize = 200;
+const RUN_EVENT_RING_BUFFER_CAPACITY: usize = 50;
+const DISPATCH_EVENT_RING_BUFFER_CAPACITY: usize = 50;
+const HITL_STREAM_RING_BUFFER_CAPACITY: usize = 200;
+const DURABLE_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(300);
+static AGENT_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static WORKFLOW_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TRIGGER_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SCHEDULE_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static PACK_TEMPLATE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 type JsonErrorResponse = (StatusCode, Json<serde_json::Value>);
 type ValidatedLooperCreateRequest = (TaskId, Option<Vec<SubtaskId>>, LooperExecutionPolicy);
+pub type RunEventStreamRegistry = ResourceSseRegistry<RUN_EVENT_RING_BUFFER_CAPACITY>;
+pub type DispatchEventStreamRegistry = ResourceSseRegistry<DISPATCH_EVENT_RING_BUFFER_CAPACITY>;
+pub type HitlStreamEventHandle = BoundedSseHandle<HITL_STREAM_RING_BUFFER_CAPACITY>;
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct WorkflowListQueryParams {
@@ -587,6 +607,14 @@ pub struct SkillListQueryParams {
     pub cursor: Option<String>,
     #[serde(default, rename = "q")]
     pub search: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct PackListQueryParams {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -834,6 +862,7 @@ fn operational_action_accepted_response(
 /// and the KernelHandle for inter-agent tool access.
 pub struct AppState {
     pub kernel: Arc<OpenFangKernel>,
+    pub pack_registry: Arc<openfang_kernel::pack_registry::PackRegistry>,
     pub started_at: Instant,
     /// Optional peer registry for OFP mesh networking status.
     pub peer_registry: Option<Arc<openfang_wire::registry::PeerRegistry>>,
@@ -852,12 +881,25 @@ pub struct AppState {
     pub provider_probe_cache: openfang_runtime::provider_health::ProbeCache,
     /// Shared registry of looper runtime event handles for control-plane SSE.
     pub looper_runtime_registry: Arc<LooperRuntimeRegistry>,
+    /// Shared bounded per-run SSE handles for `/api/v1/runs/{id}/events`.
+    pub run_event_stream_registry: Arc<RunEventStreamRegistry>,
+    /// Shared bounded per-dispatch SSE handles for `/api/v1/dispatches/{id}/events`.
+    pub dispatch_event_stream_registry: Arc<DispatchEventStreamRegistry>,
+    /// Shared bounded global SSE handle for `/api/v1/hitl-requests/stream`.
+    pub hitl_stream_event_handle: Arc<HitlStreamEventHandle>,
 }
 
 impl AppState {
     fn skill_registry(&self) -> &std::sync::RwLock<openfang_skills::registry::SkillRegistry> {
         &self.kernel.skill_registry
     }
+}
+
+#[cfg(test)]
+fn state_kernel_pack_registry(
+    kernel: &Arc<OpenFangKernel>,
+) -> Arc<openfang_kernel::pack_registry::PackRegistry> {
+    Arc::clone(&kernel.pack_registry)
 }
 
 fn agent_error_response(
@@ -911,6 +953,39 @@ fn agent_json_rejection(rejection: JsonRejection) -> (StatusCode, Json<serde_jso
             None,
         ),
     }
+}
+
+fn message_stream_completion_events(
+    session_id: &SessionId,
+    message_id: &str,
+    content: &str,
+    usage: &TokenUsage,
+    emitted_text_delta: bool,
+) -> Vec<StreamEvent> {
+    let mut events = Vec::with_capacity(2);
+    if !emitted_text_delta {
+        events.push(StreamEvent {
+            event: "message.delta".to_owned(),
+            data: serde_json::json!({
+                "session_id": session_id.to_string(),
+                "message_id": message_id,
+                "delta": content,
+            }),
+        });
+    }
+    events.push(StreamEvent {
+        event: "message.completed".to_owned(),
+        data: serde_json::json!({
+            "session_id": session_id.to_string(),
+            "message_id": message_id,
+            "content": content,
+            "usage": {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+            },
+        }),
+    });
+    events
 }
 
 fn task_query_rejection(rejection: QueryRejection) -> (StatusCode, Json<serde_json::Value>) {
@@ -2500,6 +2575,53 @@ fn ensure_safe_agent_definition_id(id: &str) -> Result<(), (StatusCode, Json<ser
     }
 }
 
+fn agent_pack_conflict_response(
+    id: &str,
+    pack_id: Option<&str>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    agent_error_response(
+        StatusCode::CONFLICT,
+        "managed_definition_conflict",
+        "Managed pack agent definitions must be forked before modification",
+        Some(serde_json::json!([{
+            "path": "id",
+            "value": id,
+            "action": "fork",
+            "pack_id": pack_id,
+        }])),
+    )
+}
+
+fn managed_pack_for_object(
+    state: &AppState,
+    resource_type: PackResourceType,
+    resource_id: &str,
+) -> Option<InstalledPack> {
+    state
+        .pack_registry
+        .find_pack_for_object(resource_type, resource_id)
+}
+
+fn pack_origin(pack: &InstalledPack) -> AgentOrigin {
+    AgentOrigin {
+        kind: AgentOriginKind::Pack,
+        pack_id: Some(pack.manifest.id.clone()),
+        pack_version: Some(pack.manifest.version.clone()),
+        source: Some(pack.manifest.source.kind.as_str().to_string()),
+    }
+}
+
+fn pack_object_ref(
+    pack: &InstalledPack,
+    resource_type: PackResourceType,
+    resource_id: &str,
+) -> Option<PackObjectRef> {
+    pack.manifest.objects.iter().find_map(|object| {
+        (object.resource_type == resource_type && object.resource_id == resource_id)
+            .then(|| object.clone())
+    })
+}
+
 fn runtime_definition_id(entry: &openfang_types::agent::AgentEntry) -> Option<&str> {
     entry
         .manifest
@@ -2513,16 +2635,8 @@ fn agent_validation_context(
     state: &AppState,
     store: &AgentDefinitionStore,
 ) -> Result<AgentValidationContext, (StatusCode, Json<serde_json::Value>)> {
-    let stored_definitions = store.list().map_err(|error| {
-        agent_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "definition_load_failed",
-            "Failed to load agent definitions",
-            Some(serde_json::json!([{
-                "message": error,
-            }])),
-        )
-    })?;
+    let _ = store;
+    let stored_definitions = load_all_agent_definition_resources(state)?;
 
     let mut known_agents = BTreeSet::new();
     for definition in stored_definitions {
@@ -2600,7 +2714,7 @@ fn load_agent_definition_resource(
     state: &AppState,
     definition_id: &str,
 ) -> Result<Option<AgentResponse>, (StatusCode, Json<serde_json::Value>)> {
-    agent_definition_store(state)
+    if let Some(resource) = agent_definition_store(state)
         .load(definition_id)
         .map_err(|error| {
             agent_error_response(
@@ -2611,7 +2725,73 @@ fn load_agent_definition_resource(
                     "message": error,
                 }])),
             )
-        })
+        })?
+    {
+        return Ok(Some(resource));
+    }
+
+    load_pack_agent_definition_resource(state, definition_id)
+}
+
+fn load_pack_agent_definition_resource(
+    state: &AppState,
+    definition_id: &str,
+) -> Result<Option<AgentResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(pack) = state
+        .pack_registry
+        .find_pack_for_object(PackResourceType::Agent, definition_id)
+    else {
+        return Ok(None);
+    };
+    let Some(object) = pack_object_ref(&pack, PackResourceType::Agent, definition_id) else {
+        return Ok(None);
+    };
+    let definition = deserialize_pack_agent_definition(&pack, &object)?;
+    Ok(Some(AgentResponse {
+        definition,
+        origin: pack_origin(&pack),
+        forked_from: None,
+        created_at: pack.updated_at.clone(),
+        updated_at: pack.updated_at,
+    }))
+}
+
+fn load_all_agent_definition_resources(
+    state: &AppState,
+) -> Result<Vec<AgentResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let user_definitions = agent_definition_store(state).list().map_err(|error| {
+        agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_load_failed",
+            "Failed to load agent definitions",
+            Some(serde_json::json!([{
+                "message": error,
+            }])),
+        )
+    })?;
+
+    let mut merged = BTreeMap::new();
+    for pack in state.pack_registry.list_packs() {
+        for object in &pack.manifest.objects {
+            if object.resource_type != PackResourceType::Agent {
+                continue;
+            }
+            merged
+                .entry(object.resource_id.clone())
+                .or_insert(AgentResponse {
+                    definition: deserialize_pack_agent_definition(&pack, object)?,
+                    origin: pack_origin(&pack),
+                    forked_from: None,
+                    created_at: pack.updated_at.clone(),
+                    updated_at: pack.updated_at.clone(),
+                });
+        }
+    }
+    for definition in user_definitions {
+        merged.insert(definition.definition.id.clone(), definition);
+    }
+
+    Ok(merged.into_values().collect())
 }
 
 fn find_runtime_agent_for_definition(
@@ -3201,19 +3381,9 @@ fn agent_list_item(resource: &AgentResponse, runtime_status: AgentRuntimeStatus)
 
 /// GET /api/v1/agents — List file-backed agent definitions.
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let store = agent_definition_store(&state);
-    let definitions = match store.list() {
+    let definitions = match load_all_agent_definition_resources(&state) {
         Ok(definitions) => definitions,
-        Err(error) => {
-            return agent_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "definition_load_failed",
-                "Failed to load agent definitions",
-                Some(serde_json::json!([{
-                    "message": error,
-                }])),
-            );
-        }
+        Err(response) => return response,
     };
 
     let mut items = Vec::with_capacity(definitions.len());
@@ -3244,6 +3414,7 @@ pub async fn create_agent(
         Ok(payload) => payload,
         Err(rejection) => return agent_json_rejection(rejection),
     };
+    let _write_guard = AGENT_DEFINITION_WRITE_LOCK.lock().await;
     let definition = request.definition;
 
     if let Err(response) = ensure_safe_agent_definition_id(&definition.id) {
@@ -3274,6 +3445,9 @@ pub async fn create_agent(
                 }])),
             );
         }
+    }
+    if let Some(pack) = managed_pack_for_object(&state, PackResourceType::Agent, &definition.id) {
+        return agent_pack_conflict_response(&definition.id, Some(&pack.manifest.id));
     }
 
     let context = match agent_validation_context(&state, &store) {
@@ -3356,6 +3530,7 @@ pub async fn update_agent(
         Ok(payload) => payload,
         Err(rejection) => return agent_json_rejection(rejection),
     };
+    let _write_guard = AGENT_DEFINITION_WRITE_LOCK.lock().await;
     let definition = request.definition;
 
     if definition.id != id {
@@ -3438,6 +3613,7 @@ pub async fn delete_agent(
     if let Err(response) = ensure_safe_agent_definition_id(&id) {
         return response.into_response();
     }
+    let _write_guard = AGENT_DEFINITION_WRITE_LOCK.lock().await;
 
     let store = agent_definition_store(&state);
     match store.delete(&id) {
@@ -4499,16 +4675,22 @@ pub async fn stream_agent_message(
     let _ = api_tx.try_send(initial_keepalive);
 
     tokio::spawn(async move {
+        let mut emitted_text_delta = false;
         while let Some(event) = kernel_rx.recv().await {
             let next_event = match event {
-                LlmStreamEvent::TextDelta { text } => Some(StreamEvent {
-                    event: "message.delta".to_owned(),
-                    data: serde_json::json!({
-                        "session_id": session_id.to_string(),
-                        "message_id": message_id,
-                        "delta": text,
-                    }),
-                }),
+                LlmStreamEvent::TextDelta { text } => {
+                    if !text.is_empty() {
+                        emitted_text_delta = true;
+                    }
+                    Some(StreamEvent {
+                        event: "message.delta".to_owned(),
+                        data: serde_json::json!({
+                            "session_id": session_id.to_string(),
+                            "message_id": message_id,
+                            "delta": text,
+                        }),
+                    })
+                }
                 LlmStreamEvent::ToolUseEnd { id, name, input } => Some(StreamEvent {
                     event: "tool.started".to_owned(),
                     data: serde_json::json!({
@@ -4543,45 +4725,54 @@ pub async fn stream_agent_message(
             }
         }
 
-        let completion_event = match handle.await {
-            Ok(Ok(result)) => StreamEvent {
-                event: "message.completed".to_owned(),
-                data: serde_json::json!({
-                    "session_id": session_id.to_string(),
-                    "message_id": message_id,
-                    "content": crate::ws::strip_think_tags(&result.response),
-                    "usage": {
-                        "input_tokens": result.total_usage.input_tokens,
-                        "output_tokens": result.total_usage.output_tokens,
-                    },
-                }),
-            },
-            Ok(Err(error)) => StreamEvent {
-                event: "error".to_owned(),
-                data: serde_json::json!({
-                    "error": {
-                        "code": "message_stream_failed",
-                        "message": "Agent message stream failed",
-                        "details": [{
-                            "message": error.to_string(),
-                        }],
+        match handle.await {
+            Ok(Ok(result)) => {
+                let content = crate::ws::strip_think_tags(&result.response);
+                for event in message_stream_completion_events(
+                    &session_id,
+                    &message_id,
+                    &content,
+                    &result.total_usage,
+                    emitted_text_delta,
+                ) {
+                    if api_tx.send(event).await.is_err() {
+                        return;
                     }
-                }),
-            },
-            Err(error) => StreamEvent {
-                event: "error".to_owned(),
-                data: serde_json::json!({
-                    "error": {
-                        "code": "message_stream_failed",
-                        "message": "Agent message stream task failed",
-                        "details": [{
-                            "message": error.to_string(),
-                        }],
-                    }
-                }),
-            },
-        };
-        let _ = api_tx.send(completion_event).await;
+                }
+            }
+            Ok(Err(error)) => {
+                let _ = api_tx
+                    .send(StreamEvent {
+                        event: "error".to_owned(),
+                        data: serde_json::json!({
+                            "error": {
+                                "code": "message_stream_failed",
+                                "message": "Agent message stream failed",
+                                "details": [{
+                                    "message": error.to_string(),
+                                }],
+                            }
+                        }),
+                    })
+                    .await;
+            }
+            Err(error) => {
+                let _ = api_tx
+                    .send(StreamEvent {
+                        event: "error".to_owned(),
+                        data: serde_json::json!({
+                            "error": {
+                                "code": "message_stream_failed",
+                                "message": "Agent message stream task failed",
+                                "details": [{
+                                    "message": error.to_string(),
+                                }],
+                            }
+                        }),
+                    })
+                    .await;
+            }
+        }
     });
 
     let sse_stream = stream::unfold(api_rx, |mut rx| async move {
@@ -5556,13 +5747,7 @@ fn workflow_v2_compile_error_response(
 async fn workflow_v2_available_agent_refs(
     state: &AppState,
 ) -> Result<BTreeSet<String>, (StatusCode, Json<serde_json::Value>)> {
-    let stored_definitions = agent_definition_store(state).list().map_err(|error| {
-        workflow_store_load_error_response(
-            "definition_load_failed",
-            "Failed to load agent definitions",
-            error,
-        )
-    })?;
+    let stored_definitions = load_all_agent_definition_resources(state)?;
 
     let mut agents = BTreeSet::new();
     for definition in stored_definitions {
@@ -5626,7 +5811,10 @@ fn workflow_definition_not_found_response() -> (StatusCode, Json<serde_json::Val
     )
 }
 
-fn workflow_pack_conflict_response(id: &str) -> (StatusCode, Json<serde_json::Value>) {
+fn workflow_pack_conflict_response(
+    id: &str,
+    pack_id: Option<&str>,
+) -> (StatusCode, Json<serde_json::Value>) {
     workflow_v2_error_response(
         StatusCode::CONFLICT,
         "managed_definition_conflict",
@@ -5635,6 +5823,7 @@ fn workflow_pack_conflict_response(id: &str) -> (StatusCode, Json<serde_json::Va
             "path": "id",
             "value": id,
             "action": "fork",
+            "pack_id": pack_id,
         }])),
     )
 }
@@ -5703,7 +5892,10 @@ fn trigger_definition_not_found_response() -> (StatusCode, Json<serde_json::Valu
     )
 }
 
-fn trigger_pack_conflict_response(id: &str) -> (StatusCode, Json<serde_json::Value>) {
+fn trigger_pack_conflict_response(
+    id: &str,
+    pack_id: Option<&str>,
+) -> (StatusCode, Json<serde_json::Value>) {
     workflow_v2_error_response(
         StatusCode::CONFLICT,
         "managed_definition_conflict",
@@ -5712,6 +5904,7 @@ fn trigger_pack_conflict_response(id: &str) -> (StatusCode, Json<serde_json::Val
             "path": "id",
             "value": id,
             "action": "fork",
+            "pack_id": pack_id,
         }])),
     )
 }
@@ -5735,7 +5928,7 @@ fn load_trigger_definition_resource(
     state: &AppState,
     definition_id: &str,
 ) -> Result<Option<TriggerResponse>, (StatusCode, Json<serde_json::Value>)> {
-    trigger_definition_store(state)
+    if let Some(resource) = trigger_definition_store(state)
         .load(definition_id)
         .map_err(|error| {
             trigger_store_load_error_response(
@@ -5743,19 +5936,70 @@ fn load_trigger_definition_resource(
                 "Failed to load trigger definition",
                 error,
             )
-        })
+        })?
+    {
+        return Ok(Some(resource));
+    }
+
+    load_pack_trigger_definition_resource(state, definition_id)
 }
 
 fn load_all_trigger_definition_resources(
     state: &AppState,
 ) -> Result<Vec<TriggerResponse>, (StatusCode, Json<serde_json::Value>)> {
-    trigger_definition_store(state).list().map_err(|error| {
+    let user_definitions = trigger_definition_store(state).list().map_err(|error| {
         trigger_store_load_error_response(
             "definition_load_failed",
             "Failed to load trigger definitions",
             error,
         )
-    })
+    })?;
+
+    let mut merged = BTreeMap::new();
+    for pack in state.pack_registry.list_packs() {
+        for object in &pack.manifest.objects {
+            if object.resource_type != PackResourceType::Trigger {
+                continue;
+            }
+            merged
+                .entry(object.resource_id.clone())
+                .or_insert(TriggerResponse {
+                    definition: deserialize_pack_trigger_definition(&pack, object)?,
+                    origin: pack_origin(&pack),
+                    forked_from: None,
+                    created_at: pack.updated_at.clone(),
+                    updated_at: pack.updated_at.clone(),
+                });
+        }
+    }
+    for definition in user_definitions {
+        merged.insert(definition.definition.id.clone(), definition);
+    }
+
+    Ok(merged.into_values().collect())
+}
+
+fn load_pack_trigger_definition_resource(
+    state: &AppState,
+    definition_id: &str,
+) -> Result<Option<TriggerResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(pack) = state
+        .pack_registry
+        .find_pack_for_object(PackResourceType::Trigger, definition_id)
+    else {
+        return Ok(None);
+    };
+    let Some(object) = pack_object_ref(&pack, PackResourceType::Trigger, definition_id) else {
+        return Ok(None);
+    };
+
+    Ok(Some(TriggerResponse {
+        definition: deserialize_pack_trigger_definition(&pack, &object)?,
+        origin: pack_origin(&pack),
+        forked_from: None,
+        created_at: pack.updated_at.clone(),
+        updated_at: pack.updated_at,
+    }))
 }
 
 fn trigger_v2_is_valid(
@@ -5863,13 +6107,7 @@ fn trigger_runtime_response(runtime: TriggerRuntimeStatus) -> TriggerRuntimeStat
 async fn trigger_compile_registry(
     state: &AppState,
 ) -> Result<TriggerCompileRegistry, (StatusCode, Json<serde_json::Value>)> {
-    let agents = agent_definition_store(state).list().map_err(|error| {
-        trigger_store_load_error_response(
-            "definition_load_failed",
-            "Failed to load agent definitions",
-            error,
-        )
-    })?;
+    let agents = load_all_agent_definition_resources(state)?;
     let workflows = load_all_workflow_definition_resources(state)?;
     let mut registry = TriggerCompileRegistry::new();
     for agent in agents {
@@ -5895,7 +6133,7 @@ fn load_workflow_definition_resource(
     state: &AppState,
     definition_id: &str,
 ) -> Result<Option<WorkflowResponse>, (StatusCode, Json<serde_json::Value>)> {
-    workflow_definition_store(state)
+    if let Some(resource) = workflow_definition_store(state)
         .load(definition_id)
         .map_err(|error| {
             workflow_store_load_error_response(
@@ -5903,19 +6141,70 @@ fn load_workflow_definition_resource(
                 "Failed to load workflow definition",
                 error,
             )
-        })
+        })?
+    {
+        return Ok(Some(resource));
+    }
+
+    load_pack_workflow_definition_resource(state, definition_id)
 }
 
 fn load_all_workflow_definition_resources(
     state: &AppState,
 ) -> Result<Vec<WorkflowResponse>, (StatusCode, Json<serde_json::Value>)> {
-    workflow_definition_store(state).list().map_err(|error| {
+    let user_definitions = workflow_definition_store(state).list().map_err(|error| {
         workflow_store_load_error_response(
             "definition_load_failed",
             "Failed to load workflow definitions",
             error,
         )
-    })
+    })?;
+
+    let mut merged = BTreeMap::new();
+    for pack in state.pack_registry.list_packs() {
+        for object in &pack.manifest.objects {
+            if object.resource_type != PackResourceType::Workflow {
+                continue;
+            }
+            merged
+                .entry(object.resource_id.clone())
+                .or_insert(WorkflowResponse {
+                    definition: deserialize_pack_workflow_definition(&pack, object)?,
+                    origin: pack_origin(&pack),
+                    forked_from: None,
+                    created_at: pack.updated_at.clone(),
+                    updated_at: pack.updated_at.clone(),
+                });
+        }
+    }
+    for definition in user_definitions {
+        merged.insert(definition.definition.id.clone(), definition);
+    }
+
+    Ok(merged.into_values().collect())
+}
+
+fn load_pack_workflow_definition_resource(
+    state: &AppState,
+    definition_id: &str,
+) -> Result<Option<WorkflowResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(pack) = state
+        .pack_registry
+        .find_pack_for_object(PackResourceType::Workflow, definition_id)
+    else {
+        return Ok(None);
+    };
+    let Some(object) = pack_object_ref(&pack, PackResourceType::Workflow, definition_id) else {
+        return Ok(None);
+    };
+
+    Ok(Some(WorkflowResponse {
+        definition: deserialize_pack_workflow_definition(&pack, &object)?,
+        origin: pack_origin(&pack),
+        forked_from: None,
+        created_at: pack.updated_at.clone(),
+        updated_at: pack.updated_at,
+    }))
 }
 
 async fn workflow_compile_registry(
@@ -6433,7 +6722,10 @@ pub async fn create_workflow_definition_v1(
     let store = workflow_definition_store(&state);
     match store.load(&definition.id) {
         Ok(Some(existing)) if existing.origin.kind == WorkflowOriginKind::Pack => {
-            return workflow_pack_conflict_response(&definition.id)
+            return workflow_pack_conflict_response(
+                &definition.id,
+                existing.origin.pack_id.as_deref(),
+            )
         }
         Ok(Some(_)) => {
             return workflow_v2_error_response(
@@ -6454,6 +6746,10 @@ pub async fn create_workflow_definition_v1(
                 error,
             )
         }
+    }
+    if let Some(pack) = managed_pack_for_object(&state, PackResourceType::Workflow, &definition.id)
+    {
+        return workflow_pack_conflict_response(&definition.id, Some(&pack.manifest.id));
     }
 
     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -6551,7 +6847,7 @@ pub async fn update_workflow_definition_v1(
         }
     };
     if existing.origin.kind == WorkflowOriginKind::Pack {
-        return workflow_pack_conflict_response(&id);
+        return workflow_pack_conflict_response(&id, existing.origin.pack_id.as_deref());
     }
 
     let resource = WorkflowResponse {
@@ -6606,7 +6902,8 @@ pub async fn delete_workflow_definition_v1(
         }
     };
     if existing.origin.kind == WorkflowOriginKind::Pack {
-        return workflow_pack_conflict_response(&id).into_response();
+        return workflow_pack_conflict_response(&id, existing.origin.pack_id.as_deref())
+            .into_response();
     }
 
     match store.delete(&id) {
@@ -7783,16 +8080,613 @@ pub async fn get_run_hitl_requests_v1(
     }
 }
 
-/// GET /api/v1/dispatches/{id}/events — Stream a snapshot + keepalive heartbeat.
+#[derive(Debug, Clone)]
+struct RunStreamSnapshot {
+    run: openfang_memory::WorkflowRunRecord,
+    dispatches: Vec<DispatchRecord>,
+    hitl_requests: Vec<HitlRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct DispatchStreamSnapshot {
+    dispatch: DispatchRecord,
+    hitl_requests: Vec<HitlRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HitlStreamFilters {
+    run_id: Option<String>,
+    status: Option<HitlStatus>,
+}
+
+fn sse_event_from_buffered(event: &BufferedSseEvent) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .id(event.id.to_string())
+        .event(event.event.clone())
+        .data(event.data.to_string())
+}
+
+fn sse_control_event(
+    event_id: u64,
+    event_name: &str,
+    data: serde_json::Value,
+) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .id(event_id.to_string())
+        .event(event_name)
+        .data(data.to_string())
+}
+
+async fn send_durable_sse_event(
+    tx: &tokio::sync::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,
+    event: axum::response::sse::Event,
+) -> bool {
+    tx.send(Ok(event)).await.is_ok()
+}
+
+fn reset_durable_keepalive(timer: std::pin::Pin<&mut tokio::time::Sleep>, interval: Duration) {
+    timer.reset(tokio::time::Instant::now() + interval);
+}
+
+fn dispatch_state_fingerprint(record: &DispatchRecord) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        record.status.as_str(),
+        record.updated_at,
+        record.attempt,
+        record.completed_at.as_deref().unwrap_or("")
+    )
+}
+
+fn hitl_state_fingerprint(record: &HitlRecord) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        record.status.as_str(),
+        record.sequence_no,
+        record.created_at.to_rfc3339(),
+        record
+            .answered_at
+            .as_ref()
+            .map(chrono::DateTime::to_rfc3339)
+            .unwrap_or_default()
+    )
+}
+
+fn dispatch_fingerprint_map(records: &[DispatchRecord]) -> HashMap<String, String> {
+    let mut fingerprints = HashMap::with_capacity(records.len());
+    for record in records {
+        fingerprints.insert(
+            record.dispatch_id.clone(),
+            dispatch_state_fingerprint(record),
+        );
+    }
+    fingerprints
+}
+
+fn hitl_fingerprint_map(records: &[HitlRecord]) -> HashMap<String, String> {
+    let mut fingerprints = HashMap::with_capacity(records.len());
+    for record in records {
+        fingerprints.insert(
+            record.hitl_request_id.clone(),
+            hitl_state_fingerprint(record),
+        );
+    }
+    fingerprints
+}
+
+fn run_stream_aggregate(
+    dispatches: &[DispatchRecord],
+    hitl_requests: &[HitlRecord],
+) -> serde_json::Value {
+    let mut dispatch_pending = 0usize;
+    let mut dispatch_running = 0usize;
+    let mut dispatch_waiting_hitl = 0usize;
+    let mut dispatch_completed = 0usize;
+    let mut dispatch_failed = 0usize;
+    let mut dispatch_cancelled = 0usize;
+    for dispatch in dispatches {
+        match dispatch.status {
+            DispatchStatus::Pending => dispatch_pending += 1,
+            DispatchStatus::Running => dispatch_running += 1,
+            DispatchStatus::WaitingHitl => dispatch_waiting_hitl += 1,
+            DispatchStatus::Completed => dispatch_completed += 1,
+            DispatchStatus::Failed => dispatch_failed += 1,
+            DispatchStatus::Cancelled => dispatch_cancelled += 1,
+        }
+    }
+
+    let mut hitl_pending = 0usize;
+    let mut hitl_answered = 0usize;
+    let mut hitl_cancelled = 0usize;
+    let mut hitl_timed_out = 0usize;
+    for hitl in hitl_requests {
+        match hitl.status {
+            HitlStatus::Pending => hitl_pending += 1,
+            HitlStatus::Answered => hitl_answered += 1,
+            HitlStatus::Cancelled => hitl_cancelled += 1,
+            HitlStatus::TimedOut => hitl_timed_out += 1,
+        }
+    }
+
+    serde_json::json!({
+        "dispatch": {
+            "total": dispatches.len(),
+            "pending": dispatch_pending,
+            "running": dispatch_running,
+            "waiting_hitl": dispatch_waiting_hitl,
+            "completed": dispatch_completed,
+            "failed": dispatch_failed,
+            "cancelled": dispatch_cancelled,
+        },
+        "hitl": {
+            "total": hitl_requests.len(),
+            "pending": hitl_pending,
+            "answered": hitl_answered,
+            "cancelled": hitl_cancelled,
+            "timed_out": hitl_timed_out,
+        }
+    })
+}
+
+fn run_updated_event_payload(snapshot: &RunStreamSnapshot) -> serde_json::Value {
+    let mut summary = run_record_to_summary(&snapshot.run);
+    if let Some(object) = summary.as_object_mut() {
+        object.insert(
+            "aggregate".to_string(),
+            run_stream_aggregate(&snapshot.dispatches, &snapshot.hitl_requests),
+        );
+    }
+    summary
+}
+
+fn run_snapshot_event_payload(snapshot: &RunStreamSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "run": run_updated_event_payload(snapshot),
+        "dispatches": snapshot
+            .dispatches
+            .iter()
+            .map(dispatch_record_to_detail_response)
+            .collect::<Vec<_>>(),
+        "hitl_requests": snapshot
+            .hitl_requests
+            .iter()
+            .map(hitl_record_to_detail_response)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn dispatch_snapshot_event_payload(snapshot: &DispatchStreamSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "dispatch": dispatch_record_to_detail_response(&snapshot.dispatch),
+        "hitl_requests": snapshot
+            .hitl_requests
+            .iter()
+            .map(hitl_record_to_detail_response)
+            .collect::<Vec<_>>(),
+    })
+}
+
+async fn list_dispatches_for_run_stream(
+    state: &AppState,
+    run_id: &str,
+) -> Result<Vec<DispatchRecord>, String> {
+    state
+        .kernel
+        .workflow_stores
+        .dispatch
+        .list(&DispatchListQuery {
+            limit: MAX_PAGE_LIMIT,
+            offset: 0,
+            run_id: Some(run_id.to_string()),
+            parent_dispatch_id: None,
+            status: None,
+            target_agent: None,
+            step_id: None,
+        })
+        .await
+        .map(|page| page.items)
+        .map_err(|error| error.to_string())
+}
+
+async fn list_hitl_for_run_stream(
+    state: &AppState,
+    run_id: &str,
+) -> Result<Vec<HitlRecord>, String> {
+    state
+        .kernel
+        .workflow_stores
+        .hitl
+        .list(&HitlListQuery {
+            limit: MAX_PAGE_LIMIT,
+            offset: 0,
+            run_id: Some(run_id.to_string()),
+            dispatch_id: None,
+            status: None,
+            kind: None,
+        })
+        .await
+        .map(|page| page.items)
+        .map_err(|error| error.to_string())
+}
+
+async fn list_hitl_for_dispatch_stream(
+    state: &AppState,
+    dispatch_id: &str,
+) -> Result<Vec<HitlRecord>, String> {
+    state
+        .kernel
+        .workflow_stores
+        .hitl
+        .list(&HitlListQuery {
+            limit: MAX_PAGE_LIMIT,
+            offset: 0,
+            run_id: None,
+            dispatch_id: Some(dispatch_id.to_string()),
+            status: None,
+            kind: None,
+        })
+        .await
+        .map(|page| page.items)
+        .map_err(|error| error.to_string())
+}
+
+async fn list_hitl_for_stream_query(
+    state: &AppState,
+    query: &HitlListQuery,
+) -> Result<Vec<HitlRecord>, String> {
+    state
+        .kernel
+        .workflow_stores
+        .hitl
+        .list(query)
+        .await
+        .map(|page| page.items)
+        .map_err(|error| error.to_string())
+}
+
+async fn load_run_stream_snapshot(
+    state: &AppState,
+    run_id: &str,
+) -> Result<Option<RunStreamSnapshot>, String> {
+    let Some(run) = state
+        .kernel
+        .workflow_stores
+        .workflow_run
+        .find_by_id(run_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let dispatches = list_dispatches_for_run_stream(state, run_id).await?;
+    let hitl_requests = list_hitl_for_run_stream(state, run_id).await?;
+
+    Ok(Some(RunStreamSnapshot {
+        run,
+        dispatches,
+        hitl_requests,
+    }))
+}
+
+async fn load_dispatch_stream_snapshot(
+    state: &AppState,
+    dispatch_id: &str,
+) -> Result<Option<DispatchStreamSnapshot>, String> {
+    let Some(dispatch) = state
+        .kernel
+        .workflow_stores
+        .dispatch
+        .find_by_id(dispatch_id)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let hitl_requests = list_hitl_for_dispatch_stream(state, dispatch_id).await?;
+
+    Ok(Some(DispatchStreamSnapshot {
+        dispatch,
+        hitl_requests,
+    }))
+}
+
+fn hitl_stream_event_matches_filters(
+    event: &BufferedSseEvent,
+    filters: &HitlStreamFilters,
+) -> bool {
+    if !matches!(event.event.as_str(), "hitl.requested" | "hitl.answered") {
+        return true;
+    }
+    let Some(payload) = event.data.as_object() else {
+        return false;
+    };
+
+    if let Some(expected_run_id) = filters.run_id.as_deref() {
+        let run_id_matches = payload
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|run_id| run_id == expected_run_id);
+        if !run_id_matches {
+            return false;
+        }
+    }
+
+    if let Some(expected_status) = filters.status {
+        let status_matches = payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<HitlStatus>().ok())
+            .is_some_and(|status| status == expected_status);
+        if !status_matches {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// GET /api/v1/runs/{id}/events — Stream run state with bounded replay.
+pub async fn stream_run_events_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::sse::Sse;
+
+    if let Err(response) = ensure_durable_run_exists(&state, &id) {
+        return response.into_response();
+    }
+    let last_event_id = match parse_last_event_id(&headers) {
+        Ok(value) => value,
+        Err(response) => return response.into_response(),
+    };
+
+    let handle = state.run_event_stream_registry.handle(&id);
+    let mut receiver = handle.subscribe();
+    let replay = handle.replay_after(last_event_id);
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >(128);
+    let state_for_stream = Arc::clone(&state);
+    tokio::spawn(async move {
+        let keepalive_interval = Duration::from_secs(15);
+        let keepalive = tokio::time::sleep(keepalive_interval);
+        tokio::pin!(keepalive);
+        let mut poll = tokio::time::interval(DURABLE_STREAM_POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let _ = poll.tick().await;
+
+        let snapshot = match load_run_stream_snapshot(&state_for_stream, &id).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!("Failed to load run stream snapshot for {id}: {error}");
+                return;
+            }
+        };
+
+        let mut last_delivered_id = last_event_id.unwrap_or(0);
+        if replay.reset_required {
+            let reset_id = handle.latest_event_id();
+            if !send_durable_sse_event(
+                &tx,
+                sse_control_event(
+                    reset_id,
+                    "stream.reset",
+                    serde_json::json!({
+                        "reason": "last_event_id_expired",
+                        "requested_last_event_id": last_event_id,
+                    }),
+                ),
+            )
+            .await
+            {
+                return;
+            }
+            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+
+            if !send_durable_sse_event(
+                &tx,
+                sse_control_event(
+                    handle.latest_event_id(),
+                    "stream.snapshot",
+                    run_snapshot_event_payload(&snapshot),
+                ),
+            )
+            .await
+            {
+                return;
+            }
+            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+            last_delivered_id = handle.latest_event_id();
+        } else if last_event_id.is_none() {
+            if !send_durable_sse_event(
+                &tx,
+                sse_control_event(
+                    handle.latest_event_id(),
+                    "stream.snapshot",
+                    run_snapshot_event_payload(&snapshot),
+                ),
+            )
+            .await
+            {
+                return;
+            }
+            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+            last_delivered_id = handle.latest_event_id();
+        } else {
+            for event in replay.events {
+                last_delivered_id = event.id;
+                if !send_durable_sse_event(&tx, sse_event_from_buffered(&event)).await {
+                    return;
+                }
+                reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+            }
+            if last_delivered_id == last_event_id.unwrap_or(0) {
+                last_delivered_id = last_delivered_id.min(handle.latest_event_id());
+            }
+        }
+
+        let mut last_run_fingerprint = run_updated_event_payload(&snapshot).to_string();
+        let mut last_dispatch_fingerprints = dispatch_fingerprint_map(&snapshot.dispatches);
+        let mut last_hitl_fingerprints = hitl_fingerprint_map(&snapshot.hitl_requests);
+
+        loop {
+            tokio::select! {
+                _ = &mut keepalive => {
+                    let keepalive_id = handle.latest_event_id().max(last_delivered_id);
+                    if !send_durable_sse_event(
+                        &tx,
+                        sse_control_event(keepalive_id, "keepalive", serde_json::json!({})),
+                    ).await {
+                        return;
+                    }
+                    reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                }
+                _ = poll.tick() => {
+                    match load_run_stream_snapshot(&state_for_stream, &id).await {
+                        Ok(Some(current)) => {
+                            let run_payload = run_updated_event_payload(&current);
+                            let run_fingerprint = run_payload.to_string();
+                            if run_fingerprint != last_run_fingerprint {
+                                let _ = handle.publish_if_changed(
+                                    format!("run:{id}:run.updated"),
+                                    run_fingerprint.clone(),
+                                    "run.updated",
+                                    run_payload,
+                                );
+                                last_run_fingerprint = run_fingerprint;
+                            }
+
+                            let mut next_dispatch_fingerprints =
+                                HashMap::with_capacity(current.dispatches.len());
+                            for dispatch in &current.dispatches {
+                                let fingerprint = dispatch_state_fingerprint(dispatch);
+                                let changed = last_dispatch_fingerprints
+                                    .get(&dispatch.dispatch_id)
+                                    != Some(&fingerprint);
+                                if changed {
+                                    let _ = handle.publish_if_changed(
+                                        format!("run:{id}:dispatch:{}:updated", dispatch.dispatch_id),
+                                        fingerprint.clone(),
+                                        "dispatch.updated",
+                                        serde_json::to_value(dispatch_record_to_detail_response(dispatch))
+                                            .unwrap_or_else(|_| serde_json::json!({})),
+                                    );
+                                }
+                                next_dispatch_fingerprints
+                                    .insert(dispatch.dispatch_id.clone(), fingerprint);
+                            }
+                            last_dispatch_fingerprints = next_dispatch_fingerprints;
+
+                            let mut next_hitl_fingerprints =
+                                HashMap::with_capacity(current.hitl_requests.len());
+                            for hitl in &current.hitl_requests {
+                                let fingerprint = hitl_state_fingerprint(hitl);
+                                let changed = last_hitl_fingerprints
+                                    .get(&hitl.hitl_request_id)
+                                    != Some(&fingerprint);
+                                if changed {
+                                    let event_name = match hitl.status {
+                                        HitlStatus::Pending => Some("hitl.requested"),
+                                        HitlStatus::Answered => Some("hitl.answered"),
+                                        HitlStatus::Cancelled | HitlStatus::TimedOut => None,
+                                    };
+                                    if let Some(event_name) = event_name {
+                                        let _ = handle.publish_if_changed(
+                                            format!("run:{id}:hitl:{}:{event_name}", hitl.hitl_request_id),
+                                            fingerprint.clone(),
+                                            event_name,
+                                            serde_json::to_value(hitl_record_to_detail_response(hitl))
+                                                .unwrap_or_else(|_| serde_json::json!({})),
+                                        );
+                                    }
+                                }
+                                next_hitl_fingerprints.insert(hitl.hitl_request_id.clone(), fingerprint);
+                            }
+                            last_hitl_fingerprints = next_hitl_fingerprints;
+                        }
+                        Ok(None) => return,
+                        Err(error) => {
+                            tracing::warn!("Failed to poll run stream snapshot for {id}: {error}");
+                        }
+                    }
+                }
+                received = receiver.recv() => {
+                    match received {
+                        Ok(event) => {
+                            if event.id <= last_delivered_id {
+                                continue;
+                            }
+                            last_delivered_id = event.id;
+                            if !send_durable_sse_event(&tx, sse_event_from_buffered(&event)).await {
+                                return;
+                            }
+                            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let reset_id = handle.latest_event_id();
+                            if !send_durable_sse_event(
+                                &tx,
+                                sse_control_event(
+                                    reset_id,
+                                    "stream.reset",
+                                    serde_json::json!({ "reason": "receiver_lagged" }),
+                                ),
+                            ).await {
+                                return;
+                            }
+                            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                            match load_run_stream_snapshot(&state_for_stream, &id).await {
+                                Ok(Some(current)) => {
+                                    if !send_durable_sse_event(
+                                        &tx,
+                                        sse_control_event(
+                                            handle.latest_event_id(),
+                                            "stream.snapshot",
+                                            run_snapshot_event_payload(&current),
+                                        ),
+                                    ).await {
+                                        return;
+                                    }
+                                    reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                                }
+                                Ok(None) => return,
+                                Err(error) => {
+                                    tracing::warn!("Failed to refresh run snapshot after lag for {id}: {error}");
+                                }
+                            }
+                            last_delivered_id = handle.latest_event_id();
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    (
+        [
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+        ],
+        Sse::new(stream),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/dispatches/{id}/events — Stream dispatch state with bounded replay.
 pub async fn stream_dispatch_events_v1(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
-    use axum::response::sse::{Event, KeepAlive, Sse};
-    use futures::stream::{self, StreamExt};
+    use axum::http::header;
+    use axum::response::sse::Sse;
 
-    let record = match state.kernel.workflow_stores.dispatch.find_by_id(&id).await {
-        Ok(Some(record)) => record,
+    match state.kernel.workflow_stores.dispatch.find_by_id(&id).await {
+        Ok(Some(_)) => {}
         Ok(None) => return dispatch_not_found_response().into_response(),
         Err(error) => {
             tracing::warn!("Failed to load dispatch {id} before streaming events: {error}");
@@ -7802,77 +8696,492 @@ pub async fn stream_dispatch_events_v1(
             )
             .into_response();
         }
-    };
-
-    let snapshot = dispatch_record_to_detail_response(&record);
-    let snapshot_json = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
-    let sse_stream = stream::once(async move {
-        Ok::<Event, std::convert::Infallible>(
-            Event::default()
-                .event("stream.snapshot")
-                .data(snapshot_json),
-        )
-    })
-    .chain(stream::pending::<Result<Event, std::convert::Infallible>>());
-
-    Sse::new(sse_stream)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(1))
-                .event(Event::default().event("keepalive").data("{}")),
-        )
-        .into_response()
-}
-
-/// GET /api/v1/hitl-requests/stream — Stream a snapshot + keepalive heartbeat.
-pub async fn stream_hitl_requests_v1(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<HitlListQueryParams>,
-) -> axum::response::Response {
-    use axum::response::sse::{Event, KeepAlive, Sse};
-    use futures::stream::{self, StreamExt};
-
-    let query = match hitl_list_query_from_params(params, None) {
-        Ok(query) => query,
+    }
+    let last_event_id = match parse_last_event_id(&headers) {
+        Ok(value) => value,
         Err(response) => return response.into_response(),
     };
 
-    let page = match state.kernel.workflow_stores.hitl.list(&query).await {
-        Ok(page) => page,
-        Err(error) => {
-            tracing::warn!("Failed to list HITL requests before streaming: {error}");
-            return hitl_internal_error_response(
-                "hitl_list_failed",
-                "Failed to list HITL requests",
+    let handle = state.dispatch_event_stream_registry.handle(&id);
+    let mut receiver = handle.subscribe();
+    let replay = handle.replay_after(last_event_id);
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >(128);
+    let state_for_stream = Arc::clone(&state);
+    tokio::spawn(async move {
+        let keepalive_interval = Duration::from_secs(15);
+        let keepalive = tokio::time::sleep(keepalive_interval);
+        tokio::pin!(keepalive);
+        let mut poll = tokio::time::interval(DURABLE_STREAM_POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let _ = poll.tick().await;
+
+        let snapshot = match load_dispatch_stream_snapshot(&state_for_stream, &id).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!("Failed to load dispatch stream snapshot for {id}: {error}");
+                return;
+            }
+        };
+
+        let mut last_delivered_id = last_event_id.unwrap_or(0);
+        if replay.reset_required {
+            let reset_id = handle.latest_event_id();
+            if !send_durable_sse_event(
+                &tx,
+                sse_control_event(
+                    reset_id,
+                    "stream.reset",
+                    serde_json::json!({
+                        "reason": "last_event_id_expired",
+                        "requested_last_event_id": last_event_id,
+                    }),
+                ),
             )
-            .into_response();
+            .await
+            {
+                return;
+            }
+            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+            if !send_durable_sse_event(
+                &tx,
+                sse_control_event(
+                    handle.latest_event_id(),
+                    "stream.snapshot",
+                    dispatch_snapshot_event_payload(&snapshot),
+                ),
+            )
+            .await
+            {
+                return;
+            }
+            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+            last_delivered_id = handle.latest_event_id();
+        } else if last_event_id.is_none() {
+            if !send_durable_sse_event(
+                &tx,
+                sse_control_event(
+                    handle.latest_event_id(),
+                    "stream.snapshot",
+                    dispatch_snapshot_event_payload(&snapshot),
+                ),
+            )
+            .await
+            {
+                return;
+            }
+            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+            last_delivered_id = handle.latest_event_id();
+        } else {
+            for event in replay.events {
+                last_delivered_id = event.id;
+                if !send_durable_sse_event(&tx, sse_event_from_buffered(&event)).await {
+                    return;
+                }
+                reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+            }
+            if last_delivered_id == last_event_id.unwrap_or(0) {
+                last_delivered_id = last_delivered_id.min(handle.latest_event_id());
+            }
         }
+
+        let mut last_dispatch_fingerprint = dispatch_state_fingerprint(&snapshot.dispatch);
+        let mut last_hitl_fingerprints = hitl_fingerprint_map(&snapshot.hitl_requests);
+
+        loop {
+            tokio::select! {
+                _ = &mut keepalive => {
+                    let keepalive_id = handle.latest_event_id().max(last_delivered_id);
+                    if !send_durable_sse_event(
+                        &tx,
+                        sse_control_event(keepalive_id, "keepalive", serde_json::json!({})),
+                    ).await {
+                        return;
+                    }
+                    reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                }
+                _ = poll.tick() => {
+                    match load_dispatch_stream_snapshot(&state_for_stream, &id).await {
+                        Ok(Some(current)) => {
+                            let dispatch_fingerprint = dispatch_state_fingerprint(&current.dispatch);
+                            if dispatch_fingerprint != last_dispatch_fingerprint {
+                                let _ = handle.publish_if_changed(
+                                    format!("dispatch:{id}:dispatch.updated"),
+                                    dispatch_fingerprint.clone(),
+                                    "dispatch.updated",
+                                    serde_json::to_value(dispatch_record_to_detail_response(&current.dispatch))
+                                        .unwrap_or_else(|_| serde_json::json!({})),
+                                );
+                                last_dispatch_fingerprint = dispatch_fingerprint;
+                            }
+
+                            let mut next_hitl_fingerprints =
+                                HashMap::with_capacity(current.hitl_requests.len());
+                            for hitl in &current.hitl_requests {
+                                let fingerprint = hitl_state_fingerprint(hitl);
+                                let changed = last_hitl_fingerprints
+                                    .get(&hitl.hitl_request_id)
+                                    != Some(&fingerprint);
+                                if changed {
+                                    let event_name = match hitl.status {
+                                        HitlStatus::Pending => Some("hitl.requested"),
+                                        HitlStatus::Answered => Some("hitl.answered"),
+                                        HitlStatus::Cancelled | HitlStatus::TimedOut => None,
+                                    };
+                                    if let Some(event_name) = event_name {
+                                        let _ = handle.publish_if_changed(
+                                            format!("dispatch:{id}:hitl:{}:{event_name}", hitl.hitl_request_id),
+                                            fingerprint.clone(),
+                                            event_name,
+                                            serde_json::to_value(hitl_record_to_detail_response(hitl))
+                                                .unwrap_or_else(|_| serde_json::json!({})),
+                                        );
+                                    }
+                                }
+                                next_hitl_fingerprints.insert(hitl.hitl_request_id.clone(), fingerprint);
+                            }
+                            last_hitl_fingerprints = next_hitl_fingerprints;
+                        }
+                        Ok(None) => return,
+                        Err(error) => {
+                            tracing::warn!("Failed to poll dispatch stream snapshot for {id}: {error}");
+                        }
+                    }
+                }
+                received = receiver.recv() => {
+                    match received {
+                        Ok(event) => {
+                            if event.id <= last_delivered_id {
+                                continue;
+                            }
+                            last_delivered_id = event.id;
+                            if !send_durable_sse_event(&tx, sse_event_from_buffered(&event)).await {
+                                return;
+                            }
+                            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let reset_id = handle.latest_event_id();
+                            if !send_durable_sse_event(
+                                &tx,
+                                sse_control_event(
+                                    reset_id,
+                                    "stream.reset",
+                                    serde_json::json!({ "reason": "receiver_lagged" }),
+                                ),
+                            ).await {
+                                return;
+                            }
+                            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                            match load_dispatch_stream_snapshot(&state_for_stream, &id).await {
+                                Ok(Some(current)) => {
+                                    if !send_durable_sse_event(
+                                        &tx,
+                                        sse_control_event(
+                                            handle.latest_event_id(),
+                                            "stream.snapshot",
+                                            dispatch_snapshot_event_payload(&current),
+                                        ),
+                                    ).await {
+                                        return;
+                                    }
+                                    reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                                }
+                                Ok(None) => return,
+                                Err(error) => {
+                                    tracing::warn!("Failed to refresh dispatch snapshot after lag for {id}: {error}");
+                                }
+                            }
+                            last_delivered_id = handle.latest_event_id();
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    (
+        [
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+        ],
+        Sse::new(stream),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/hitl-requests/stream — Stream global HITL events with bounded replay.
+pub async fn stream_hitl_requests_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HitlListQueryParams>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::sse::Sse;
+
+    let base_query = match hitl_list_query_from_params(params, None) {
+        Ok(query) => query,
+        Err(response) => return response.into_response(),
+    };
+    let filters = HitlStreamFilters {
+        run_id: base_query.run_id.clone(),
+        status: base_query.status,
+    };
+    let mut snapshot_query = base_query.clone();
+    snapshot_query.limit = MAX_PAGE_LIMIT;
+    snapshot_query.offset = 0;
+    let last_event_id = match parse_last_event_id(&headers) {
+        Ok(value) => value,
+        Err(response) => return response.into_response(),
     };
 
-    let snapshot = HitlListResponse {
-        items: page
-            .items
-            .iter()
-            .map(hitl_record_to_detail_response)
-            .collect(),
-        next_cursor: page.next_cursor,
-    };
-    let snapshot_json = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
-    let sse_stream = stream::once(async move {
-        Ok::<Event, std::convert::Infallible>(
-            Event::default()
-                .event("stream.snapshot")
-                .data(snapshot_json),
-        )
-    })
-    .chain(stream::pending::<Result<Event, std::convert::Infallible>>());
+    let handle = Arc::clone(&state.hitl_stream_event_handle);
+    let mut receiver = handle.subscribe();
+    let replay = handle.replay_after(last_event_id);
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >(128);
+    let state_for_stream = Arc::clone(&state);
+    tokio::spawn(async move {
+        let keepalive_interval = Duration::from_secs(15);
+        let keepalive = tokio::time::sleep(keepalive_interval);
+        tokio::pin!(keepalive);
+        let mut poll = tokio::time::interval(DURABLE_STREAM_POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let _ = poll.tick().await;
 
-    Sse::new(sse_stream)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(1))
-                .event(Event::default().event("keepalive").data("{}")),
+        let snapshot_items =
+            match list_hitl_for_stream_query(&state_for_stream, &snapshot_query).await {
+                Ok(records) => records,
+                Err(error) => {
+                    tracing::warn!("Failed to load HITL stream snapshot: {error}");
+                    return;
+                }
+            };
+
+        let mut all_hitl_fingerprints = match list_hitl_for_stream_query(
+            &state_for_stream,
+            &HitlListQuery {
+                limit: MAX_PAGE_LIMIT,
+                offset: 0,
+                run_id: None,
+                dispatch_id: None,
+                status: None,
+                kind: None,
+            },
         )
+        .await
+        {
+            Ok(records) => hitl_fingerprint_map(&records),
+            Err(error) => {
+                tracing::warn!("Failed to load baseline HITL stream state: {error}");
+                HashMap::new()
+            }
+        };
+
+        let mut last_delivered_id = last_event_id.unwrap_or(0);
+        if replay.reset_required {
+            let reset_id = handle.latest_event_id();
+            if !send_durable_sse_event(
+                &tx,
+                sse_control_event(
+                    reset_id,
+                    "stream.reset",
+                    serde_json::json!({
+                        "reason": "last_event_id_expired",
+                        "requested_last_event_id": last_event_id,
+                    }),
+                ),
+            )
+            .await
+            {
+                return;
+            }
+            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+            if !send_durable_sse_event(
+                &tx,
+                sse_control_event(
+                    handle.latest_event_id(),
+                    "stream.snapshot",
+                    serde_json::json!(HitlListResponse {
+                        items: snapshot_items
+                            .iter()
+                            .map(hitl_record_to_detail_response)
+                            .collect(),
+                        next_cursor: None,
+                    }),
+                ),
+            )
+            .await
+            {
+                return;
+            }
+            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+            last_delivered_id = handle.latest_event_id();
+        } else if last_event_id.is_none() {
+            if !send_durable_sse_event(
+                &tx,
+                sse_control_event(
+                    handle.latest_event_id(),
+                    "stream.snapshot",
+                    serde_json::json!(HitlListResponse {
+                        items: snapshot_items
+                            .iter()
+                            .map(hitl_record_to_detail_response)
+                            .collect(),
+                        next_cursor: None,
+                    }),
+                ),
+            )
+            .await
+            {
+                return;
+            }
+            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+            last_delivered_id = handle.latest_event_id();
+        } else {
+            for event in replay.events {
+                if !hitl_stream_event_matches_filters(&event, &filters) {
+                    continue;
+                }
+                last_delivered_id = event.id;
+                if !send_durable_sse_event(&tx, sse_event_from_buffered(&event)).await {
+                    return;
+                }
+                reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+            }
+            if last_delivered_id == last_event_id.unwrap_or(0) {
+                last_delivered_id = last_delivered_id.min(handle.latest_event_id());
+            }
+        }
+
+        loop {
+            tokio::select! {
+                _ = &mut keepalive => {
+                    let keepalive_id = handle.latest_event_id().max(last_delivered_id);
+                    if !send_durable_sse_event(
+                        &tx,
+                        sse_control_event(keepalive_id, "keepalive", serde_json::json!({})),
+                    ).await {
+                        return;
+                    }
+                    reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                }
+                _ = poll.tick() => {
+                    let all_query = HitlListQuery {
+                        limit: MAX_PAGE_LIMIT,
+                        offset: 0,
+                        run_id: None,
+                        dispatch_id: None,
+                        status: None,
+                        kind: None,
+                    };
+                    match list_hitl_for_stream_query(&state_for_stream, &all_query).await {
+                        Ok(records) => {
+                            let mut next_fingerprints = HashMap::with_capacity(records.len());
+                            for record in &records {
+                                let fingerprint = hitl_state_fingerprint(record);
+                                let changed = all_hitl_fingerprints
+                                    .get(&record.hitl_request_id)
+                                    != Some(&fingerprint);
+                                if changed {
+                                    let event_name = match record.status {
+                                        HitlStatus::Pending => Some("hitl.requested"),
+                                        HitlStatus::Answered => Some("hitl.answered"),
+                                        HitlStatus::Cancelled | HitlStatus::TimedOut => None,
+                                    };
+                                    if let Some(event_name) = event_name {
+                                        let _ = handle.publish_if_changed(
+                                            format!("hitl:{}:{event_name}", record.hitl_request_id),
+                                            fingerprint.clone(),
+                                            event_name,
+                                            serde_json::to_value(hitl_record_to_detail_response(record))
+                                                .unwrap_or_else(|_| serde_json::json!({})),
+                                        );
+                                    }
+                                }
+                                next_fingerprints.insert(record.hitl_request_id.clone(), fingerprint);
+                            }
+                            all_hitl_fingerprints = next_fingerprints;
+                        }
+                        Err(error) => {
+                            tracing::warn!("Failed to poll HITL stream state: {error}");
+                        }
+                    }
+                }
+                received = receiver.recv() => {
+                    match received {
+                        Ok(event) => {
+                            if event.id <= last_delivered_id {
+                                continue;
+                            }
+                            if !hitl_stream_event_matches_filters(&event, &filters) {
+                                continue;
+                            }
+                            last_delivered_id = event.id;
+                            if !send_durable_sse_event(&tx, sse_event_from_buffered(&event)).await {
+                                return;
+                            }
+                            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let reset_id = handle.latest_event_id();
+                            if !send_durable_sse_event(
+                                &tx,
+                                sse_control_event(
+                                    reset_id,
+                                    "stream.reset",
+                                    serde_json::json!({ "reason": "receiver_lagged" }),
+                                ),
+                            ).await {
+                                return;
+                            }
+                            reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                            match list_hitl_for_stream_query(&state_for_stream, &snapshot_query).await {
+                                Ok(records) => {
+                                    if !send_durable_sse_event(
+                                        &tx,
+                                        sse_control_event(
+                                            handle.latest_event_id(),
+                                            "stream.snapshot",
+                                            serde_json::json!(HitlListResponse {
+                                                items: records
+                                                    .iter()
+                                                    .map(hitl_record_to_detail_response)
+                                                    .collect(),
+                                                next_cursor: None,
+                                            }),
+                                        ),
+                                    ).await {
+                                        return;
+                                    }
+                                    reset_durable_keepalive(keepalive.as_mut(), keepalive_interval);
+                                }
+                                Err(error) => {
+                                    tracing::warn!("Failed to refresh HITL snapshot after lag: {error}");
+                                }
+                            }
+                            last_delivered_id = handle.latest_event_id();
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    (
+        [
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+        ],
+        Sse::new(stream),
+    )
         .into_response()
 }
 
@@ -8935,6 +10244,9 @@ pub async fn create_trigger_definition_v1(
             )
         }
     }
+    if let Some(pack) = managed_pack_for_object(&state, PackResourceType::Trigger, &definition.id) {
+        return trigger_pack_conflict_response(&definition.id, Some(&pack.manifest.id));
+    }
 
     let normalized = match normalize_trigger_definition(&definition, &registry) {
         Ok(normalized) => normalized,
@@ -9036,7 +10348,7 @@ pub async fn update_trigger_definition_v1(
         }
     };
     if existing.origin.kind == TriggerOriginKind::Pack {
-        return trigger_pack_conflict_response(&id);
+        return trigger_pack_conflict_response(&id, existing.origin.pack_id.as_deref());
     }
 
     let normalized = match normalize_trigger_definition(&definition, &registry) {
@@ -9094,7 +10406,8 @@ pub async fn delete_trigger_definition_v1(
         }
     };
     if existing.origin.kind == TriggerOriginKind::Pack {
-        return trigger_pack_conflict_response(&id).into_response();
+        return trigger_pack_conflict_response(&id, existing.origin.pack_id.as_deref())
+            .into_response();
     }
 
     match store.delete(&id) {
@@ -9377,7 +10690,8 @@ async fn set_trigger_definition_enabled(
         }
     };
     if resource.origin.kind == TriggerOriginKind::Pack {
-        return trigger_pack_conflict_response(&id).into_response();
+        return trigger_pack_conflict_response(&id, resource.origin.pack_id.as_deref())
+            .into_response();
     }
 
     resource.definition.enabled = enabled;
@@ -12334,6 +13648,1565 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
         )],
         out,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Pack endpoints
+// ---------------------------------------------------------------------------
+
+fn pack_error_response(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    details: Option<serde_json::Value>,
+) -> JsonErrorResponse {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message.into(),
+                "details": details.unwrap_or_else(|| serde_json::json!([])),
+            }
+        })),
+    )
+}
+
+fn pack_not_found_response(pack_id: &str) -> JsonErrorResponse {
+    pack_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Pack not found",
+        Some(serde_json::json!([{
+            "path": "id",
+            "value": pack_id,
+        }])),
+    )
+}
+
+fn pack_object_not_found_response(
+    pack_id: &str,
+    resource_type: PackResourceType,
+    resource_id: &str,
+) -> JsonErrorResponse {
+    pack_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Pack object not found",
+        Some(serde_json::json!([{
+            "pack_id": pack_id,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+        }])),
+    )
+}
+
+fn pack_already_forked_response(pack_id: &str, object: &PackObjectRef) -> JsonErrorResponse {
+    pack_error_response(
+        StatusCode::CONFLICT,
+        "already_forked",
+        "Managed pack object already has a user-owned fork",
+        Some(serde_json::json!([{
+            "pack_id": pack_id,
+            "resource_type": object.resource_type,
+            "resource_id": object.resource_id,
+            "action": "fork",
+        }])),
+    )
+}
+
+fn pack_object_load_error_response(
+    pack_id: &str,
+    object: &PackObjectRef,
+    message: &str,
+    error: impl Into<String>,
+) -> JsonErrorResponse {
+    pack_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "definition_load_failed",
+        message,
+        Some(serde_json::json!([{
+            "pack_id": pack_id,
+            "resource_type": object.resource_type,
+            "resource_id": object.resource_id,
+            "message": error.into(),
+        }])),
+    )
+}
+
+fn pack_definition_persist_error_response(
+    pack_id: &str,
+    object: &PackObjectRef,
+    message: &str,
+    error: impl Into<String>,
+) -> JsonErrorResponse {
+    pack_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "definition_persist_failed",
+        message,
+        Some(serde_json::json!([{
+            "pack_id": pack_id,
+            "resource_type": object.resource_type,
+            "resource_id": object.resource_id,
+            "message": error.into(),
+        }])),
+    )
+}
+
+fn pack_summary_from_installed(pack: &InstalledPack) -> PackSummary {
+    PackSummary {
+        id: pack.manifest.id.clone(),
+        name: pack.manifest.name.clone(),
+        version: pack.manifest.version.clone(),
+        source: pack.manifest.source.clone(),
+        installed: true,
+        managed: true,
+        objects: PackObjectCounts::from_objects(&pack.manifest.objects),
+        updated_at: pack.updated_at.clone(),
+    }
+}
+
+fn pack_detail_from_installed(pack: &InstalledPack) -> PackDetail {
+    PackDetail {
+        manifest: pack.manifest.clone(),
+        installed: true,
+        managed: true,
+        updated_at: pack.updated_at.clone(),
+    }
+}
+
+fn pack_installer_error_response(error: PackInstallerError) -> JsonErrorResponse {
+    match error {
+        PackInstallerError::PackNotFound { pack_id } => pack_not_found_response(&pack_id),
+        PackInstallerError::AlreadyInstalledDifferentVersion {
+            pack_id,
+            current_version,
+            requested_version,
+        } => pack_error_response(
+            StatusCode::CONFLICT,
+            "already_installed",
+            "Pack is already installed at a different version",
+            Some(serde_json::json!([{
+                "pack_id": pack_id,
+                "current_version": current_version,
+                "requested_version": requested_version,
+                "action": "upgrade",
+            }])),
+        ),
+        PackInstallerError::BundledPackVersionNotFound { pack_id, version } => pack_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Bundled pack version is not available",
+            Some(serde_json::json!([{
+                "pack_id": pack_id,
+                "version": version,
+            }])),
+        ),
+        PackInstallerError::ExternalPackNotStaged {
+            pack_id,
+            version,
+            stage_path,
+        } => pack_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "External pack version is not staged locally",
+            Some(serde_json::json!([{
+                "pack_id": pack_id,
+                "version": version,
+                "stage_path": stage_path,
+            }])),
+        ),
+        PackInstallerError::UserForksPresent {
+            pack_id,
+            forked_ids,
+        } => pack_error_response(
+            StatusCode::CONFLICT,
+            "managed_definition_conflict",
+            "Pack has user forks and cannot be uninstalled without force",
+            Some(serde_json::json!([{
+                "pack_id": pack_id,
+                "forked_ids": forked_ids,
+            }])),
+        ),
+        PackInstallerError::InvalidManifest { pack_id, message } => pack_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Pack manifest is invalid",
+            Some(serde_json::json!([{
+                "pack_id": pack_id,
+                "message": message,
+            }])),
+        ),
+        PackInstallerError::InvalidObject {
+            pack_id,
+            resource_type,
+            resource_id,
+            message,
+        } => pack_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Pack object is invalid",
+            Some(serde_json::json!([{
+                "pack_id": pack_id,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "message": message,
+            }])),
+        ),
+        PackInstallerError::PackStore(error) => pack_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pack_state_failed",
+            "Failed to persist pack state",
+            Some(serde_json::json!([{
+                "message": error.to_string(),
+            }])),
+        ),
+        PackInstallerError::CronPersist(message)
+        | PackInstallerError::CronSchedule(message)
+        | PackInstallerError::Filesystem(message)
+        | PackInstallerError::Serialization(message) => pack_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pack_operation_failed",
+            "Pack operation failed",
+            Some(serde_json::json!([{
+                "message": message,
+            }])),
+        ),
+    }
+}
+
+fn pack_action_response(pack_id: &str) -> PackActionResponse {
+    PackActionResponse::accepted(pack_id)
+}
+
+fn pack_json_rejection(rejection: JsonRejection) -> JsonErrorResponse {
+    pack_error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        format!("Invalid JSON body: {rejection}"),
+        None,
+    )
+}
+
+fn pack_json_error_message(response: &(StatusCode, Json<serde_json::Value>)) -> String {
+    let payload = &response.1 .0;
+    serde_json::to_string(payload).unwrap_or_else(|_| "pack refresh failed".to_string())
+}
+
+pub(crate) async fn reload_effective_workflow_definitions(state: &AppState) -> Result<(), String> {
+    let resources = load_all_workflow_definition_resources(state)
+        .map_err(|response| pack_json_error_message(&response))?;
+    let agent_refs = workflow_v2_available_agent_refs(state)
+        .await
+        .map_err(|response| pack_json_error_message(&response))?;
+    state
+        .kernel
+        .workflows
+        .replace_workflow_v2_definitions(
+            resources.into_iter().map(|resource| resource.definition),
+            agent_refs,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn reload_effective_trigger_definitions(state: &AppState) -> Result<(), String> {
+    let definitions = load_all_trigger_definition_resources(state)
+        .map_err(|response| pack_json_error_message(&response))?;
+    let registry = trigger_compile_registry(state)
+        .await
+        .map_err(|response| pack_json_error_message(&response))?;
+    state
+        .kernel
+        .trigger_v2
+        .replace_definitions(
+            definitions
+                .into_iter()
+                .map(|resource| resource.definition)
+                .collect::<Vec<_>>(),
+            &registry,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn reload_effective_pack_runtime_state(state: &AppState) -> Result<(), JsonErrorResponse> {
+    reload_effective_workflow_definitions(state)
+        .await
+        .map_err(|error| {
+            pack_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "definition_reload_failed",
+                "Failed to reload workflow definitions after pack mutation",
+                Some(serde_json::json!([{
+                    "message": error,
+                }])),
+            )
+        })?;
+    reload_effective_trigger_definitions(state)
+        .await
+        .map_err(|error| {
+            pack_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "definition_reload_failed",
+                "Failed to reload trigger definitions after pack mutation",
+                Some(serde_json::json!([{
+                    "message": error,
+                }])),
+            )
+        })?;
+    Ok(())
+}
+
+fn pack_fork_provenance(pack: &InstalledPack, object: &PackObjectRef) -> PackForkedFrom {
+    PackForkedFrom {
+        kind: PackForkOriginKind::Pack,
+        pack_id: pack.manifest.id.clone(),
+        pack_version: pack.manifest.version.clone(),
+        resource_type: object.resource_type,
+        resource_id: object.resource_id.clone(),
+    }
+}
+
+fn pack_fork_response(pack: &InstalledPack, object: &PackObjectRef) -> PackForkResponse {
+    PackForkResponse {
+        id: object.resource_id.clone(),
+        origin: PackForkOrigin::user(),
+        forked_from: pack_fork_provenance(pack, object),
+    }
+}
+
+fn pack_shadow_path(home_dir: &std::path::Path, object: &PackObjectRef) -> PathBuf {
+    home_dir
+        .join(object.resource_type.directory())
+        .join(format!("{}.toml", object.resource_id))
+}
+
+fn pack_object_is_forked(state: &AppState, object: &PackObjectRef) -> bool {
+    let shadow_exists = pack_shadow_path(&state.kernel.config.home_dir, object).exists();
+    if object.resource_type == PackResourceType::Schedule {
+        shadow_exists
+            || state
+                .kernel
+                .cron_scheduler
+                .get_meta_by_definition_id(&object.resource_id)
+                .is_some_and(|meta| meta.origin.kind == CronDefinitionOriginKind::User)
+    } else {
+        shadow_exists
+    }
+}
+
+fn read_pack_object_text(
+    pack: &InstalledPack,
+    object: &PackObjectRef,
+) -> Result<String, JsonErrorResponse> {
+    let path = pack.object_path(object);
+    std::fs::read_to_string(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            pack_error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Managed pack object file not found",
+                Some(serde_json::json!([{
+                    "pack_id": pack.manifest.id.clone(),
+                    "resource_type": object.resource_type,
+                    "resource_id": object.resource_id,
+                    "path": path.display().to_string(),
+                }])),
+            )
+        } else {
+            pack_object_load_error_response(
+                &pack.manifest.id,
+                object,
+                "Failed to read managed pack object",
+                format!("{}: {error}", path.display()),
+            )
+        }
+    })
+}
+
+fn deserialize_pack_agent_definition(
+    pack: &InstalledPack,
+    object: &PackObjectRef,
+) -> Result<AgentDefinition, JsonErrorResponse> {
+    let content = read_pack_object_text(pack, object)?;
+    if let Ok(resource) = toml::from_str::<AgentResponse>(&content) {
+        return Ok(resource.definition);
+    }
+
+    toml::from_str::<AgentDefinition>(&content)
+        .map(stage4_normalize)
+        .map_err(|error| {
+            pack_object_load_error_response(
+                &pack.manifest.id,
+                object,
+                "Managed pack agent definition is invalid",
+                error.to_string(),
+            )
+        })
+}
+
+fn deserialize_pack_workflow_definition(
+    pack: &InstalledPack,
+    object: &PackObjectRef,
+) -> Result<WorkflowV2Definition, JsonErrorResponse> {
+    let content = read_pack_object_text(pack, object)?;
+    if let Ok(resource) = toml::from_str::<WorkflowResponse>(&content) {
+        return Ok(canonicalize_workflow_definition(resource.definition));
+    }
+
+    toml::from_str::<WorkflowV2Definition>(&content)
+        .map(canonicalize_workflow_definition)
+        .map_err(|error| {
+            pack_object_load_error_response(
+                &pack.manifest.id,
+                object,
+                "Managed pack workflow definition is invalid",
+                error.to_string(),
+            )
+        })
+}
+
+fn deserialize_pack_trigger_definition(
+    pack: &InstalledPack,
+    object: &PackObjectRef,
+) -> Result<TriggerV2Definition, JsonErrorResponse> {
+    let content = read_pack_object_text(pack, object)?;
+    if let Ok(resource) = toml::from_str::<TriggerResponse>(&content) {
+        return Ok(canonicalize_trigger_definition(resource.definition));
+    }
+
+    toml::from_str::<TriggerV2Definition>(&content)
+        .map(canonicalize_trigger_definition)
+        .map_err(|error| {
+            pack_object_load_error_response(
+                &pack.manifest.id,
+                object,
+                "Managed pack trigger definition is invalid",
+                error.to_string(),
+            )
+        })
+}
+
+fn deserialize_pack_schedule_definition(
+    pack: &InstalledPack,
+    object: &PackObjectRef,
+) -> Result<ScheduleDefinition, JsonErrorResponse> {
+    let content = read_pack_object_text(pack, object)?;
+    if let Ok(resource) = toml::from_str::<ScheduleResponse>(&content) {
+        return Ok(ScheduleDefinition {
+            agent: resource.agent,
+            name: resource.name,
+            enabled: resource.enabled,
+            schedule: resource.schedule,
+            action: resource.action,
+            delivery: resource.delivery,
+        });
+    }
+
+    toml::from_str::<ScheduleDefinition>(&content).map_err(|error| {
+        pack_object_load_error_response(
+            &pack.manifest.id,
+            object,
+            "Managed pack schedule definition is invalid",
+            error.to_string(),
+        )
+    })
+}
+
+fn deserialize_pack_template_document(
+    pack: &InstalledPack,
+    object: &PackObjectRef,
+) -> Result<toml::Value, JsonErrorResponse> {
+    let content = read_pack_object_text(pack, object)?;
+    toml::from_str::<toml::Value>(&content).map_err(|error| {
+        pack_object_load_error_response(
+            &pack.manifest.id,
+            object,
+            "Managed pack template definition is invalid",
+            error.to_string(),
+        )
+    })
+}
+
+fn persist_pack_shadow_file(path: &std::path::Path, id: &str, payload: &str) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err(format!(
+            "Failed to determine parent directory for '{}'",
+            path.display()
+        ));
+    };
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "Failed to create definition directory '{}': {error}",
+            parent.display()
+        )
+    })?;
+
+    let mut temp_file = tempfile::Builder::new()
+        .prefix(id)
+        .suffix(".toml.tmp")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            format!(
+                "Failed to create temporary definition near '{}': {error}",
+                path.display()
+            )
+        })?;
+    temp_file.write_all(payload.as_bytes()).map_err(|error| {
+        format!(
+            "Failed to write temporary definition '{}': {error}",
+            path.display()
+        )
+    })?;
+    temp_file.flush().map_err(|error| {
+        format!(
+            "Failed to flush temporary definition '{}': {error}",
+            path.display()
+        )
+    })?;
+    temp_file
+        .persist(path)
+        .map_err(|error| format!("Failed to replace definition '{}': {error}", path.display()))?;
+    Ok(())
+}
+
+async fn fork_pack_agent_object(
+    state: &AppState,
+    pack: &InstalledPack,
+    object: &PackObjectRef,
+) -> Result<PackForkResponse, JsonErrorResponse> {
+    let definition = deserialize_pack_agent_definition(pack, object)?;
+    let store = agent_definition_store(state);
+    let context = agent_validation_context(state, &store)?;
+    let (normalized, _compiled) = match prepare_agent_definition(definition, &context) {
+        Ok(prepared) => prepared,
+        Err(AgentPreparationFailure::Validation(issues)) => {
+            return Err(pack_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "definition_load_failed",
+                "Managed pack agent definition is invalid",
+                Some(serde_json::to_value(issues).unwrap_or_else(|_| serde_json::json!([]))),
+            ))
+        }
+        Err(AgentPreparationFailure::Compile(error)) => {
+            return Err(pack_object_load_error_response(
+                &pack.manifest.id,
+                object,
+                "Managed pack agent definition failed compilation",
+                error.to_string(),
+            ))
+        }
+    };
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let resource = AgentResponse {
+        definition: normalized,
+        origin: AgentOrigin::user(),
+        forked_from: Some(AgentForkedFrom {
+            kind: AgentOriginKind::Pack,
+            pack_id: Some(pack.manifest.id.clone()),
+            pack_version: Some(pack.manifest.version.clone()),
+            resource_type: object.resource_type.as_str().to_string(),
+            resource_id: object.resource_id.clone(),
+        }),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+
+    store.persist(&resource).map_err(|error| {
+        pack_definition_persist_error_response(
+            &pack.manifest.id,
+            object,
+            "Failed to persist forked agent definition",
+            error,
+        )
+    })?;
+
+    Ok(pack_fork_response(pack, object))
+}
+
+async fn fork_pack_workflow_object(
+    state: &AppState,
+    pack: &InstalledPack,
+    object: &PackObjectRef,
+) -> Result<PackForkResponse, JsonErrorResponse> {
+    let definition = deserialize_pack_workflow_definition(pack, object)?;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let resource = WorkflowResponse {
+        definition,
+        origin: WorkflowOrigin::user(),
+        forked_from: Some(WorkflowForkedFrom {
+            kind: WorkflowOriginKind::Pack,
+            pack_id: Some(pack.manifest.id.clone()),
+            pack_version: Some(pack.manifest.version.clone()),
+            resource_type: object.resource_type.as_str().to_string(),
+            resource_id: object.resource_id.clone(),
+        }),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+
+    let compiled = compile_workflow_resource(state, &resource).await?;
+    workflow_definition_store(state)
+        .persist(&resource)
+        .map_err(|error| {
+            pack_definition_persist_error_response(
+                &pack.manifest.id,
+                object,
+                "Failed to persist forked workflow definition",
+                error,
+            )
+        })?;
+    state
+        .kernel
+        .workflows
+        .upsert_workflow_v2_definition(resource.definition.clone(), compiled)
+        .await;
+
+    Ok(pack_fork_response(pack, object))
+}
+
+async fn fork_pack_trigger_object(
+    state: &AppState,
+    pack: &InstalledPack,
+    object: &PackObjectRef,
+) -> Result<PackForkResponse, JsonErrorResponse> {
+    let definition = deserialize_pack_trigger_definition(pack, object)?;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let resource = TriggerResponse {
+        definition,
+        origin: TriggerOrigin::user(),
+        forked_from: Some(TriggerForkedFrom {
+            kind: TriggerOriginKind::Pack,
+            pack_id: Some(pack.manifest.id.clone()),
+            pack_version: Some(pack.manifest.version.clone()),
+            resource_type: object.resource_type.as_str().to_string(),
+            resource_id: object.resource_id.clone(),
+        }),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+
+    trigger_definition_store(state)
+        .persist(&resource)
+        .map_err(|error| {
+            pack_definition_persist_error_response(
+                &pack.manifest.id,
+                object,
+                "Failed to persist forked trigger definition",
+                error,
+            )
+        })?;
+
+    let registry = trigger_compile_registry(state).await?;
+    state
+        .kernel
+        .trigger_v2
+        .upsert_definition(resource.definition.clone(), &registry)
+        .await
+        .map_err(apply_trigger_engine_error)?;
+
+    Ok(pack_fork_response(pack, object))
+}
+
+fn schedule_shadow_snapshot(
+    meta: &ScheduleJobMeta,
+    home_dir: &std::path::Path,
+) -> Result<(), String> {
+    let path = home_dir
+        .join(PackResourceType::Schedule.directory())
+        .join(format!("{}.toml", meta.definition_id));
+    let snapshot = schedule_response(meta, &schedule_runtime_snapshot(meta));
+    let payload = toml::to_string_pretty(&snapshot).map_err(|error| {
+        format!(
+            "Failed to serialize schedule shadow '{}': {error}",
+            meta.definition_id
+        )
+    })?;
+    persist_pack_shadow_file(&path, &meta.definition_id, &payload)
+}
+
+async fn fork_pack_schedule_object(
+    state: &AppState,
+    pack: &InstalledPack,
+    object: &PackObjectRef,
+) -> Result<PackForkResponse, JsonErrorResponse> {
+    let definition = deserialize_pack_schedule_definition(pack, object)?;
+    let definition_value = serde_json::to_value(&definition).map_err(|error| {
+        pack_object_load_error_response(
+            &pack.manifest.id,
+            object,
+            "Failed to normalize managed pack schedule definition",
+            error.to_string(),
+        )
+    })?;
+    let (issues, validated) = validate_schedule_definition_value(state, &definition_value);
+    let Some(validated) = validated else {
+        return Err(pack_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "definition_load_failed",
+            "Managed pack schedule definition is invalid",
+            Some(serde_json::to_value(issues).unwrap_or_else(|_| serde_json::json!([]))),
+        ));
+    };
+
+    let mut meta = schedule_definition_to_meta(object.resource_id.clone(), validated, None);
+    meta.origin = CronDefinitionOrigin::user();
+    meta.forked_from = Some(CronDefinitionForkedFrom {
+        kind: CronDefinitionOriginKind::Pack,
+        pack_id: Some(pack.manifest.id.clone()),
+        pack_version: Some(pack.manifest.version.clone()),
+        resource_type: object.resource_type.as_str().to_string(),
+        resource_id: object.resource_id.clone(),
+    });
+
+    state
+        .kernel
+        .cron_scheduler
+        .add_job_meta(meta.clone())
+        .map_err(|error| {
+            pack_object_load_error_response(
+                &pack.manifest.id,
+                object,
+                "Managed pack schedule definition is invalid",
+                error.to_string(),
+            )
+        })?;
+
+    if let Err(error) = state.kernel.cron_scheduler.persist() {
+        let _ = state
+            .kernel
+            .cron_scheduler
+            .remove_job_by_definition_id(&object.resource_id);
+        return Err(pack_definition_persist_error_response(
+            &pack.manifest.id,
+            object,
+            "Failed to persist forked schedule definition",
+            error.to_string(),
+        ));
+    }
+
+    if let Err(error) = schedule_shadow_snapshot(&meta, &state.kernel.config.home_dir) {
+        let _ = state
+            .kernel
+            .cron_scheduler
+            .remove_job_by_definition_id(&object.resource_id);
+        let _ = state.kernel.cron_scheduler.persist();
+        return Err(pack_definition_persist_error_response(
+            &pack.manifest.id,
+            object,
+            "Failed to persist forked schedule shadow file",
+            error,
+        ));
+    }
+
+    Ok(pack_fork_response(pack, object))
+}
+
+async fn fork_pack_template_object(
+    state: &AppState,
+    pack: &InstalledPack,
+    object: &PackObjectRef,
+) -> Result<PackForkResponse, JsonErrorResponse> {
+    let mut document = deserialize_pack_template_document(pack, object)?;
+    let Some(table) = document.as_table_mut() else {
+        return Err(pack_object_load_error_response(
+            &pack.manifest.id,
+            object,
+            "Managed pack template definition is invalid",
+            "template document must be a TOML table",
+        ));
+    };
+
+    table.insert(
+        "origin".to_string(),
+        toml::Value::Table(toml::map::Map::from_iter([(
+            "kind".to_string(),
+            toml::Value::String("user".to_string()),
+        )])),
+    );
+    table.insert(
+        "forked_from".to_string(),
+        toml::Value::Table(toml::map::Map::from_iter([
+            ("kind".to_string(), toml::Value::String("pack".to_string())),
+            (
+                "pack_id".to_string(),
+                toml::Value::String(pack.manifest.id.clone()),
+            ),
+            (
+                "pack_version".to_string(),
+                toml::Value::String(pack.manifest.version.clone()),
+            ),
+            (
+                "resource_type".to_string(),
+                toml::Value::String(object.resource_type.as_str().to_string()),
+            ),
+            (
+                "resource_id".to_string(),
+                toml::Value::String(object.resource_id.clone()),
+            ),
+        ])),
+    );
+
+    let payload = toml::to_string_pretty(&document).map_err(|error| {
+        pack_definition_persist_error_response(
+            &pack.manifest.id,
+            object,
+            "Failed to serialize forked template definition",
+            error.to_string(),
+        )
+    })?;
+    let path = pack_shadow_path(&state.kernel.config.home_dir, object);
+    persist_pack_shadow_file(&path, &object.resource_id, &payload).map_err(|error| {
+        pack_definition_persist_error_response(
+            &pack.manifest.id,
+            object,
+            "Failed to persist forked template definition",
+            error,
+        )
+    })?;
+
+    Ok(pack_fork_response(pack, object))
+}
+
+/// GET /api/v1/packs — List installed packs discovered at boot.
+pub async fn list_packs_v1(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PackListQueryParams>,
+) -> impl IntoResponse {
+    let limit = match parse_pagination_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
+    let offset = match parse_cursor_offset(params.cursor.as_deref()) {
+        Ok(offset) => offset,
+        Err(response) => return response,
+    };
+
+    let mut items = state
+        .pack_registry
+        .list_packs()
+        .into_iter()
+        .map(|pack| pack_summary_from_installed(&pack))
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let next_cursor = if offset + limit < items.len() {
+        Some((offset + limit).to_string())
+    } else {
+        None
+    };
+    let items = items
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(PackListResponse { items, next_cursor })),
+    )
+}
+
+/// GET /api/v1/packs/{id} — Load one installed pack manifest and metadata.
+pub async fn get_pack_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.pack_registry.get_pack(&id) {
+        Some(pack) => (
+            StatusCode::OK,
+            Json(serde_json::json!(pack_detail_from_installed(&pack))),
+        )
+            .into_response(),
+        None => pack_not_found_response(&id).into_response(),
+    }
+}
+
+/// POST /api/v1/packs/install — Install one pack from a bundled or external source.
+pub async fn install_pack_v1(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<PackInstallRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return pack_json_rejection(rejection).into_response(),
+    };
+
+    let _agent_guard = AGENT_DEFINITION_WRITE_LOCK.lock().await;
+    let _workflow_guard = WORKFLOW_DEFINITION_WRITE_LOCK.lock().await;
+    let _trigger_guard = TRIGGER_DEFINITION_WRITE_LOCK.lock().await;
+    let _schedule_guard = SCHEDULE_DEFINITION_WRITE_LOCK.lock().await;
+    let _template_guard = PACK_TEMPLATE_WRITE_LOCK.lock().await;
+
+    match PackInstaller::new(&state.kernel).install(&request.source) {
+        Ok(record) => match reload_effective_pack_runtime_state(&state).await {
+            Ok(()) => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!(pack_action_response(&record.pack_id))),
+            )
+                .into_response(),
+            Err(response) => response.into_response(),
+        },
+        Err(error) => pack_installer_error_response(error).into_response(),
+    }
+}
+
+/// POST /api/v1/packs/{id}/upgrade/dry-run — Diff one explicit pack upgrade without mutating.
+pub async fn upgrade_pack_dry_run_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<PackUpgradeRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return pack_json_rejection(rejection).into_response(),
+    };
+
+    match PackInstaller::new(&state.kernel).upgrade_dry_run(&id, &request.target_version) {
+        Ok(response) => (StatusCode::OK, Json(serde_json::json!(response))).into_response(),
+        Err(error) => pack_installer_error_response(error).into_response(),
+    }
+}
+
+/// POST /api/v1/packs/{id}/upgrade — Apply one explicit pack upgrade.
+pub async fn upgrade_pack_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<PackUpgradeRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return pack_json_rejection(rejection).into_response(),
+    };
+
+    let _agent_guard = AGENT_DEFINITION_WRITE_LOCK.lock().await;
+    let _workflow_guard = WORKFLOW_DEFINITION_WRITE_LOCK.lock().await;
+    let _trigger_guard = TRIGGER_DEFINITION_WRITE_LOCK.lock().await;
+    let _schedule_guard = SCHEDULE_DEFINITION_WRITE_LOCK.lock().await;
+    let _template_guard = PACK_TEMPLATE_WRITE_LOCK.lock().await;
+
+    match PackInstaller::new(&state.kernel).upgrade(&id, &request.target_version) {
+        Ok(record) => match reload_effective_pack_runtime_state(&state).await {
+            Ok(()) => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!(pack_action_response(&record.pack_id))),
+            )
+                .into_response(),
+            Err(response) => response.into_response(),
+        },
+        Err(error) => pack_installer_error_response(error).into_response(),
+    }
+}
+
+/// POST /api/v1/packs/{id}/uninstall — Remove one installed pack and its managed definitions.
+pub async fn uninstall_pack_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<PackUninstallRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return pack_json_rejection(rejection).into_response(),
+    };
+
+    let _agent_guard = AGENT_DEFINITION_WRITE_LOCK.lock().await;
+    let _workflow_guard = WORKFLOW_DEFINITION_WRITE_LOCK.lock().await;
+    let _trigger_guard = TRIGGER_DEFINITION_WRITE_LOCK.lock().await;
+    let _schedule_guard = SCHEDULE_DEFINITION_WRITE_LOCK.lock().await;
+    let _template_guard = PACK_TEMPLATE_WRITE_LOCK.lock().await;
+
+    match PackInstaller::new(&state.kernel).uninstall(&id, request.force) {
+        Ok(()) => match reload_effective_pack_runtime_state(&state).await {
+            Ok(()) => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!(pack_action_response(&id))),
+            )
+                .into_response(),
+            Err(response) => response.into_response(),
+        },
+        Err(error) => pack_installer_error_response(error).into_response(),
+    }
+}
+
+/// GET /api/v1/packs/{id}/objects — List managed objects within one pack.
+pub async fn list_pack_objects_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<PackListQueryParams>,
+) -> impl IntoResponse {
+    let limit = match parse_pagination_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
+    let offset = match parse_cursor_offset(params.cursor.as_deref()) {
+        Ok(offset) => offset,
+        Err(response) => return response,
+    };
+
+    let Some(pack) = state.pack_registry.get_pack(&id) else {
+        return pack_not_found_response(&id);
+    };
+
+    let mut items = pack
+        .manifest
+        .objects
+        .iter()
+        .cloned()
+        .map(|object| PackObjectSummary {
+            forked: pack_object_is_forked(&state, &object),
+            object,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        left.object
+            .resource_type
+            .cmp(&right.object.resource_type)
+            .then(left.object.resource_id.cmp(&right.object.resource_id))
+    });
+
+    let next_cursor = if offset + limit < items.len() {
+        Some((offset + limit).to_string())
+    } else {
+        None
+    };
+    let items = items
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(PackObjectListResponse {
+            items,
+            next_cursor,
+        })),
+    )
+}
+
+/// POST /api/v1/packs/{id}/fork — Create a same-ID user shadow for one managed object.
+pub async fn fork_pack_object_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<PackForkRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return pack_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("Invalid JSON body: {rejection}"),
+                None,
+            )
+            .into_response()
+        }
+    };
+
+    if request.mode != "shadow" {
+        return pack_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Pack forks currently support only `shadow` mode",
+            Some(serde_json::json!([{
+                "path": "mode",
+                "value": request.mode,
+            }])),
+        )
+        .into_response();
+    }
+
+    let Some(pack) = state.pack_registry.get_pack(&id) else {
+        return pack_not_found_response(&id).into_response();
+    };
+    let Some(object) = pack
+        .manifest
+        .objects
+        .iter()
+        .find(|object| {
+            object.resource_type == request.resource_type
+                && object.resource_id == request.resource_id
+        })
+        .cloned()
+    else {
+        return pack_object_not_found_response(&id, request.resource_type, &request.resource_id)
+            .into_response();
+    };
+
+    let fork_result = match object.resource_type {
+        PackResourceType::Agent => {
+            let _write_guard = AGENT_DEFINITION_WRITE_LOCK.lock().await;
+            if pack_object_is_forked(&state, &object) {
+                return pack_already_forked_response(&id, &object).into_response();
+            }
+            fork_pack_agent_object(&state, &pack, &object).await
+        }
+        PackResourceType::Workflow => {
+            let _write_guard = WORKFLOW_DEFINITION_WRITE_LOCK.lock().await;
+            if pack_object_is_forked(&state, &object) {
+                return pack_already_forked_response(&id, &object).into_response();
+            }
+            fork_pack_workflow_object(&state, &pack, &object).await
+        }
+        PackResourceType::Trigger => {
+            let _write_guard = TRIGGER_DEFINITION_WRITE_LOCK.lock().await;
+            if pack_object_is_forked(&state, &object) {
+                return pack_already_forked_response(&id, &object).into_response();
+            }
+            fork_pack_trigger_object(&state, &pack, &object).await
+        }
+        PackResourceType::Schedule => {
+            let _write_guard = SCHEDULE_DEFINITION_WRITE_LOCK.lock().await;
+            if pack_object_is_forked(&state, &object) {
+                return pack_already_forked_response(&id, &object).into_response();
+            }
+            fork_pack_schedule_object(&state, &pack, &object).await
+        }
+        PackResourceType::Template => {
+            let _write_guard = PACK_TEMPLATE_WRITE_LOCK.lock().await;
+            if pack_object_is_forked(&state, &object) {
+                return pack_already_forked_response(&id, &object).into_response();
+            }
+            fork_pack_template_object(&state, &pack, &object).await
+        }
+    };
+
+    match fork_result {
+        Ok(response) => match PackInstaller::new(&state.kernel).sync_pack_record(&id) {
+            Ok(_) => (StatusCode::OK, Json(serde_json::json!(response))).into_response(),
+            Err(error) => pack_installer_error_response(error).into_response(),
+        },
+        Err(response) => response.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod pack_route_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use openfang_agent_definition::{CapabilitiesBlock, PromptBlock, ProviderBlock, RuntimeBlock};
+    use openfang_types::config::{DefaultModelConfig, KernelConfig};
+    use pretty_assertions::assert_eq;
+    use serde::Serialize;
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    struct PackRouteTestContext {
+        state: Arc<AppState>,
+        _tmp: TempDir,
+    }
+
+    impl Drop for PackRouteTestContext {
+        fn drop(&mut self) {
+            self.state.kernel.shutdown();
+        }
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("parent directory should exist");
+        }
+        fs::write(path, content).expect("fixture file should be written");
+    }
+
+    fn write_toml_file<T: Serialize>(path: &Path, value: &T) {
+        let payload = toml::to_string_pretty(value).expect("fixture should serialize to TOML");
+        write_file(path, &payload);
+    }
+
+    fn pack_agent_definition(id: &str, name: &str) -> AgentDefinition {
+        AgentDefinition {
+            id: id.to_string(),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            description: format!("Pack fixture agent {name}"),
+            enabled: Some(true),
+            group: Some("packs".to_string()),
+            tags: vec!["packs".to_string()],
+            provider: ProviderBlock {
+                driver: "claude_code".to_string(),
+                model: "sonnet".to_string(),
+                ..ProviderBlock::default()
+            },
+            prompt: PromptBlock::default(),
+            capabilities: CapabilitiesBlock::default(),
+            runtime: RuntimeBlock::default(),
+            input: None,
+            output: None,
+        }
+    }
+
+    fn noop_workflow_definition(id: &str, name: &str) -> WorkflowV2Definition {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": name,
+            "version": "1.0.0",
+            "description": format!("Pack workflow {name}"),
+            "enabled": true,
+            "tags": ["packs"],
+            "input": {
+                "kind": "object",
+                "required": [],
+                "open": true,
+                "fields": {}
+            },
+            "output": {
+                "kind": "object",
+                "required": ["result"],
+                "open": false,
+                "fields": {
+                    "result": { "kind": "string" }
+                }
+            },
+            "steps": [{
+                "id": "noop-step",
+                "name": "Noop Step",
+                "kind": "noop",
+                "save_as": "result",
+                "flow": { "mode": "sequential" }
+            }],
+            "outputs": {
+                "result": "{{ vars.result }}"
+            }
+        }))
+        .expect("workflow fixture should deserialize")
+    }
+
+    fn trigger_definition(id: &str, workflow_id: &str) -> TriggerV2Definition {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": format!("Trigger {id}"),
+            "description": "Pack trigger fixture",
+            "enabled": true,
+            "max_fires": 0,
+            "cooldown_secs": 0,
+            "match": {
+                "event": "issue.created",
+                "source": "tests",
+                "filters": {}
+            },
+            "target": {
+                "kind": "workflow_start",
+                "workflow": workflow_id,
+                "input": {
+                    "issue_id": "{{ event.issue_id }}"
+                }
+            }
+        }))
+        .expect("trigger fixture should deserialize")
+    }
+
+    fn schedule_definition(agent: &str, workflow_id: &str) -> ScheduleDefinition {
+        serde_json::from_value(json!({
+            "agent": agent,
+            "name": "Analytics Daily",
+            "enabled": true,
+            "schedule": {
+                "kind": "cron",
+                "expr": "0 9 * * *",
+                "tz": "UTC"
+            },
+            "action": {
+                "kind": "workflow_run",
+                "workflow_id": workflow_id,
+                "input": {
+                    "scope": "packs"
+                },
+                "timeout_secs": 120
+            },
+            "delivery": {
+                "kind": "none"
+            }
+        }))
+        .expect("schedule fixture should deserialize")
+    }
+
+    fn user_agent_resource(id: &str, name: &str) -> AgentResponse {
+        AgentResponse {
+            definition: stage4_normalize(pack_agent_definition(id, name)),
+            origin: AgentOrigin::user(),
+            forked_from: None,
+            created_at: "2026-03-25T12:00:00Z".to_string(),
+            updated_at: "2026-03-25T12:00:00Z".to_string(),
+        }
+    }
+
+    fn user_workflow_resource(id: &str, name: &str) -> WorkflowResponse {
+        WorkflowResponse {
+            definition: canonicalize_workflow_definition(noop_workflow_definition(id, name)),
+            origin: WorkflowOrigin::user(),
+            forked_from: None,
+            created_at: "2026-03-25T12:00:00Z".to_string(),
+            updated_at: "2026-03-25T12:00:00Z".to_string(),
+        }
+    }
+
+    fn seed_pack_fixtures(home_dir: &Path) {
+        write_toml_file(
+            &home_dir.join("agents/schedule-runner.toml"),
+            &user_agent_resource("schedule-runner", "Schedule Runner"),
+        );
+
+        let analytics_manifest = PackManifest {
+            id: "analytics".to_string(),
+            name: "Analytics".to_string(),
+            version: "1.2.0".to_string(),
+            description: "Analytics pack fixture".to_string(),
+            source: PackSource {
+                kind: PackSourceKind::Bundled,
+            },
+            objects: vec![
+                PackObjectRef {
+                    resource_type: PackResourceType::Agent,
+                    resource_id: "analytics-agent".to_string(),
+                },
+                PackObjectRef {
+                    resource_type: PackResourceType::Workflow,
+                    resource_id: "analytics-main".to_string(),
+                },
+                PackObjectRef {
+                    resource_type: PackResourceType::Trigger,
+                    resource_id: "analytics-trigger".to_string(),
+                },
+                PackObjectRef {
+                    resource_type: PackResourceType::Schedule,
+                    resource_id: "analytics-daily".to_string(),
+                },
+                PackObjectRef {
+                    resource_type: PackResourceType::Template,
+                    resource_id: "analytics-template".to_string(),
+                },
+            ],
+        };
+        write_toml_file(
+            &home_dir.join("packs/analytics/pack.toml"),
+            &analytics_manifest,
+        );
+        write_toml_file(
+            &home_dir.join("packs/analytics/agents/analytics-agent.toml"),
+            &pack_agent_definition("analytics-agent", "Analytics Agent"),
+        );
+        write_toml_file(
+            &home_dir.join("packs/analytics/workflows/analytics-main.toml"),
+            &noop_workflow_definition("analytics-main", "Analytics Main"),
+        );
+        write_toml_file(
+            &home_dir.join("packs/analytics/triggers/analytics-trigger.toml"),
+            &trigger_definition("analytics-trigger", "analytics-main"),
+        );
+        write_toml_file(
+            &home_dir.join("packs/analytics/schedules/analytics-daily.toml"),
+            &schedule_definition("schedule-runner", "analytics-main"),
+        );
+        write_file(
+            &home_dir.join("packs/analytics/templates/analytics-template.toml"),
+            "title = \"Analytics Template\"\nbody = \"analytics\"\n",
+        );
+
+        let sdlc_manifest = PackManifest {
+            id: "sdlc".to_string(),
+            name: "SDLC".to_string(),
+            version: "2.0.0".to_string(),
+            description: "SDLC pack fixture".to_string(),
+            source: PackSource {
+                kind: PackSourceKind::External,
+            },
+            objects: vec![PackObjectRef {
+                resource_type: PackResourceType::Workflow,
+                resource_id: "sdlc-main".to_string(),
+            }],
+        };
+        write_toml_file(&home_dir.join("packs/sdlc/pack.toml"), &sdlc_manifest);
+        write_toml_file(
+            &home_dir.join("packs/sdlc/workflows/sdlc-main.toml"),
+            &noop_workflow_definition("sdlc-main", "SDLC Main"),
+        );
+    }
+
+    async fn route_test_context() -> PackRouteTestContext {
+        let tmp = tempfile::tempdir().expect("temporary directory should be created");
+        seed_pack_fixtures(tmp.path());
+
+        let config = KernelConfig {
+            home_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().join("data"),
+            default_model: DefaultModelConfig {
+                provider: "ollama".to_string(),
+                model: "test-model".to_string(),
+                api_key_env: "OLLAMA_API_KEY".to_string(),
+                base_url: None,
+            },
+            ..KernelConfig::default()
+        };
+
+        let kernel =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel should boot"));
+        kernel.set_self_handle();
+        kernel.bootstrap_workflow_definitions().await;
+
+        let state = Arc::new(AppState {
+            pack_registry: state_kernel_pack_registry(&kernel),
+            kernel,
+            started_at: Instant::now(),
+            peer_registry: None,
+            looper_runtime_registry: Arc::new(LooperRuntimeRegistry::new()),
+            run_event_stream_registry: Arc::new(RunEventStreamRegistry::default()),
+            dispatch_event_stream_registry: Arc::new(DispatchEventStreamRegistry::default()),
+            hitl_stream_event_handle: Arc::new(HitlStreamEventHandle::new()),
+            bridge_manager: tokio::sync::Mutex::new(None),
+            channels_config: tokio::sync::RwLock::new(Default::default()),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            clawhub_cache: DashMap::new(),
+            provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        });
+
+        PackRouteTestContext { state, _tmp: tmp }
+    }
+
+    async fn json_response(response: impl IntoResponse) -> (StatusCode, Value) {
+        let response = response.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let json = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body should be valid JSON")
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn list_packs_v1_should_return_items_and_next_cursor_shape() {
+        let context = route_test_context().await;
+
+        let (status, body) = json_response(
+            list_packs_v1(
+                State(Arc::clone(&context.state)),
+                Query(PackListQueryParams {
+                    limit: Some(1),
+                    cursor: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let items = body["items"]
+            .as_array()
+            .expect("pack list should include an items array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], json!("analytics"));
+        assert_eq!(items[0]["objects"]["agents"], json!(1));
+        assert_eq!(items[0]["objects"]["workflows"], json!(1));
+        assert_eq!(items[0]["objects"]["triggers"], json!(1));
+        assert_eq!(items[0]["objects"]["schedules"], json!(1));
+        assert_eq!(items[0]["objects"]["templates"], json!(1));
+        assert_eq!(body["next_cursor"], json!("1"));
+    }
+
+    #[tokio::test]
+    async fn get_pack_v1_should_return_not_found_for_unknown_id() {
+        let context = route_test_context().await;
+
+        let (status, body) = json_response(
+            get_pack_v1(
+                State(Arc::clone(&context.state)),
+                Path("missing-pack".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("not_found"));
+    }
+
+    #[tokio::test]
+    async fn list_pack_objects_v1_should_mark_existing_shadow_as_forked() {
+        let context = route_test_context().await;
+        write_toml_file(
+            &context
+                .state
+                .kernel
+                .config
+                .home_dir
+                .join("workflows/analytics-main.toml"),
+            &user_workflow_resource("analytics-main", "Analytics Main"),
+        );
+
+        let (status, body) = json_response(
+            list_pack_objects_v1(
+                State(Arc::clone(&context.state)),
+                Path("analytics".to_string()),
+                Query(PackListQueryParams::default()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let workflow_item = body["items"]
+            .as_array()
+            .expect("pack object list should include items")
+            .iter()
+            .find(|item| item["resource_type"] == json!("workflow"))
+            .expect("workflow object should be present");
+        assert_eq!(workflow_item["resource_id"], json!("analytics-main"));
+        assert_eq!(workflow_item["forked"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn fork_pack_object_v1_should_create_user_owned_shadow() {
+        let context = route_test_context().await;
+
+        let (status, body) = json_response(
+            fork_pack_object_v1(
+                State(Arc::clone(&context.state)),
+                Path("analytics".to_string()),
+                Ok(Json(PackForkRequest {
+                    resource_type: PackResourceType::Workflow,
+                    resource_id: "analytics-main".to_string(),
+                    mode: "shadow".to_string(),
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], json!("analytics-main"));
+        assert_eq!(body["origin"]["kind"], json!("user"));
+        assert_eq!(body["forked_from"]["kind"], json!("pack"));
+        assert_eq!(body["forked_from"]["pack_id"], json!("analytics"));
+        assert_eq!(body["forked_from"]["resource_type"], json!("workflow"));
+
+        let persisted = std::fs::read_to_string(
+            context
+                .state
+                .kernel
+                .config
+                .home_dir
+                .join("workflows/analytics-main.toml"),
+        )
+        .expect("forked workflow file should exist");
+        let resource: WorkflowResponse =
+            toml::from_str(&persisted).expect("forked workflow should deserialize");
+        assert_eq!(resource.origin.kind, WorkflowOriginKind::User);
+        assert_eq!(
+            resource
+                .forked_from
+                .expect("fork provenance should exist")
+                .pack_id,
+            Some("analytics".to_string())
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -17467,7 +20340,7 @@ fn resolve_schedule_agent_reference(
         });
     }
 
-    if let Ok(definitions) = agent_definition_store(state).list() {
+    if let Ok(definitions) = load_all_agent_definition_resources(state) {
         if let Some(resource) = definitions
             .into_iter()
             .find(|resource| resource.definition.name == value)
@@ -21571,10 +24444,14 @@ mod agent_definition_route_tests {
             openfang_skills::registry::SkillRegistry::new(tmp.path().join("skills"));
 
         let state = Arc::new(AppState {
+            pack_registry: state_kernel_pack_registry(&kernel),
             kernel,
             started_at: Instant::now(),
             peer_registry: None,
             looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
+            run_event_stream_registry: Arc::new(RunEventStreamRegistry::default()),
+            dispatch_event_stream_registry: Arc::new(DispatchEventStreamRegistry::default()),
+            hitl_stream_event_handle: Arc::new(HitlStreamEventHandle::new()),
             bridge_manager: tokio::sync::Mutex::new(None),
             channels_config: tokio::sync::RwLock::new(Default::default()),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -22337,6 +25214,64 @@ mod agent_definition_route_tests {
         assert!(body.contains("\"code\":\"not_found\""));
     }
 
+    #[test]
+    fn message_stream_completion_events_should_backfill_missing_delta_for_non_empty_content() {
+        let session_id = SessionId::new();
+        let usage = TokenUsage {
+            input_tokens: 7,
+            output_tokens: 3,
+        };
+
+        let events = message_stream_completion_events(
+            &session_id,
+            "message-1",
+            "hello there",
+            &usage,
+            false,
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "message.delta");
+        assert_eq!(events[0].data["delta"], json!("hello there"));
+        assert_eq!(events[1].event, "message.completed");
+        assert_eq!(events[1].data["content"], json!("hello there"));
+        assert_eq!(events[1].data["usage"]["input_tokens"], json!(7));
+        assert_eq!(events[1].data["usage"]["output_tokens"], json!(3));
+    }
+
+    #[test]
+    fn message_stream_completion_events_should_backfill_empty_delta_for_empty_content() {
+        let session_id = SessionId::new();
+        let usage = TokenUsage {
+            input_tokens: 2,
+            output_tokens: 0,
+        };
+
+        let events = message_stream_completion_events(&session_id, "message-0", "", &usage, false);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "message.delta");
+        assert_eq!(events[0].data["delta"], json!(""));
+        assert_eq!(events[1].event, "message.completed");
+        assert_eq!(events[1].data["content"], json!(""));
+    }
+
+    #[test]
+    fn message_stream_completion_events_should_not_duplicate_existing_text_delta() {
+        let session_id = SessionId::new();
+        let usage = TokenUsage {
+            input_tokens: 5,
+            output_tokens: 2,
+        };
+
+        let events =
+            message_stream_completion_events(&session_id, "message-2", "done", &usage, true);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "message.completed");
+        assert_eq!(events[0].data["content"], json!("done"));
+    }
+
     fn noop_workflow_definition(id: &str) -> openfang_types::workflow::WorkflowV2Definition {
         serde_json::from_value(json!({
             "id": id,
@@ -22721,10 +25656,14 @@ mod trigger_definition_route_tests {
         kernel.bootstrap_workflow_definitions().await;
 
         let state = Arc::new(AppState {
+            pack_registry: state_kernel_pack_registry(&kernel),
             kernel,
             started_at: Instant::now(),
             peer_registry: None,
             looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
+            run_event_stream_registry: Arc::new(RunEventStreamRegistry::default()),
+            dispatch_event_stream_registry: Arc::new(DispatchEventStreamRegistry::default()),
+            hitl_stream_event_handle: Arc::new(HitlStreamEventHandle::new()),
             bridge_manager: tokio::sync::Mutex::new(None),
             channels_config: tokio::sync::RwLock::new(Default::default()),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -23041,10 +25980,14 @@ mod task_control_plane_route_tests {
         kernel.bootstrap_workflow_definitions().await;
 
         let state = Arc::new(AppState {
+            pack_registry: state_kernel_pack_registry(&kernel),
             kernel,
             started_at: Instant::now(),
             peer_registry: None,
             looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
+            run_event_stream_registry: Arc::new(RunEventStreamRegistry::default()),
+            dispatch_event_stream_registry: Arc::new(DispatchEventStreamRegistry::default()),
+            hitl_stream_event_handle: Arc::new(HitlStreamEventHandle::new()),
             bridge_manager: tokio::sync::Mutex::new(None),
             channels_config: tokio::sync::RwLock::new(Default::default()),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),

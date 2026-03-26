@@ -19,6 +19,8 @@ pub mod heartbeat;
 pub mod kernel;
 pub mod looper;
 pub mod metering;
+pub mod pack_installer;
+pub mod pack_registry;
 pub mod pairing;
 pub mod registry;
 pub mod scheduler;

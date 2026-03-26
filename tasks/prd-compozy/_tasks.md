@@ -38,10 +38,10 @@
 - [x] [_task_34.md](_task_34.md) — Task 34.0: Looper Durable Schema And Runtime
 - [x] [_task_35.md](_task_35.md) — Task 35.0: Trigger v2 Types And Definition CRUD
 - [x] [_task_36.md](_task_36.md) — Task 36.0: Event Ingress Pipeline And Match Engine
-- [ ] [_task_37.md](_task_37.md) — Task 37.0: Artifact And Doc Versioning
+- [x] [_task_37.md](_task_37.md) — Task 37.0: Artifact And Doc Versioning
 - [ ] [_task_38.md](_task_38.md) — Task 38.0: Artifact And Doc Standalone Read Endpoints
-- [ ] [_task_39.md](_task_39.md) — Task 39.0: Looper Control-Plane And SSE Surfaces
+- [x] [_task_39.md](_task_39.md) — Task 39.0: Looper Control-Plane And SSE Surfaces
 - [ ] [_task_40.md](_task_40.md) — Task 40.0: Pack List Detail And CRUD Endpoints
 - [ ] [_task_41.md](_task_41.md) — Task 41.0: Pack System Install Upgrade And Bootstrap
-- [ ] [_task_42.md](_task_42.md) — Task 42.0: Retention Policies And Remaining SSE Endpoints
-- [ ] [_task_43.md](_task_43.md) — Task 43.0: E2E Integration Test And Restart Recovery Regression
+- [x] [_task_42.md](_task_42.md) — Task 42.0: Retention Policies And Remaining SSE Endpoints
+- [x] [_task_43.md](_task_43.md) — Task 43.0: E2E Integration Test And Restart Recovery Regression

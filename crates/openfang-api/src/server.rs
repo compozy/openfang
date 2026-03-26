@@ -1,16 +1,12 @@
 //! OpenFang daemon server — boots the kernel and serves the HTTP API.
 
-use crate::agent_definitions::AgentDefinitionStore;
 use crate::channel_bridge;
 use crate::middleware;
 use crate::rate_limiter;
 use crate::routes::{self, AppState};
-use crate::trigger_definitions::TriggerDefinitionStore;
 use crate::webchat;
-use crate::workflow_definitions::WorkflowDefinitionStore;
 use crate::ws;
 use axum::Router;
-use openfang_kernel::trigger_v2::TriggerCompileRegistry;
 use openfang_kernel::OpenFangKernel;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -42,23 +38,33 @@ pub async fn build_router(
     kernel: Arc<OpenFangKernel>,
     listen_addr: SocketAddr,
 ) -> (Router<()>, Arc<AppState>) {
-    bootstrap_trigger_definitions(&kernel).await;
-
-    // Start channel bridges (Telegram, etc.)
-    let bridge = channel_bridge::start_channel_bridge(kernel.clone()).await;
-
     let channels_config = kernel.config.channels.clone();
     let state = Arc::new(AppState {
         kernel: kernel.clone(),
+        pack_registry: kernel.pack_registry.clone(),
         started_at: Instant::now(),
         peer_registry: kernel.peer_registry.get().map(|r| Arc::new(r.clone())),
         looper_runtime_registry: kernel.looper_runtime_registry(),
-        bridge_manager: tokio::sync::Mutex::new(bridge),
+        run_event_stream_registry: Arc::new(routes::RunEventStreamRegistry::default()),
+        dispatch_event_stream_registry: Arc::new(routes::DispatchEventStreamRegistry::default()),
+        hitl_stream_event_handle: Arc::new(routes::HitlStreamEventHandle::new()),
+        bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(channels_config),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
     });
+
+    if let Err(error) = routes::reload_effective_workflow_definitions(&state).await {
+        warn!("Workflow bootstrap completed with recoverable errors: {error}");
+    }
+    if let Err(error) = routes::reload_effective_trigger_definitions(&state).await {
+        warn!("Trigger bootstrap completed with recoverable errors: {error}");
+    }
+
+    // Start channel bridges (Telegram, etc.) after effective definitions are loaded.
+    let bridge = channel_bridge::start_channel_bridge(kernel.clone()).await;
+    *state.bridge_manager.lock().await = bridge;
 
     // CORS: allow localhost origins by default. If API key is set, the API
     // is protected anyway. For development, permissive CORS is convenient.
@@ -458,6 +464,35 @@ pub async fn build_router(
             "/api/v1/schedules/{id}/run-now/dry-run",
             axum::routing::post(routes::dry_run_schedule_definition_now_v1),
         )
+        .route("/api/v1/packs", axum::routing::get(routes::list_packs_v1))
+        .route(
+            "/api/v1/packs/install",
+            axum::routing::post(routes::install_pack_v1),
+        )
+        .route(
+            "/api/v1/packs/{id}",
+            axum::routing::get(routes::get_pack_v1),
+        )
+        .route(
+            "/api/v1/packs/{id}/objects",
+            axum::routing::get(routes::list_pack_objects_v1),
+        )
+        .route(
+            "/api/v1/packs/{id}/upgrade",
+            axum::routing::post(routes::upgrade_pack_v1),
+        )
+        .route(
+            "/api/v1/packs/{id}/upgrade/dry-run",
+            axum::routing::post(routes::upgrade_pack_dry_run_v1),
+        )
+        .route(
+            "/api/v1/packs/{id}/uninstall",
+            axum::routing::post(routes::uninstall_pack_v1),
+        )
+        .route(
+            "/api/v1/packs/{id}/fork",
+            axum::routing::post(routes::fork_pack_object_v1),
+        )
         .route("/api/v1/skills", axum::routing::get(routes::list_skills_v1))
         .route(
             "/api/v1/skills/{id}",
@@ -549,6 +584,10 @@ pub async fn build_router(
         )
         .route("/api/v1/runs", axum::routing::get(routes::list_runs_v1))
         .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))
+        .route(
+            "/api/v1/runs/{id}/events",
+            axum::routing::get(routes::stream_run_events_v1),
+        )
         .route(
             "/api/v1/runs/{id}/checkpoints",
             axum::routing::get(routes::get_run_checkpoints_v1),
@@ -1059,64 +1098,6 @@ pub async fn build_router(
     (app, state)
 }
 
-async fn bootstrap_trigger_definitions(kernel: &Arc<OpenFangKernel>) {
-    let trigger_store = TriggerDefinitionStore::new(&kernel.config.home_dir);
-    let trigger_resources = match trigger_store.list() {
-        Ok(resources) => resources,
-        Err(error) => {
-            warn!("Trigger bootstrap skipped because trigger definitions could not be loaded: {error}");
-            return;
-        }
-    };
-
-    let agent_resources = match AgentDefinitionStore::new(&kernel.config.home_dir).list() {
-        Ok(resources) => resources,
-        Err(error) => {
-            warn!(
-                "Trigger bootstrap skipped because agent definitions could not be loaded: {error}"
-            );
-            return;
-        }
-    };
-    let workflow_resources = match WorkflowDefinitionStore::new(&kernel.config.home_dir).list() {
-        Ok(resources) => resources,
-        Err(error) => {
-            warn!(
-                "Trigger bootstrap skipped because workflow definitions could not be loaded: {error}"
-            );
-            return;
-        }
-    };
-
-    let mut registry = TriggerCompileRegistry::new();
-    for agent in agent_resources {
-        registry.insert_agent(agent.definition.id, Some(agent.definition.name));
-    }
-    for workflow in workflow_resources {
-        registry.insert_workflow(workflow.definition.id, Some(workflow.definition.name));
-    }
-
-    let definitions = trigger_resources
-        .iter()
-        .map(|resource| resource.definition.clone())
-        .collect::<Vec<_>>();
-    match kernel
-        .trigger_v2
-        .replace_definitions(definitions, &registry)
-        .await
-    {
-        Ok(()) => {
-            info!(
-                loaded = trigger_resources.len(),
-                "Trigger bootstrap completed"
-            );
-        }
-        Err(error) => {
-            warn!("Trigger bootstrap completed with recoverable errors: {error}");
-        }
-    }
-}
-
 /// Start the OpenFang daemon: boot kernel + HTTP API server.
 ///
 /// This function blocks until Ctrl+C or a shutdown request.
@@ -1131,7 +1112,6 @@ pub async fn run_daemon(
     kernel.set_self_handle();
     kernel.bootstrap_workflow_definitions().await;
     kernel.recover_looper_runs_on_startup().await?;
-    kernel.start_background_agents();
 
     // Config file hot-reload watcher (polls every 30 seconds)
     {
@@ -1165,6 +1145,7 @@ pub async fn run_daemon(
     }
 
     let (app, state) = build_router(kernel.clone(), addr).await;
+    kernel.start_background_agents();
 
     // Write daemon info file
     if let Some(info_path) = daemon_info_path {

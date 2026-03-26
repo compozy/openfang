@@ -40,6 +40,7 @@ openfang-agent-definition.workspace = true
 openfang-provider-binding.workspace = true
 arky-session = { workspace = true, features = ["sqlite"] }
 tokio-util.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

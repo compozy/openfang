@@ -11,6 +11,7 @@ pub mod rate_limiter;
 pub mod routes;
 pub mod server;
 pub mod session_auth;
+pub mod sse;
 pub mod stream_chunker;
 pub mod stream_dedup;
 mod trigger_definitions;

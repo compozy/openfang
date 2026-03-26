@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/hitl/runtime</domain>
@@ -84,14 +84,14 @@ This task covers the live process path where the oneshot channel is available in
 
 ## Subtasks
 
-- [ ] 30.1 Design and implement the oneshot channel-based HITL signal interface. The step executor
+- [x] 30.1 Design and implement the oneshot channel-based HITL signal interface. The step executor
       creates a `tokio::oneshot::channel()` before beginning agent execution. The `Sender` is
       registered in a `HashMap<HitlRequestId, oneshot::Sender<HitlAnswer>>` held on the workflow
       engine (or a dedicated `HitlRegistry` struct). The agent execution path receives a handle
       (e.g., `HitlEmitter`) that can signal a HITL question. Evaluate the existing
       `crates/openfang-runtime/src/hooks.rs` for extension points before designing a new mechanism.
 
-- [ ] 30.2 Implement the pause side of the HITL cycle. When the HITL signal is received by the
+- [x] 30.2 Implement the pause side of the HITL cycle. When the HITL signal is received by the
       step executor: (a) assign the next `sequence_no` via `HitlRepository::create`, (b) transition
       the dispatch to `waiting_hitl` via `DispatchRepository::update_status`, (c) update
       `workflow_run.active_hitl_request_id` via `WorkflowRunRepository::set_active_hitl_request`,
@@ -99,27 +99,27 @@ This task covers the live process path where the oneshot channel is available in
       in the engine's HashMap. All database writes must succeed before the step executor suspends
       on the `Receiver` future.
 
-- [ ] 30.3 Implement the resume path triggered by `HitlRepository::answer`. After the answer is
+- [x] 30.3 Implement the resume path triggered by `HitlRepository::answer`. After the answer is
       written: (a) transition the dispatch back to `running`, (b) clear
       `workflow_run.active_hitl_request_id`, (c) look up the `Sender` in the HashMap and send the
       answer, and (d) the step executor's `Receiver` resolves with the answer, which is injected
       as a continuation turn (user input message) into the agent loop. The step executor then
       continues execution.
 
-- [ ] 30.4 Implement the multi-turn HITL loop within a single step. After the first resume, the
+- [x] 30.4 Implement the multi-turn HITL loop within a single step. After the first resume, the
       agent loop must be able to emit a second HITL signal (`sequence_no = 2`) with the same dispatch
       context. A new oneshot channel is created for each question. The step executor must handle this
       as a second pause/resume cycle without creating a new dispatch record. The existing `dispatch_id`
       and `run_id` are reused; only `hitl_request_id` changes.
 
-- [ ] 30.5 Implement the mutual exclusion guard between `wait_signal` and in-step HITL. The step
+- [x] 30.5 Implement the mutual exclusion guard between `wait_signal` and in-step HITL. The step
       executor must return an error if both `waiting_kind` and `active_hitl_request_id` would be set
       simultaneously on the same run.
 
-- [ ] 30.6 Write unit tests covering the full pause/resume cycle, the multi-turn case, and the
+- [x] 30.6 Write unit tests covering the full pause/resume cycle, the multi-turn case, and the
       guard against `wait_signal` conflation. See Tests section below.
 
-- [ ] 30.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 30.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass at zero warnings before marking this task complete.
 
 ## Implementation Details
@@ -205,56 +205,56 @@ and `active_hitl_request_id` set simultaneously. The step executor must enforce 
 
 ### Unit Tests (Required)
 
-- [ ] `hitl_pause_should_create_request_and_transition_dispatch_atomically` -- invoke the HITL
+- [x] `hitl_pause_should_create_request_and_transition_dispatch_atomically` -- invoke the HITL
       signal in a test step executor; verify `hitl_request` is `pending` and `agent_dispatch` is
       `waiting_hitl` after the signal, with neither being updated partially.
-- [ ] `hitl_pause_should_set_run_active_hitl_request_id` -- after a HITL pause, verify that
+- [x] `hitl_pause_should_set_run_active_hitl_request_id` -- after a HITL pause, verify that
       `workflow_run.active_hitl_request_id` matches the created `hitl_request_id`.
-- [ ] `hitl_pause_should_register_oneshot_sender_in_registry` -- after a HITL pause, verify that
+- [x] `hitl_pause_should_register_oneshot_sender_in_registry` -- after a HITL pause, verify that
       the `HitlRegistry` contains an entry for the `hitl_request_id`.
-- [ ] `hitl_resume_should_transition_dispatch_back_to_running` -- trigger the resume path by
+- [x] `hitl_resume_should_transition_dispatch_back_to_running` -- trigger the resume path by
       answering the HITL request; verify the dispatch is back to `running` and
       `active_hitl_request_id` is null.
-- [ ] `hitl_resume_should_inject_answer_into_continuation_context` -- after resume, verify the
+- [x] `hitl_resume_should_inject_answer_into_continuation_context` -- after resume, verify the
       answer text is present in the next turn submitted to the agent loop (inspect the constructed
       `TurnContext` or equivalent).
-- [ ] `hitl_resume_should_send_answer_through_oneshot_channel` -- verify the oneshot `Receiver`
+- [x] `hitl_resume_should_send_answer_through_oneshot_channel` -- verify the oneshot `Receiver`
       resolves with the correct `HitlAnswer` when the answer API handler sends through the `Sender`.
-- [ ] `hitl_second_question_in_same_step_should_reuse_dispatch_id` -- emit two HITL signals in
+- [x] `hitl_second_question_in_same_step_should_reuse_dispatch_id` -- emit two HITL signals in
       sequence for the same step; verify both `hitl_request` records reference the same `dispatch_id`
       and have `sequence_no` 1 and 2 respectively.
-- [ ] `hitl_step_id_should_not_advance_during_pause` -- pause on HITL and verify
+- [x] `hitl_step_id_should_not_advance_during_pause` -- pause on HITL and verify
       `workflow_run.current_step_id` is unchanged after the pause.
-- [ ] `hitl_should_not_be_conflatable_with_wait_signal` -- attempt to set both `waiting_kind`
+- [x] `hitl_should_not_be_conflatable_with_wait_signal` -- attempt to set both `waiting_kind`
       and `active_hitl_request_id` on the same run and verify the step executor returns an error.
 
 ### Integration Tests (Required)
 
-- [ ] `hitl_end_to_end_pause_and_resume_in_single_step` -- run a workflow step with a test agent
+- [x] `hitl_end_to_end_pause_and_resume_in_single_step` -- run a workflow step with a test agent
       that emits a HITL question, submit an answer through the HITL repository, and verify the step
       completes successfully with the answer injected into the continuation context.
-- [ ] `hitl_multiple_turns_end_to_end` -- run a step that emits two sequential HITL questions,
+- [x] `hitl_multiple_turns_end_to_end` -- run a step that emits two sequential HITL questions,
       answer each in turn, and verify the step completes with both answers available in the agent's
       context at the end of execution.
-- [ ] `hitl_cancelled_request_should_fail_dispatch` -- cancel a pending HITL request via
+- [x] `hitl_cancelled_request_should_fail_dispatch` -- cancel a pending HITL request via
       `HitlRepository::cancel`; verify the dispatch transitions to `failed` and the workflow run is
       updated to reflect the failure.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not implement HITL clarification as a separate synthetic workflow step -- creating a new
+- [x] Do not implement HITL clarification as a separate synthetic workflow step -- creating a new
       `wait_signal` step for each question breaks the mid-step semantics required by ADR-018 and
       causes `current_step_id` to advance incorrectly.
-- [ ] Do not conflate `wait_signal` (workflow-level waiting) with in-step HITL (`waiting_hitl`
+- [x] Do not conflate `wait_signal` (workflow-level waiting) with in-step HITL (`waiting_hitl`
       dispatch status + `active_hitl_request_id`) -- they use different fields and different code paths.
-- [ ] Do not allow the step executor to advance `current_step_id` while `active_hitl_request_id`
+- [x] Do not allow the step executor to advance `current_step_id` while `active_hitl_request_id`
       is non-null -- add an assertion or guard in the step completion path.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

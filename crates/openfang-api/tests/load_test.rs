@@ -52,10 +52,16 @@ async fn start_test_server() -> TestServer {
     kernel.bootstrap_workflow_definitions().await;
 
     let state = Arc::new(AppState {
+        pack_registry: kernel.pack_registry.clone(),
         kernel,
         started_at: Instant::now(),
         peer_registry: None,
         looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
+        run_event_stream_registry: Arc::new(openfang_api::routes::RunEventStreamRegistry::default()),
+        dispatch_event_stream_registry: Arc::new(
+            openfang_api::routes::DispatchEventStreamRegistry::default(),
+        ),
+        hitl_stream_event_handle: Arc::new(openfang_api::routes::HitlStreamEventHandle::new()),
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),

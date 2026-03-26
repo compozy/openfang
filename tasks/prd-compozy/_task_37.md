@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>domain/artifacts/schema</domain>
@@ -75,34 +75,34 @@ full lineage tracing from artifact back to execution.
 
 ## Subtasks
 
-- [ ] 37.1 Write `compozy.db` migrations for `artifact`, `artifact_version`,
+- [x] 37.1 Write `compozy.db` migrations for `artifact`, `artifact_version`,
       `doc`, and `doc_version` tables. Include all approved columns, FK constraints,
       uniqueness on `(artifact_id, version_no)` and `(doc_id, version_no)`,
       indexes on `artifact_version.artifact_id`, `artifact_version.content_hash`,
       `doc_version.doc_id`, `doc_version.content_hash`, and `artifact.type` /
       `doc.type` for list filtering. Migration files go in `migrations/compozy/`
       and must continue the existing numbering sequence.
-- [ ] 37.2 Define domain types for artifacts and docs: `ArtifactId` newtype,
+- [x] 37.2 Define domain types for artifacts and docs: `ArtifactId` newtype,
       `ArtifactVersionId` newtype, `DocId` newtype, `DocVersionId` newtype,
       `ArtifactType` enum (or open string type), `DocType` enum, `ContentHash`
       newtype wrapping `String` (hex SHA-256), and `ProvenanceRef` struct with
       `kind: ProvenanceKind` and `ref_id: String`. These types go in
       `crates/openfang-types/` or the domain crate introduced in task 28. All
       types derive `serde::Serialize` and `serde::Deserialize`.
-- [ ] 37.3 Implement `ArtifactRepository` with `create`, `append_version`,
+- [x] 37.3 Implement `ArtifactRepository` with `create`, `append_version`,
       `find_by_id`, `find_version_by_id`, `find_version_by_hash`, `list_versions`,
       and `list`. The `create` and `append_version` operations must use a single
       SQLite transaction each. `find_version_by_hash` must use a covering index
       scan, not a full table scan.
-- [ ] 37.4 Implement `DocRepository` with the same operation set as
+- [x] 37.4 Implement `DocRepository` with the same operation set as
       `ArtifactRepository` applied to the `doc`/`doc_version` family.
-- [ ] 37.5 Implement the `content_hash` computation helper: canonicalize the
+- [x] 37.5 Implement the `content_hash` computation helper: canonicalize the
       `content_json` value (sort object keys deterministically, strip insignificant
       whitespace), compute SHA-256, and return the lowercase hex string. This must
       be a pure function with a unit test — the same logical content must always
       produce the same hash regardless of JSON field ordering in the input.
-- [ ] 37.6 Write unit and integration tests as detailed in the Tests section.
-- [ ] 37.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 37.6 Write unit and integration tests as detailed in the Tests section.
+- [x] 37.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass with zero warnings before marking done.
 
 ## Implementation Details
@@ -188,67 +188,67 @@ collide).
 
 ### Unit Tests (Required)
 
-- [ ] `ArtifactRepository::create` creates the artifact record and a first
+- [x] `ArtifactRepository::create` creates the artifact record and a first
       `artifact_version` with `version_no = 1` in a single transaction; the
       artifact's `current_version_id` points at the new version ID.
-- [ ] `ArtifactRepository::append_version` on an artifact that already has two
+- [x] `ArtifactRepository::append_version` on an artifact that already has two
       versions assigns `version_no = 3` and updates `current_version_id`; the
       previous two versions remain in the table unchanged and their `content_json`
       values are unmodified.
-- [ ] `ArtifactRepository::find_version_by_hash` returns the correct version
+- [x] `ArtifactRepository::find_version_by_hash` returns the correct version
       when queried by the SHA-256 hash of its canonical content; it returns `None`
       for a hash that does not exist.
-- [ ] The `content_hash` helper produces identical output for two JSON values
+- [x] The `content_hash` helper produces identical output for two JSON values
       that have the same keys and values but different field ordering in the
       serialized string.
-- [ ] Attempting to call any method that would mutate an existing `artifact_version`
+- [x] Attempting to call any method that would mutate an existing `artifact_version`
       row (e.g., update `content_json` directly) is either absent from the public
       repository API or returns a domain-level immutability error.
-- [ ] `DocRepository::append_version` with `created_by_kind = "dispatch"` and
+- [x] `DocRepository::append_version` with `created_by_kind = "dispatch"` and
       `created_by_ref = "dispatch_456"` persists both provenance fields and returns
       them unchanged on `find_version_by_id`.
-- [ ] `DocRepository::create` with `provenance = None` stores `NULL` in
+- [x] `DocRepository::create` with `provenance = None` stores `NULL` in
       `created_by_kind` and `created_by_ref`; reading the version back returns
       `provenance = None` without error.
 
 ### Integration Tests (Required)
 
-- [ ] `ArtifactRepository` round-trips through a file-backed temp database:
+- [x] `ArtifactRepository` round-trips through a file-backed temp database:
       create, append three versions, close the connection, reopen, and verify all
       four version records (`version_no` 1–4 with the implicit first) are present
       and `content_json` is byte-identical to the original writes.
-- [ ] `DocRepository` round-trips through the same pattern; verify `content_hash`
+- [x] `DocRepository` round-trips through the same pattern; verify `content_hash`
       values are preserved exactly across the connection close/reopen cycle.
-- [ ] Provenance queries: given an artifact with three versions where versions
+- [x] Provenance queries: given an artifact with three versions where versions
       2 and 3 have `created_by_kind = "dispatch"` and different `created_by_ref`
       values, a query filtering by `created_by_ref = "dispatch_456"` returns only
       the correct version.
-- [ ] Concurrent `append_version` calls on the same artifact (simulated with
+- [x] Concurrent `append_version` calls on the same artifact (simulated with
       two sequential calls in the same test process) produce strictly sequential
       `version_no` values with no duplicates.
-- [ ] Content-addressable deduplication round-trip: append a version, compute
+- [x] Content-addressable deduplication round-trip: append a version, compute
       the hash externally using the same canonical algorithm, and verify
       `find_version_by_hash` retrieves the correct version record.
-- [ ] Retention policy guard (anticipating task 42): confirm that the
+- [x] Retention policy guard (anticipating task 42): confirm that the
       `artifact_version` table has an index on `created_at` that is usable by a
       range-delete query; verify the index exists after migration.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not allow mutation of existing version records through any code path
+- [x] Do not allow mutation of existing version records through any code path
       reachable from the public repository API.
-- [ ] Do not store version content inline in the `artifact` or `doc` table;
+- [x] Do not store version content inline in the `artifact` or `doc` table;
       `content_json` must live in `artifact_version` and `doc_version` only.
-- [ ] Do not compute `version_no` in application code before the SQL insert; it
+- [x] Do not compute `version_no` in application code before the SQL insert; it
       must be computed inside the transaction to prevent races.
-- [ ] Do not break the schema contract defined in DATABASE-SCHEMA.md; no column
+- [x] Do not break the schema contract defined in DATABASE-SCHEMA.md; no column
       may be omitted or renamed from the approved set.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

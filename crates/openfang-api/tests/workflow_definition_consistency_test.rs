@@ -223,11 +223,12 @@ async fn preloaded_definitions_are_visible_before_first_request() {
 
 #[tokio::test]
 async fn create_returns_internal_server_error_when_definition_persist_fails() {
-    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-    let blocked_home = temp_dir.path().join("blocked-home");
-    std::fs::write(&blocked_home, "not a directory").expect("blocked home should exist");
-    let server = start_workflow_test_server(blocked_home).await;
+    let home = tempfile::tempdir().expect("temp dir should be created");
+    let server = start_workflow_test_server(home.path().to_path_buf()).await;
     let client = reqwest::Client::new();
+    let blocked_workflows_path = home.path().join("workflows");
+    std::fs::write(&blocked_workflows_path, "not a directory")
+        .expect("workflow path blocker should exist");
 
     let (status, body) = post_workflow(
         &client,

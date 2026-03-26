@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>api/skills</domain>
@@ -51,24 +51,24 @@ routes registered in `server.rs`, handlers implemented in `routes.rs`, paginatio
 
 ## Subtasks
 
-- [ ] 27.1 Define the `SkillSummary` and `SkillDetail` response types in
+- [x] 27.1 Define the `SkillSummary` and `SkillDetail` response types in
       `crates/openfang-types/src/skill.rs` (or extend the existing skill types). `SkillSummary`
       carries `id`, `name`, `description`, `source`. `SkillDetail` adds `created_at` and
       `updated_at`. Both derive `Serialize` and `Deserialize`.
-- [ ] 27.2 Register the `/api/v1/skills` router group in `crates/openfang-api/src/server.rs` with
+- [x] 27.2 Register the `/api/v1/skills` router group in `crates/openfang-api/src/server.rs` with
       two routes: `GET /` (list) and `GET /:id` (detail). Ensure the router is nested under the
       existing `/api/v1` prefix.
-- [ ] 27.3 Implement the `list_skills` handler. Read from the in-memory skill registry on
+- [x] 27.3 Implement the `list_skills` handler. Read from the in-memory skill registry on
       `AppState`. Apply optional `q` filter (case-insensitive substring match on `name` and
       `description`). Apply cursor-based pagination with `limit` and `cursor` query params. Return
       `{ items: Vec<SkillSummary>, next_cursor: Option<String> }`.
-- [ ] 27.4 Implement the `get_skill` handler. Look up the skill by ID in the in-memory registry.
+- [x] 27.4 Implement the `get_skill` handler. Look up the skill by ID in the in-memory registry.
       Return `SkillDetail` on success, or 404 with the standard error envelope
       (`{ error: { code, message, details } }`) on miss.
-- [ ] 27.5 Ensure the kernel boot sequence populates the skill registry from `~/.compozy/skills/`
+- [x] 27.5 Ensure the kernel boot sequence populates the skill registry from `~/.compozy/skills/`
       and that `AppState` holds a reference to this registry. If the registry already exists from
       existing OpenFang code, wire it into `AppState` without duplicating it.
-- [ ] 27.6 Add route-level and handler-level tests. See the Tests section below.
+- [x] 27.6 Add route-level and handler-level tests. See the Tests section below.
 
 ## Implementation Details
 
@@ -150,39 +150,39 @@ Error response (404):
 
 ### Unit Tests (Required)
 
-- [ ] `SkillSummary` serialization: a summary with all fields populated produces the expected JSON
+- [x] `SkillSummary` serialization: a summary with all fields populated produces the expected JSON
       shape with `id`, `name`, `description`, and `source` keys.
-- [ ] `SkillDetail` serialization: a detail with timestamps produces the expected JSON shape
+- [x] `SkillDetail` serialization: a detail with timestamps produces the expected JSON shape
       including `created_at` and `updated_at`.
-- [ ] Pagination logic: given 5 skills and `limit=2`, the first page returns 2 items with a
+- [x] Pagination logic: given 5 skills and `limit=2`, the first page returns 2 items with a
       non-null `next_cursor`; using that cursor returns the next 2; the final page returns 1 item
       with `next_cursor: null`.
-- [ ] The `q` filter matches case-insensitively on both `name` and `description` fields.
+- [x] The `q` filter matches case-insensitively on both `name` and `description` fields.
 
 ### Integration Tests (Required)
 
-- [ ] `GET /api/v1/skills` returns `{ items, next_cursor }` with loaded skills from the test
+- [x] `GET /api/v1/skills` returns `{ items, next_cursor }` with loaded skills from the test
       registry. Verify status 200 and correct item count.
-- [ ] `GET /api/v1/skills/{id}` with a valid skill ID returns status 200 and the full skill detail
+- [x] `GET /api/v1/skills/{id}` with a valid skill ID returns status 200 and the full skill detail
       including `source` path.
-- [ ] `GET /api/v1/skills/{id}` with an unknown ID returns status 404 with the standard error
+- [x] `GET /api/v1/skills/{id}` with an unknown ID returns status 404 with the standard error
       envelope containing `code: "not_found"`.
-- [ ] `GET /api/v1/skills?q=writing` returns only skills whose name or description matches the
+- [x] `GET /api/v1/skills?q=writing` returns only skills whose name or description matches the
       query string.
-- [ ] Pagination across multiple pages returns all skills without duplicates or omissions.
+- [x] Pagination across multiple pages returns all skills without duplicates or omissions.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No POST, PUT, or DELETE routes exist under `/api/v1/skills`. Attempting them returns 405
+- [x] No POST, PUT, or DELETE routes exist under `/api/v1/skills`. Attempting them returns 405
       Method Not Allowed.
-- [ ] The endpoint reads from the in-memory registry, not from disk on each request.
-- [ ] The skill registry is populated before the API server starts accepting requests.
+- [x] The endpoint reads from the in-memory registry, not from disk on each request.
+- [x] The skill registry is populated before the API server starts accepting requests.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

@@ -719,30 +719,41 @@ async fn workflow_list_endpoint_supports_offset_pagination() {
         .expect("next cursor should exist")
         .to_string();
 
-    let (second_status, second_body) = get_json(
-        &client,
-        &server,
-        &format!("/api/v1/workflows?limit=2&cursor={next_cursor}&sort=id&order=asc"),
-    )
-    .await;
-    assert!(second_status == reqwest::StatusCode::OK);
-    assert!(second_body["items"].as_array().map(|items| items.len()) == Some(1));
-    assert!(second_body["next_cursor"].is_null());
-
     let mut ids = first_body["items"]
         .as_array()
         .expect("items should be an array")
         .iter()
-        .chain(
-            second_body["items"]
+        .filter_map(|item| item["id"].as_str())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut cursor = Some(next_cursor);
+
+    while let Some(next_cursor) = cursor.take() {
+        let (page_status, page_body) = get_json(
+            &client,
+            &server,
+            &format!("/api/v1/workflows?limit=2&cursor={next_cursor}&sort=id&order=asc"),
+        )
+        .await;
+        assert!(page_status == reqwest::StatusCode::OK);
+
+        ids.extend(
+            page_body["items"]
                 .as_array()
                 .expect("items should be an array")
-                .iter(),
-        )
-        .filter_map(|item| item["id"].as_str())
+                .iter()
+                .filter_map(|item| item["id"].as_str())
+                .map(str::to_string),
+        );
+        cursor = page_body["next_cursor"].as_str().map(ToOwned::to_owned);
+    }
+
+    let mut created_ids = ids
+        .into_iter()
+        .filter(|id| id.starts_with("page-"))
         .collect::<Vec<_>>();
-    ids.sort_unstable();
-    assert!(ids == vec!["page-a", "page-b", "page-c"]);
+    created_ids.sort();
+    assert!(created_ids == vec!["page-a", "page-b", "page-c"]);
 }
 
 #[tokio::test]

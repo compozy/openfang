@@ -261,7 +261,7 @@ fn migration_status_is_queryable_after_boot() {
     let compozy_rows = schema_migration_rows(&compozy_db);
 
     assert_eq!(runtime_rows.len(), 5);
-    assert_eq!(compozy_rows.len(), 12);
+    assert_eq!(compozy_rows.len(), 14);
     assert_eq!(runtime_rows[0].0, 1);
     assert_eq!(compozy_rows[0].0, 1);
     assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -281,6 +281,8 @@ fn migration_status_is_queryable_after_boot() {
     assert_eq!(compozy_rows[9].1, "0010_task_subtask");
     assert_eq!(compozy_rows[10].1, "0011_looper_runtime");
     assert_eq!(compozy_rows[11].1, "0012_artifact_doc_versioning");
+    assert_eq!(compozy_rows[12].1, "0013_pack");
+    assert_eq!(compozy_rows[13].1, "0014_workflow_checkpoint_retention");
 
     kernel.shutdown();
 }
@@ -697,6 +699,132 @@ fn schedule_runtime_state_should_survive_restart() {
     );
 
     second_kernel.shutdown();
+}
+
+#[test]
+fn checkpoint_retention_cycle_should_prune_old_terminal_runs_in_batches() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let mut config = boot_test_config(tmp.path());
+    config.memory.workflow_checkpoint_retention_max_rows_per_run = 100;
+    config.memory.workflow_checkpoint_retention_age_days = 30;
+    config.memory.workflow_checkpoint_retention_batch_size = 500;
+    let retention_cap = config.memory.workflow_checkpoint_retention_max_rows_per_run;
+
+    let kernel = OpenFangKernel::boot_with_config(config).expect("kernel should boot");
+
+    let terminal_run_id = "run-retention-terminal".to_string();
+    kernel
+        .workflow_stores
+        .workflow_run
+        .insert_run(&WorkflowRunRecord {
+            run_id: terminal_run_id.clone(),
+            workflow_id: "workflow-retention".to_string(),
+            workflow_version: "1.0.0".to_string(),
+            status: WorkflowRunStatus::Completed,
+            input_json: "{}".to_string(),
+            vars_json: "{}".to_string(),
+            current_step_id: Some("finish".to_string()),
+            waiting_kind: None,
+            waiting_ref: None,
+            active_dispatch_id: None,
+            active_hitl_request_id: None,
+            labels_json: "[]".to_string(),
+            metadata_json: "{}".to_string(),
+            error_json: None,
+            started_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            completed_at: Some("2025-01-01T00:00:00Z".to_string()),
+        })
+        .expect("terminal workflow run should persist");
+
+    for index in 0..600 {
+        kernel
+            .workflow_stores
+            .workflow_checkpoint
+            .append(&openfang_memory::WorkflowCheckpointRecord {
+                checkpoint_id: format!("chk-terminal-{index:04}"),
+                run_id: terminal_run_id.clone(),
+                step_id: Some("finish".to_string()),
+                kind: CheckpointKind::StepCompleted,
+                data_json: json!({
+                    "index": index,
+                })
+                .to_string(),
+                created_at: format!("2025-01-01T00:{:02}:{:02}Z", (index / 60) % 60, index % 60),
+            })
+            .expect("terminal run checkpoint should persist");
+    }
+
+    let active_run_id = "run-retention-active".to_string();
+    kernel
+        .workflow_stores
+        .workflow_run
+        .insert_run(&WorkflowRunRecord {
+            run_id: active_run_id.clone(),
+            workflow_id: "workflow-retention".to_string(),
+            workflow_version: "1.0.0".to_string(),
+            status: WorkflowRunStatus::Running,
+            input_json: "{}".to_string(),
+            vars_json: "{}".to_string(),
+            current_step_id: Some("write".to_string()),
+            waiting_kind: None,
+            waiting_ref: None,
+            active_dispatch_id: None,
+            active_hitl_request_id: None,
+            labels_json: "[]".to_string(),
+            metadata_json: "{}".to_string(),
+            error_json: None,
+            started_at: "2026-03-25T10:00:00Z".to_string(),
+            updated_at: "2026-03-25T10:00:00Z".to_string(),
+            completed_at: None,
+        })
+        .expect("active workflow run should persist");
+
+    for index in 0..50 {
+        kernel
+            .workflow_stores
+            .workflow_checkpoint
+            .append(&openfang_memory::WorkflowCheckpointRecord {
+                checkpoint_id: format!("chk-active-{index:03}"),
+                run_id: active_run_id.clone(),
+                step_id: Some("write".to_string()),
+                kind: CheckpointKind::StepCompleted,
+                data_json: json!({
+                    "index": index,
+                })
+                .to_string(),
+                created_at: format!("2026-03-25T10:00:{index:02}Z"),
+            })
+            .expect("active run checkpoint should persist");
+    }
+
+    let deleted_rows = kernel
+        .run_workflow_checkpoint_retention_cycle()
+        .expect("retention cycle should execute");
+    assert!(deleted_rows > 0, "retention cycle should prune old rows");
+
+    let terminal_remaining = kernel
+        .workflow_stores
+        .workflow_run
+        .find_checkpoints_for_run(&terminal_run_id)
+        .expect("terminal checkpoints should load");
+    let active_remaining = kernel
+        .workflow_stores
+        .workflow_run
+        .find_checkpoints_for_run(&active_run_id)
+        .expect("active checkpoints should load");
+
+    assert!(
+        terminal_remaining.len() <= retention_cap,
+        "terminal run should be pruned to configured cap"
+    );
+    assert_eq!(
+        active_remaining.len(),
+        50,
+        "running runs should keep all checkpoints"
+    );
+
+    kernel.shutdown();
 }
 
 #[test]

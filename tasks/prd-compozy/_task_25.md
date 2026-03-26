@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/workflows/api</domain>
@@ -65,36 +65,36 @@ ADR-023.
 
 ## Subtasks
 
-- [ ] 25.1 Register the `/api/v1/workflows` router group in `crates/openfang-api/src/server.rs`,
+- [x] 25.1 Register the `/api/v1/workflows` router group in `crates/openfang-api/src/server.rs`,
       replacing the existing `/api/workflows` registration. Wire `AppState` to a new workflow handler
       module. Implement `GET /api/v1/workflows` (paginated list with `enabled`, `tag`, `q` filters),
       `POST /api/v1/workflows` (create with validate-normalize-write-reload), `GET /api/v1/workflows/{id}`
       (full detail), `PUT /api/v1/workflows/{id}` (update with same write path), and
       `DELETE /api/v1/workflows/{id}`.
-- [ ] 25.2 Implement `POST /api/v1/workflows/validate` per ADR-038 and API-SPEC.md section 2.
+- [x] 25.2 Implement `POST /api/v1/workflows/validate` per ADR-038 and API-SPEC.md section 2.
       Validation must be layered: schema check, reference check (agent IDs, primitive names, workflow
       IDs in sub-workflow steps), semantic check (unique step IDs, legal `kind`/`uses`/`flow`
       combinations, binding reference resolution for `input`, `vars`, and `steps.<id>.output`,
       `save_as`, and `outputs`). Normalization fills defaults and canonicalizes aliases
       (`text` → `string`, `json` → `any`). Never invoke the runtime or make network calls during
       validation (ADR-041).
-- [ ] 25.3 Implement `POST /api/v1/workflows/compile` and `GET /api/v1/workflows/{id}/compiled` per
+- [x] 25.3 Implement `POST /api/v1/workflows/compile` and `GET /api/v1/workflows/{id}/compiled` per
       ADR-038. Compile delegates to the workflow IR compiler from task 14. The response carries
       `{ definition_id, normalized, compiled: { workflow_ir } }`. Compilation must succeed only on a
       valid, normalized definition; a compilation request for an invalid definition returns a structured
       error following the API-SPEC.md section 2 error envelope.
-- [ ] 25.4 Implement `POST /api/v1/workflows/{id}/fork` per API-SPEC.md section 7. The fork writes
+- [x] 25.4 Implement `POST /api/v1/workflows/{id}/fork` per API-SPEC.md section 7. The fork writes
       a new file-backed user-owned definition with `origin.kind = "user"` and populates `forked_from`
       with the upstream pack provenance. Same-ID shadowing of managed pack objects is allowed only
       through this explicit endpoint; direct `POST /api/v1/workflows` with a conflicting ID must be
       rejected with a clear error.
-- [ ] 25.5 Implement `GET /api/v1/workflows/{id}/runtime`, `POST /api/v1/workflows/{id}/runs`, and
+- [x] 25.5 Implement `GET /api/v1/workflows/{id}/runtime`, `POST /api/v1/workflows/{id}/runs`, and
       `POST /api/v1/workflows/{id}/runs/dry-run`. The dry-run response follows the ADR-034/API-SPEC.md
       dry-run envelope: `{ would_execute, resolved, effects, explanation }`. The explanation block must
       include the resolved `input_contract` and `output_contract` shapes.
-- [ ] 25.6 Implement `GET /api/v1/workflows/{id}/runs` returning a paginated list of run summaries
+- [x] 25.6 Implement `GET /api/v1/workflows/{id}/runs` returning a paginated list of run summaries
       (`id`, `status`, `current_step_id`, `started_at`, `updated_at`) for that workflow.
-- [ ] 25.7 Add route-level and handler-level tests. See the Tests section below.
+- [x] 25.7 Add route-level and handler-level tests. See the Tests section below.
 
 ## Implementation Details
 
@@ -168,57 +168,57 @@ Error responses use the stable envelope: `{ "error": { "code": "...", "message":
 
 ### Unit Tests (Required)
 
-- [ ] Workflow definition with valid steps serializes/deserializes correctly through the public
+- [x] Workflow definition with valid steps serializes/deserializes correctly through the public
       resource shape (all top-level fields: `id`, `name`, `version`, `description`, `enabled`, `tags`,
       `input`, `output`, `defaults`, `steps`, `outputs`, `origin`, `forked_from`, `created_at`,
       `updated_at`).
-- [ ] Validation returns `valid: false` with a structured issue list when a step references a
+- [x] Validation returns `valid: false` with a structured issue list when a step references a
       non-existent agent ID; `path` must point to the offending field (e.g. `steps[1].uses.agent`).
-- [ ] Validation accepts the convenience alias `"text"` for step input kinds and normalizes it to
+- [x] Validation accepts the convenience alias `"text"` for step input kinds and normalizes it to
       `"string"` in the `normalized` response block.
-- [ ] Compile returns `{ definition_id, normalized, compiled: { workflow_ir } }` for a
+- [x] Compile returns `{ definition_id, normalized, compiled: { workflow_ir } }` for a
       well-formed definition; the `workflow_ir` field must be non-null and non-empty.
-- [ ] Compile returns a structured error (not a 500) when called on an invalid definition; the
+- [x] Compile returns a structured error (not a 500) when called on an invalid definition; the
       error envelope must carry `code` and `message`.
-- [ ] The `POST /api/v1/workflows/{id}/runs/dry-run` response carries `would_execute: true` and
+- [x] The `POST /api/v1/workflows/{id}/runs/dry-run` response carries `would_execute: true` and
       an `explanation` block containing `input_contract` and `output_contract`.
 
 ### Integration Tests (Required)
 
-- [ ] Full CRUD round-trip: create a workflow definition (`POST`), read it back (`GET {id}`),
+- [x] Full CRUD round-trip: create a workflow definition (`POST`), read it back (`GET {id}`),
       update its description (`PUT {id}`), verify the update is reflected, then delete it
       (`DELETE {id}`) and confirm a subsequent `GET {id}` returns 404.
-- [ ] List endpoint returns `{ items, next_cursor }` with correct pagination: create three
+- [x] List endpoint returns `{ items, next_cursor }` with correct pagination: create three
       definitions, fetch with `limit=2`, assert `next_cursor` is non-null, fetch second page,
       assert `next_cursor` is null and both pages together contain all three.
-- [ ] `POST /api/v1/workflows/validate` for a workflow with a missing required field returns
+- [x] `POST /api/v1/workflows/validate` for a workflow with a missing required field returns
       `valid: false` and an `issues` array with at least one entry whose `severity` is `"error"`.
-- [ ] `GET /api/v1/workflows/{id}/compiled` after a successful create returns the compiled form
+- [x] `GET /api/v1/workflows/{id}/compiled` after a successful create returns the compiled form
       without needing to re-supply the definition body.
-- [ ] `POST /api/v1/workflows/{id}/fork` creates a new file-backed definition with
+- [x] `POST /api/v1/workflows/{id}/fork` creates a new file-backed definition with
       `origin.kind = "user"` and a populated `forked_from` block; a subsequent `GET` on the forked ID
       returns the correct provenance fields.
-- [ ] `POST /api/v1/workflows` with an ID that collides with a managed pack definition without
+- [x] `POST /api/v1/workflows` with an ID that collides with a managed pack definition without
       using the fork endpoint returns a 409 conflict error.
-- [ ] `DELETE /api/v1/workflows/{id}` on a non-existent ID returns 404 with the stable error
+- [x] `DELETE /api/v1/workflows/{id}` on a non-existent ID returns 404 with the stable error
       envelope.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No endpoint returns null or empty for a valid definition: `GET /api/v1/workflows/{id}` must
+- [x] No endpoint returns null or empty for a valid definition: `GET /api/v1/workflows/{id}` must
       return the full resource shape including all required fields.
-- [ ] File-backed writes are atomic: a failed normalization during `POST` or `PUT` must not leave
+- [x] File-backed writes are atomic: a failed normalization during `POST` or `PUT` must not leave
       a partial file on disk; the previous definition file must remain intact.
-- [ ] Validation never boots the runtime, makes network calls, or executes template expressions;
+- [x] Validation never boots the runtime, makes network calls, or executes template expressions;
       these are forbidden per ADR-041.
-- [ ] `POST /api/v1/workflows/compile` is definition-oriented and does not trigger a workflow run
+- [x] `POST /api/v1/workflows/compile` is definition-oriented and does not trigger a workflow run
       or any side-effecting operation (ADR-038).
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

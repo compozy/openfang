@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>domain/tasks/api</domain>
@@ -75,39 +75,39 @@ administration through the same public contracts per ADR-031 and DESIGN.md secti
 
 ## Subtasks
 
-- [ ] 32.1 Register the `/api/v1/tasks` and `/api/v1/subtasks` router groups in
+- [x] 32.1 Register the `/api/v1/tasks` and `/api/v1/subtasks` router groups in
       `crates/openfang-api/src/server.rs`. Implement `GET /api/v1/tasks` (paginated list with
       `status`, `priority`, `created_by`, `source_kind`, `label`, `repository`, `q` filters),
       `POST /api/v1/tasks` (create, persisted to `compozy.db`), `GET /api/v1/tasks/{id}` (full detail
       with all ref fields), `PUT /api/v1/tasks/{id}` (update), and `DELETE /api/v1/tasks/{id}`.
       Create and update must return the full task resource shape.
-- [ ] 32.2 Implement the subtask surfaces: `GET /api/v1/tasks/{id}/subtasks` (paginated, filtered),
+- [x] 32.2 Implement the subtask surfaces: `GET /api/v1/tasks/{id}/subtasks` (paginated, filtered),
       `POST /api/v1/tasks/{id}/subtasks` (create subtask under task), `GET /api/v1/subtasks`
       (global paginated list with `task_id`, `status`, `assignee_kind`, `assignee_ref`, `kind`,
       `ready`, `blocked` filters), `GET /api/v1/subtasks/{id}` (full detail), `PUT /api/v1/subtasks/{id}`
       (update), and `DELETE /api/v1/subtasks/{id}`. Subtask create and update must return the full
       subtask resource shape.
-- [ ] 32.3 Implement `POST /api/v1/tasks/{id}/replan`. The handler must apply all operations in
+- [x] 32.3 Implement `POST /api/v1/tasks/{id}/replan`. The handler must apply all operations in
       the `operations` array atomically inside a single `compozy.db` transaction:
       `cancel_subtasks` marks the listed subtask IDs as cancelled (must reject if any ID is not a
       subtask of the target task), `create_subtasks` inserts new subtask rows with the supplied fields,
       and `update_subtasks` applies the supplied field patches to the identified subtask rows. The
       response carries `{ accepted, resource_id, status, effects }` with counts for each operation
       kind. Task identity (`id`, `slug`, `created_at`) must not change as a result of replan.
-- [ ] 32.4 Implement the linked context sub-resources: `GET /api/v1/tasks/{id}/artifacts`,
+- [x] 32.4 Implement the linked context sub-resources: `GET /api/v1/tasks/{id}/artifacts`,
       `GET /api/v1/tasks/{id}/docs`, and `GET /api/v1/tasks/{id}/files`. Each returns
       `{ items, next_cursor }`. Items project the corresponding ref fields already attached to the
       task (`artifact_refs`, `doc_refs`, `file_refs`) without fetching the full artifact or doc bodies.
-- [ ] 32.5 Define the `compozy.db` table schemas for `tasks` and `subtasks` if not already
+- [x] 32.5 Define the `compozy.db` table schemas for `tasks` and `subtasks` if not already
       created by task 23. The tables must support all queryable fields used by the list filters
       (`status`, `priority`, `created_by`, `source_kind`, `label`, `repository`, `assignee_kind`,
       `assignee_ref`, `kind`, `ready`, `blocked`). The ref fields (`artifact_refs`, `doc_refs`,
       `file_refs`, `repository_refs`, `label_refs`) may be stored as JSON columns on the task row or
       as normalized join tables; either is acceptable provided the list filter queries remain indexed.
-- [ ] 32.6 Verify that the same public task and subtask endpoints are usable by internal agents
+- [x] 32.6 Verify that the same public task and subtask endpoints are usable by internal agents
       (not only human operators). Write an integration test that simulates an agent-sourced replan
       request with `metadata.source = "agent"` and verifies the effects response.
-- [ ] 32.7 Add route-level and handler-level tests. See the Tests section below.
+- [x] 32.7 Add route-level and handler-level tests. See the Tests section below.
 
 ## Implementation Details
 
@@ -197,58 +197,58 @@ a collection of scattered endpoint calls. The old approach must not be replicate
 
 ### Unit Tests (Required)
 
-- [ ] Task resource shape serializes/deserializes correctly for all top-level fields including
+- [x] Task resource shape serializes/deserializes correctly for all top-level fields including
       nested `source`, `owner`, `created_by`, `repository_refs`, `label_refs`, `artifact_refs`,
       `doc_refs`, and `file_refs`.
-- [ ] Subtask resource shape serializes/deserializes correctly for all fields including `assignee`,
+- [x] Subtask resource shape serializes/deserializes correctly for all fields including `assignee`,
       `depends_on`, `parallelizable`, `input`, and `result`.
-- [ ] A `replan` request with `cancel_subtasks` referencing a subtask ID that belongs to a
+- [x] A `replan` request with `cancel_subtasks` referencing a subtask ID that belongs to a
       different task returns a structured 422 error; the operation must not partially apply.
-- [ ] A `replan` request with `create_subtasks` items whose `depends_on` references a non-existent
+- [x] A `replan` request with `create_subtasks` items whose `depends_on` references a non-existent
       subtask ID returns a structured 422 error before any database writes occur.
-- [ ] A `replan` request with all three operation kinds (`cancel_subtasks`, `create_subtasks`,
+- [x] A `replan` request with all three operation kinds (`cancel_subtasks`, `create_subtasks`,
       `update_subtasks`) applies all three atomically: the effects response counts must match the
       actual database state after the operation.
-- [ ] Subtask list filter `ready=true` returns only subtasks whose `depends_on` subtasks are all
+- [x] Subtask list filter `ready=true` returns only subtasks whose `depends_on` subtasks are all
       in a completed status; `blocked=true` returns subtasks with at least one incomplete dependency.
 
 ### Integration Tests (Required)
 
-- [ ] Full task CRUD round-trip: create a task (`POST`), read it back (`GET {id}`) with all ref
+- [x] Full task CRUD round-trip: create a task (`POST`), read it back (`GET {id}`) with all ref
       fields, update its `priority` (`PUT {id}`), verify the update is reflected, delete it
       (`DELETE {id}`), confirm subsequent `GET {id}` returns 404.
-- [ ] Create a task with two subtasks, then call `POST /api/v1/tasks/{id}/replan` with one
+- [x] Create a task with two subtasks, then call `POST /api/v1/tasks/{id}/replan` with one
       `cancel_subtasks` and one `create_subtasks` operation; verify the response `effects` counts are
       correct and the database reflects the new subtask plan without changing the task `id` or `slug`.
-- [ ] `GET /api/v1/tasks/{id}/subtasks` returns only subtasks belonging to that task; adding a
+- [x] `GET /api/v1/tasks/{id}/subtasks` returns only subtasks belonging to that task; adding a
       subtask to a different task does not appear in the first task's list.
-- [ ] `GET /api/v1/tasks/{id}/artifacts` returns `{ items, next_cursor }` projecting only the
+- [x] `GET /api/v1/tasks/{id}/artifacts` returns `{ items, next_cursor }` projecting only the
       `artifact_refs` attached to that task.
-- [ ] `GET /api/v1/tasks` with filter `status=in_progress` returns only tasks whose status field
+- [x] `GET /api/v1/tasks` with filter `status=in_progress` returns only tasks whose status field
       matches; `q=onboarding` performs text search across `title` and `description`.
-- [ ] `GET /api/v1/subtasks` with filter `assignee_ref=prd-writer` returns only subtasks assigned
+- [x] `GET /api/v1/subtasks` with filter `assignee_ref=prd-writer` returns only subtasks assigned
       to that agent.
-- [ ] Internal agent-sourced replan: a replan request with `metadata.source = "agent"` succeeds
+- [x] Internal agent-sourced replan: a replan request with `metadata.source = "agent"` succeeds
       and is stored; the same public endpoint is used by both human operators and internal agents.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] `replan` is the only canonical way to change the subtask plan in bulk; do not add hidden
+- [x] `replan` is the only canonical way to change the subtask plan in bulk; do not add hidden
       side-effecting paths on `PUT /api/v1/tasks/{id}` that silently replace or delete subtasks.
-- [ ] Subtasks are not hidden under looper-run surfaces only; `GET /api/v1/tasks/{id}/subtasks`
+- [x] Subtasks are not hidden under looper-run surfaces only; `GET /api/v1/tasks/{id}/subtasks`
       and `GET /api/v1/subtasks` must work independently of whether a looper-run exists.
-- [ ] Task control does not depend on workflow-run internals; `GET /api/v1/tasks/{id}` must return
+- [x] Task control does not depend on workflow-run internals; `GET /api/v1/tasks/{id}` must return
       the task even when no associated `run_id` exists (source kind `"manual"`).
-- [ ] The public domain names `task` and `subtask` must not be renamed to `issue` or
+- [x] The public domain names `task` and `subtask` must not be renamed to `issue` or
       `work_item` or any other legacy term in handler code, route paths, or response payloads.
-- [ ] A `replan` that partially fails (e.g., valid `cancel_subtasks` but invalid `create_subtasks`)
+- [x] A `replan` that partially fails (e.g., valid `cancel_subtasks` but invalid `create_subtasks`)
       must not apply any part of the operation; the entire transaction must roll back.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

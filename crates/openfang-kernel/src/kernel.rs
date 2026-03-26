@@ -10,6 +10,8 @@ use crate::error::{KernelError, KernelResult};
 use crate::event_bus::EventBus;
 use crate::looper::{LooperDispatchExecutor, LooperRuntime, LooperRuntimeRegistry};
 use crate::metering::MeteringEngine;
+use crate::pack_installer::PackInstaller;
+use crate::pack_registry::PackRegistry;
 use crate::registry::AgentRegistry;
 use crate::scheduler::AgentScheduler;
 use crate::supervisor::Supervisor;
@@ -54,6 +56,7 @@ use openfang_types::looper::{
     LooperSubtaskRecord,
 };
 use openfang_types::memory::Memory;
+use openfang_types::pack::PackResourceType;
 use openfang_types::task::{ActorKind, SubtaskRecord, TaskId};
 use openfang_types::tool::ToolDefinition;
 use openfang_types::workflow::WorkflowIr;
@@ -175,6 +178,8 @@ pub struct OpenFangKernel {
     pub triggers: TriggerEngine,
     /// Trigger v2 definition registry and active matching set.
     pub trigger_v2: TriggerV2Engine,
+    /// Boot-time registry of installed packs.
+    pub pack_registry: Arc<PackRegistry>,
     /// Background agent executor.
     pub background: BackgroundExecutor,
     /// Merkle hash chain audit trail.
@@ -1059,6 +1064,7 @@ impl OpenFangKernel {
         > = {
             use openfang_runtime::embedding::create_embedding_driver;
             let configured_model = &config.memory.embedding_model;
+            let default_provider = config.default_model.provider.as_str();
             if let Some(ref provider) = config.memory.embedding_provider {
                 // Explicit config takes priority — use the configured embedding model.
                 // If the user left embedding_model at the default ("all-MiniLM-L6-v2"),
@@ -1081,6 +1087,34 @@ impl OpenFangKernel {
                     }
                     Err(e) => {
                         warn!(provider = %provider, error = %e, "Embedding driver init failed — falling back to text search");
+                        None
+                    }
+                }
+            } else if is_local_embedding_provider(default_provider) {
+                let model = if configured_model == "all-MiniLM-L6-v2" {
+                    default_embedding_model_for_provider(default_provider)
+                } else {
+                    configured_model.as_str()
+                };
+                let local_url = config
+                    .provider_urls
+                    .get(default_provider)
+                    .map(|s| s.as_str());
+                match create_embedding_driver(default_provider, model, "", local_url) {
+                    Ok(d) => {
+                        info!(
+                            provider = %default_provider,
+                            model = %model,
+                            "Embedding driver auto-detected from local default provider"
+                        );
+                        Some(Arc::from(d))
+                    }
+                    Err(error) => {
+                        debug!(
+                            provider = %default_provider,
+                            error = %error,
+                            "Local default embedding provider unavailable — using text search fallback"
+                        );
                         None
                     }
                 }
@@ -1201,6 +1235,11 @@ impl OpenFangKernel {
                 warn!("Failed to load cron jobs: {e}");
             }
         }
+        let pack_scan = PackRegistry::scan(&config.home_dir);
+        for warning in &pack_scan.warnings {
+            warn!("{warning}");
+        }
+        let pack_registry = Arc::new(pack_scan.registry);
 
         // Initialize execution approval manager
         let approval_manager = crate::approval::ApprovalManager::new(config.approval.clone());
@@ -1230,6 +1269,7 @@ impl OpenFangKernel {
             ),
             triggers: TriggerEngine::new(),
             trigger_v2: TriggerV2Engine::new(runtime_stores.trigger_runtime.clone()),
+            pack_registry,
             background,
             audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
             metering,
@@ -1473,6 +1513,8 @@ impl OpenFangKernel {
                 }
             }
         }
+
+        PackInstaller::new(&kernel).ensure_bundled_sdlc_installed()?;
 
         info!("OpenFang kernel booted successfully");
         Ok(kernel)
@@ -2445,6 +2487,15 @@ impl OpenFangKernel {
                     };
                     let _ = phase_tx.try_send(event);
                 });
+            let sync_session_projection = || {
+                if let Err(error) = kernel_clone.sync_agent_runtime_projection(agent_id) {
+                    warn!(
+                        agent_id = %agent_id,
+                        error = %error,
+                        "Failed to sync session projection after persisting streamed user turn"
+                    );
+                }
+            };
 
             let result = run_agent_loop_streaming(
                 &manifest,
@@ -2462,6 +2513,7 @@ impl OpenFangKernel {
                 kernel_clone.embedding_driver.as_deref(),
                 manifest.workspace.as_deref(),
                 Some(&phase_cb),
+                Some(&sync_session_projection),
                 Some(&kernel_clone.media_engine),
                 if kernel_clone.config.tts.enabled {
                     Some(&kernel_clone.tts_engine)
@@ -3046,6 +3098,15 @@ impl OpenFangKernel {
         } else {
             message.to_string()
         };
+        let sync_session_projection = || {
+            if let Err(error) = self.sync_agent_runtime_projection(agent_id) {
+                warn!(
+                    agent_id = %agent_id,
+                    error = %error,
+                    "Failed to sync session projection after persisting user turn"
+                );
+            }
+        };
 
         let result = run_agent_loop(
             &manifest,
@@ -3062,6 +3123,7 @@ impl OpenFangKernel {
             self.embedding_driver.as_deref(),
             manifest.workspace.as_deref(),
             None, // on_phase callback
+            Some(&sync_session_projection),
             Some(&self.media_engine),
             if self.config.tts.enabled {
                 Some(&self.tts_engine)
@@ -4291,7 +4353,7 @@ impl OpenFangKernel {
             .map_err(Into::into)
     }
 
-    fn stable_runtime_agent_id(definition_id: &str) -> AgentId {
+    pub(crate) fn stable_runtime_agent_id(definition_id: &str) -> AgentId {
         AgentId::from_string(&format!("compozy-definition:{definition_id}"))
     }
 
@@ -4312,21 +4374,16 @@ impl OpenFangKernel {
             .join(format!("{definition_id}.toml"))
     }
 
-    fn load_definition_runtime_by_id(
+    fn load_definition_runtime_from_path(
         &self,
-        definition_id: &str,
-    ) -> KernelResult<Option<LoadedDefinitionRuntime>> {
-        let path = self.agent_definition_path(definition_id);
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(KernelError::OpenFang(OpenFangError::Internal(format!(
-                    "Failed to read agent definition '{}': {error}",
-                    path.display()
-                ))));
-            }
-        };
+        path: &Path,
+    ) -> KernelResult<LoadedDefinitionRuntime> {
+        let content = std::fs::read_to_string(path).map_err(|error| {
+            KernelError::OpenFang(OpenFangError::Internal(format!(
+                "Failed to read agent definition '{}': {error}",
+                path.display()
+            )))
+        })?;
 
         let stored = toml::from_str::<StoredAgentDefinitionFile>(&content).map_err(|error| {
             KernelError::OpenFang(OpenFangError::Internal(format!(
@@ -4337,14 +4394,39 @@ impl OpenFangKernel {
         let definition = stage4_normalize(stored.definition);
         let compiled = compile_agent_definition(definition.clone()).map_err(|error| {
             KernelError::OpenFang(OpenFangError::Internal(format!(
-                "Failed to compile agent definition '{definition_id}': {error}"
+                "Failed to compile agent definition '{}': {error}",
+                definition.id
             )))
         })?;
 
-        Ok(Some(LoadedDefinitionRuntime {
+        Ok(LoadedDefinitionRuntime {
             definition,
             compiled,
-        }))
+        })
+    }
+
+    fn pack_agent_definition_path(&self, definition_id: &str) -> Option<PathBuf> {
+        let pack = self
+            .pack_registry
+            .find_pack_for_object(PackResourceType::Agent, definition_id)?;
+        let object = pack.manifest.objects.iter().find(|object| {
+            object.resource_type == PackResourceType::Agent && object.resource_id == definition_id
+        })?;
+        Some(pack.object_path(object))
+    }
+
+    fn load_definition_runtime_by_id(
+        &self,
+        definition_id: &str,
+    ) -> KernelResult<Option<LoadedDefinitionRuntime>> {
+        let path = self.agent_definition_path(definition_id);
+        if path.is_file() {
+            return self.load_definition_runtime_from_path(&path).map(Some);
+        }
+
+        self.pack_agent_definition_path(definition_id)
+            .map(|path| self.load_definition_runtime_from_path(&path))
+            .transpose()
     }
 
     fn load_definition_runtime_for_reference(
@@ -4378,34 +4460,27 @@ impl OpenFangKernel {
                 continue;
             }
 
-            let content = std::fs::read_to_string(&path).map_err(|error| {
-                KernelError::OpenFang(OpenFangError::Internal(format!(
-                    "Failed to read agent definition '{}': {error}",
-                    path.display()
-                )))
-            })?;
-            let stored =
-                toml::from_str::<StoredAgentDefinitionFile>(&content).map_err(|error| {
-                    KernelError::OpenFang(OpenFangError::Internal(format!(
-                        "Failed to deserialize agent definition '{}': {error}",
-                        path.display()
-                    )))
-                })?;
-            let definition = stage4_normalize(stored.definition);
-            if definition.name != agent_ref {
+            let runtime = self.load_definition_runtime_from_path(&path)?;
+            if runtime.definition.name != agent_ref {
                 continue;
             }
+            return Ok(Some(runtime));
+        }
 
-            let compiled = compile_agent_definition(definition.clone()).map_err(|error| {
-                KernelError::OpenFang(OpenFangError::Internal(format!(
-                    "Failed to compile agent definition '{}': {error}",
-                    definition.id
-                )))
-            })?;
-            return Ok(Some(LoadedDefinitionRuntime {
-                definition,
-                compiled,
-            }));
+        for pack in self.pack_registry.list_packs() {
+            for object in &pack.manifest.objects {
+                if object.resource_type != PackResourceType::Agent {
+                    continue;
+                }
+                if self.agent_definition_path(&object.resource_id).is_file() {
+                    continue;
+                }
+
+                let runtime = self.load_definition_runtime_from_path(&pack.object_path(object))?;
+                if runtime.definition.name == agent_ref {
+                    return Ok(Some(runtime));
+                }
+            }
         }
 
         Ok(None)
@@ -5700,6 +5775,44 @@ impl OpenFangKernel {
         Arc::clone(&self.looper_runtime_registry)
     }
 
+    /// Execute one checkpoint retention cycle for terminal runs.
+    ///
+    /// The cycle keeps the newest N checkpoints per terminal run older than
+    /// the configured age threshold and deletes rows in bounded SQL batches.
+    pub fn run_workflow_checkpoint_retention_cycle(&self) -> Result<usize, String> {
+        let config = &self.config.memory;
+        if config.workflow_checkpoint_retention_max_rows_per_run == 0 {
+            return Ok(0);
+        }
+
+        let days_i64 =
+            i64::try_from(config.workflow_checkpoint_retention_age_days).unwrap_or(i64::MAX);
+        let cutoff_timestamp = (chrono::Utc::now() - chrono::Duration::days(days_i64)).to_rfc3339();
+        let batch_limit = config
+            .workflow_checkpoint_retention_batch_size
+            .clamp(1, 500);
+        let mut total_deleted = 0usize;
+
+        loop {
+            let deleted = self
+                .workflow_stores
+                .workflow_checkpoint
+                .prune_terminal_runs_older_than(
+                    &cutoff_timestamp,
+                    config.workflow_checkpoint_retention_max_rows_per_run,
+                    batch_limit,
+                )
+                .map_err(|error| format!("Failed to prune workflow checkpoints: {error}"))?;
+
+            total_deleted = total_deleted.saturating_add(deleted);
+            if deleted < batch_limit {
+                break;
+            }
+        }
+
+        Ok(total_deleted)
+    }
+
     fn seed_looper_subtask_scope(
         &self,
         looper_run: &LooperRunRecord,
@@ -6774,6 +6887,55 @@ impl OpenFangKernel {
                     }
                 }
             });
+        }
+
+        // Periodic workflow checkpoint retention pruning for terminal runs.
+        {
+            let interval_secs = self
+                .config
+                .memory
+                .workflow_checkpoint_retention_interval_secs;
+            if interval_secs > 0 {
+                let kernel = Arc::clone(self);
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                    interval.tick().await; // Skip first immediate tick
+                    loop {
+                        interval.tick().await;
+                        if kernel.supervisor.is_shutting_down() {
+                            break;
+                        }
+                        match kernel.run_workflow_checkpoint_retention_cycle() {
+                            Ok(removed) if removed > 0 => {
+                                info!(
+                                    removed = removed,
+                                    max_rows_per_run = kernel
+                                        .config
+                                        .memory
+                                        .workflow_checkpoint_retention_max_rows_per_run,
+                                    age_days =
+                                        kernel.config.memory.workflow_checkpoint_retention_age_days,
+                                    "Workflow checkpoint retention pruned old rows"
+                                );
+                            }
+                            Err(error) => {
+                                warn!("Workflow checkpoint retention pruning failed: {error}");
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+                info!(
+                    interval_secs = interval_secs,
+                    max_rows_per_run = self
+                        .config
+                        .memory
+                        .workflow_checkpoint_retention_max_rows_per_run,
+                    age_days = self.config.memory.workflow_checkpoint_retention_age_days,
+                    "Workflow checkpoint retention scheduled"
+                );
+            }
         }
 
         // Periodic memory consolidation (decays stale memory confidence)
@@ -8224,6 +8386,10 @@ fn default_embedding_model_for_provider(provider: &str) -> &'static str {
         // Other OpenAI-compatible APIs typically support the OpenAI model names
         _ => "text-embedding-3-small",
     }
+}
+
+fn is_local_embedding_provider(provider: &str) -> bool {
+    matches!(provider, "ollama" | "vllm" | "lmstudio")
 }
 
 /// Infer provider from a model name when catalog lookup fails.
@@ -10494,7 +10660,7 @@ mod tests {
         let compozy_rows = schema_migration_rows(&compozy_db);
 
         assert_eq!(runtime_rows.len(), 5);
-        assert_eq!(compozy_rows.len(), 12);
+        assert_eq!(compozy_rows.len(), 14);
         assert_eq!(runtime_rows[0].0, 1);
         assert_eq!(compozy_rows[0].0, 1);
         assert_eq!(runtime_rows[0].1, "schema_migrations_bootstrap");
@@ -10514,6 +10680,8 @@ mod tests {
         assert_eq!(compozy_rows[9].1, "0010_task_subtask");
         assert_eq!(compozy_rows[10].1, "0011_looper_runtime");
         assert_eq!(compozy_rows[11].1, "0012_artifact_doc_versioning");
+        assert_eq!(compozy_rows[12].1, "0013_pack");
+        assert_eq!(compozy_rows[13].1, "0014_workflow_checkpoint_retention");
 
         kernel.shutdown();
     }

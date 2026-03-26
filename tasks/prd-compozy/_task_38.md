@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: done
 
 <task_context>
 <domain>api/artifacts</domain>
@@ -60,25 +60,25 @@ ADR-034. Filtering by `artifact_type`/`doc_type` and `task_id` is supported.
 
 ## Subtasks
 
-- [ ] 38.1 Define response types in `crates/openfang-types/`: `ArtifactSummary`, `ArtifactDetail`,
+- [x] 38.1 Define response types in `crates/openfang-types/`: `ArtifactSummary`, `ArtifactDetail`,
       `ArtifactVersionSummary`, `DocSummary`, `DocDetail`, `DocVersionSummary`. All derive
       `Serialize` and `Deserialize`. Place in `artifact.rs` and `doc.rs` respectively (create or
       extend existing modules from task 37).
-- [ ] 38.2 Add list and detail query methods to the artifact and doc stores in
+- [x] 38.2 Add list and detail query methods to the artifact and doc stores in
       `crates/openfang-memory/src/artifact.rs` and `crates/openfang-memory/src/doc.rs`. Methods:
       `list_artifacts(filters, limit, cursor)`, `get_artifact(id)`,
       `list_artifact_versions(artifact_id, limit, cursor)`, and the equivalent for docs. Use the
       store interfaces created by task 37.
-- [ ] 38.3 Register the `/api/v1/artifacts` router group in `server.rs` with three routes:
+- [x] 38.3 Register the `/api/v1/artifacts` router group in `server.rs` with three routes:
       `GET /` (list), `GET /:id` (detail), `GET /:id/versions` (version history).
-- [ ] 38.4 Register the `/api/v1/docs` router group in `server.rs` with the same three routes:
+- [x] 38.4 Register the `/api/v1/docs` router group in `server.rs` with the same three routes:
       `GET /` (list), `GET /:id` (detail), `GET /:id/versions` (version history).
-- [ ] 38.5 Implement the `list_artifacts`, `get_artifact`, and `list_artifact_versions` handlers.
+- [x] 38.5 Implement the `list_artifacts`, `get_artifact`, and `list_artifact_versions` handlers.
       Apply `artifact_type`, `task_id`, and `q` filters. Apply cursor-based pagination. The detail
       handler joins the current version inline.
-- [ ] 38.6 Implement the `list_docs`, `get_doc`, and `list_doc_versions` handlers. Same pattern as
+- [x] 38.6 Implement the `list_docs`, `get_doc`, and `list_doc_versions` handlers. Same pattern as
       the artifact handlers but reading from `doc` and `doc_version` tables.
-- [ ] 38.7 Add route-level and handler-level tests. See the Tests section below.
+- [x] 38.7 Add route-level and handler-level tests. See the Tests section below.
 
 ## Implementation Details
 
@@ -174,48 +174,48 @@ Document shapes follow the same pattern, replacing `artifact_type` with `doc_typ
 
 ### Unit Tests (Required)
 
-- [ ] `ArtifactSummary` serialization produces the expected JSON shape with `id`, `artifact_type`,
+- [x] `ArtifactSummary` serialization produces the expected JSON shape with `id`, `artifact_type`,
       `task_id`, `current_version_id`, `created_at`, `updated_at`.
-- [ ] `ArtifactDetail` serialization includes the `current_version` object inline with
+- [x] `ArtifactDetail` serialization includes the `current_version` object inline with
       `version_number` and `content_hash`.
-- [ ] `DocSummary` and `DocDetail` serialization mirrors the artifact shapes with `doc_type`
+- [x] `DocSummary` and `DocDetail` serialization mirrors the artifact shapes with `doc_type`
       instead of `artifact_type`.
-- [ ] Filter parsing: `artifact_type=prd` produces the correct filter predicate;
+- [x] Filter parsing: `artifact_type=prd` produces the correct filter predicate;
       `task_id=task_001` produces the correct filter predicate.
 
 ### Integration Tests (Required)
 
-- [ ] `GET /api/v1/artifacts` returns `{ items, next_cursor }` with status 200. Items match
+- [x] `GET /api/v1/artifacts` returns `{ items, next_cursor }` with status 200. Items match
       inserted test data.
-- [ ] `GET /api/v1/artifacts/{id}` returns status 200 with the artifact detail and current version
+- [x] `GET /api/v1/artifacts/{id}` returns status 200 with the artifact detail and current version
       inline.
-- [ ] `GET /api/v1/artifacts/{id}` with unknown ID returns status 404 with the standard error
+- [x] `GET /api/v1/artifacts/{id}` with unknown ID returns status 404 with the standard error
       envelope.
-- [ ] `GET /api/v1/artifacts/{id}/versions` returns paginated version list ordered by
+- [x] `GET /api/v1/artifacts/{id}/versions` returns paginated version list ordered by
       `version_number` descending.
-- [ ] `GET /api/v1/artifacts?artifact_type=prd` returns only artifacts of type `prd`.
-- [ ] `GET /api/v1/artifacts?task_id=task_001` returns only artifacts linked to `task_001`.
-- [ ] `GET /api/v1/docs` returns `{ items, next_cursor }` with status 200.
-- [ ] `GET /api/v1/docs/{id}` returns status 200 with the doc detail and current version inline.
-- [ ] `GET /api/v1/docs/{id}` with unknown ID returns status 404.
-- [ ] `GET /api/v1/docs/{id}/versions` returns paginated version list.
-- [ ] `GET /api/v1/docs?doc_type=brief` filters correctly by doc type.
+- [x] `GET /api/v1/artifacts?artifact_type=prd` returns only artifacts of type `prd`.
+- [x] `GET /api/v1/artifacts?task_id=task_001` returns only artifacts linked to `task_001`.
+- [x] `GET /api/v1/docs` returns `{ items, next_cursor }` with status 200.
+- [x] `GET /api/v1/docs/{id}` returns status 200 with the doc detail and current version inline.
+- [x] `GET /api/v1/docs/{id}` with unknown ID returns status 404.
+- [x] `GET /api/v1/docs/{id}/versions` returns paginated version list.
+- [x] `GET /api/v1/docs?doc_type=brief` filters correctly by doc type.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No POST, PUT, or DELETE routes exist under `/api/v1/artifacts` or `/api/v1/docs`. Attempting
+- [x] No POST, PUT, or DELETE routes exist under `/api/v1/artifacts` or `/api/v1/docs`. Attempting
       them returns 405 Method Not Allowed.
-- [ ] Version lists are ordered by `version_number` descending, not by insertion order.
-- [ ] The detail endpoint joins the current version in a single query (or two bounded queries),
+- [x] Version lists are ordered by `version_number` descending, not by insertion order.
+- [x] The detail endpoint joins the current version in a single query (or two bounded queries),
       not via N+1 loading.
-- [ ] Empty version history for a newly created artifact returns `{ items: [], next_cursor: null }`,
+- [x] Empty version history for a newly created artifact returns `{ items: [], next_cursor: null }`,
       not an error.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

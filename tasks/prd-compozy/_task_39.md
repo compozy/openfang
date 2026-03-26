@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>domain/looper/api</domain>
@@ -74,30 +74,30 @@ followed by `stream.snapshot` before continuing with live events.
 
 ## Subtasks
 
-- [ ] 39.1 Implement `POST /api/v1/looper-runs`: validate request body
+- [x] 39.1 Implement `POST /api/v1/looper-runs`: validate request body
       (`task_id` required, `execution_policy` required and well-formed), call
       `LooperRunRepository::create` from task 34, start the `LooperRuntime`, and
       return the accepted response with `looper_run_id`. Register the route in
       `crates/openfang-api/src/server.rs`.
-- [ ] 39.2 Implement `GET /api/v1/looper-runs` with list filters (`task_id`,
+- [x] 39.2 Implement `GET /api/v1/looper-runs` with list filters (`task_id`,
       `source_run_id`, `status`, `execution_mode`), cursor pagination, and the
       looper run summary shape. Implement `GET /api/v1/looper-runs/{id}` with the
       full detail shape including progress and policy.
-- [ ] 39.3 Implement `GET /api/v1/looper-runs/{id}/subtasks` returning the
+- [x] 39.3 Implement `GET /api/v1/looper-runs/{id}/subtasks` returning the
       `looper_subtask` execution view (from `LooperSubtaskRepository` in task 34),
       not the canonical `subtask` records from `SubtaskRepository` in task 28.
-- [ ] 39.4 Implement `POST /api/v1/looper-runs/{id}/pause`,
+- [x] 39.4 Implement `POST /api/v1/looper-runs/{id}/pause`,
       `POST /api/v1/looper-runs/{id}/resume`, and
       `POST /api/v1/looper-runs/{id}/cancel`. Each must call the corresponding
       method on `LooperRuntime` and return the action response. Return HTTP 409
       when the run is in a terminal state.
-- [ ] 39.5 Implement `GET /api/v1/looper-runs/{id}/events` as an SSE endpoint.
+- [x] 39.5 Implement `GET /api/v1/looper-runs/{id}/events` as an SSE endpoint.
       Wire an in-process event channel from `LooperRuntime` (a `tokio::sync::broadcast`
       channel is recommended) into the SSE response stream. Implement the ring
       buffer for bounded replay and the `stream.reset` + `stream.snapshot`
       fallback. Register the route in `crates/openfang-api/src/server.rs`.
-- [ ] 39.6 Write unit and integration tests as detailed in the Tests section.
-- [ ] 39.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 39.6 Write unit and integration tests as detailed in the Tests section.
+- [x] 39.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass with zero warnings before marking done.
 
 ## Implementation Details

@@ -11,7 +11,7 @@ use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{MemoryFilter, MemoryFragment, MemoryId, MemorySource};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
@@ -78,6 +78,109 @@ impl SemanticStore {
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(id)
+    }
+
+    /// Return true when at least one non-deleted memory matches the filter.
+    pub fn has_memories(&self, filter: Option<MemoryFilter>) -> OpenFangResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+        let mut sql = String::from("SELECT 1 FROM memories WHERE deleted = 0");
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1;
+
+        if let Some(ref f) = filter {
+            if let Some(agent_id) = f.agent_id {
+                sql.push_str(&format!(" AND agent_id = ?{param_idx}"));
+                params.push(Box::new(agent_id.0.to_string()));
+                param_idx += 1;
+            }
+            if let Some(ref scope) = f.scope {
+                sql.push_str(&format!(" AND scope = ?{param_idx}"));
+                params.push(Box::new(scope.clone()));
+                param_idx += 1;
+            }
+            if let Some(min_conf) = f.min_confidence {
+                sql.push_str(&format!(" AND confidence >= ?{param_idx}"));
+                params.push(Box::new(min_conf as f64));
+                param_idx += 1;
+            }
+            if let Some(ref source) = f.source {
+                let source_str = serde_json::to_string(source)
+                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+                sql.push_str(&format!(" AND source = ?{param_idx}"));
+                params.push(Box::new(source_str));
+            }
+        }
+
+        sql.push_str(" LIMIT 1");
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let exists = stmt
+            .query_row(param_refs.as_slice(), |_| Ok(()))
+            .optional()
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?
+            .is_some();
+
+        Ok(exists)
+    }
+
+    /// Return true when at least one non-deleted memory with an embedding matches the filter.
+    pub fn has_embedded_memories(&self, filter: Option<MemoryFilter>) -> OpenFangResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+        let mut sql =
+            String::from("SELECT 1 FROM memories WHERE deleted = 0 AND embedding IS NOT NULL");
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1;
+
+        if let Some(ref f) = filter {
+            if let Some(agent_id) = f.agent_id {
+                sql.push_str(&format!(" AND agent_id = ?{param_idx}"));
+                params.push(Box::new(agent_id.0.to_string()));
+                param_idx += 1;
+            }
+            if let Some(ref scope) = f.scope {
+                sql.push_str(&format!(" AND scope = ?{param_idx}"));
+                params.push(Box::new(scope.clone()));
+                param_idx += 1;
+            }
+            if let Some(min_conf) = f.min_confidence {
+                sql.push_str(&format!(" AND confidence >= ?{param_idx}"));
+                params.push(Box::new(min_conf as f64));
+                param_idx += 1;
+            }
+            if let Some(ref source) = f.source {
+                let source_str = serde_json::to_string(source)
+                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+                sql.push_str(&format!(" AND source = ?{param_idx}"));
+                params.push(Box::new(source_str));
+            }
+        }
+
+        sql.push_str(" LIMIT 1");
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let exists = stmt
+            .query_row(param_refs.as_slice(), |_| Ok(()))
+            .optional()
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?
+            .is_some();
+
+        Ok(exists)
     }
 
     /// Search for memories using text matching (fallback, no embeddings).
@@ -417,6 +520,66 @@ mod tests {
         store.forget(id).unwrap();
         let results = store.recall("To forget", 10, None).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_has_memories_should_respect_filters() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        assert!(!store
+            .has_memories(Some(MemoryFilter::agent(agent_id)))
+            .unwrap());
+
+        store
+            .remember(
+                agent_id,
+                "Remember this",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+            )
+            .unwrap();
+
+        assert!(store
+            .has_memories(Some(MemoryFilter::agent(agent_id)))
+            .unwrap());
+        assert!(!store
+            .has_memories(Some(MemoryFilter::agent(AgentId::new())))
+            .unwrap());
+    }
+
+    #[test]
+    fn test_has_embedded_memories_should_ignore_rows_without_embeddings() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        store
+            .remember(
+                agent_id,
+                "Plain memory",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+            )
+            .unwrap();
+        assert!(!store
+            .has_embedded_memories(Some(MemoryFilter::agent(agent_id)))
+            .unwrap());
+
+        store
+            .remember_with_embedding(
+                agent_id,
+                "Vector memory",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+                Some(&[0.1, 0.2, 0.3]),
+            )
+            .unwrap();
+        assert!(store
+            .has_embedded_memories(Some(MemoryFilter::agent(agent_id)))
+            .unwrap());
     }
 
     #[test]

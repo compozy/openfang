@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/workflows/recovery</domain>
@@ -76,7 +76,7 @@ established in ADR-021.
 
 ## Subtasks
 
-- [ ] 19.1 Implement the startup recovery scan as a dedicated async function
+- [x] 19.1 Implement the startup recovery scan as a dedicated async function
       called during kernel boot, after the `compozy.db` connection is
       established but before the HTTP server begins accepting requests. The
       function must: open `compozy.db`, query all `workflow_run` rows with
@@ -84,35 +84,35 @@ established in ADR-021.
       `run_recovered_needs_resume` checkpoint. Use a SQLite transaction so the
       scan is atomic: either all affected runs are downgraded together or none
       are.
-- [ ] 19.2 Extend the `WorkflowRunStatus` enum to include `Paused` and
+- [x] 19.2 Extend the `WorkflowRunStatus` enum to include `Paused` and
       `Cancelled` variants alongside the `WaitingSignal` variant introduced in
       Task 17. Update all match arms across `workflow.rs`, any repository code,
       and route handlers. Ensure `Paused` serializes to `"paused"` and
       `Cancelled` serializes to `"cancelled"` in JSON responses to match the
       run detail shape in API-SPEC.md §9.
-- [ ] 19.3 Implement `WorkflowRunRepository` with at minimum: `find_by_id`,
+- [x] 19.3 Implement `WorkflowRunRepository` with at minimum: `find_by_id`,
       `list` (with `status` and `waiting_kind` filters), `update_status`,
       `insert_checkpoint`, and `find_checkpoints_for_run`. All methods must
       operate on `compozy.db`. Follow the `Arc<Mutex<Connection>>` with WAL
       mode pattern from `crates/openfang-memory/src/substrate.rs`.
-- [ ] 19.4 Implement run control-plane action handlers. Wire
+- [x] 19.4 Implement run control-plane action handlers. Wire
       `POST /api/v1/runs/{id}/pause`, `POST /api/v1/runs/{id}/resume`, and
       `POST /api/v1/runs/{id}/cancel` through `WorkflowRunRepository`. Pause
       must only succeed from `running` or `waiting_signal` status. Resume must
       only succeed from `paused`. Cancel must succeed from any non-terminal
       status. Return HTTP 409 with a structured error if the transition is
       invalid.
-- [ ] 19.5 Route all run read surfaces to `WorkflowRunRepository`. Replace any
+- [x] 19.5 Route all run read surfaces to `WorkflowRunRepository`. Replace any
       in-memory lookups in existing route handlers for `GET /api/v1/runs`,
       `GET /api/v1/runs/{id}`, `GET /api/v1/runs/{id}/checkpoints`, and
       `GET /api/v1/runs/{id}/dispatches` with repository calls. Register any
       missing routes in `crates/openfang-api/src/server.rs`.
-- [ ] 19.6 Add the `run_paused`, `run_resumed`, and `run_cancelled` checkpoint
+- [x] 19.6 Add the `run_paused`, `run_resumed`, and `run_cancelled` checkpoint
       kinds. Each control-plane action (pause, resume, cancel) must insert a
       checkpoint with the corresponding kind and a `data` field recording the
       actor source (`"api"` or `"system"`). The checkpoint must be inserted in
       the same transaction as the status update.
-- [ ] 19.7 Integrate the recovery scan into the daemon boot sequence. The scan
+- [x] 19.7 Integrate the recovery scan into the daemon boot sequence. The scan
       must execute before `ShutdownCoordinator` moves out of `ShutdownPhase::Running`
       and before the HTTP server begins accepting requests. Log the count of
       recovered runs at `info` level and each recovered `run_id` at `debug` level.
@@ -233,74 +233,74 @@ any run that was downgraded.
 
 ### Unit Tests (Required)
 
-- [ ] `running_runs_downgrade_to_paused_on_recovery_scan`: Insert a `running`
+- [x] `running_runs_downgrade_to_paused_on_recovery_scan`: Insert a `running`
       run into `compozy.db`, execute the recovery scan, assert the row now has
       `status = paused` and a `run_recovered_needs_resume` checkpoint exists
       with `data.previous_status = "running"`.
-- [ ] `waiting_signal_runs_survive_recovery_scan_unchanged`: Insert a
+- [x] `waiting_signal_runs_survive_recovery_scan_unchanged`: Insert a
       `waiting_signal` run, execute the recovery scan, assert the row status,
       `waiting_kind`, and `waiting_ref` are all unchanged.
-- [ ] `waiting_hitl_runs_survive_recovery_scan_unchanged`: Insert a
+- [x] `waiting_hitl_runs_survive_recovery_scan_unchanged`: Insert a
       `waiting_hitl` run, execute the recovery scan, assert the row is
       unchanged.
-- [ ] `terminal_runs_are_not_touched_by_recovery_scan`: Insert runs with
+- [x] `terminal_runs_are_not_touched_by_recovery_scan`: Insert runs with
       `completed`, `failed`, and `cancelled` statuses, execute the scan, assert
       none are mutated and no extra checkpoints are inserted.
-- [ ] `recovery_scan_is_atomic`: Inject a connection failure midway through the
+- [x] `recovery_scan_is_atomic`: Inject a connection failure midway through the
       recovery transaction, assert the database is not in a partially-downgraded
       state after reconnect (all runs remain `running` or all are `paused`).
-- [ ] `recovery_checkpoints_record_previous_status`: Assert the `data` JSON on
+- [x] `recovery_checkpoints_record_previous_status`: Assert the `data` JSON on
       every `run_recovered_needs_resume` checkpoint contains
       `"previous_status": "running"` exactly.
-- [ ] `pause_action_rejects_invalid_source_status`: Attempt to pause a
+- [x] `pause_action_rejects_invalid_source_status`: Attempt to pause a
       `completed` run; assert `update_status` returns an error without writing
       any row or checkpoint.
-- [ ] `resume_action_only_valid_from_paused`: Attempt to resume a `running` run
+- [x] `resume_action_only_valid_from_paused`: Attempt to resume a `running` run
       directly; assert the operation is rejected and the status remains `running`.
 
 ### Integration Tests (Required)
 
-- [ ] `restart_after_in_flight_run_preserves_durable_state`: Start a run,
+- [x] `restart_after_in_flight_run_preserves_durable_state`: Start a run,
       simulate an abrupt restart (drop in-memory engine state, re-open
       `compozy.db`), assert the run is now `paused` and
       `GET /api/v1/runs/{id}` returns the `paused` status with a
       `run_recovered_needs_resume` checkpoint visible at
       `GET /api/v1/runs/{id}/checkpoints`.
-- [ ] `get_run_list_reflects_recovered_state`: After recovery, call
+- [x] `get_run_list_reflects_recovered_state`: After recovery, call
       `GET /api/v1/runs?status=paused`; assert all previously-running runs
       appear in the response.
-- [ ] `signal_and_checkpoint_history_intact_after_restart`: Insert signals and
+- [x] `signal_and_checkpoint_history_intact_after_restart`: Insert signals and
       checkpoints before restart, simulate restart, assert both
       `GET /api/v1/runs/{id}/signals` and `GET /api/v1/runs/{id}/checkpoints`
       return the pre-restart records without loss.
-- [ ] `pause_resume_cancel_round_trip_through_db`: Call pause, then resume, then
+- [x] `pause_resume_cancel_round_trip_through_db`: Call pause, then resume, then
       cancel on a run; assert each intermediate status is reflected in
       `GET /api/v1/runs/{id}` and each action produces the expected checkpoint.
-- [ ] `waiting_signal_run_still_accepts_signal_after_restart`: Park a run at a
+- [x] `waiting_signal_run_still_accepts_signal_after_restart`: Park a run at a
       `wait_signal` step, simulate restart, submit a signal via
       `POST /api/v1/runs/{id}/signals`, assert the run resumes correctly.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not auto-resume arbitrary in-flight `running` execution in Phase 1 —
+- [x] Do not auto-resume arbitrary in-flight `running` execution in Phase 1 —
       any code path that transitions a recovered run from `paused` back to
       `running` without an explicit operator `resume` action is a test failure.
-- [ ] Do not keep API reads pointed at in-memory state after durability lands —
+- [x] Do not keep API reads pointed at in-memory state after durability lands —
       any route handler that reads `WorkflowEngine.runs` directly (bypassing
       the repository) must be flagged by a test that clears the in-memory map
       and asserts the API still returns data.
-- [ ] Do not hide recovery decisions from checkpoint history — a run with no
+- [x] Do not hide recovery decisions from checkpoint history — a run with no
       `run_recovered_needs_resume` checkpoint after restart, despite having been
       `running` at the time, is a test failure.
-- [ ] Do not apply the downgrade to `waiting_signal` or `waiting_hitl` runs —
+- [x] Do not apply the downgrade to `waiting_signal` or `waiting_hitl` runs —
       a test must assert that the count of `waiting_signal` runs before and
       after the recovery scan is identical.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

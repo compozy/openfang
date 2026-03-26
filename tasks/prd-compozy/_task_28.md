@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>domain/tasks/schema</domain>
@@ -75,14 +75,14 @@ state. The schema must exactly match the column set approved in
 
 ## Subtasks
 
-- [ ] 28.1 Write `compozy.db` migrations for `task` and `subtask` tables.
+- [x] 28.1 Write `compozy.db` migrations for `task` and `subtask` tables.
       Include: all approved columns from DATABASE-SCHEMA.md, `slug` uniqueness
       constraint on `task`, foreign-key constraint from `subtask.task_id` to
       `task.task_id` (enable `PRAGMA foreign_keys = ON` in the connection setup),
       and basic indexes on `task.status`, `task.priority`, `subtask.task_id`, and
       `subtask.status`. Migration numbers must continue the existing
       `migrations/compozy/` sequence.
-- [ ] 28.2 Define domain types for task and subtask in `crates/openfang-types/`
+- [x] 28.2 Define domain types for task and subtask in `crates/openfang-types/`
       or a new `crates/openfang-domain/` crate. Types must include: `TaskId`
       newtype, `SubtaskId` newtype, `TaskStatus` enum, `SubtaskStatus` enum,
       `SubtaskKind` enum, `Priority` enum, `Complexity` enum, `OwnerRef` struct
@@ -90,27 +90,27 @@ state. The schema must exactly match the column set approved in
       types for artifacts, docs, files, repositories, and labels. All types must
       derive `serde::Serialize` and `serde::Deserialize` and use the snake_case
       naming convention from the project `.rustfmt.toml`.
-- [ ] 28.3 Implement `TaskRepository` with full CRUD, slug lookup, list with
+- [x] 28.3 Implement `TaskRepository` with full CRUD, slug lookup, list with
       cursor pagination (using `position` as the stable sort key), and the
       `source_run_id` linkage that allows workflow runs to be traced back to tasks.
       Follow the `StructuredStore` pattern in
       `crates/openfang-memory/src/structured.rs` for shared-connection handling.
-- [ ] 28.4 Implement `SubtaskRepository` with full CRUD, `list_for_task` with
+- [x] 28.4 Implement `SubtaskRepository` with full CRUD, `list_for_task` with
       the `ready` and `blocked` computed filters, and dependency validation on
       write (a subtask's `depends_on` entries must all reference subtasks that
       belong to the same parent task). Return a domain error, not a panic, when
       validation fails.
-- [ ] 28.5 Implement the `replan` operation as a transactional method on
+- [x] 28.5 Implement the `replan` operation as a transactional method on
       `TaskRepository` or a dedicated `TaskReplanner` type. It must apply
       `cancel_subtasks`, `create_subtasks`, and `update_subtasks` operations
       atomically within a single SQLite transaction, matching the replan request
       shape in API-SPEC.md section 12. On error the entire transaction rolls back.
-- [ ] 28.6 Write unit and integration tests as detailed in the Tests section.
+- [x] 28.6 Write unit and integration tests as detailed in the Tests section.
       Tests must use `pretty_assertions::assert_eq` throughout (enforced by
       clippy). Use in-memory SQLite (`Connection::open_in_memory()`) for unit
       tests; use a temp-file database for integration tests that need restart
       semantics.
-- [ ] 28.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 28.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass with zero warnings before marking this
       task done.
 
@@ -183,60 +183,60 @@ current version against the migration threshold.
 
 ### Unit Tests (Required)
 
-- [ ] Creating a `task` with all required fields persists every column correctly;
+- [x] Creating a `task` with all required fields persists every column correctly;
       reading it back by `task_id` returns an identical record with no field loss.
-- [ ] Creating a `task` with a duplicate `slug` returns a domain-level error, not
+- [x] Creating a `task` with a duplicate `slug` returns a domain-level error, not
       a raw rusqlite constraint violation.
-- [ ] Creating a `subtask` with a `depends_on` entry that references a subtask
+- [x] Creating a `subtask` with a `depends_on` entry that references a subtask
       from a different parent task is rejected with a domain validation error.
-- [ ] `list_for_task` with `ready = true` returns only subtasks whose every
+- [x] `list_for_task` with `ready = true` returns only subtasks whose every
       `depends_on` entry has status `completed`; subtasks with any incomplete
       dependency are excluded.
-- [ ] `list_for_task` with `blocked = true` returns only subtasks that have at
+- [x] `list_for_task` with `blocked = true` returns only subtasks that have at
       least one `depends_on` entry with a non-completed status.
-- [ ] `SubtaskRepository::update` on a subtask with `parallelizable = true`
+- [x] `SubtaskRepository::update` on a subtask with `parallelizable = true`
       persists the boolean correctly and returns it unchanged on read.
-- [ ] `replan` with `cancel_subtasks` + `create_subtasks` + `update_subtasks`
+- [x] `replan` with `cancel_subtasks` + `create_subtasks` + `update_subtasks`
       operations applies atomically: if `create_subtasks` fails mid-operation,
       neither the cancellations nor any partial creates persist.
 
 ### Integration Tests (Required)
 
-- [ ] A fresh `compozy.db` (file-backed temp path) bootstraps with the task and
+- [x] A fresh `compozy.db` (file-backed temp path) bootstraps with the task and
       subtask migrations applied cleanly, and a subsequent migration run is
       idempotent (no error, no duplicate schema objects).
-- [ ] A task created before a simulated restart is queryable by `task_id` and by
+- [x] A task created before a simulated restart is queryable by `task_id` and by
       `slug` after the database connection is reopened, with all ref columns intact.
-- [ ] A subtask chain with `depends_on` ordering survives a connection close and
+- [x] A subtask chain with `depends_on` ordering survives a connection close and
       reopen; the dependency array is preserved byte-for-byte.
-- [ ] `source_run_id` linkage: creating a task with a `source_run_id` value and
+- [x] `source_run_id` linkage: creating a task with a `source_run_id` value and
       then querying by that value returns the correct task set.
-- [ ] List pagination with `cursor` and `limit` returns the correct page of
+- [x] List pagination with `cursor` and `limit` returns the correct page of
       tasks sorted by `position`, and `next_cursor` is null on the last page.
-- [ ] Replan round-trip: a task with three subtasks can have one cancelled, one
+- [x] Replan round-trip: a task with three subtasks can have one cancelled, one
       updated, and one new one created through a single replan call; the resulting
       subtask list matches the expected state exactly.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not route canonical task/subtask state through the old OpenFang task
+- [x] Do not route canonical task/subtask state through the old OpenFang task
       queue or any legacy `openfang_tasks` storage path.
-- [ ] Do not reduce task context to runtime-only fields; all ref columns
+- [x] Do not reduce task context to runtime-only fields; all ref columns
       (`artifact_refs_json`, `doc_refs_json`, `file_refs_json`, etc.) must be
       persisted as first-class columns, not shoved into `metadata_json`.
-- [ ] Do not store subtask dependency structure as an opaque blob with no
+- [x] Do not store subtask dependency structure as an opaque blob with no
       validation; the dependency invariant (same parent task) must be checked on
       write.
-- [ ] Do not use `unwrap()` in repository code; all fallible operations must
+- [x] Do not use `unwrap()` in repository code; all fallible operations must
       propagate errors with `?` and typed error variants.
-- [ ] Do not let `rusqlite::Error` escape module boundaries; always convert to
+- [x] Do not let `rusqlite::Error` escape module boundaries; always convert to
       domain error types at the repository layer.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

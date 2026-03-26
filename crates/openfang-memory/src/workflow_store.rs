@@ -11,6 +11,7 @@ use crate::hitl::{
     HitlRecord, HitlStatus, NewHitlRequest, SqliteHitlRepository,
 };
 use crate::looper::{LooperRunRepository, LooperSubtaskRepository};
+use crate::pack::PackRepository;
 use crate::task::{SubtaskRepository, TaskRepository};
 use chrono::Utc;
 use openfang_types::error::OpenFangError;
@@ -42,6 +43,10 @@ pub const WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL: &str =
 pub const WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL: &str =
     include_str!("../migrations/compozy/20260323_007_workflow_run_control_plane.sql");
 
+/// SQL for migration `0014_workflow_checkpoint_retention`.
+pub const WORKFLOW_CHECKPOINT_RETENTION_MIGRATION_SQL: &str =
+    include_str!("../migrations/compozy/20260326_014_workflow_checkpoint_retention.sql");
+
 /// Shared `compozy.db` repository handles.
 #[derive(Clone)]
 pub struct WorkflowStoreSet {
@@ -68,6 +73,8 @@ pub struct WorkflowStoreSet {
     pub artifact: ArtifactRepository,
     /// Repository for durable document state.
     pub doc: DocRepository,
+    /// Repository for durable pack state.
+    pub pack: PackRepository,
 }
 
 impl WorkflowStoreSet {
@@ -86,6 +93,7 @@ impl WorkflowStoreSet {
             subtask: SubtaskRepository::new(Arc::clone(&conn)),
             artifact: ArtifactRepository::new(Arc::clone(&conn)),
             doc: DocRepository::new(Arc::clone(&conn)),
+            pack: PackRepository::new(Arc::clone(&conn)),
             workflow_signal: WorkflowSignalRepository::new(conn),
         }
     }
@@ -146,6 +154,14 @@ pub enum WorkflowStoreError {
         run_id: String,
         /// Client-supplied idempotency key.
         idempotency_key: String,
+    },
+    /// One list/pruning query parameter could not be represented safely.
+    #[error("invalid workflow query parameter '{field}' with value '{value}'")]
+    InvalidListQuery {
+        /// Invalid field name.
+        field: &'static str,
+        /// Original value.
+        value: String,
     },
     /// A stored workflow status string was invalid.
     #[error("invalid workflow run status '{status}'")]
@@ -1036,6 +1052,25 @@ impl WorkflowCheckpointRepository {
         let conn = lock_conn(&self.conn)?;
         list_run_checkpoints(&conn, run_id)
     }
+
+    /// Prune durable checkpoints for terminal runs older than a cutoff.
+    ///
+    /// Keeps at most `max_rows_per_run` newest checkpoints per eligible run and
+    /// deletes at most `batch_limit` rows per call.
+    pub fn prune_terminal_runs_older_than(
+        &self,
+        older_than: &str,
+        max_rows_per_run: usize,
+        batch_limit: usize,
+    ) -> Result<usize, WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        prune_terminal_run_checkpoints(
+            &conn,
+            older_than,
+            usize_to_i64(max_rows_per_run, "max_rows_per_run")?,
+            usize_to_i64(batch_limit, "batch_limit")?,
+        )
+    }
 }
 
 impl WorkflowSignalRepository {
@@ -1604,6 +1639,51 @@ fn list_run_checkpoints(
     Ok(records)
 }
 
+fn prune_terminal_run_checkpoints(
+    conn: &Connection,
+    older_than: &str,
+    max_rows_per_run: i64,
+    batch_limit: i64,
+) -> Result<usize, WorkflowStoreError> {
+    if max_rows_per_run < 0 {
+        return Err(WorkflowStoreError::InvalidListQuery {
+            field: "max_rows_per_run",
+            value: max_rows_per_run.to_string(),
+        });
+    }
+    if batch_limit <= 0 {
+        return Ok(0);
+    }
+
+    let deleted = conn.execute(
+        "WITH ranked AS (
+             SELECT
+                 wc.checkpoint_id,
+                 ROW_NUMBER() OVER (
+                     PARTITION BY wc.run_id
+                     ORDER BY wc.created_at DESC, wc.checkpoint_id DESC
+                 ) AS row_no
+             FROM workflow_checkpoint AS wc
+             JOIN workflow_run AS wr
+               ON wr.run_id = wc.run_id
+             WHERE wr.status IN ('completed', 'failed', 'cancelled')
+               AND datetime(COALESCE(wr.completed_at, wr.updated_at)) < datetime(?1)
+         ),
+         to_delete AS (
+             SELECT checkpoint_id
+             FROM ranked
+             WHERE row_no > ?2
+             ORDER BY checkpoint_id ASC
+             LIMIT ?3
+         )
+         DELETE FROM workflow_checkpoint
+         WHERE checkpoint_id IN (SELECT checkpoint_id FROM to_delete)",
+        params![older_than, max_rows_per_run, batch_limit],
+    )?;
+
+    Ok(deleted)
+}
+
 fn list_run_dispatches(
     conn: &Connection,
     run_id: &str,
@@ -1800,6 +1880,13 @@ fn bool_to_sql(value: bool) -> i64 {
 
 fn sql_to_bool(value: i64) -> bool {
     value != 0
+}
+
+fn usize_to_i64(value: usize, field: &'static str) -> Result<i64, WorkflowStoreError> {
+    i64::try_from(value).map_err(|_| WorkflowStoreError::InvalidListQuery {
+        field,
+        value: value.to_string(),
+    })
 }
 
 /// Return the current UTC timestamp in RFC 3339 format.
@@ -2726,6 +2813,119 @@ mod tests {
         assert_eq!(checkpoints.len(), 2);
         assert!(checkpoints.contains(&consumed_checkpoint));
         assert!(checkpoints.contains(&resumed_checkpoint));
+    }
+
+    #[test]
+    fn checkpoint_retention_should_prune_terminal_runs_in_bounded_batches() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+
+        let mut terminal = sample_run_record("run-terminal-old");
+        terminal.status = WorkflowRunStatus::Completed;
+        terminal.completed_at = Some("2025-01-01T00:00:00Z".to_string());
+        terminal.updated_at = "2025-01-01T00:00:00Z".to_string();
+
+        stores
+            .workflow_run
+            .insert_run(&terminal)
+            .expect("insert terminal run");
+        for index in 0..1200 {
+            stores
+                .workflow_checkpoint
+                .append(&sample_checkpoint(
+                    &terminal.run_id,
+                    Some("archive"),
+                    CheckpointKind::StepCompleted,
+                    &format!("2025-01-01T00:{:02}:{:02}Z", (index / 60) % 60, index % 60),
+                ))
+                .expect("append terminal checkpoint");
+        }
+
+        let deleted_first_batch = stores
+            .workflow_checkpoint
+            .prune_terminal_runs_older_than("2026-01-01T00:00:00Z", 200, 500)
+            .expect("first prune batch should succeed");
+        let deleted_second_batch = stores
+            .workflow_checkpoint
+            .prune_terminal_runs_older_than("2026-01-01T00:00:00Z", 200, 500)
+            .expect("second prune batch should succeed");
+        let deleted_third_batch = stores
+            .workflow_checkpoint
+            .prune_terminal_runs_older_than("2026-01-01T00:00:00Z", 200, 500)
+            .expect("final prune batch should succeed");
+
+        let remaining = stores
+            .workflow_checkpoint
+            .list_for_run(&terminal.run_id)
+            .expect("remaining checkpoints should load");
+
+        assert_eq!(deleted_first_batch, 500);
+        assert_eq!(deleted_second_batch, 500);
+        assert_eq!(deleted_third_batch, 0);
+        assert_eq!(remaining.len(), 200);
+    }
+
+    #[test]
+    fn checkpoint_retention_should_ignore_active_and_recent_runs() {
+        let stores = WorkflowStoreSet::new(compozy_conn());
+
+        let mut active = sample_run_record("run-active");
+        active.status = WorkflowRunStatus::Running;
+        active.completed_at = None;
+        active.updated_at = "2026-03-26T12:00:00Z".to_string();
+
+        let mut recent_terminal = sample_run_record("run-terminal-recent");
+        recent_terminal.status = WorkflowRunStatus::Failed;
+        recent_terminal.completed_at = Some("2026-03-20T10:00:00Z".to_string());
+        recent_terminal.updated_at = "2026-03-20T10:00:00Z".to_string();
+
+        stores
+            .workflow_run
+            .insert_run(&active)
+            .expect("insert active run");
+        stores
+            .workflow_run
+            .insert_run(&recent_terminal)
+            .expect("insert recent terminal run");
+
+        for index in 0..80 {
+            let minute = (index / 60) % 60;
+            let second = index % 60;
+            stores
+                .workflow_checkpoint
+                .append(&sample_checkpoint(
+                    &active.run_id,
+                    Some("step-active"),
+                    CheckpointKind::StepStarted,
+                    &format!("2026-03-26T12:{minute:02}:{second:02}Z"),
+                ))
+                .expect("append active checkpoint");
+            stores
+                .workflow_checkpoint
+                .append(&sample_checkpoint(
+                    &recent_terminal.run_id,
+                    Some("step-terminal"),
+                    CheckpointKind::StepFailed,
+                    &format!("2026-03-20T10:{minute:02}:{second:02}Z"),
+                ))
+                .expect("append recent terminal checkpoint");
+        }
+
+        let deleted = stores
+            .workflow_checkpoint
+            .prune_terminal_runs_older_than("2026-03-01T00:00:00Z", 10, 500)
+            .expect("prune should succeed");
+        let active_checkpoints = stores
+            .workflow_checkpoint
+            .list_for_run(&active.run_id)
+            .expect("active checkpoints should load");
+        let recent_terminal_checkpoints = stores
+            .workflow_checkpoint
+            .list_for_run(&recent_terminal.run_id)
+            .expect("recent terminal checkpoints should load");
+
+        assert_eq!(deleted, 0);
+        assert_eq!(active_checkpoints.len(), 80);
+        assert_eq!(recent_terminal_checkpoints.len(), 80);
     }
 
     #[test]

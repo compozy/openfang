@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/schedules/api</domain>
@@ -67,33 +67,33 @@ replaces that surface with the typed, Compozy-owned schedule contract.
 
 ## Subtasks
 
-- [ ] 26.1 Register the `/api/v1/schedules` router group in `crates/openfang-api/src/server.rs`,
+- [x] 26.1 Register the `/api/v1/schedules` router group in `crates/openfang-api/src/server.rs`,
       replacing the existing `/api/schedules` registration. Implement `GET /api/v1/schedules`
       (paginated list with `agent`, `enabled`, `schedule_kind`, `action_kind`, `q` filters),
       `POST /api/v1/schedules` (create, persisted to `runtime.db`), `GET /api/v1/schedules/{id}`,
       `PUT /api/v1/schedules/{id}`, and `DELETE /api/v1/schedules/{id}`. Create and update must
       validate the cron expression and action before writing.
-- [ ] 26.2 Implement `POST /api/v1/schedules/validate` per ADR-038. Validation must parse the
+- [x] 26.2 Implement `POST /api/v1/schedules/validate` per ADR-038. Validation must parse the
       typed `schedule` block (including `kind`, `expr`, and `tz`), validate the cron expression using
       the existing cron types in `crates/openfang-types/src/scheduler.rs`, check action kind is one of
       `system_event`, `agent_turn`, `workflow_run`, `workflow_signal`, check delivery kind is one of
       `none`, `channel`, `last_channel`, `webhook`, and validate target references (workflow ID,
       agent ID). Returns `{ valid, issues, normalized }` with structured issue objects.
-- [ ] 26.3 Implement `POST /api/v1/schedules/{id}/fork` to produce a user-owned fork with
+- [x] 26.3 Implement `POST /api/v1/schedules/{id}/fork` to produce a user-owned fork with
       `origin.kind = "user"` and a populated `forked_from` block, persisted to `runtime.db`.
-- [ ] 26.4 Implement `GET /api/v1/schedules/{id}/runtime` backed by the `runtime.db` schedule
+- [x] 26.4 Implement `GET /api/v1/schedules/{id}/runtime` backed by the `runtime.db` schedule
       runtime status row for that schedule ID. The response carries `schedule_id`, `enabled`,
       `last_run`, `next_run`, `last_status`, `consecutive_errors`, and `one_shot`.
-- [ ] 26.5 Implement `POST /api/v1/schedules/{id}/enable` and `POST /api/v1/schedules/{id}/disable`.
+- [x] 26.5 Implement `POST /api/v1/schedules/{id}/enable` and `POST /api/v1/schedules/{id}/disable`.
       Both update the `enabled` flag in `runtime.db` and notify the scheduler engine so the change
       takes effect immediately without a daemon restart. A newly disabled schedule must be removed from
       the active cron queue before the endpoint returns.
-- [ ] 26.6 Implement `POST /api/v1/schedules/{id}/run-now` and
+- [x] 26.6 Implement `POST /api/v1/schedules/{id}/run-now` and
       `POST /api/v1/schedules/{id}/run-now/dry-run`. The run-now endpoint dispatches the schedule
       action immediately (bypassing the cron timer) and returns the accepted envelope. The dry-run
       endpoint returns `{ would_execute, resolved: { schedule_id, action }, effects: { schedule_fire },
 explanation: { delivery } }` per API-SPEC.md section 6.
-- [ ] 26.7 Add route-level and handler-level tests. See the Tests section below.
+- [x] 26.7 Add route-level and handler-level tests. See the Tests section below.
 
 ## Implementation Details
 
@@ -171,54 +171,54 @@ must be migrated. The old `/run` sub-resource becomes `/run-now` under the new p
 
 ### Unit Tests (Required)
 
-- [ ] Cron expression validation: a valid standard 5-field expression (`"0 2 * * *"`) passes
+- [x] Cron expression validation: a valid standard 5-field expression (`"0 2 * * *"`) passes
       validation; a malformed expression (`"99 99 99 99 99"`) returns `valid: false` with a structured
       issue whose `path` is `"schedule.expr"`.
-- [ ] Timezone validation: an unknown timezone string in `schedule.tz` returns `valid: false` with
+- [x] Timezone validation: an unknown timezone string in `schedule.tz` returns `valid: false` with
       a structured issue.
-- [ ] Action payload validation: a `workflow_run` action with a missing `workflow_id` field returns
+- [x] Action payload validation: a `workflow_run` action with a missing `workflow_id` field returns
       `valid: false` with `path: "action.workflow_id"` in the issues list.
-- [ ] An unsupported action kind returns a structured validation error, not a 500 or a silent
+- [x] An unsupported action kind returns a structured validation error, not a 500 or a silent
       success.
-- [ ] Validation of a `workflow_signal` action correctly requires a `selector.workflow_id` field.
-- [ ] Enable/disable state transitions: after `POST /api/v1/schedules/{id}/disable` the persisted
+- [x] Validation of a `workflow_signal` action correctly requires a `selector.workflow_id` field.
+- [x] Enable/disable state transitions: after `POST /api/v1/schedules/{id}/disable` the persisted
       `enabled` flag becomes false and the schedule is removed from the active cron queue synchronously.
 
 ### Integration Tests (Required)
 
-- [ ] Full schedule lifecycle: create → validate its definition → enable → run-now → disable →
+- [x] Full schedule lifecycle: create → validate its definition → enable → run-now → disable →
       delete. Each step must return the correct status code and payload shape.
-- [ ] `POST /api/v1/schedules` with a valid `workflow_run` action persists the record in `runtime.db`
+- [x] `POST /api/v1/schedules` with a valid `workflow_run` action persists the record in `runtime.db`
       and returns the full schedule resource including `runtime_status`.
-- [ ] List endpoint returns `{ items, next_cursor }` with pagination: create four schedules, fetch
+- [x] List endpoint returns `{ items, next_cursor }` with pagination: create four schedules, fetch
       with `limit=2`, assert `next_cursor` non-null, fetch second page, assert all four are returned
       across both pages.
-- [ ] A disabled schedule (`enabled: false`) never fires even when its cron expression matches the
+- [x] A disabled schedule (`enabled: false`) never fires even when its cron expression matches the
       current time; verified by checking scheduler state after disable.
-- [ ] `POST /api/v1/schedules/{id}/run-now` on a disabled schedule must still succeed (run-now
+- [x] `POST /api/v1/schedules/{id}/run-now` on a disabled schedule must still succeed (run-now
       bypasses the enabled gate) or return a clear documented error if the product decides to block it.
       Either behavior must be explicitly tested and consistent with API-SPEC.md.
-- [ ] `POST /api/v1/schedules/{id}/run-now/dry-run` returns `would_execute: true` and a `resolved`
+- [x] `POST /api/v1/schedules/{id}/run-now/dry-run` returns `would_execute: true` and a `resolved`
       block containing the schedule ID and action kind without performing any side effect.
-- [ ] `DELETE /api/v1/schedules/{id}` on a non-existent ID returns 404 with the stable error
+- [x] `DELETE /api/v1/schedules/{id}` on a non-existent ID returns 404 with the stable error
       envelope.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Disabled schedules never fire: verified through scheduler state inspection after disable, not
+- [x] Disabled schedules never fire: verified through scheduler state inspection after disable, not
       only through the flag in the database row.
-- [ ] Invalid cron expressions are rejected at write time (`POST` and `PUT`) and at validate time;
+- [x] Invalid cron expressions are rejected at write time (`POST` and `PUT`) and at validate time;
       they must never reach the cron queue.
-- [ ] The old blob-style `/api/schedules` routes are removed and not duplicated alongside the new
+- [x] The old blob-style `/api/schedules` routes are removed and not duplicated alongside the new
       v1 surface.
-- [ ] Run-now is the only bypass for the cron timer; no hidden side-effecting path triggers
+- [x] Run-now is the only bypass for the cron timer; no hidden side-effecting path triggers
       schedule actions outside of the scheduler and run-now endpoints.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

@@ -4,6 +4,7 @@
 *.pdb
 .tmp
 .codex/CONTINUITY*
+node_modules
 
 # Environment & secrets
 .env

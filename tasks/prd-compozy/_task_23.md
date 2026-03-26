@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/dispatch/schema</domain>
@@ -58,34 +58,34 @@ No runtime wiring happens in this task — only the durable storage layer.
 
 ## Subtasks
 
-- [ ] 23.1 Add a new `compozy.db` migration function that creates the `agent_dispatch` table with
+- [x] 23.1 Add a new `compozy.db` migration function that creates the `agent_dispatch` table with
       all required columns, proper indexes (`idx_dispatch_run`, `idx_dispatch_parent`,
       `idx_dispatch_status`), and records itself in the migration log. Verify the migration is
       idempotent and upgrades cleanly from a pre-existing `compozy.db` with earlier schema versions.
 
-- [ ] 23.2 Define the `DispatchKind` enum (`Call`, `Send`, `Spawn`) and `DispatchStatus` enum
+- [x] 23.2 Define the `DispatchKind` enum (`Call`, `Send`, `Spawn`) and `DispatchStatus` enum
       (`Pending`, `Running`, `WaitingHitl`, `Completed`, `Failed`, `Cancelled`) in the appropriate
       types module. Implement `Display`, `FromStr`, and `serde` derives. Enforce legal status
       transitions in the repository layer, not in callers.
 
-- [ ] 23.3 Implement the `DispatchRecord` struct and the `DispatchRepository` trait in a new
+- [x] 23.3 Implement the `DispatchRecord` struct and the `DispatchRepository` trait in a new
       module (e.g., `crates/openfang-memory/src/dispatch.rs` or a new `compozy-db` crate following
       the project's crate-split conventions). The trait must be `Send + Sync` and async.
 
-- [ ] 23.4 Implement the SQLite-backed `DispatchRepository` using `rusqlite` in a pattern
+- [x] 23.4 Implement the SQLite-backed `DispatchRepository` using `rusqlite` in a pattern
       consistent with `crates/openfang-memory/src/structured.rs`. All JSON columns (`input_json`,
       `result_json`, `error_json`) must serialize/deserialize via `serde_json`. Use parameterized
       queries throughout; no string interpolation in SQL.
 
-- [ ] 23.5 Add indexes for common query patterns: `(run_id)` for run-scoped dispatch lists,
+- [x] 23.5 Add indexes for common query patterns: `(run_id)` for run-scoped dispatch lists,
       `(parent_dispatch_id)` for lineage traversal, `(status)` for status-filtered queries. Verify
       index presence in migration tests.
 
-- [ ] 23.6 Write repository-layer unit tests using an in-memory SQLite connection. Cover create,
+- [x] 23.6 Write repository-layer unit tests using an in-memory SQLite connection. Cover create,
       find, status transitions, parent-child linkage, and attempt increment. Verify that illegal status
       transitions return an error rather than silently succeeding.
 
-- [ ] 23.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 23.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass at zero warnings before marking this task complete.
 
 ## Implementation Details
@@ -152,53 +152,53 @@ schema is intentional and documented — they are not yet read by anything in th
 
 ### Unit Tests (Required)
 
-- [ ] `dispatch_record_should_persist_all_required_fields` — create a dispatch record and reload
+- [x] `dispatch_record_should_persist_all_required_fields` — create a dispatch record and reload
       it; verify every column round-trips correctly including JSON payloads and nullable fields.
-- [ ] `dispatch_parent_child_linkage_should_persist_and_be_queryable` — insert a parent dispatch
+- [x] `dispatch_parent_child_linkage_should_persist_and_be_queryable` — insert a parent dispatch
       and two child dispatches referencing its ID; `find_children(parent_id)` must return both
       children and no others.
-- [ ] `dispatch_status_transitions_should_enforce_legality` — attempt all illegal transitions
+- [x] `dispatch_status_transitions_should_enforce_legality` — attempt all illegal transitions
       (e.g., `completed -> running`, `failed -> waiting_hitl`) and verify each returns an error;
       attempt all legal transitions and verify they succeed.
-- [ ] `dispatch_attempt_counter_should_increment_on_retry` — create a dispatch at attempt 1,
+- [x] `dispatch_attempt_counter_should_increment_on_retry` — create a dispatch at attempt 1,
       increment to attempt 2, and verify the stored value is 2.
-- [ ] `dispatch_kind_spawn_should_store_spawned_agent_id` — create a `spawn` dispatch with a
+- [x] `dispatch_kind_spawn_should_store_spawned_agent_id` — create a `spawn` dispatch with a
       `spawned_agent_id` and verify it is stored and retrievable.
-- [ ] `dispatch_find_by_run_should_return_all_run_dispatches` — insert dispatches for two
+- [x] `dispatch_find_by_run_should_return_all_run_dispatches` — insert dispatches for two
       different run IDs and verify `find_by_run` returns only those belonging to the queried run.
-- [ ] `dispatch_of_kind_send_should_not_require_result` — insert a `send` dispatch that completes
+- [x] `dispatch_of_kind_send_should_not_require_result` — insert a `send` dispatch that completes
       without a result payload and verify this is stored without error.
 
 ### Integration Tests (Required)
 
-- [ ] `compozy_db_migration_should_add_dispatch_table_cleanly` — open an in-memory `compozy.db`,
+- [x] `compozy_db_migration_should_add_dispatch_table_cleanly` — open an in-memory `compozy.db`,
       run all migrations, and verify the `agent_dispatch` table and all required indexes exist.
-- [ ] `compozy_db_migration_should_be_idempotent` — run migrations twice on the same database
+- [x] `compozy_db_migration_should_be_idempotent` — run migrations twice on the same database
       and verify no error and no duplicate tables or indexes.
-- [ ] `dispatch_repository_should_survive_connection_restart` — write a dispatch record, drop and
+- [x] `dispatch_repository_should_survive_connection_restart` — write a dispatch record, drop and
       re-open the SQLite connection, and verify the record is still present and queryable.
-- [ ] `dispatch_repository_should_handle_concurrent_status_updates` — simulate two concurrent
+- [x] `dispatch_repository_should_handle_concurrent_status_updates` — simulate two concurrent
       tasks attempting to transition the same dispatch status and verify the outcome is consistent
       and non-corrupting.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not encode dispatch state only as workflow checkpoint payloads — the `agent_dispatch`
+- [x] Do not encode dispatch state only as workflow checkpoint payloads — the `agent_dispatch`
       table must exist as its own first-class table, not as JSON inside `workflow_checkpoint.data_json`.
-- [ ] Do not skip parent-child lineage fields for convenience — `parent_dispatch_id` must be
+- [x] Do not skip parent-child lineage fields for convenience — `parent_dispatch_id` must be
       nullable but never omitted from the schema.
-- [ ] Do not let dispatch lifecycle depend on runtime-only in-memory structures — every status
+- [x] Do not let dispatch lifecycle depend on runtime-only in-memory structures — every status
       transition must be reflected immediately in the database row.
-- [ ] Do not use `unwrap()` in repository code — all SQLite errors must propagate as typed errors.
-- [ ] Do not allow the `approval` subsystem (the old `ApprovalManager` in
+- [x] Do not use `unwrap()` in repository code — all SQLite errors must propagate as typed errors.
+- [x] Do not allow the `approval` subsystem (the old `ApprovalManager` in
       `crates/openfang-kernel/src/approval.rs`) to be confused with dispatch persistence — these are
       entirely different concepts and must not share code paths.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

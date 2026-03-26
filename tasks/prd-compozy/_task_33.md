@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/dispatch/api</domain>
@@ -78,45 +78,45 @@ responses from durable storage, never from in-memory runtime state alone.
 
 ## Subtasks
 
-- [ ] 33.1 Register the new route handlers in `crates/openfang-api/src/server.rs`. Add all
+- [x] 33.1 Register the new route handlers in `crates/openfang-api/src/server.rs`. Add all
       dispatch and HITL routes to the Axum router under `/api/v1/`. Confirm all paths match the
       exact strings in API-SPEC.md sections 10 and 11. Routes registered in `server.rs` but not
       implemented in `routes.rs` must return 501 Not Implemented during development, not 404.
 
-- [ ] 33.2 Implement the dispatch read surfaces: `GET /api/v1/dispatches`,
+- [x] 33.2 Implement the dispatch read surfaces: `GET /api/v1/dispatches`,
       `GET /api/v1/dispatches/{id}`, `GET /api/v1/dispatches/{id}/children`. These are read-only
       handlers backed by `DispatchRepository`. Apply the `run_id`, `status`, `target_agent`, and
       `step_id` query filters. Return the summary shape for list items and the detail shape for
       single-record endpoints, as defined in API-SPEC.md section 10.
 
-- [ ] 33.3 Implement the dispatch action surfaces: `POST /api/v1/dispatches/{id}/cancel` and
+- [x] 33.3 Implement the dispatch action surfaces: `POST /api/v1/dispatches/{id}/cancel` and
       `POST /api/v1/dispatches/{id}/retry`. Both must validate the current dispatch status before
       acting. `cancel` must cascade to linked HITL requests. `retry` must increment `attempt` and
       re-enqueue execution through the workflow engine or dispatch runtime.
 
-- [ ] 33.4 Implement the HITL read surfaces: `GET /api/v1/hitl-requests`,
+- [x] 33.4 Implement the HITL read surfaces: `GET /api/v1/hitl-requests`,
       `GET /api/v1/hitl-requests/{id}`. These are backed by `HitlRepository`. Apply the `run_id`,
       `dispatch_id`, `status`, and `kind` filters. Return the exact detail shape from API-SPEC.md
       section 11, including `sequence_no`, `context`, `response`, and `timeout_at`.
 
-- [ ] 33.5 Implement `POST /api/v1/hitl-requests/{id}/answer`. This is the primary human
+- [x] 33.5 Implement `POST /api/v1/hitl-requests/{id}/answer`. This is the primary human
       interaction endpoint. It must: validate the request is `pending`, call `HitlRepository::answer`
       to write the response, and then trigger the task 30 resume path that transitions the dispatch
       and wakes (or reconstructs) the suspended step executor. Return the accepted action response
       shape from API-SPEC.md common conventions.
 
-- [ ] 33.6 Implement `POST /api/v1/hitl-requests/{id}/cancel`. Cancel the HITL request and
+- [x] 33.6 Implement `POST /api/v1/hitl-requests/{id}/cancel`. Cancel the HITL request and
       cascade to fail the linked dispatch. Update `workflow_run.active_hitl_request_id` to null.
 
-- [ ] 33.7 Implement the run-scoped sub-resources `GET /api/v1/runs/{id}/dispatches` and
+- [x] 33.7 Implement the run-scoped sub-resources `GET /api/v1/runs/{id}/dispatches` and
       `GET /api/v1/runs/{id}/hitl-requests` as thin delegating handlers that call the same
       repository query with `run_id` pre-filtered.
 
-- [ ] 33.8 Register stub SSE handlers for `GET /api/v1/dispatches/{id}/events` and
+- [x] 33.8 Register stub SSE handlers for `GET /api/v1/dispatches/{id}/events` and
       `GET /api/v1/hitl-requests/stream` that return a `stream.snapshot` and `keepalive`. Full
       live streaming is deferred but the endpoints must be reachable.
 
-- [ ] 33.9 Write end-to-end tests covering the full lifecycle: create a run and dispatch via the
+- [x] 33.9 Write end-to-end tests covering the full lifecycle: create a run and dispatch via the
       workflow engine, read the dispatch through the API, submit a HITL answer through the API,
       verify the dispatch and run transition correctly, and read the final state through the API.
 

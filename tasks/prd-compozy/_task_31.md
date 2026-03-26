@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/hitl/recovery</domain>
@@ -61,13 +61,13 @@ live channel exists.
 
 ## Subtasks
 
-- [ ] 31.1 Implement the restart recovery guard. On process startup, if a workflow run has a
+- [x] 31.1 Implement the restart recovery guard. On process startup, if a workflow run has a
       non-null `active_hitl_request_id` and its dispatch is `waiting_hitl`, the recovery logic (from
       Task 19) must leave these records intact and not attempt re-execution. Add detection for
       `waiting_hitl` dispatch status as a recognized stable state in the recovery scan. Log these
       as informational ("Run {id} has pending HITL request {hitl_id}, awaiting human answer").
 
-- [ ] 31.2 Implement the post-restart resume path in the answer API handler. When an answer
+- [x] 31.2 Implement the post-restart resume path in the answer API handler. When an answer
       arrives and no live oneshot `Sender` is found in the `HitlRegistry` HashMap: (a) answer
       the `hitl_request` in the database, (b) transition the dispatch back to `running`,
       (c) clear `workflow_run.active_hitl_request_id`, (d) load the provider session from the
@@ -76,27 +76,27 @@ live channel exists.
       step executor from the last checkpoint. The step execution resumes from the HITL request
       point, not from the beginning of the step.
 
-- [ ] 31.3 Ensure provider session context is preserved across restart. For Arky-backed providers,
+- [x] 31.3 Ensure provider session context is preserved across restart. For Arky-backed providers,
       the `SessionId` written in Task 29 must be sufficient to resume the session via
       `arky_session::SessionStore::load`. For the OpenFang LLM driver, the canonical session in
       `openfang_memory::session` must be checkpointed so it is reloadable after suspension. Verify
       that the session loaded post-restart contains the full conversation context up to the HITL
       pause point.
 
-- [ ] 31.4 Implement the two-branch dispatch in the answer handler. The handler must:
+- [x] 31.4 Implement the two-branch dispatch in the answer handler. The handler must:
       (a) check whether a live oneshot `Sender` exists in the `HitlRegistry` for this
       `hitl_request_id`, (b) if yes, use Task 30's live channel path (send answer through oneshot),
       (c) if no, use this task's reconstruction path (load session, reconstruct step executor).
       This branching must be explicit and well-documented in code.
 
-- [ ] 31.5 Verify multi-turn HITL works after restart: after the post-restart resume, if the
+- [x] 31.5 Verify multi-turn HITL works after restart: after the post-restart resume, if the
       agent asks another question, the live oneshot channel path from Task 30 handles it correctly
       (since the step executor is now alive in the current process).
 
-- [ ] 31.6 Write unit and integration tests covering the restart recovery guard, the post-restart
+- [x] 31.6 Write unit and integration tests covering the restart recovery guard, the post-restart
       resume path, the session reconstruction, and the two-branch dispatch. See Tests section below.
 
-- [ ] 31.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 31.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass at zero warnings before marking this task complete.
 
 ## Implementation Details
@@ -155,50 +155,50 @@ checkpoint state.
 
 ### Unit Tests (Required)
 
-- [ ] `recovery_scan_should_skip_waiting_hitl_dispatches` -- simulate a restart by creating a
+- [x] `recovery_scan_should_skip_waiting_hitl_dispatches` -- simulate a restart by creating a
       run with non-null `active_hitl_request_id` and a dispatch in `waiting_hitl` status; run the
       recovery scan and verify these records are left intact (not transitioned or re-executed).
-- [ ] `post_restart_resume_should_load_session_from_store` -- after simulating a restart (no
+- [x] `post_restart_resume_should_load_session_from_store` -- after simulating a restart (no
       live oneshot channel), submit an answer and verify the session is loaded via
       `SessionStore::load` using the `session_id` from the dispatch record, not from in-memory state.
-- [ ] `post_restart_resume_should_reconstruct_step_executor` -- after the post-restart resume,
+- [x] `post_restart_resume_should_reconstruct_step_executor` -- after the post-restart resume,
       verify a new step executor is created and executes the continuation turn with the answer.
-- [ ] `two_branch_dispatch_should_use_live_path_when_sender_exists` -- with a live oneshot
+- [x] `two_branch_dispatch_should_use_live_path_when_sender_exists` -- with a live oneshot
       `Sender` in the registry, verify the answer handler uses the live channel path.
-- [ ] `two_branch_dispatch_should_use_reconstruction_when_no_sender` -- without a live oneshot
+- [x] `two_branch_dispatch_should_use_reconstruction_when_no_sender` -- without a live oneshot
       `Sender` in the registry, verify the answer handler uses the reconstruction path.
 
 ### Integration Tests (Required)
 
-- [ ] `hitl_restart_during_pending_request_should_preserve_state` -- pause on HITL, simulate a
+- [x] `hitl_restart_during_pending_request_should_preserve_state` -- pause on HITL, simulate a
       process restart (drop and recreate the runtime context), run the restart recovery scan, and
       verify: the run's `active_hitl_request_id` is still set, the dispatch is still `waiting_hitl`,
       and the HITL request is still `pending`.
-- [ ] `hitl_post_restart_resume_should_reconstruct_session_from_store` -- after the restart
+- [x] `hitl_post_restart_resume_should_reconstruct_session_from_store` -- after the restart
       simulation above, submit an answer and verify the session is loaded via `SessionStore::load`
       using the `session_id` from the dispatch record, not from in-memory state.
-- [ ] `hitl_post_restart_resume_should_complete_step` -- after post-restart resume, verify the
+- [x] `hitl_post_restart_resume_should_complete_step` -- after post-restart resume, verify the
       step completes successfully and the workflow advances to the next step.
-- [ ] `hitl_multi_turn_after_restart_should_use_live_path` -- after post-restart resume, trigger
+- [x] `hitl_multi_turn_after_restart_should_use_live_path` -- after post-restart resume, trigger
       a second HITL question; verify the second question uses the live oneshot channel path (since
       the step executor is now alive) and the second answer completes the step.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not lose provider/session context across the HITL pause/resume boundary -- the session
+- [x] Do not lose provider/session context across the HITL pause/resume boundary -- the session
       must be loadable by `SessionStore::load` after a restart; an in-memory-only session is not safe.
-- [ ] Do not resume with a freshly created session instead of the stored session -- this would
+- [x] Do not resume with a freshly created session instead of the stored session -- this would
       lose the agent's reasoning context and produce a broken continuation.
-- [ ] Do not consolidate the live and post-restart resume paths into one code path that loses the
+- [x] Do not consolidate the live and post-restart resume paths into one code path that loses the
       explicit post-restart case -- they must be separately testable.
-- [ ] Do not have the recovery scan attempt to re-execute a step that is in `waiting_hitl` state --
+- [x] Do not have the recovery scan attempt to re-execute a step that is in `waiting_hitl` state --
       this would corrupt the pending HITL interaction.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

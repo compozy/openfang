@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>domain/looper/runtime</domain>
@@ -73,18 +73,18 @@ execution lineage. The `looper_run` table anchors each looper execution to a
 
 ## Subtasks
 
-- [ ] 34.1 Write `compozy.db` migrations for `looper_run` and `looper_subtask`.
+- [x] 34.1 Write `compozy.db` migrations for `looper_run` and `looper_subtask`.
       Include all approved columns, FK constraints (`looper_run.task_id` → `task`,
       `looper_subtask.looper_run_id` → `looper_run`, `looper_subtask.subtask_id`
       → `subtask`), and indexes on `looper_run.task_id`, `looper_run.status`,
       `looper_subtask.looper_run_id`, and `looper_subtask.status`. Migration files
       go in `migrations/compozy/` and must continue the existing numbering sequence.
-- [ ] 34.2 Implement `LooperRunRepository` and `LooperSubtaskRepository` with
+- [x] 34.2 Implement `LooperRunRepository` and `LooperSubtaskRepository` with
       the operations listed in requirements. Follow the shared-connection pattern
       from `crates/openfang-memory/src/structured.rs`. Validate
       `execution_policy_json` shape on `create` — reject unknown `mode` values and
       `max_parallelism < 1` with a domain error, not a panic.
-- [ ] 34.3 Implement `LooperRuntime` executor. The runtime must: (a) load the
+- [x] 34.3 Implement `LooperRuntime` executor. The runtime must: (a) load the
       looper run and its policy from the repository; (b) load the target subtask
       list from `SubtaskRepository` (task 28), applying the `selection` strategy
       (`priority` ordering is the default); (c) drive execution in `sequential` or
@@ -93,16 +93,16 @@ execution lineage. The `looper_run` table anchors each looper execution to a
       `looper_run.progress_json` and `looper_run.current_subtask_id` as work
       advances; (e) transition the looper run to `completed` or `failed` on
       terminal outcomes.
-- [ ] 34.4 Implement restart recovery: on daemon boot, the kernel (or a
+- [x] 34.4 Implement restart recovery: on daemon boot, the kernel (or a
       dedicated recovery step) must scan `looper_run` for runs in `running` status
       and re-attach the `LooperRuntime` to them, resuming from the last committed
       `looper_subtask` state. Completed subtasks must not be re-dispatched.
-- [ ] 34.5 Implement `pause` and `resume` transitions on `LooperRuntime`. Pausing
+- [x] 34.5 Implement `pause` and `resume` transitions on `LooperRuntime`. Pausing
       must stop accepting new subtask dispatches while allowing in-flight dispatches
       to complete. Resuming must restart subtask selection from where the run left
       off.
-- [ ] 34.6 Write unit and integration tests as detailed in the Tests section.
-- [ ] 34.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 34.6 Write unit and integration tests as detailed in the Tests section.
+- [x] 34.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass with zero warnings before marking done.
 
 ## Implementation Details
@@ -195,62 +195,62 @@ completion callback.
 
 ### Unit Tests (Required)
 
-- [ ] Creating a `looper_run` with `mode = "sequential"` persists the full
+- [x] Creating a `looper_run` with `mode = "sequential"` persists the full
       `execution_policy_json` and returns it unchanged on `find_by_id`.
-- [ ] Creating a `looper_run` with a missing `mode` field in `execution_policy_json`
+- [x] Creating a `looper_run` with a missing `mode` field in `execution_policy_json`
       returns a domain error at creation time, not a panic.
-- [ ] Creating a `looper_run` with `max_parallelism = 0` returns a domain validation
+- [x] Creating a `looper_run` with `max_parallelism = 0` returns a domain validation
       error.
-- [ ] `LooperRuntime` in `sequential` mode dispatches subtasks one at a time;
+- [x] `LooperRuntime` in `sequential` mode dispatches subtasks one at a time;
       after each dispatch completes, the next subtask is selected. Confirm no more
       than one `looper_subtask` record has status `running` at any point.
-- [ ] `LooperRuntime` in `parallel` mode with `max_parallelism = 2` dispatches
+- [x] `LooperRuntime` in `parallel` mode with `max_parallelism = 2` dispatches
       at most 2 subtasks concurrently. A third subtask does not start until one of
       the first two completes.
-- [ ] A subtask with `parallelizable = false` causes the parallel runtime to wait
+- [x] A subtask with `parallelizable = false` causes the parallel runtime to wait
       for all in-flight dispatches to complete before starting that subtask, even
       if the semaphore has capacity.
-- [ ] `depends_on` enforcement: a subtask whose dependency has not yet reached
+- [x] `depends_on` enforcement: a subtask whose dependency has not yet reached
       `completed` status is skipped by the subtask selector and becomes eligible
       only after the dependency settles.
 
 ### Integration Tests (Required)
 
-- [ ] A `looper_run` created against a `task` with five subtasks advances through
+- [x] A `looper_run` created against a `task` with five subtasks advances through
       all five in `sequential` mode, setting `looper_run.status = completed` and
       `progress.completed = 5` at the end.
-- [ ] Simulating a daemon restart mid-looper-run: the looper run record is in
+- [x] Simulating a daemon restart mid-looper-run: the looper run record is in
       `running` state, three subtasks are `completed`, two are `pending`. After
       recovery, the runtime resumes from the two pending subtasks and does not
       re-execute the completed ones.
-- [ ] `pause` transitions the looper run to `paused` without interrupting
+- [x] `pause` transitions the looper run to `paused` without interrupting
       already-dispatched subtasks; `resume` restarts selection from the remaining
       pending subtasks.
-- [ ] `cancel` transitions the looper run to `cancelled` and stops all further
+- [x] `cancel` transitions the looper run to `cancelled` and stops all further
       subtask selection. In-flight dispatches may complete, but no new ones are
       started.
-- [ ] Parallel execution with `max_parallelism = 3` and 10 subtasks (none with
+- [x] Parallel execution with `max_parallelism = 3` and 10 subtasks (none with
       `depends_on`): all 10 complete, the run finishes with `completed`, and the
       `progress_json` reflects `total = 10, completed = 10`.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not treat the old OpenFang task queue as the looper backend. The looper
+- [x] Do not treat the old OpenFang task queue as the looper backend. The looper
       must use `looper_run` and `looper_subtask` records in `compozy.db`, not any
       legacy queue table.
-- [ ] Do not infer concurrency mode when `execution_policy_json` is absent or
+- [x] Do not infer concurrency mode when `execution_policy_json` is absent or
       malformed. Fail hard at creation time.
-- [ ] Do not let subtasks widen the looper policy: a subtask that is individually
+- [x] Do not let subtasks widen the looper policy: a subtask that is individually
       `parallelizable = true` must not cause more than `max_parallelism` concurrent
       dispatches under any circumstances.
-- [ ] Do not hold a `Mutex` lock across an async dispatch call; follow the
+- [x] Do not hold a `Mutex` lock across an async dispatch call; follow the
       project's `Never hold locks across .await points` rule from `CLAUDE.md`.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

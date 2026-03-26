@@ -1629,10 +1629,39 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
+    /// Max checkpoints to retain per completed/failed/cancelled run once the
+    /// run is older than `workflow_checkpoint_retention_age_days`.
+    #[serde(default = "default_workflow_checkpoint_retention_max_rows_per_run")]
+    pub workflow_checkpoint_retention_max_rows_per_run: usize,
+    /// Age threshold (days) for terminal run checkpoint retention pruning.
+    #[serde(default = "default_workflow_checkpoint_retention_age_days")]
+    pub workflow_checkpoint_retention_age_days: u64,
+    /// Retention scheduler interval in seconds.
+    #[serde(default = "default_workflow_checkpoint_retention_interval_secs")]
+    pub workflow_checkpoint_retention_interval_secs: u64,
+    /// Maximum rows deleted per retention SQL batch.
+    #[serde(default = "default_workflow_checkpoint_retention_batch_size")]
+    pub workflow_checkpoint_retention_batch_size: usize,
 }
 
 fn default_consolidation_interval() -> u64 {
     24
+}
+
+fn default_workflow_checkpoint_retention_max_rows_per_run() -> usize {
+    1_000
+}
+
+fn default_workflow_checkpoint_retention_age_days() -> u64 {
+    30
+}
+
+fn default_workflow_checkpoint_retention_interval_secs() -> u64 {
+    3_600
+}
+
+fn default_workflow_checkpoint_retention_batch_size() -> usize {
+    500
 }
 
 impl Default for MemoryConfig {
@@ -1644,6 +1673,14 @@ impl Default for MemoryConfig {
             embedding_provider: None,
             embedding_api_key_env: None,
             consolidation_interval_hours: default_consolidation_interval(),
+            workflow_checkpoint_retention_max_rows_per_run:
+                default_workflow_checkpoint_retention_max_rows_per_run(),
+            workflow_checkpoint_retention_age_days: default_workflow_checkpoint_retention_age_days(
+            ),
+            workflow_checkpoint_retention_interval_secs:
+                default_workflow_checkpoint_retention_interval_secs(),
+            workflow_checkpoint_retention_batch_size:
+                default_workflow_checkpoint_retention_batch_size(),
         }
     }
 }
@@ -3730,6 +3767,10 @@ mod tests {
             embedding_provider: Some("ollama".to_string()),
             embedding_api_key_env: Some("OLLAMA_API_KEY".to_string()),
             consolidation_interval_hours: 8,
+            workflow_checkpoint_retention_max_rows_per_run: 250,
+            workflow_checkpoint_retention_age_days: 15,
+            workflow_checkpoint_retention_interval_secs: 1800,
+            workflow_checkpoint_retention_batch_size: 200,
         };
 
         assert_eq!(memory.embedding_model, "test-model");

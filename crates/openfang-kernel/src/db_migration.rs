@@ -6,9 +6,10 @@
 use openfang_memory::{
     AGENT_DISPATCH_MIGRATION_SQL, AGENT_RUNTIME_CORE_MIGRATION_SQL,
     AGENT_SESSIONS_AND_MESSAGES_MIGRATION_SQL, ARTIFACT_DOC_VERSIONING_MIGRATION_SQL,
-    HITL_REQUEST_MIGRATION_SQL, LOOPER_RUNTIME_MIGRATION_SQL, SCHEDULE_RUNTIME_CORE_MIGRATION_SQL,
-    TASK_SUBTASK_MIGRATION_SQL, TRIGGER_RUNTIME_CORE_MIGRATION_SQL,
-    WORKFLOW_CHECKPOINT_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
+    HITL_REQUEST_MIGRATION_SQL, LOOPER_RUNTIME_MIGRATION_SQL, PACK_MIGRATION_SQL,
+    SCHEDULE_RUNTIME_CORE_MIGRATION_SQL, TASK_SUBTASK_MIGRATION_SQL,
+    TRIGGER_RUNTIME_CORE_MIGRATION_SQL, WORKFLOW_CHECKPOINT_MIGRATION_SQL,
+    WORKFLOW_CHECKPOINT_RETENTION_MIGRATION_SQL, WORKFLOW_RUNTIME_DURABILITY_MIGRATION_SQL,
     WORKFLOW_RUN_CONTROL_PLANE_MIGRATION_SQL, WORKFLOW_RUN_CORE_MIGRATION_SQL,
     WORKFLOW_SIGNAL_MIGRATION_SQL, WORKFLOW_SIGNAL_WAITING_STATE_MIGRATION_SQL,
 };
@@ -179,6 +180,12 @@ const COMPOZY_BOOTSTRAP_MIGRATIONS: &[MigrationStep<'static>] = &[
         12,
         "0012_artifact_doc_versioning",
         ARTIFACT_DOC_VERSIONING_MIGRATION_SQL,
+    ),
+    MigrationStep::new(13, "0013_pack", PACK_MIGRATION_SQL),
+    MigrationStep::new(
+        14,
+        "0014_workflow_checkpoint_retention",
+        WORKFLOW_CHECKPOINT_RETENTION_MIGRATION_SQL,
     ),
 ];
 
@@ -742,6 +749,28 @@ mod tests {
     }
 
     #[test]
+    fn compozy_db_migration_should_create_pack_table() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_compozy_migrations(&conn);
+
+        assert!(table_exists(&conn, "pack"));
+        assert_eq!(
+            table_columns(&conn, "pack"),
+            vec![
+                "pack_id".to_string(),
+                "name".to_string(),
+                "version".to_string(),
+                "source_kind".to_string(),
+                "installed".to_string(),
+                "managed".to_string(),
+                "installed_at".to_string(),
+                "updated_at".to_string(),
+                "objects_json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn compozy_db_migration_should_create_all_required_indexes() {
         let conn = Connection::open_in_memory().expect("in-memory db");
         apply_compozy_migrations(&conn);
@@ -750,6 +779,7 @@ mod tests {
             "idx_workflow_run_workflow_id",
             "idx_workflow_run_status",
             "idx_workflow_run_updated_at",
+            "idx_workflow_run_status_completed_at",
             "idx_workflow_checkpoint_run",
             "idx_workflow_signal_run",
             "idx_workflow_signal_run_consumed",
@@ -772,6 +802,8 @@ mod tests {
             "idx_doc_version_doc_id_version_no",
             "idx_doc_version_content_hash",
             "idx_doc_version_created_at",
+            "idx_pack_source_kind",
+            "idx_pack_updated_at",
         ] {
             assert!(
                 index_exists(&conn, index_name),
@@ -799,6 +831,7 @@ mod tests {
             "doc",
             "doc_version",
             "looper_run",
+            "pack",
         ] {
             assert!(
                 !runtime_sql.contains(disallowed_table),
@@ -831,19 +864,14 @@ mod tests {
     }
 
     #[test]
-    fn compozy_db_migration_should_not_include_cross_database_sql_or_pack_tables() {
+    fn compozy_db_migration_should_not_include_cross_database_sql() {
         let compozy_sql = compozy_migration_steps()
             .iter()
             .map(|step| step.sql)
             .collect::<Vec<_>>()
             .join("\n");
 
-        for disallowed_fragment in [
-            "CREATE TABLE pack",
-            "CREATE TABLE IF NOT EXISTS pack",
-            "ATTACH DATABASE",
-            "attach database",
-        ] {
+        for disallowed_fragment in ["ATTACH DATABASE", "attach database"] {
             assert!(
                 !compozy_sql.contains(disallowed_fragment),
                 "compozy.db migrations unexpectedly reference {disallowed_fragment}"
@@ -868,6 +896,7 @@ mod tests {
         assert!(table_exists(&conn, "artifact_version"));
         assert!(table_exists(&conn, "doc"));
         assert!(table_exists(&conn, "doc_version"));
+        assert!(table_exists(&conn, "pack"));
         for index_name in [
             "idx_dispatch_run",
             "idx_dispatch_parent",
@@ -895,6 +924,9 @@ mod tests {
             "idx_doc_version_doc_id_version_no",
             "idx_doc_version_content_hash",
             "idx_doc_version_created_at",
+            "idx_workflow_run_status_completed_at",
+            "idx_pack_source_kind",
+            "idx_pack_updated_at",
         ] {
             assert!(
                 index_exists(&conn, index_name),
@@ -907,7 +939,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("query schema_migration row count");
-        assert_eq!(migration_count, 12);
+        assert_eq!(migration_count, 14);
     }
 
     #[test]
@@ -929,6 +961,7 @@ mod tests {
         assert!(table_exists(&conn, "artifact_version"));
         assert!(table_exists(&conn, "doc"));
         assert!(table_exists(&conn, "doc_version"));
+        assert!(table_exists(&conn, "pack"));
         assert_eq!(
             table_columns(&conn, "task"),
             vec![

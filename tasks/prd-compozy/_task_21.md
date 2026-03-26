@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>api/agents/runtime</domain>
@@ -45,11 +45,11 @@ definition.
 
 ## Subtasks
 
-- [ ] 21.1 Add new request and response types to `crates/openfang-api/src/types.rs` for runtime and session sub-resources: `AgentRuntimeResponse`, `RuntimeModeRequest`, `SessionListItem`, `SessionDetail`, `CreateSessionRequest`. All structs must match the `API-SPEC.md` payload shapes exactly.
-- [ ] 21.2 Implement runtime sub-resource route handlers: `get_agent_runtime`, `start_agent_runtime`, `stop_agent_runtime`, `restart_agent_runtime`, `set_agent_runtime_mode`. These must delegate to the existing kernel agent lifecycle methods (`set_state`, `set_mode` on `AgentRegistry`) and return the `API-SPEC.md` runtime resource shape.
-- [ ] 21.3 Implement session sub-resource route handlers: `list_agent_sessions`, `create_agent_session`, `get_agent_session`, `activate_agent_session`, `reset_agent_session`, `compact_agent_session`. Session state must be stored in and retrieved from the kernel or a dedicated session store.
-- [ ] 21.4 Register all runtime and session routes in `crates/openfang-api/src/server.rs` under the `/api/v1/agents/{id}/` prefix.
-- [ ] 21.5 Write unit and integration tests for all runtime and session sub-resource endpoints.
+- [x] 21.1 Add new request and response types to `crates/openfang-api/src/types.rs` for runtime and session sub-resources: `AgentRuntimeResponse`, `RuntimeModeRequest`, `SessionListItem`, `SessionDetail`, `CreateSessionRequest`. All structs must match the `API-SPEC.md` payload shapes exactly.
+- [x] 21.2 Implement runtime sub-resource route handlers: `get_agent_runtime`, `start_agent_runtime`, `stop_agent_runtime`, `restart_agent_runtime`, `set_agent_runtime_mode`. These must delegate to the existing kernel agent lifecycle methods (`set_state`, `set_mode` on `AgentRegistry`) and return the `API-SPEC.md` runtime resource shape.
+- [x] 21.3 Implement session sub-resource route handlers: `list_agent_sessions`, `create_agent_session`, `get_agent_session`, `activate_agent_session`, `reset_agent_session`, `compact_agent_session`. Session state must be stored in and retrieved from the kernel or a dedicated session store.
+- [x] 21.4 Register all runtime and session routes in `crates/openfang-api/src/server.rs` under the `/api/v1/agents/{id}/` prefix.
+- [x] 21.5 Write unit and integration tests for all runtime and session sub-resource endpoints.
 
 ## Implementation Details
 
@@ -120,30 +120,30 @@ include the full conversation context if requested.
 
 ### Unit Tests (Required)
 
-- [ ] `get_agent_runtime` returns the runtime resource shape with `loaded`, `state`, `mode`, `healthy`, `active_sessions`, `active_dispatches` fields.
-- [ ] `start_agent_runtime` returns `{ accepted: true, resource_id: "...", status: "accepted" }` for a valid agent ID.
-- [ ] `set_agent_runtime_mode` returns `400` when given an unknown mode string not in the `AgentMode` enum.
-- [ ] `list_agent_sessions` returns `{ items: [...], next_cursor: null }` shape.
-- [ ] `create_agent_session` returns a session detail with a generated `session_id`.
-- [ ] `get_agent_session` returns `404` for an unknown session ID.
+- [x] `get_agent_runtime` returns the runtime resource shape with `loaded`, `state`, `mode`, `healthy`, `active_sessions`, `active_dispatches` fields.
+- [x] `start_agent_runtime` returns `{ accepted: true, resource_id: "...", status: "accepted" }` for a valid agent ID.
+- [x] `set_agent_runtime_mode` returns `400` when given an unknown mode string not in the `AgentMode` enum.
+- [x] `list_agent_sessions` returns `{ items: [...], next_cursor: null }` shape.
+- [x] `create_agent_session` returns a session detail with a generated `session_id`.
+- [x] `get_agent_session` returns `404` for an unknown session ID.
 
 ### Integration Tests (Required)
 
-- [ ] An agent runtime lifecycle sequence — `start`, `get runtime`, `stop` — results in consistent `state` values in the runtime resource responses across the three calls.
-- [ ] Session lifecycle: `create_session`, `list_sessions` includes the new session, `activate_session` changes the active flag, `reset_session` clears session state.
-- [ ] Definition endpoints (`PUT /api/v1/agents/{id}` from Task 20) must not have observable side effects on live runtime state — confirmed by asserting that `get_agent_runtime` state is unchanged after a `PUT` call.
+- [x] An agent runtime lifecycle sequence — `start`, `get runtime`, `stop` — results in consistent `state` values in the runtime resource responses across the three calls.
+- [x] Session lifecycle: `create_session`, `list_sessions` includes the new session, `activate_session` changes the active flag, `reset_session` clears session state.
+- [x] Definition endpoints (`PUT /api/v1/agents/{id}` from Task 20) must not have observable side effects on live runtime state — confirmed by asserting that `get_agent_runtime` state is unchanged after a `PUT` call.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] No runtime handler may modify the stored agent definition.
-- [ ] All error responses must use the `{ error: { code, message, details } }` envelope.
-- [ ] No internal agent side channels: runtime operations must not bypass the public API contract to apply privileged mutations not available to external callers (ADR-023).
+- [x] No runtime handler may modify the stored agent definition.
+- [x] All error responses must use the `{ error: { code, message, details } }` envelope.
+- [x] No internal agent side channels: runtime operations must not bypass the public API contract to apply privileged mutations not available to external callers (ADR-023).
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

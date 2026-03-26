@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/triggers/types</domain>
@@ -72,41 +72,41 @@ routes with the new CRUD surface.
 
 ## Subtasks
 
-- [ ] 35.1 Define the trigger v2 types in a new module (e.g. `crates/openfang-kernel/src/trigger_v2.rs`
+- [x] 35.1 Define the trigger v2 types in a new module (e.g. `crates/openfang-kernel/src/trigger_v2.rs`
       or a dedicated `crates/openfang-types/src/trigger.rs`). The types must cover: `TriggerV2`
       (top-level resource with all fields from ADR-025), `TriggerMatch` (`event`, `source`, `contains`,
       `filters`), `TriggerTarget` (enum over `AgentMessage`, `WorkflowStart`, `WorkflowSignal`),
       and `TriggerRuntimeStatus` (`trigger_id`, `enabled`, `fire_count`, `max_fires`, `cooldown_secs`,
       `last_fired_at`). These types must be clearly isolated from the legacy `TriggerPattern` enum.
 
-- [ ] 35.2 Register the `/api/v1/triggers` router group in `crates/openfang-api/src/server.rs`,
+- [x] 35.2 Register the `/api/v1/triggers` router group in `crates/openfang-api/src/server.rs`,
       replacing the existing `/api/triggers` registration. Implement the full CRUD surface:
       `GET /api/v1/triggers` (paginated with `enabled`, `event`, `target_kind`, `q` filters),
       `POST /api/v1/triggers` (create, file-backed), `GET /api/v1/triggers/{id}` (full detail),
       `PUT /api/v1/triggers/{id}` (update with validate-normalize-write-reload), and
       `DELETE /api/v1/triggers/{id}`.
 
-- [ ] 35.3 Implement `POST /api/v1/triggers/validate`, `POST /api/v1/triggers/compile`, and
+- [x] 35.3 Implement `POST /api/v1/triggers/validate`, `POST /api/v1/triggers/compile`, and
       `GET /api/v1/triggers/{id}/compiled` per ADR-038. Validation must check match field types,
       target kind enum validity, target-kind-specific required fields, and referenced agent/workflow
       IDs. Compile returns `{ definition_id, normalized, compiled: { trigger_ir } }`. Validation must
       not execute the event pipeline or contact external systems.
 
-- [ ] 35.4 Implement `POST /api/v1/triggers/{id}/fork` with correct provenance metadata, and
+- [x] 35.4 Implement `POST /api/v1/triggers/{id}/fork` with correct provenance metadata, and
       `GET /api/v1/triggers/{id}/runtime` backed by persisted runtime state. Implement
       `POST /api/v1/triggers/{id}/enable` and `POST /api/v1/triggers/{id}/disable`. Enable/disable
       must update the in-memory matching set synchronously so a newly disabled trigger is excluded from
       the next event match cycle without a daemon restart.
 
-- [ ] 35.5 Implement `POST /api/v1/triggers/{id}/test`. The handler accepts a synthetic event
+- [x] 35.5 Implement `POST /api/v1/triggers/{id}/test`. The handler accepts a synthetic event
       payload `{ event: { event, source, payload } }` and evaluates all match fields against it using
       the trigger matching engine. The response carries `{ matched, resolved_target, would_dispatch,
       explanation }`. The handler must not execute any action or dispatch, even when `matched = true`
       and `would_dispatch = true`.
 
-- [ ] 35.6 Add route-level and type-level tests. See the Tests section below.
+- [x] 35.6 Add route-level and type-level tests. See the Tests section below.
 
-- [ ] 35.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 35.7 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass at zero warnings before marking this task complete.
 
 ## Implementation Details
@@ -194,47 +194,47 @@ Operational action responses (enable, disable) use the accepted envelope:
 
 ### Unit Tests (Required)
 
-- [ ] `TriggerTarget::WorkflowSignal` requires a non-empty `selector.workflow_id`; a definition
+- [x] `TriggerTarget::WorkflowSignal` requires a non-empty `selector.workflow_id`; a definition
       without it returns `valid: false` in validate with `path: "target.selector.workflow_id"`.
-- [ ] Target kind resolution correctly maps the three target kinds to their dispatch actions:
+- [x] Target kind resolution correctly maps the three target kinds to their dispatch actions:
       `agent_message` -> agent message send, `workflow_start` -> run creation, `workflow_signal` ->
       signal dispatch.
-- [ ] Enable/disable state transitions: after `POST /api/v1/triggers/{id}/disable` the trigger is
+- [x] Enable/disable state transitions: after `POST /api/v1/triggers/{id}/disable` the trigger is
       removed from the active matching set; after `POST /api/v1/triggers/{id}/enable` it is re-added.
       Both changes take effect before the endpoint returns.
-- [ ] Compile returns `{ definition_id, normalized, compiled: { trigger_ir } }` for a valid
+- [x] Compile returns `{ definition_id, normalized, compiled: { trigger_ir } }` for a valid
       definition; `trigger_ir` must be non-null and non-empty.
-- [ ] Validate with `strict = true` reports warnings as errors.
+- [x] Validate with `strict = true` reports warnings as errors.
 
 ### Integration Tests (Required)
 
-- [ ] Full CRUD round-trip: create a trigger (`POST`), read it back (`GET {id}`) with all fields,
+- [x] Full CRUD round-trip: create a trigger (`POST`), read it back (`GET {id}`) with all fields,
       update its `max_fires` (`PUT {id}`), verify the change, delete it (`DELETE {id}`), confirm
       subsequent `GET {id}` returns 404.
-- [ ] `POST /api/v1/triggers/{id}/test` with a matching synthetic event returns `matched: true`,
+- [x] `POST /api/v1/triggers/{id}/test` with a matching synthetic event returns `matched: true`,
       a non-null `resolved_target`, and `would_dispatch: true`, without creating any workflow run or
       agent message.
-- [ ] `POST /api/v1/triggers/{id}/test` with a non-matching synthetic event returns
+- [x] `POST /api/v1/triggers/{id}/test` with a non-matching synthetic event returns
       `matched: false` and `would_dispatch: false`.
-- [ ] `POST /api/v1/triggers/validate` for a `workflow_signal` target without a `selector` field
+- [x] `POST /api/v1/triggers/validate` for a `workflow_signal` target without a `selector` field
       returns `valid: false` with a structured issue at `path: "target.selector"`.
-- [ ] List endpoint returns `{ items, next_cursor }` with pagination; `target_kind=workflow_start`
+- [x] List endpoint returns `{ items, next_cursor }` with pagination; `target_kind=workflow_start`
       filter returns only triggers with that target kind.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] The legacy `TriggerPattern` enum in `crates/openfang-kernel/src/triggers.rs` must not be
+- [x] The legacy `TriggerPattern` enum in `crates/openfang-kernel/src/triggers.rs` must not be
       extended to carry v2 matching fields; the two type systems must remain isolated.
-- [ ] `POST /api/v1/triggers/{id}/test` must never dispatch an action, even when both
+- [x] `POST /api/v1/triggers/{id}/test` must never dispatch an action, even when both
       `matched = true` and `would_dispatch = true`.
-- [ ] File-backed writes for trigger definitions are atomic: a failed normalization must not
+- [x] File-backed writes for trigger definitions are atomic: a failed normalization must not
       leave a partial file.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 
