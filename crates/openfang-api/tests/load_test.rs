@@ -55,6 +55,7 @@ async fn start_test_server() -> TestServer {
         kernel,
         started_at: Instant::now(),
         peer_registry: None,
+        looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),

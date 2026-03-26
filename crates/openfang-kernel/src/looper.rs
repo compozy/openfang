@@ -1,23 +1,179 @@
 //! Durable looper runtime for task/subtask execution.
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use openfang_memory::{
     now_timestamp, DispatchKind, DispatchRecord, DispatchRepository, DispatchStatus,
     DispatchStoreError, LooperStoreError, TaskStoreError, WorkflowStoreSet,
 };
 use openfang_types::looper::{
-    LooperExecutionMode, LooperProgress, LooperRunId, LooperRunRecord, LooperRunStatus,
-    LooperSubtaskRecord, LooperSubtaskStatus,
+    LooperExecutionMode, LooperProgress, LooperRunId, LooperRunRecord, LooperRunResource,
+    LooperRunStatus, LooperSubtaskRecord, LooperSubtaskStatus, LooperSubtaskView,
 };
 use openfang_types::task::{SubtaskId, SubtaskListQuery, SubtaskRecord, SubtaskStatus, TaskId};
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{broadcast, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Minimum retained looper events per run for bounded SSE replay.
+pub const LOOPER_EVENT_RING_BUFFER_CAPACITY: usize = 50;
+const LOOPER_EVENT_BROADCAST_CAPACITY: usize = 128;
+
+/// One buffered looper SSE event emitted by the runtime registry.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LooperStreamEvent {
+    /// Monotonically increasing per-run event identifier.
+    pub id: u64,
+    /// Stable SSE event name.
+    pub event: String,
+    /// JSON payload associated with the event.
+    pub data: JsonValue,
+}
+
+/// Replay decision for one looper SSE subscriber.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LooperReplayResult {
+    /// Whether the caller's requested event id fell outside the retained window.
+    pub reset_required: bool,
+    /// Retained events newer than the requested `Last-Event-ID`.
+    pub events: Vec<LooperStreamEvent>,
+}
+
+/// Per-run looper event fan-out handle shared between the kernel and API layer.
+#[derive(Debug)]
+pub struct LooperRuntimeHandle {
+    sender: broadcast::Sender<LooperStreamEvent>,
+    history: RwLock<VecDeque<LooperStreamEvent>>,
+    next_event_id: AtomicU64,
+}
+
+impl Default for LooperRuntimeHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LooperRuntimeHandle {
+    /// Create an empty event handle with bounded replay retention.
+    #[must_use]
+    pub fn new() -> Self {
+        let (sender, _) = broadcast::channel(LOOPER_EVENT_BROADCAST_CAPACITY);
+        Self {
+            sender,
+            history: RwLock::new(VecDeque::with_capacity(LOOPER_EVENT_RING_BUFFER_CAPACITY)),
+            next_event_id: AtomicU64::new(0),
+        }
+    }
+
+    /// Return the latest assigned event id for the run.
+    #[must_use]
+    pub fn latest_event_id(&self) -> u64 {
+        self.next_event_id.load(Ordering::Relaxed)
+    }
+
+    /// Subscribe to live events for one looper run.
+    pub fn subscribe(&self) -> broadcast::Receiver<LooperStreamEvent> {
+        self.sender.subscribe()
+    }
+
+    /// Record and fan out one looper event.
+    pub fn publish(&self, event: impl Into<String>, data: JsonValue) -> LooperStreamEvent {
+        let buffered = LooperStreamEvent {
+            id: self.next_event_id.fetch_add(1, Ordering::Relaxed) + 1,
+            event: event.into(),
+            data,
+        };
+
+        {
+            let mut history = self
+                .history
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            history.push_back(buffered.clone());
+            while history.len() > LOOPER_EVENT_RING_BUFFER_CAPACITY {
+                history.pop_front();
+            }
+        }
+
+        let _ = self.sender.send(buffered.clone());
+        buffered
+    }
+
+    /// Replay retained events newer than the requested id, or signal reset when
+    /// the retained window no longer reaches that far back.
+    #[must_use]
+    pub fn replay_after(&self, last_event_id: Option<u64>) -> LooperReplayResult {
+        let history = self
+            .history
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(last_event_id) = last_event_id else {
+            return LooperReplayResult {
+                reset_required: false,
+                events: Vec::new(),
+            };
+        };
+
+        let Some(oldest_id) = history.front().map(|event| event.id) else {
+            return LooperReplayResult {
+                reset_required: false,
+                events: Vec::new(),
+            };
+        };
+        if last_event_id < oldest_id.saturating_sub(1) {
+            return LooperReplayResult {
+                reset_required: true,
+                events: Vec::new(),
+            };
+        }
+
+        LooperReplayResult {
+            reset_required: false,
+            events: history
+                .iter()
+                .filter(|event| event.id > last_event_id)
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+/// Registry of live looper runtime handles keyed by durable run id.
+#[derive(Debug, Default)]
+pub struct LooperRuntimeRegistry {
+    handles: DashMap<LooperRunId, Arc<LooperRuntimeHandle>>,
+}
+
+impl LooperRuntimeRegistry {
+    /// Create an empty looper runtime registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the existing handle for one run, when available.
+    pub fn get(&self, looper_run_id: &LooperRunId) -> Option<Arc<LooperRuntimeHandle>> {
+        self.handles
+            .get(looper_run_id)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// Return the existing handle for one run or create it on demand.
+    pub fn handle(&self, looper_run_id: &LooperRunId) -> Arc<LooperRuntimeHandle> {
+        Arc::clone(
+            self.handles
+                .entry(looper_run_id.clone())
+                .or_insert_with(|| Arc::new(LooperRuntimeHandle::new()))
+                .value(),
+        )
+    }
+}
 
 /// Async executor used by the looper runtime to drive one durable dispatch.
 #[async_trait]
@@ -43,6 +199,9 @@ pub(crate) enum LooperRuntimeError {
     /// Durable dispatch store returned an error.
     #[error(transparent)]
     DispatchStore(#[from] DispatchStoreError),
+    /// JSON serialization failed while publishing an event.
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     /// One asynchronous task failed to join cleanly.
     #[error("looper task join failed: {0}")]
     Join(String),
@@ -59,6 +218,7 @@ pub(crate) enum LooperRuntimeError {
 pub(crate) struct LooperRuntime {
     stores: WorkflowStoreSet,
     executor: Arc<dyn LooperDispatchExecutor>,
+    event_handle: Arc<LooperRuntimeHandle>,
 }
 
 #[derive(Debug)]
@@ -76,8 +236,16 @@ struct SubtaskCompletion {
 
 impl LooperRuntime {
     /// Create a new looper runtime from durable stores and a dispatch executor.
-    pub(crate) fn new(stores: WorkflowStoreSet, executor: Arc<dyn LooperDispatchExecutor>) -> Self {
-        Self { stores, executor }
+    pub(crate) fn new(
+        stores: WorkflowStoreSet,
+        executor: Arc<dyn LooperDispatchExecutor>,
+        event_handle: Arc<LooperRuntimeHandle>,
+    ) -> Self {
+        Self {
+            stores,
+            executor,
+            event_handle,
+        }
     }
 
     /// Resume or execute one looper run until it settles or is externally stopped.
@@ -174,6 +342,11 @@ impl LooperRuntime {
                     next_subtask.updated_at = started_at.clone();
                     next_subtask.completed_at = None;
                     self.stores.subtask.update(&next_subtask)?;
+                    self.emit_subtask_event(
+                        "subtask.started",
+                        &next_subtask,
+                        LooperSubtaskStatus::Running,
+                    )?;
                     subtasks_by_id.insert(subtask_id.clone(), next_subtask.clone());
 
                     let permit = Arc::clone(&semaphore)
@@ -206,51 +379,55 @@ impl LooperRuntime {
             if in_flight.is_empty() {
                 match self.determine_idle_outcome(&looper_run, &ordered_subtasks, &execution_view) {
                     IdleOutcome::Pause => {
-                        self.stores.looper_run.set_current_subtask(
+                        looper_run = self.stores.looper_run.set_current_subtask(
                             &looper_run.looper_run_id,
                             None,
                             &now_timestamp(),
                         )?;
+                        self.emit_run_updated(&looper_run)?;
                         return Ok(());
                     }
                     IdleOutcome::Cancel => {
-                        self.stores.looper_run.set_current_subtask(
+                        looper_run = self.stores.looper_run.set_current_subtask(
                             &looper_run.looper_run_id,
                             None,
                             &now_timestamp(),
                         )?;
+                        self.emit_run_updated(&looper_run)?;
                         return Ok(());
                     }
                     IdleOutcome::Complete => {
                         let completed_at = now_timestamp();
-                        self.stores.looper_run.update_status(
+                        looper_run = self.stores.looper_run.update_status(
                             &looper_run.looper_run_id,
                             LooperRunStatus::Completed,
                             None,
                             &completed_at,
                             Some(&completed_at),
                         )?;
-                        self.stores.looper_run.set_current_subtask(
+                        looper_run = self.stores.looper_run.set_current_subtask(
                             &looper_run.looper_run_id,
                             None,
                             &completed_at,
                         )?;
+                        self.emit_run_updated(&looper_run)?;
                         return Ok(());
                     }
                     IdleOutcome::Fail(message) => {
                         let failed_at = now_timestamp();
-                        self.stores.looper_run.update_status(
+                        looper_run = self.stores.looper_run.update_status(
                             &looper_run.looper_run_id,
                             LooperRunStatus::Failed,
                             Some(&serde_json::json!({ "message": message })),
                             &failed_at,
                             Some(&failed_at),
                         )?;
-                        self.stores.looper_run.set_current_subtask(
+                        looper_run = self.stores.looper_run.set_current_subtask(
                             &looper_run.looper_run_id,
                             None,
                             &failed_at,
                         )?;
+                        self.emit_run_updated(&looper_run)?;
                         return Ok(());
                     }
                 }
@@ -298,6 +475,11 @@ impl LooperRuntime {
                     next_subtask.updated_at = completed_at.clone();
                     next_subtask.completed_at = Some(completed_at.clone());
                     self.stores.subtask.update(&next_subtask)?;
+                    self.emit_subtask_event(
+                        "subtask.completed",
+                        &next_subtask,
+                        LooperSubtaskStatus::Completed,
+                    )?;
                     subtasks_by_id.insert(completion.subtask_id.clone(), next_subtask);
                 }
                 Err(message) => {
@@ -323,6 +505,11 @@ impl LooperRuntime {
                     next_subtask.updated_at = completed_at.clone();
                     next_subtask.completed_at = Some(completed_at.clone());
                     self.stores.subtask.update(&next_subtask)?;
+                    self.emit_subtask_event(
+                        "subtask.failed",
+                        &next_subtask,
+                        LooperSubtaskStatus::Failed,
+                    )?;
                     subtasks_by_id.insert(completion.subtask_id.clone(), next_subtask);
                 }
             }
@@ -345,8 +532,16 @@ impl LooperRuntime {
             .into_iter()
             .map(|record| (record.subtask_id.to_string(), record))
             .collect::<HashMap<_, _>>();
+        let scoped_subtasks = if execution_view.is_empty() {
+            ordered_subtasks.iter().collect::<Vec<_>>()
+        } else {
+            ordered_subtasks
+                .iter()
+                .filter(|subtask| execution_view.contains_key(subtask.subtask_id.as_ref()))
+                .collect::<Vec<_>>()
+        };
 
-        for subtask in ordered_subtasks {
+        for subtask in scoped_subtasks {
             if let Some(record) = execution_view.get(&subtask.subtask_id.to_string()) {
                 if record.status == LooperSubtaskStatus::Running {
                     let reset_at = now_timestamp();
@@ -453,6 +648,7 @@ impl LooperRuntime {
     ) -> Result<(), LooperRuntimeError> {
         let progress = compute_progress(execution_view);
         let current_subtask_id = current_running_subtask_id(ordered_subtasks, execution_view);
+        let mut changed = false;
 
         if looper_run.progress != progress {
             *looper_run = self.stores.looper_run.update_progress(
@@ -460,6 +656,7 @@ impl LooperRuntime {
                 progress,
                 &now_timestamp(),
             )?;
+            changed = true;
         }
 
         if looper_run.current_subtask_id != current_subtask_id {
@@ -468,8 +665,39 @@ impl LooperRuntime {
                 current_subtask_id.as_ref(),
                 &now_timestamp(),
             )?;
+            changed = true;
         }
 
+        if changed {
+            self.emit_run_updated(looper_run)?;
+        }
+
+        Ok(())
+    }
+
+    fn emit_run_updated(&self, looper_run: &LooperRunRecord) -> Result<(), LooperRuntimeError> {
+        self.event_handle.publish(
+            "run.updated",
+            serde_json::to_value(LooperRunResource::from(looper_run))?,
+        );
+        Ok(())
+    }
+
+    fn emit_subtask_event(
+        &self,
+        event: &str,
+        subtask: &SubtaskRecord,
+        status: LooperSubtaskStatus,
+    ) -> Result<(), LooperRuntimeError> {
+        self.event_handle.publish(
+            event,
+            serde_json::to_value(LooperSubtaskView {
+                id: subtask.subtask_id.clone(),
+                title: subtask.title.clone(),
+                status,
+                updated_at: subtask.updated_at.clone(),
+            })?,
+        );
         Ok(())
     }
 
@@ -1106,7 +1334,11 @@ mod tests {
             "subtask-2".to_string(),
             "subtask-3".to_string(),
         ]));
-        let runtime = LooperRuntime::new(stores.clone(), executor.clone());
+        let runtime = LooperRuntime::new(
+            stores.clone(),
+            executor.clone(),
+            Arc::new(LooperRuntimeHandle::new()),
+        );
         let looper_run_id = looper_run.looper_run_id.clone();
 
         let task = tokio::spawn(async move {
@@ -1158,7 +1390,11 @@ mod tests {
             "subtask-2".to_string(),
             "subtask-3".to_string(),
         ]));
-        let runtime = LooperRuntime::new(stores.clone(), executor.clone());
+        let runtime = LooperRuntime::new(
+            stores.clone(),
+            executor.clone(),
+            Arc::new(LooperRuntimeHandle::new()),
+        );
         let looper_run_id = looper_run.looper_run_id.clone();
 
         let task = tokio::spawn(async move {
@@ -1205,7 +1441,11 @@ mod tests {
             "subtask-2".to_string(),
             "subtask-3".to_string(),
         ]));
-        let runtime = LooperRuntime::new(stores.clone(), executor.clone());
+        let runtime = LooperRuntime::new(
+            stores.clone(),
+            executor.clone(),
+            Arc::new(LooperRuntimeHandle::new()),
+        );
         let looper_run_id = looper_run.looper_run_id.clone();
 
         let task = tokio::spawn(async move {
@@ -1264,7 +1504,11 @@ mod tests {
             "subtask-2".to_string(),
             "subtask-3".to_string(),
         ]));
-        let runtime = LooperRuntime::new(stores.clone(), executor.clone());
+        let runtime = LooperRuntime::new(
+            stores.clone(),
+            executor.clone(),
+            Arc::new(LooperRuntimeHandle::new()),
+        );
         let looper_run_id = looper_run.looper_run_id.clone();
 
         let task = tokio::spawn(async move {
@@ -1317,7 +1561,11 @@ mod tests {
             1,
             subtasks,
         );
-        let runtime = LooperRuntime::new(stores.clone(), Arc::new(ImmediateExecutor));
+        let runtime = LooperRuntime::new(
+            stores.clone(),
+            Arc::new(ImmediateExecutor),
+            Arc::new(LooperRuntimeHandle::new()),
+        );
 
         runtime
             .run(&looper_run.looper_run_id, CancellationToken::new())
@@ -1420,7 +1668,11 @@ mod tests {
             "subtask-4".to_string(),
             "subtask-5".to_string(),
         ]));
-        let runtime = LooperRuntime::new(recovered_stores.clone(), executor.clone());
+        let runtime = LooperRuntime::new(
+            recovered_stores.clone(),
+            executor.clone(),
+            Arc::new(LooperRuntimeHandle::new()),
+        );
         let recovery_task = tokio::spawn({
             let looper_run_id = looper_run_id.clone();
             async move {
@@ -1478,7 +1730,11 @@ mod tests {
             "subtask-2".to_string(),
             "subtask-3".to_string(),
         ]));
-        let runtime = LooperRuntime::new(stores.clone(), executor.clone());
+        let runtime = LooperRuntime::new(
+            stores.clone(),
+            executor.clone(),
+            Arc::new(LooperRuntimeHandle::new()),
+        );
 
         let first_pass = tokio::spawn({
             let looper_run_id = looper_run.looper_run_id.clone();
@@ -1517,7 +1773,11 @@ mod tests {
             .looper_run
             .resume(&looper_run.looper_run_id, "2026-03-25T10:05:00Z")
             .expect("resume should persist");
-        let resumed_runtime = LooperRuntime::new(stores.clone(), executor.clone());
+        let resumed_runtime = LooperRuntime::new(
+            stores.clone(),
+            executor.clone(),
+            Arc::new(LooperRuntimeHandle::new()),
+        );
         let second_pass = tokio::spawn({
             let looper_run_id = looper_run.looper_run_id.clone();
             async move {
@@ -1570,7 +1830,11 @@ mod tests {
             "subtask-2".to_string(),
             "subtask-3".to_string(),
         ]));
-        let runtime = LooperRuntime::new(stores.clone(), executor.clone());
+        let runtime = LooperRuntime::new(
+            stores.clone(),
+            executor.clone(),
+            Arc::new(LooperRuntimeHandle::new()),
+        );
 
         let cancel_task = tokio::spawn({
             let looper_run_id = looper_run.looper_run_id.clone();
@@ -1636,7 +1900,11 @@ mod tests {
                 .map(|index| format!("subtask-{index}"))
                 .collect::<Vec<_>>(),
         ));
-        let runtime = LooperRuntime::new(stores.clone(), executor.clone());
+        let runtime = LooperRuntime::new(
+            stores.clone(),
+            executor.clone(),
+            Arc::new(LooperRuntimeHandle::new()),
+        );
         let looper_run_id = looper_run.looper_run_id.clone();
 
         let task = tokio::spawn(async move {

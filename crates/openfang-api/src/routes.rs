@@ -8,7 +8,7 @@ use axum::extract::{
     rejection::{JsonRejection, QueryRejection},
     Path, Query, State,
 };
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -21,6 +21,7 @@ use openfang_agent_definition::{
 };
 use openfang_kernel::cron::JobMeta as ScheduleJobMeta;
 use openfang_kernel::kernel::ScheduleExecutionResult;
+use openfang_kernel::looper::{LooperRuntimeRegistry, LooperStreamEvent};
 use openfang_kernel::metering::MeteringEngine;
 use openfang_kernel::trigger_v2::{
     compile_trigger_definition as compile_trigger_ir_definition, evaluate_compiled_trigger,
@@ -47,6 +48,10 @@ use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest, AgentState, SessionId};
 use openfang_types::artifact::{ArtifactId, ArtifactListQuery};
 use openfang_types::doc::{DocId, DocListQuery};
+use openfang_types::looper::{
+    LooperExecutionMode, LooperExecutionPolicy, LooperRunId, LooperRunListQuery, LooperRunRecord,
+    LooperRunResource, LooperRunStatus, LooperSelectionStrategy, LooperSubtaskView,
+};
 use openfang_types::scheduler::{
     CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDelivery, CronJob, CronJobId,
     CronSchedule, CronTextInputItem, CronTextInputPayload, CronWorkflowSignalSelector,
@@ -79,6 +84,415 @@ pub struct RunListQueryParams {
     pub search: Option<String>,
 }
 
+#[cfg(test)]
+mod looper_control_plane_route_tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::get;
+    use axum::Router;
+    use futures::stream;
+    use openfang_memory::NewLooperRun;
+    use openfang_types::config::{DefaultModelConfig, KernelConfig};
+    use openfang_types::looper::{
+        LooperExecutionMode, LooperExecutionPolicy, LooperProgress, LooperRunId,
+        LooperSelectionStrategy,
+    };
+    use pretty_assertions::assert_eq;
+    use serde_json::{json, Value};
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    struct RouteTestContext {
+        state: Arc<AppState>,
+        _tmp: TempDir,
+    }
+
+    impl Drop for RouteTestContext {
+        fn drop(&mut self) {
+            self.state.kernel.shutdown();
+        }
+    }
+
+    async fn route_test_context() -> RouteTestContext {
+        let tmp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = KernelConfig {
+            home_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().join("data"),
+            default_model: DefaultModelConfig {
+                provider: "ollama".to_string(),
+                model: "test-model".to_string(),
+                api_key_env: "OLLAMA_API_KEY".to_string(),
+                base_url: None,
+            },
+            ..KernelConfig::default()
+        };
+
+        let kernel =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel should boot"));
+        kernel.set_self_handle();
+        kernel.bootstrap_workflow_definitions().await;
+        let looper_runtime_registry = kernel.looper_runtime_registry();
+
+        let state = Arc::new(AppState {
+            kernel,
+            started_at: Instant::now(),
+            peer_registry: None,
+            looper_runtime_registry,
+            bridge_manager: tokio::sync::Mutex::new(None),
+            channels_config: tokio::sync::RwLock::new(Default::default()),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            clawhub_cache: DashMap::new(),
+            provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        });
+
+        RouteTestContext { state, _tmp: tmp }
+    }
+
+    async fn json_response(response: impl IntoResponse) -> (StatusCode, Value) {
+        let response = response.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let json = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body should be valid JSON")
+        };
+        (status, json)
+    }
+
+    fn sample_task(id: &str) -> TaskRecord {
+        TaskRecord {
+            task_id: TaskId::new(id),
+            slug: format!("{id}-slug"),
+            title: format!("Task {id}"),
+            description: "Looper test task".to_string(),
+            status: openfang_types::task::TaskStatus::Planned,
+            priority: openfang_types::task::Priority::High,
+            complexity: openfang_types::task::Complexity::Medium,
+            position: 1,
+            source: TaskSource::Manual,
+            owner: openfang_types::task::OwnerRef {
+                kind: openfang_types::task::ActorKind::AgentGroup,
+                ref_id: "sdlc".to_string(),
+            },
+            created_by: openfang_types::task::OwnerRef {
+                kind: openfang_types::task::ActorKind::Agent,
+                ref_id: "planner".to_string(),
+            },
+            repository_refs: vec![],
+            label_refs: vec![],
+            artifact_refs: vec![],
+            doc_refs: vec![],
+            file_refs: vec![],
+            metadata: json!({}),
+            created_at: "2026-03-25T12:00:00Z".to_string(),
+            updated_at: "2026-03-25T12:00:00Z".to_string(),
+            completed_at: None,
+        }
+    }
+
+    fn sample_looper_policy() -> LooperExecutionPolicy {
+        LooperExecutionPolicy {
+            mode: LooperExecutionMode::Parallel,
+            max_parallelism: 4,
+            selection: LooperSelectionStrategy::Priority,
+        }
+    }
+
+    fn seed_task(context: &RouteTestContext, task_id: &str) -> TaskRecord {
+        let task = sample_task(task_id);
+        context
+            .state
+            .kernel
+            .workflow_stores
+            .task
+            .create(&task)
+            .expect("task should persist");
+        task
+    }
+
+    fn seed_looper_run(
+        context: &RouteTestContext,
+        task_id: &TaskId,
+        looper_run_id: &str,
+        status: LooperRunStatus,
+    ) -> LooperRunRecord {
+        context
+            .state
+            .kernel
+            .workflow_stores
+            .looper_run
+            .create(&NewLooperRun {
+                looper_run_id: LooperRunId::new(looper_run_id),
+                task_id: task_id.clone(),
+                source_run_id: Some("run_source".to_string()),
+                status,
+                execution_policy_json: serde_json::to_value(sample_looper_policy())
+                    .expect("looper policy should encode"),
+                current_subtask_id: None,
+                progress_json: json!({
+                    "total": 1,
+                    "completed": usize::from(status == LooperRunStatus::Completed),
+                    "failed": usize::from(status == LooperRunStatus::Failed),
+                }),
+                error_json: None,
+                started_at: "2026-03-25T12:00:00Z".to_string(),
+                updated_at: "2026-03-25T12:01:00Z".to_string(),
+                completed_at: status
+                    .is_terminal()
+                    .then(|| "2026-03-25T12:02:00Z".to_string()),
+            })
+            .expect("looper run should persist")
+    }
+
+    #[tokio::test]
+    async fn create_looper_run_v1_should_accept_valid_request() {
+        let context = route_test_context().await;
+        let task = seed_task(&context, "task_looper_create");
+
+        let (status, body) = json_response(
+            create_looper_run_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(CreateLooperRunRequest {
+                    task_id: Some(task.task_id.clone()),
+                    subtask_ids: None,
+                    execution_policy: Some(
+                        serde_json::to_value(sample_looper_policy())
+                            .expect("looper policy should encode"),
+                    ),
+                    metadata: json!({ "source": "test" }),
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["accepted"], json!(true));
+        assert_eq!(body["status"], json!("accepted"));
+        assert_eq!(body["resource_id"], body["looper_run_id"]);
+        assert!(!body["looper_run_id"]
+            .as_str()
+            .expect("looper_run_id should be a string")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_looper_run_v1_should_reject_missing_execution_policy() {
+        let context = route_test_context().await;
+        let task = seed_task(&context, "task_looper_validation");
+
+        let (status, body) = json_response(
+            create_looper_run_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(CreateLooperRunRequest {
+                    task_id: Some(task.task_id.clone()),
+                    subtask_ids: None,
+                    execution_policy: None,
+                    metadata: json!({}),
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], json!("validation_error"));
+        assert_eq!(
+            body["error"]["details"][0]["path"],
+            json!("execution_policy")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_looper_run_v1_should_reject_zero_max_parallelism() {
+        let context = route_test_context().await;
+        let task = seed_task(&context, "task_looper_parallelism");
+
+        let (status, body) = json_response(
+            create_looper_run_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(CreateLooperRunRequest {
+                    task_id: Some(task.task_id.clone()),
+                    subtask_ids: None,
+                    execution_policy: Some(json!({
+                        "mode": "parallel",
+                        "max_parallelism": 0,
+                        "selection": "priority",
+                    })),
+                    metadata: json!({}),
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], json!("validation_error"));
+        assert_eq!(
+            body["error"]["details"][0]["path"],
+            json!("execution_policy.max_parallelism")
+        );
+    }
+
+    #[tokio::test]
+    async fn looper_sse_event_serialization_should_emit_standard_event_stream_fields() {
+        let payload = serde_json::to_value(LooperRunResource {
+            id: LooperRunId::new("loop_serialize"),
+            task_id: TaskId::new("task_serialize"),
+            source_run_id: Some("run_123".to_string()),
+            status: LooperRunStatus::Running,
+            execution_policy: sample_looper_policy(),
+            current_subtask_id: None,
+            progress: LooperProgress {
+                total: 1,
+                completed: 0,
+                failed: 0,
+            },
+            error: None,
+            started_at: "2026-03-25T12:00:00Z".to_string(),
+            updated_at: "2026-03-25T12:00:01Z".to_string(),
+            completed_at: None,
+        })
+        .expect("looper resource should encode");
+        let event = LooperStreamEvent {
+            id: 42,
+            event: "run.updated".to_string(),
+            data: payload,
+        };
+
+        let app = Router::new().route(
+            "/events",
+            get({
+                let event = event.clone();
+                move || {
+                    let event = event.clone();
+                    async move {
+                        Sse::new(stream::once(async move {
+                            Ok::<Event, std::convert::Infallible>(looper_stream_event_to_sse(
+                                &event,
+                            ))
+                        }))
+                    }
+                }
+            }),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .body(Body::empty())
+                    .expect("SSE request should build"),
+            )
+            .await
+            .expect("SSE route should respond");
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("SSE body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("SSE body should be UTF-8");
+
+        assert!(text.contains("id: 42"));
+        assert!(text.contains("event: run.updated"));
+        let data_line = text
+            .lines()
+            .find(|line| line.starts_with("data: "))
+            .expect("SSE payload should include a data line");
+        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: "))
+            .expect("data field should deserialize as JSON");
+        assert_eq!(payload["status"], json!("running"));
+        assert_eq!(payload["progress"]["total"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn pause_looper_run_v1_should_return_conflict_for_completed_run() {
+        let context = route_test_context().await;
+        let task = seed_task(&context, "task_looper_terminal");
+        seed_looper_run(
+            &context,
+            &task.task_id,
+            "loop_completed",
+            LooperRunStatus::Completed,
+        );
+
+        let (status, body) = json_response(
+            pause_looper_run_v1(
+                State(Arc::clone(&context.state)),
+                Path("loop_completed".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], json!("invalid_looper_transition"));
+        assert_eq!(
+            body["error"]["details"][0]["current_status"],
+            json!("completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_looper_run_v1_should_return_not_found_for_unknown_id() {
+        let context = route_test_context().await;
+
+        let (status, body) = json_response(
+            get_looper_run_v1(
+                State(Arc::clone(&context.state)),
+                Path("loop_missing".to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("not_found"));
+    }
+
+    #[tokio::test]
+    async fn list_looper_runs_v1_should_filter_running_status() {
+        let context = route_test_context().await;
+        let task = seed_task(&context, "task_looper_filters");
+        seed_looper_run(
+            &context,
+            &task.task_id,
+            "loop_running",
+            LooperRunStatus::Running,
+        );
+        seed_looper_run(
+            &context,
+            &task.task_id,
+            "loop_completed",
+            LooperRunStatus::Completed,
+        );
+
+        let (status, body) = json_response(
+            list_looper_runs_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Query(LooperRunListQueryParams {
+                    status: Some(LooperRunStatus::Running),
+                    ..LooperRunListQueryParams::default()
+                })),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let items = body["items"]
+            .as_array()
+            .expect("looper run list should return an items array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], json!("loop_running"));
+        assert_eq!(items[0]["status"], json!("running"));
+    }
+}
+
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct RunSignalListQueryParams {
     #[serde(default)]
@@ -98,6 +512,8 @@ const MAX_PAGE_LIMIT: usize = 200;
 static WORKFLOW_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TRIGGER_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SCHEDULE_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+type JsonErrorResponse = (StatusCode, Json<serde_json::Value>);
+type ValidatedLooperCreateRequest = (TaskId, Option<Vec<SubtaskId>>, LooperExecutionPolicy);
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct WorkflowListQueryParams {
@@ -434,6 +850,8 @@ pub struct AppState {
     /// Avoids blocking the `/api/providers` endpoint on TCP timeouts to
     /// unreachable local services. 60-second TTL.
     pub provider_probe_cache: openfang_runtime::provider_health::ProbeCache,
+    /// Shared registry of looper runtime event handles for control-plane SSE.
+    pub looper_runtime_registry: Arc<LooperRuntimeRegistry>,
 }
 
 impl AppState {
@@ -667,6 +1085,316 @@ fn subtask_summary_from_record(record: &SubtaskRecord) -> SubtaskSummaryResponse
         assignee: record.assignee.clone(),
         updated_at: record.updated_at.clone(),
     }
+}
+
+fn looper_run_resource_from_record(record: &LooperRunRecord) -> LooperRunResource {
+    LooperRunResource::from(record)
+}
+
+fn looper_run_not_found_response() -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Looper run not found",
+        None,
+    )
+}
+
+fn looper_internal_error_response(
+    code: &str,
+    message: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(StatusCode::INTERNAL_SERVER_ERROR, code, message, None)
+}
+
+fn looper_validation_error_response(
+    message: &str,
+    details: Vec<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "validation_error",
+        message,
+        Some(serde_json::Value::Array(details)),
+    )
+}
+
+fn invalid_looper_transition_response(
+    action: &str,
+    current_status: LooperRunStatus,
+    allowed_statuses: &[LooperRunStatus],
+) -> (StatusCode, Json<serde_json::Value>) {
+    workflow_v2_error_response(
+        StatusCode::CONFLICT,
+        "invalid_looper_transition",
+        format!(
+            "Looper run cannot be {action} from status '{}'",
+            current_status.as_str()
+        ),
+        Some(serde_json::json!([{
+            "action": action,
+            "current_status": current_status.as_str(),
+            "allowed_statuses": allowed_statuses
+                .iter()
+                .map(|status| status.as_str())
+                .collect::<Vec<_>>(),
+        }])),
+    )
+}
+
+fn looper_list_query_from_params(
+    params: LooperRunListQueryParams,
+) -> Result<(LooperRunListQuery, usize, usize), (StatusCode, Json<serde_json::Value>)> {
+    Ok((
+        LooperRunListQuery {
+            task_id: params.task_id,
+            source_run_id: params.source_run_id,
+            status: params.status,
+            execution_mode: params.execution_mode,
+        },
+        parse_pagination_limit(params.limit)?,
+        parse_cursor_offset(params.cursor.as_deref())?,
+    ))
+}
+
+fn paginate_looper_runs(
+    records: Vec<LooperRunRecord>,
+    limit: usize,
+    offset: usize,
+) -> LooperRunListResponse {
+    let total = records.len();
+    let items = records
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|record| looper_run_resource_from_record(&record))
+        .collect();
+    let next_cursor = if offset + limit < total {
+        Some((offset + limit).to_string())
+    } else {
+        None
+    };
+
+    LooperRunListResponse { items, next_cursor }
+}
+
+fn load_looper_run_or_not_found(
+    state: &AppState,
+    looper_run_id: &LooperRunId,
+) -> Result<LooperRunRecord, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .kernel
+        .get_looper_run(looper_run_id)
+        .map_err(|error| {
+            tracing::warn!("Failed to load looper run {looper_run_id}: {error}");
+            looper_internal_error_response("looper_run_load_failed", "Failed to load looper run")
+        })?
+        .ok_or_else(looper_run_not_found_response)
+}
+
+fn load_looper_subtask_views(
+    state: &AppState,
+    looper_run_id: &LooperRunId,
+) -> Result<Vec<LooperSubtaskView>, (StatusCode, Json<serde_json::Value>)> {
+    let records = state
+        .kernel
+        .list_looper_subtasks(looper_run_id)
+        .map_err(|error| {
+            tracing::warn!("Failed to list looper subtasks for {looper_run_id}: {error}");
+            looper_internal_error_response(
+                "looper_subtask_list_failed",
+                "Failed to list looper subtasks",
+            )
+        })?;
+
+    let mut items = Vec::with_capacity(records.len());
+    for record in records {
+        let Some(subtask) = state
+            .kernel
+            .workflow_stores
+            .subtask
+            .find_by_id(&record.subtask_id)
+            .map_err(|error| {
+                tracing::warn!(
+                    "Failed to load canonical subtask {} for looper run {}: {}",
+                    record.subtask_id,
+                    looper_run_id,
+                    error
+                );
+                looper_internal_error_response(
+                    "looper_subtask_projection_failed",
+                    "Failed to load looper subtask projection",
+                )
+            })?
+        else {
+            return Err(looper_internal_error_response(
+                "looper_subtask_projection_failed",
+                "Failed to load looper subtask projection",
+            ));
+        };
+
+        items.push(LooperSubtaskView {
+            id: record.subtask_id,
+            title: subtask.title,
+            status: record.status,
+            updated_at: record.updated_at,
+        });
+    }
+
+    Ok(items)
+}
+
+fn validate_create_looper_run_request(
+    request: CreateLooperRunRequest,
+) -> Result<ValidatedLooperCreateRequest, JsonErrorResponse> {
+    let mut details = Vec::new();
+    let task_id = match request.task_id {
+        Some(task_id) => Some(task_id),
+        None => {
+            details.push(serde_json::json!({
+                "path": "task_id",
+                "message": "field is required",
+            }));
+            None
+        }
+    };
+    let execution_policy_value = match request.execution_policy {
+        Some(policy) => Some(policy),
+        None => {
+            details.push(serde_json::json!({
+                "path": "execution_policy",
+                "message": "field is required",
+            }));
+            None
+        }
+    };
+
+    if !request.metadata.is_object() {
+        details.push(serde_json::json!({
+            "path": "metadata",
+            "message": "must be a JSON object",
+        }));
+    }
+
+    let execution_policy = if let Some(value) = execution_policy_value.as_ref() {
+        match parse_looper_execution_policy(value) {
+            Ok(policy) => Some(policy),
+            Err(mut policy_details) => {
+                details.append(&mut policy_details);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if !details.is_empty() {
+        return Err(looper_validation_error_response(
+            "looper run request is invalid",
+            details,
+        ));
+    }
+
+    Ok((
+        task_id.expect("task_id validated above"),
+        request.subtask_ids,
+        execution_policy.expect("execution_policy validated above"),
+    ))
+}
+
+fn parse_looper_execution_policy(
+    value: &serde_json::Value,
+) -> Result<LooperExecutionPolicy, Vec<serde_json::Value>> {
+    let Some(object) = value.as_object() else {
+        return Err(vec![serde_json::json!({
+            "path": "execution_policy",
+            "message": "must be a JSON object",
+        })]);
+    };
+
+    let mut details = Vec::new();
+    let mode = match object.get("mode").and_then(serde_json::Value::as_str) {
+        Some(mode_text) => match mode_text {
+            "sequential" => Some(LooperExecutionMode::Sequential),
+            "parallel" => Some(LooperExecutionMode::Parallel),
+            _ => {
+                details.push(serde_json::json!({
+                    "path": "execution_policy.mode",
+                    "message": "must be one of: sequential, parallel",
+                }));
+                None
+            }
+        },
+        None => {
+            details.push(serde_json::json!({
+                "path": "execution_policy.mode",
+                "message": "field is required",
+            }));
+            None
+        }
+    };
+    let max_parallelism = match object.get("max_parallelism") {
+        Some(raw) => match raw.as_u64() {
+            Some(0) => {
+                details.push(serde_json::json!({
+                    "path": "execution_policy.max_parallelism",
+                    "message": "must be greater than zero",
+                }));
+                None
+            }
+            Some(value) => match u32::try_from(value) {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    details.push(serde_json::json!({
+                        "path": "execution_policy.max_parallelism",
+                        "message": "must fit in u32",
+                    }));
+                    None
+                }
+            },
+            None => {
+                details.push(serde_json::json!({
+                    "path": "execution_policy.max_parallelism",
+                    "message": "must be an unsigned integer",
+                }));
+                None
+            }
+        },
+        None => {
+            details.push(serde_json::json!({
+                "path": "execution_policy.max_parallelism",
+                "message": "field is required",
+            }));
+            None
+        }
+    };
+    let selection = match object.get("selection").and_then(serde_json::Value::as_str) {
+        Some("priority") => Some(LooperSelectionStrategy::Priority),
+        Some(_) => {
+            details.push(serde_json::json!({
+                "path": "execution_policy.selection",
+                "message": "must be one of: priority",
+            }));
+            None
+        }
+        None => {
+            details.push(serde_json::json!({
+                "path": "execution_policy.selection",
+                "message": "field is required",
+            }));
+            None
+        }
+    };
+
+    if !details.is_empty() {
+        return Err(details);
+    }
+
+    Ok(LooperExecutionPolicy {
+        mode: mode.expect("mode validated above"),
+        max_parallelism: max_parallelism.expect("max_parallelism validated above"),
+        selection: selection.expect("selection validated above"),
+    })
 }
 
 fn task_list_query_from_params(
@@ -7369,6 +8097,478 @@ pub async fn cancel_run_v1(
             run_internal_error_response("run_cancel_failed", "Failed to cancel run")
         }
     }
+}
+
+/// POST /api/v1/looper-runs — Create and start a looper run.
+pub async fn create_looper_run_v1(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<CreateLooperRunRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return workflow_v2_json_rejection(rejection),
+    };
+    let (task_id, subtask_ids, execution_policy) = match validate_create_looper_run_request(request)
+    {
+        Ok(validated) => validated,
+        Err(response) => return response,
+    };
+
+    match state.kernel.workflow_stores.task.find_by_id(&task_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return task_store_error_response(TaskStoreError::TaskNotFound {
+                task_id: task_id.to_string(),
+            });
+        }
+        Err(error) => return task_store_error_response(error),
+    }
+
+    match state
+        .kernel
+        .create_looper_run(task_id, None, subtask_ids, execution_policy)
+        .await
+    {
+        Ok(record) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!(CreateLooperRunAcceptedResponse {
+                accepted: true,
+                resource_id: record.looper_run_id.to_string(),
+                status: "accepted".to_string(),
+                looper_run_id: record.looper_run_id.to_string(),
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!("Failed to create looper run: {error}");
+            if error.contains("Scoped looper subtask")
+                || error.contains("Dependency '")
+                || error.contains("must be in planned or ready status")
+            {
+                return looper_validation_error_response(
+                    "looper run request is invalid",
+                    vec![serde_json::json!({
+                        "message": error,
+                    })],
+                );
+            }
+            looper_internal_error_response(
+                "looper_run_create_failed",
+                "Failed to create looper run",
+            )
+        }
+    }
+}
+
+/// GET /api/v1/looper-runs — List durable looper runs.
+pub async fn list_looper_runs_v1(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<LooperRunListQueryParams>, QueryRejection>,
+) -> impl IntoResponse {
+    let Query(params) = match query {
+        Ok(query) => query,
+        Err(rejection) => return task_query_rejection(rejection),
+    };
+    let (query, limit, offset) = match looper_list_query_from_params(params) {
+        Ok(values) => values,
+        Err(response) => return response,
+    };
+
+    match state.kernel.list_looper_runs(&query) {
+        Ok(records) => (
+            StatusCode::OK,
+            Json(serde_json::json!(paginate_looper_runs(
+                records, limit, offset
+            ))),
+        ),
+        Err(error) => {
+            tracing::warn!("Failed to list looper runs: {error}");
+            looper_internal_error_response("looper_run_list_failed", "Failed to list looper runs")
+        }
+    }
+}
+
+/// GET /api/v1/looper-runs/{id} — Load one durable looper run.
+pub async fn get_looper_run_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let looper_run_id = LooperRunId::new(id);
+    match load_looper_run_or_not_found(&state, &looper_run_id) {
+        Ok(record) => (
+            StatusCode::OK,
+            Json(serde_json::json!(looper_run_resource_from_record(&record))),
+        ),
+        Err(response) => response,
+    }
+}
+
+/// GET /api/v1/looper-runs/{id}/subtasks — Load the looper execution view.
+pub async fn list_looper_subtasks_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let looper_run_id = LooperRunId::new(id);
+    if let Err(response) = load_looper_run_or_not_found(&state, &looper_run_id) {
+        return response;
+    }
+
+    match load_looper_subtask_views(&state, &looper_run_id) {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(serde_json::json!(LooperSubtaskListResponse {
+                items,
+                next_cursor: None,
+            })),
+        ),
+        Err(response) => response,
+    }
+}
+
+/// POST /api/v1/looper-runs/{id}/pause — Pause a looper run.
+pub async fn pause_looper_run_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let looper_run_id = LooperRunId::new(id.clone());
+    let current = match load_looper_run_or_not_found(&state, &looper_run_id) {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+    if !matches!(
+        current.status,
+        LooperRunStatus::Pending | LooperRunStatus::Running
+    ) {
+        return invalid_looper_transition_response(
+            "pause",
+            current.status,
+            &[LooperRunStatus::Pending, LooperRunStatus::Running],
+        );
+    }
+
+    match state
+        .kernel
+        .pause_looper_run_control_plane(&looper_run_id)
+        .await
+    {
+        Ok(_) => operational_action_accepted_response(&id),
+        Err(error) => {
+            tracing::warn!("Failed to pause looper run {id}: {error}");
+            looper_internal_error_response("looper_run_pause_failed", "Failed to pause looper run")
+        }
+    }
+}
+
+/// POST /api/v1/looper-runs/{id}/resume — Resume a looper run.
+pub async fn resume_looper_run_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let looper_run_id = LooperRunId::new(id.clone());
+    let current = match load_looper_run_or_not_found(&state, &looper_run_id) {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+    if current.status != LooperRunStatus::Paused {
+        return invalid_looper_transition_response(
+            "resume",
+            current.status,
+            &[LooperRunStatus::Paused],
+        );
+    }
+
+    match state
+        .kernel
+        .resume_looper_run_control_plane(&looper_run_id)
+        .await
+    {
+        Ok(_) => operational_action_accepted_response(&id),
+        Err(error) => {
+            tracing::warn!("Failed to resume looper run {id}: {error}");
+            looper_internal_error_response(
+                "looper_run_resume_failed",
+                "Failed to resume looper run",
+            )
+        }
+    }
+}
+
+/// POST /api/v1/looper-runs/{id}/cancel — Cancel a looper run.
+pub async fn cancel_looper_run_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let looper_run_id = LooperRunId::new(id.clone());
+    let current = match load_looper_run_or_not_found(&state, &looper_run_id) {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+    if current.status.is_terminal() {
+        return invalid_looper_transition_response(
+            "cancel",
+            current.status,
+            &[
+                LooperRunStatus::Pending,
+                LooperRunStatus::Running,
+                LooperRunStatus::Paused,
+            ],
+        );
+    }
+
+    match state
+        .kernel
+        .cancel_looper_run_control_plane(&looper_run_id, "cancelled via API")
+        .await
+    {
+        Ok(_) => operational_action_accepted_response(&id),
+        Err(error) => {
+            tracing::warn!("Failed to cancel looper run {id}: {error}");
+            looper_internal_error_response(
+                "looper_run_cancel_failed",
+                "Failed to cancel looper run",
+            )
+        }
+    }
+}
+
+fn parse_last_event_id(
+    headers: &HeaderMap,
+) -> Result<Option<u64>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(value) = headers.get("last-event-id") else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "`Last-Event-ID` must be ASCII text",
+            Some(serde_json::json!([{
+                "path": "Last-Event-ID",
+            }])),
+        )
+    })?;
+    value.parse::<u64>().map(Some).map_err(|_| {
+        workflow_v2_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "`Last-Event-ID` must be an unsigned integer",
+            Some(serde_json::json!([{
+                "path": "Last-Event-ID",
+                "value": value,
+            }])),
+        )
+    })
+}
+
+fn looper_stream_event_to_sse(event: &LooperStreamEvent) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .id(event.id.to_string())
+        .event(event.event.clone())
+        .data(event.data.to_string())
+}
+
+fn looper_control_event_to_sse(
+    event_id: u64,
+    event_name: &str,
+    data: serde_json::Value,
+) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .id(event_id.to_string())
+        .event(event_name)
+        .data(data.to_string())
+}
+
+fn current_looper_snapshot(
+    state: &AppState,
+    looper_run_id: &LooperRunId,
+) -> Option<LooperRunResource> {
+    state
+        .kernel
+        .get_looper_run(looper_run_id)
+        .ok()
+        .flatten()
+        .map(|record| looper_run_resource_from_record(&record))
+}
+
+async fn send_looper_sse_event(
+    tx: &tokio::sync::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,
+    event: axum::response::sse::Event,
+) -> bool {
+    tx.send(Ok(event)).await.is_ok()
+}
+
+fn reset_looper_keepalive(timer: std::pin::Pin<&mut tokio::time::Sleep>, interval: Duration) {
+    timer.reset(tokio::time::Instant::now() + interval);
+}
+
+/// GET /api/v1/looper-runs/{id}/events — Stream looper state with bounded replay.
+pub async fn stream_looper_run_events_v1(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::sse::Sse;
+
+    let looper_run_id = LooperRunId::new(id);
+    if let Err(response) = load_looper_run_or_not_found(&state, &looper_run_id) {
+        return response.into_response();
+    }
+    let last_event_id = match parse_last_event_id(&headers) {
+        Ok(value) => value,
+        Err(response) => return response.into_response(),
+    };
+
+    let handle = state.looper_runtime_registry.handle(&looper_run_id);
+    let mut receiver = handle.subscribe();
+    let replay = handle.replay_after(last_event_id);
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >(128);
+    let state_for_stream = Arc::clone(&state);
+    tokio::spawn(async move {
+        let keepalive_interval = Duration::from_secs(15);
+        let keepalive = tokio::time::sleep(keepalive_interval);
+        tokio::pin!(keepalive);
+        let mut last_delivered_id = last_event_id.unwrap_or(0);
+
+        if replay.reset_required {
+            let reset_id = handle.latest_event_id();
+            if !send_looper_sse_event(
+                &tx,
+                looper_control_event_to_sse(
+                    reset_id,
+                    "stream.reset",
+                    serde_json::json!({
+                        "reason": "last_event_id_expired",
+                        "requested_last_event_id": last_event_id,
+                    }),
+                ),
+            )
+            .await
+            {
+                return;
+            }
+            reset_looper_keepalive(keepalive.as_mut(), keepalive_interval);
+            if let Some(snapshot) = current_looper_snapshot(&state_for_stream, &looper_run_id) {
+                if !send_looper_sse_event(
+                    &tx,
+                    looper_control_event_to_sse(
+                        handle.latest_event_id(),
+                        "stream.snapshot",
+                        serde_json::to_value(snapshot).unwrap_or_else(|_| serde_json::json!({})),
+                    ),
+                )
+                .await
+                {
+                    return;
+                }
+                reset_looper_keepalive(keepalive.as_mut(), keepalive_interval);
+            }
+            last_delivered_id = handle.latest_event_id();
+        } else if last_event_id.is_none() {
+            if let Some(snapshot) = current_looper_snapshot(&state_for_stream, &looper_run_id) {
+                if !send_looper_sse_event(
+                    &tx,
+                    looper_control_event_to_sse(
+                        handle.latest_event_id(),
+                        "stream.snapshot",
+                        serde_json::to_value(snapshot).unwrap_or_else(|_| serde_json::json!({})),
+                    ),
+                )
+                .await
+                {
+                    return;
+                }
+                reset_looper_keepalive(keepalive.as_mut(), keepalive_interval);
+            }
+            last_delivered_id = handle.latest_event_id();
+        } else {
+            for event in replay.events {
+                last_delivered_id = event.id;
+                if !send_looper_sse_event(&tx, looper_stream_event_to_sse(&event)).await {
+                    return;
+                }
+                reset_looper_keepalive(keepalive.as_mut(), keepalive_interval);
+            }
+            if last_delivered_id == last_event_id.unwrap_or(0) {
+                last_delivered_id = last_delivered_id.min(handle.latest_event_id());
+            }
+        }
+
+        loop {
+            tokio::select! {
+                _ = &mut keepalive => {
+                    let keepalive_id = handle.latest_event_id().max(last_delivered_id);
+                    if !send_looper_sse_event(
+                        &tx,
+                        looper_control_event_to_sse(
+                            keepalive_id,
+                            "keepalive",
+                            serde_json::json!({}),
+                        ),
+                    ).await {
+                        return;
+                    }
+                    reset_looper_keepalive(keepalive.as_mut(), keepalive_interval);
+                }
+                received = receiver.recv() => {
+                    match received {
+                        Ok(event) => {
+                            if event.id <= last_delivered_id {
+                                continue;
+                            }
+                            last_delivered_id = event.id;
+                            if !send_looper_sse_event(&tx, looper_stream_event_to_sse(&event)).await {
+                                return;
+                            }
+                            reset_looper_keepalive(keepalive.as_mut(), keepalive_interval);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let reset_id = handle.latest_event_id();
+                            if !send_looper_sse_event(
+                                &tx,
+                                looper_control_event_to_sse(
+                                    reset_id,
+                                    "stream.reset",
+                                    serde_json::json!({
+                                        "reason": "receiver_lagged",
+                                    }),
+                                ),
+                            ).await {
+                                return;
+                            }
+                            reset_looper_keepalive(keepalive.as_mut(), keepalive_interval);
+                            if let Some(snapshot) = current_looper_snapshot(&state_for_stream, &looper_run_id) {
+                                if !send_looper_sse_event(
+                                    &tx,
+                                    looper_control_event_to_sse(
+                                        handle.latest_event_id(),
+                                        "stream.snapshot",
+                                        serde_json::to_value(snapshot).unwrap_or_else(|_| serde_json::json!({})),
+                                    ),
+                                ).await {
+                                    return;
+                                }
+                                reset_looper_keepalive(keepalive.as_mut(), keepalive_interval);
+                            }
+                            last_delivered_id = handle.latest_event_id();
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    (
+        [
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+        ],
+        Sse::new(stream),
+    )
+        .into_response()
 }
 
 /// POST /api/v1/runs/{id}/signals — Submit a durable signal for one run.
@@ -20374,6 +21574,7 @@ mod agent_definition_route_tests {
             kernel,
             started_at: Instant::now(),
             peer_registry: None,
+            looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
             bridge_manager: tokio::sync::Mutex::new(None),
             channels_config: tokio::sync::RwLock::new(Default::default()),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -21523,6 +22724,7 @@ mod trigger_definition_route_tests {
             kernel,
             started_at: Instant::now(),
             peer_registry: None,
+            looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
             bridge_manager: tokio::sync::Mutex::new(None),
             channels_config: tokio::sync::RwLock::new(Default::default()),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -21842,6 +23044,7 @@ mod task_control_plane_route_tests {
             kernel,
             started_at: Instant::now(),
             peer_registry: None,
+            looper_runtime_registry: Arc::new(openfang_kernel::looper::LooperRuntimeRegistry::new()),
             bridge_manager: tokio::sync::Mutex::new(None),
             channels_config: tokio::sync::RwLock::new(Default::default()),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),

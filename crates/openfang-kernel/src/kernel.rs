@@ -8,7 +8,7 @@ use crate::db::DatabaseManager;
 use crate::db_migration::{self, DatabaseIdentity, MigrationStep};
 use crate::error::{KernelError, KernelResult};
 use crate::event_bus::EventBus;
-use crate::looper::{LooperDispatchExecutor, LooperRuntime};
+use crate::looper::{LooperDispatchExecutor, LooperRuntime, LooperRuntimeRegistry};
 use crate::metering::MeteringEngine;
 use crate::registry::AgentRegistry;
 use crate::scheduler::AgentScheduler;
@@ -270,6 +270,8 @@ pub struct OpenFangKernel {
     looper_runtime_tokens: dashmap::DashMap<String, CancellationToken>,
     /// Cooperative cancellation token shared by background looper runtimes.
     looper_runtime_cancel: CancellationToken,
+    /// Per-run looper event handles used by the public SSE control plane.
+    looper_runtime_registry: Arc<LooperRuntimeRegistry>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -1273,6 +1275,7 @@ impl OpenFangKernel {
             looper_runtime_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
             looper_runtime_tokens: dashmap::DashMap::new(),
             looper_runtime_cancel: CancellationToken::new(),
+            looper_runtime_registry: Arc::new(LooperRuntimeRegistry::new()),
             self_handle: OnceLock::new(),
         };
 
@@ -4941,7 +4944,21 @@ impl OpenFangKernel {
             current
         };
 
-        let runtime = LooperRuntime::new(self.workflow_stores.clone(), executor);
+        let event_handle = self
+            .looper_runtime_registry
+            .handle(&running_record.looper_run_id);
+        let runtime = LooperRuntime::new(
+            self.workflow_stores.clone(),
+            executor,
+            Arc::clone(&event_handle),
+        );
+        let _ = event_handle.publish(
+            "run.updated",
+            serde_json::to_value(openfang_types::looper::LooperRunResource::from(
+                &running_record,
+            ))
+            .unwrap_or_else(|_| serde_json::json!({})),
+        );
         let cancel_token = self.looper_runtime_cancel.child_token();
         let tracked_kernel = Arc::clone(self);
         let task_kernel = Arc::clone(self);
@@ -4964,10 +4981,19 @@ impl OpenFangKernel {
                         &failed_at,
                         Some(&failed_at),
                     );
-                    let _ = task_kernel
+                    let latest = task_kernel
                         .workflow_stores
                         .looper_run
                         .set_current_subtask(&run_id, None, &failed_at);
+                    if let Ok(latest) = latest {
+                        let _ = task_kernel.looper_runtime_registry.handle(&run_id).publish(
+                            "run.updated",
+                            serde_json::to_value(openfang_types::looper::LooperRunResource::from(
+                                &latest,
+                            ))
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                        );
+                    }
                     warn!(
                         looper_run_id = %run_id,
                         "Looper runtime task failed: {error}"
@@ -5599,6 +5625,7 @@ impl OpenFangKernel {
         self: &Arc<Self>,
         task_id: TaskId,
         source_run_id: Option<String>,
+        subtask_ids: Option<Vec<openfang_types::task::SubtaskId>>,
         execution_policy: LooperExecutionPolicy,
     ) -> Result<LooperRunRecord, String> {
         let timestamp = openfang_memory::now_timestamp();
@@ -5626,6 +5653,9 @@ impl OpenFangKernel {
                 completed_at: None,
             })
             .map_err(|error| format!("Failed to create looper run: {error}"))?;
+        if let Some(subtask_ids) = subtask_ids {
+            self.seed_looper_subtask_scope(&created, &subtask_ids)?;
+        }
 
         self.start_looper_runtime(&created.looper_run_id).await
     }
@@ -5665,6 +5695,117 @@ impl OpenFangKernel {
             })
     }
 
+    /// Return the shared registry of looper runtime event handles.
+    pub fn looper_runtime_registry(&self) -> Arc<LooperRuntimeRegistry> {
+        Arc::clone(&self.looper_runtime_registry)
+    }
+
+    fn seed_looper_subtask_scope(
+        &self,
+        looper_run: &LooperRunRecord,
+        subtask_ids: &[openfang_types::task::SubtaskId],
+    ) -> Result<(), String> {
+        let mut selected_subtasks = Vec::new();
+        let mut selected_ids = HashSet::new();
+
+        for subtask_id in subtask_ids {
+            if !selected_ids.insert(subtask_id.to_string()) {
+                continue;
+            }
+
+            let subtask = self
+                .workflow_stores
+                .subtask
+                .find_by_id(subtask_id)
+                .map_err(|error| {
+                    format!(
+                        "Failed to load scoped looper subtask '{}' for run '{}': {error}",
+                        subtask_id, looper_run.looper_run_id
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "Scoped looper subtask '{}' was not found for run '{}'",
+                        subtask_id, looper_run.looper_run_id
+                    )
+                })?;
+
+            if subtask.task_id != looper_run.task_id {
+                return Err(format!(
+                    "Scoped looper subtask '{}' does not belong to task '{}'",
+                    subtask_id, looper_run.task_id
+                ));
+            }
+            if !matches!(
+                subtask.status,
+                openfang_types::task::SubtaskStatus::Planned
+                    | openfang_types::task::SubtaskStatus::Ready
+            ) {
+                return Err(format!(
+                    "Scoped looper subtask '{}' must be in planned or ready status",
+                    subtask_id
+                ));
+            }
+
+            selected_subtasks.push(subtask);
+        }
+
+        if selected_subtasks.is_empty() {
+            return Err(format!(
+                "Scoped looper run '{}' must include at least one eligible subtask",
+                looper_run.looper_run_id
+            ));
+        }
+
+        for subtask in &selected_subtasks {
+            for dependency_id in &subtask.depends_on {
+                if selected_ids.contains(dependency_id.as_ref()) {
+                    continue;
+                }
+
+                let dependency = self
+                    .workflow_stores
+                    .subtask
+                    .find_by_id(dependency_id)
+                    .map_err(|error| {
+                        format!(
+                            "Failed to load dependency '{}' for scoped looper subtask '{}': {error}",
+                            dependency_id, subtask.subtask_id
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        format!(
+                            "Dependency '{}' for scoped looper subtask '{}' was not found",
+                            dependency_id, subtask.subtask_id
+                        )
+                    })?;
+
+                if dependency.task_id != looper_run.task_id
+                    || dependency.status != openfang_types::task::SubtaskStatus::Completed
+                {
+                    return Err(format!(
+                        "Scoped looper subtask '{}' depends on excluded subtask '{}' that is not already completed",
+                        subtask.subtask_id, dependency_id
+                    ));
+                }
+            }
+        }
+
+        for subtask in &selected_subtasks {
+            self.workflow_stores
+                .looper_subtask
+                .create_for_run(looper_run, subtask)
+                .map_err(|error| {
+                    format!(
+                        "Failed to seed scoped looper execution row for subtask '{}' in run '{}': {error}",
+                        subtask.subtask_id, looper_run.looper_run_id
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
     /// Pause a live looper run without interrupting in-flight dispatches.
     pub async fn pause_looper_run_control_plane(
         self: &Arc<Self>,
@@ -5680,14 +5821,25 @@ impl OpenFangKernel {
             .looper_runtime_tokens
             .contains_key(looper_run_id.as_ref())
         {
-            return self
+            let record = self
                 .workflow_stores
                 .looper_run
                 .set_current_subtask(looper_run_id, None, &timestamp)
                 .map_err(|error| {
                     format!("Failed to clear looper run '{looper_run_id}' current subtask: {error}")
-                });
+                })?;
+            let _ = self.looper_runtime_registry.handle(looper_run_id).publish(
+                "run.updated",
+                serde_json::to_value(openfang_types::looper::LooperRunResource::from(&record))
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            );
+            return Ok(record);
         }
+        let _ = self.looper_runtime_registry.handle(looper_run_id).publish(
+            "run.updated",
+            serde_json::to_value(openfang_types::looper::LooperRunResource::from(&record))
+                .unwrap_or_else(|_| serde_json::json!({})),
+        );
         Ok(record)
     }
 
@@ -5697,10 +5849,16 @@ impl OpenFangKernel {
         looper_run_id: &LooperRunId,
     ) -> Result<LooperRunRecord, String> {
         let timestamp = openfang_memory::now_timestamp();
-        self.workflow_stores
+        let record = self
+            .workflow_stores
             .looper_run
             .resume(looper_run_id, &timestamp)
             .map_err(|error| format!("Failed to resume looper run '{looper_run_id}': {error}"))?;
+        let _ = self.looper_runtime_registry.handle(looper_run_id).publish(
+            "run.updated",
+            serde_json::to_value(openfang_types::looper::LooperRunResource::from(&record))
+                .unwrap_or_else(|_| serde_json::json!({})),
+        );
         self.start_looper_runtime(looper_run_id).await
     }
 
@@ -5719,6 +5877,11 @@ impl OpenFangKernel {
             .looper_run
             .cancel(looper_run_id, Some(&error_json), &timestamp)
             .map_err(|error| format!("Failed to cancel looper run '{looper_run_id}': {error}"))?;
+        let _ = self.looper_runtime_registry.handle(looper_run_id).publish(
+            "run.updated",
+            serde_json::to_value(openfang_types::looper::LooperRunResource::from(&record))
+                .unwrap_or_else(|_| serde_json::json!({})),
+        );
         if let Some(cancel_token) = self
             .looper_runtime_tokens
             .get(looper_run_id.as_ref())
@@ -5728,12 +5891,19 @@ impl OpenFangKernel {
             return Ok(record);
         }
 
-        self.workflow_stores
+        let record = self
+            .workflow_stores
             .looper_run
             .set_current_subtask(looper_run_id, None, &timestamp)
             .map_err(|error| {
                 format!("Failed to finalize cancelled looper run '{looper_run_id}': {error}")
-            })
+            })?;
+        let _ = self.looper_runtime_registry.handle(looper_run_id).publish(
+            "run.updated",
+            serde_json::to_value(openfang_types::looper::LooperRunResource::from(&record))
+                .unwrap_or_else(|_| serde_json::json!({})),
+        );
+        Ok(record)
     }
 
     /// Reattach runtime workers to durable looper runs that were active before restart.

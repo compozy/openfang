@@ -52,6 +52,7 @@ pub async fn build_router(
         kernel: kernel.clone(),
         started_at: Instant::now(),
         peer_registry: kernel.peer_registry.get().map(|r| Arc::new(r.clone())),
+        looper_runtime_registry: kernel.looper_runtime_registry(),
         bridge_manager: tokio::sync::Mutex::new(bridge),
         channels_config: tokio::sync::RwLock::new(channels_config),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -633,6 +634,34 @@ pub async fn build_router(
             axum::routing::get(routes::get_subtask_v1)
                 .put(routes::update_subtask_v1)
                 .delete(routes::delete_subtask_v1),
+        )
+        .route(
+            "/api/v1/looper-runs",
+            axum::routing::get(routes::list_looper_runs_v1).post(routes::create_looper_run_v1),
+        )
+        .route(
+            "/api/v1/looper-runs/{id}",
+            axum::routing::get(routes::get_looper_run_v1),
+        )
+        .route(
+            "/api/v1/looper-runs/{id}/subtasks",
+            axum::routing::get(routes::list_looper_subtasks_v1),
+        )
+        .route(
+            "/api/v1/looper-runs/{id}/pause",
+            axum::routing::post(routes::pause_looper_run_v1),
+        )
+        .route(
+            "/api/v1/looper-runs/{id}/resume",
+            axum::routing::post(routes::resume_looper_run_v1),
+        )
+        .route(
+            "/api/v1/looper-runs/{id}/cancel",
+            axum::routing::post(routes::cancel_looper_run_v1),
+        )
+        .route(
+            "/api/v1/looper-runs/{id}/events",
+            axum::routing::get(routes::stream_looper_run_events_v1),
         )
         // Skills endpoints
         .route("/api/skills", axum::routing::get(routes::list_skills))

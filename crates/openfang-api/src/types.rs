@@ -14,6 +14,8 @@ use openfang_types::doc::DocType;
 pub use openfang_types::doc::{
     DocDetail, DocListPage, DocSummary, DocVersionListPage, DocVersionSummary,
 };
+use openfang_types::looper::{LooperExecutionMode, LooperRunStatus};
+pub use openfang_types::looper::{LooperRunResource, LooperSubtaskView};
 use openfang_types::scheduler::{
     CronAction, CronDefinitionForkedFrom, CronDefinitionOrigin, CronDelivery, CronSchedule,
 };
@@ -409,6 +411,46 @@ pub struct TaskReplanAcceptedResponse {
     pub effects: TaskReplanEffects,
 }
 
+/// Request payload for creating and starting a looper run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateLooperRunRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtask_ids: Option<Vec<SubtaskId>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_policy: Option<serde_json::Value>,
+    #[serde(default = "default_empty_object")]
+    pub metadata: serde_json::Value,
+}
+
+/// Accepted response returned after creating a looper run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateLooperRunAcceptedResponse {
+    pub accepted: bool,
+    pub resource_id: String,
+    pub status: String,
+    pub looper_run_id: String,
+}
+
+/// Paginated looper run list response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct LooperRunListResponse {
+    pub items: Vec<LooperRunResource>,
+    pub next_cursor: Option<String>,
+}
+
+/// Paginated looper-subtask execution-view response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct LooperSubtaskListResponse {
+    pub items: Vec<LooperSubtaskView>,
+    pub next_cursor: Option<String>,
+}
+
 /// Query parameters accepted by task list endpoints.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -463,6 +505,24 @@ pub struct SubtaskListQueryParams {
     pub ready: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<bool>,
+}
+
+/// Query parameters accepted by looper run list endpoints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct LooperRunListQueryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<LooperRunStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<LooperExecutionMode>,
 }
 
 /// Query parameters accepted by standalone artifact list endpoints.

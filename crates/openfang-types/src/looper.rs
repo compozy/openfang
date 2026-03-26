@@ -302,6 +302,36 @@ pub struct LooperRunRecord {
     pub completed_at: Option<String>,
 }
 
+/// Public looper run resource shape returned by the control plane.
+///
+/// Unlike `LooperRunRecord`, nullable fields are always serialized as `null`
+/// so the HTTP API can match the exact payload contract in `API-SPEC.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LooperRunResource {
+    /// Stable looper run identifier.
+    pub id: LooperRunId,
+    /// Owning task identifier.
+    pub task_id: TaskId,
+    /// Producing workflow run identifier, when applicable.
+    pub source_run_id: Option<String>,
+    /// Current looper lifecycle state.
+    pub status: LooperRunStatus,
+    /// Explicit execution policy.
+    pub execution_policy: LooperExecutionPolicy,
+    /// Currently active subtask identifier, when one is in-flight.
+    pub current_subtask_id: Option<SubtaskId>,
+    /// Aggregated progress counters.
+    pub progress: LooperProgress,
+    /// Structured terminal or runtime error payload.
+    pub error: Option<JsonValue>,
+    /// Run start timestamp in RFC 3339 UTC format.
+    pub started_at: String,
+    /// Last update timestamp in RFC 3339 UTC format.
+    pub updated_at: String,
+    /// Completion timestamp for terminal states.
+    pub completed_at: Option<String>,
+}
+
 /// One looper-run subtask execution view row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LooperSubtaskRecord {
@@ -327,6 +357,19 @@ pub struct LooperSubtaskRecord {
     pub updated_at: String,
 }
 
+/// Public looper-subtask execution view exposed by the control plane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LooperSubtaskView {
+    /// Stable canonical subtask identifier.
+    pub id: SubtaskId,
+    /// Human-facing subtask title.
+    pub title: String,
+    /// Current looper execution status.
+    pub status: LooperSubtaskStatus,
+    /// Last update timestamp in RFC 3339 UTC format.
+    pub updated_at: String,
+}
+
 /// Filter set for listing durable looper runs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LooperRunListQuery {
@@ -342,6 +385,24 @@ pub struct LooperRunListQuery {
     /// Optional execution mode filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_mode: Option<LooperExecutionMode>,
+}
+
+impl From<&LooperRunRecord> for LooperRunResource {
+    fn from(record: &LooperRunRecord) -> Self {
+        Self {
+            id: record.looper_run_id.clone(),
+            task_id: record.task_id.clone(),
+            source_run_id: record.source_run_id.clone(),
+            status: record.status,
+            execution_policy: record.execution_policy.clone(),
+            current_subtask_id: record.current_subtask_id.clone(),
+            progress: record.progress,
+            error: record.error.clone(),
+            started_at: record.started_at.clone(),
+            updated_at: record.updated_at.clone(),
+            completed_at: record.completed_at.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
