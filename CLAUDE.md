@@ -27,9 +27,8 @@ OpenFang is an open-source Agent Operating System written in Rust (14+ crates).
 - **USE** `fix-coderabbit-review` skill when addressing CodeRabbit review issues
 - **USE** `ratatui-tui` skill when working on the interactive CLI/TUI
 - **THIRD PARTY LIBRARIES** (just applied when needing external resources):
-  - **MANDATORY** Always use `sourcebot` skill (5-7 times) to search code and find information about **EXTERNAL libraries, frameworks, and code patterns**
-  - **YOU MUST** use Context7 (multiple times) when the library you research on `sourcebot` is not available
-  - **NEVER use Sourcebot to search local project code**. For local code, use `codebase_search` or `Grep`/`Glob` instead
+  - **MANDATORY** Use the `find-docs` skill for **EXTERNAL** libraries, frameworks, SDKs, APIs, and code patterns when you need up-to-date documentation, references, or examples
+  - **NEVER** use `find-docs` (or other external-documentation workflows) to search **local** project code. For local code, use `codebase_search` or `Grep`/`Glob` instead
 
 ### CRITICAL: Git Commands Restriction
 
@@ -170,7 +169,7 @@ Every agent MUST follow this protocol before writing code:
 - **Ambiguous requirements / multi-crate scope** -> `requirements-clarity`
 - **Test plan / regression scope** -> `qa-test-planner` + `test-anti-patterns`
 - **Large or high-risk diff review** -> `adversarial-review`
-- **External lib research** -> `sourcebot` + `deep-research`
+- **External libraries / documentation research** -> `find-docs`
 - **Architecture diagrams** -> `mermaid-diagrams`
 - **Documentation / writing** -> `writing-clearly-and-concisely` + `crafting-effective-readmes`
 - **Skill discovery / capability gaps** -> `find-skills`
@@ -188,7 +187,7 @@ Every agent MUST follow this protocol before writing code:
 | Ambiguous requirements | `requirements-clarity` | + domain skills after scope is clear |
 | Test planning / regression design | `qa-test-planner` | + `test-anti-patterns` |
 | High-risk change review | `adversarial-review` | + `receiving-code-review` (follow-up feedback) |
-| External lib research | `sourcebot` | + `deep-research` (complex analysis) |
+| External libraries, SDKs, docs | `find-docs` | |
 | Task completion | `verification-before-completion` | |
 | Code review response | `receiving-code-review` | |
 | Git rebase/conflicts | `git-rebase` | |
@@ -197,7 +196,6 @@ Every agent MUST follow this protocol before writing code:
 | Documentation / writing | `writing-clearly-and-concisely` | + `crafting-effective-readmes` (READMEs) |
 | Post-implementation review | `lesson-learned` | |
 | Skill discovery / workflow extension | `find-skills` | |
-| Parallel agent work | `dispatching-parallel-agents` | |
 
 ### Step 3: Verify Before Completion
 
@@ -215,7 +213,7 @@ Before any agent marks a task as complete:
 1. **Skip skill activation** because "it's a small change" - every domain change requires its skill
 2. **Activate only one skill** when the task touches multiple domains
 3. **Forget `verification-before-completion`** before marking tasks done
-4. **Use `sourcebot` for local code** - it's only for external libraries
+4. **Use `find-docs` for local project code** — local code belongs in `codebase_search`, `Grep`, or `Glob`
 5. **Write tests without `test-anti-patterns`** - leads to bad test patterns
 6. **Fix bugs without `systematic-debugging`** - leads to symptom-patching
 7. **Apply workarounds without `no-workarounds`** - type assertions, lint suppressions, error swallowing are all rejected
