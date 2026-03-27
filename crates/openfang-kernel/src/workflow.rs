@@ -1788,6 +1788,92 @@ impl TransitionWriter {
         Ok(cancelled_record)
     }
 
+    async fn timeout_hitl_request(
+        &self,
+        hitl_request_id: &str,
+    ) -> Result<HitlRecord, TransitionError> {
+        let current_hitl = self
+            .workflow_stores
+            .hitl
+            .find_by_id(hitl_request_id)
+            .await
+            .map_err(WorkflowStoreError::from)?
+            .ok_or_else(|| {
+                WorkflowStoreError::Hitl(openfang_memory::HitlStoreError::HitlRequestNotFound {
+                    hitl_request_id: hitl_request_id.to_string(),
+                })
+            })?;
+        let current_run = self
+            .workflow_stores
+            .workflow_run
+            .find_by_id(&current_hitl.run_id)?
+            .ok_or_else(|| TransitionError::RunNotFound {
+                run_id: current_hitl.run_id.clone(),
+            })?;
+        let dispatch_id =
+            current_hitl
+                .dispatch_id
+                .clone()
+                .ok_or_else(|| TransitionError::DispatchNotFound {
+                    dispatch_id: "<missing>".to_string(),
+                })?;
+        let current_dispatch = self.load_dispatch(&dispatch_id).await?;
+
+        if current_run.status != DurableWorkflowRunStatus::WaitingHitl {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current_run.run_id.clone(),
+                from: current_run.status.to_string(),
+                to: DurableWorkflowRunStatus::Running.to_string(),
+            });
+        }
+        if current_dispatch.status != DispatchStatus::WaitingHitl {
+            return Err(TransitionError::InvalidStatusTransition {
+                run_id: current_run.run_id.clone(),
+                from: current_dispatch.status.to_string(),
+                to: DispatchStatus::Failed.to_string(),
+            });
+        }
+
+        let timeout_message = format!("HITL request '{}' timed out", hitl_request_id);
+        let timestamp = now_timestamp();
+        let mut next_run = current_run.clone();
+        next_run.status = DurableWorkflowRunStatus::Running;
+        next_run.waiting_kind = None;
+        next_run.waiting_ref = None;
+        next_run.active_dispatch_id = None;
+        next_run.active_hitl_request_id = None;
+        next_run.updated_at = timestamp.clone();
+
+        let mut next_dispatch = current_dispatch.clone();
+        next_dispatch.status = DispatchStatus::Failed;
+        next_dispatch.error_json = Some(serde_json::json!({
+            "message": timeout_message,
+        }));
+        next_dispatch.updated_at = timestamp.clone();
+        next_dispatch.completed_at = Some(timestamp.clone());
+
+        let repository = self.workflow_stores.workflow_run.clone();
+        let current_run_record = current_run.clone();
+        let next_run_record = next_run.clone();
+        let current_dispatch_record = current_dispatch.clone();
+        let next_dispatch_record = next_dispatch.clone();
+        let hitl_request_id_text = hitl_request_id.to_string();
+        let timed_out_record = tokio::task::spawn_blocking(move || {
+            repository.persist_hitl_timeout(
+                &current_run_record,
+                &next_run_record,
+                &current_dispatch_record,
+                &next_dispatch_record,
+                &hitl_request_id_text,
+            )
+        })
+        .await
+        .map_err(|error| TransitionError::Join(error.to_string()))??;
+
+        self.sync_cache_from_record(&next_run, None).await?;
+        Ok(timed_out_record)
+    }
+
     async fn record_run_completed(
         &self,
         run_id: WorkflowRunId,
@@ -2877,8 +2963,15 @@ impl WorkflowEngine {
         Ok(record)
     }
 
-    pub async fn detach_hitl_waiter(&self, hitl_request_id: &str) {
-        let _ = self.hitl_registry.remove(hitl_request_id).await;
+    pub async fn timeout_hitl_request(&self, hitl_request_id: &str) -> Result<HitlRecord, String> {
+        self.transition_writer()
+            .timeout_hitl_request(hitl_request_id)
+            .await
+            .map_err(transition_error_to_string)
+    }
+
+    pub async fn detach_hitl_waiter(&self, hitl_request_id: &str) -> bool {
+        self.hitl_registry.remove(hitl_request_id).await.is_some()
     }
 
     async fn record_run_failed_transition(

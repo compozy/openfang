@@ -3,6 +3,7 @@
 ## Project Overview
 
 OpenFang is an open-source Agent Operating System written in Rust (14+ crates).
+
 - Config: `~/.openfang/config.toml`
 - Default API: `http://127.0.0.1:4200`
 - CLI binary: `target/release/openfang.exe` (or `target/debug/openfang.exe`)
@@ -71,6 +72,7 @@ make clean        # Clean build artifacts
 **If any of these commands fail, the task is NOT complete.** Fix all issues and re-run until all three pass.
 
 Alternatively, the raw cargo commands:
+
 ```bash
 cargo +nightly-2026-03-15 fmt --all --check       # Formatting (nightly required)
 cargo clippy --all-targets --all-features -- -D warnings  # Linting
@@ -176,26 +178,26 @@ Every agent MUST follow this protocol before writing code:
 
 ### Step 2: Activate All Matching Skills
 
-| Domain | Required Skills | Conditional Skills |
-|--------|----------------|-------------------|
-| Any Rust code | `rust-best-practices` | |
-| CLI/TUI work | `ratatui-tui` | + `rust-best-practices` |
-| Bug fix | `systematic-debugging` + `no-workarounds` | + `test-anti-patterns` (test failures) |
-| Writing tests | `test-anti-patterns` | + domain skill for code being tested |
-| PRD task execution | `executing-plans` | + domain skills |
-| CodeRabbit reviews | `fix-coderabbit-review` | + domain skills |
-| Ambiguous requirements | `requirements-clarity` | + domain skills after scope is clear |
-| Test planning / regression design | `qa-test-planner` | + `test-anti-patterns` |
-| High-risk change review | `adversarial-review` | + `receiving-code-review` (follow-up feedback) |
-| External libraries, SDKs, docs | `find-docs` | |
-| Task completion | `verification-before-completion` | |
-| Code review response | `receiving-code-review` | |
-| Git rebase/conflicts | `git-rebase` | |
-| Architecture audit | `architectural-analysis` | + `adversarial-review` (for risky structural changes) |
-| Architecture diagrams | `mermaid-diagrams` | |
-| Documentation / writing | `writing-clearly-and-concisely` | + `crafting-effective-readmes` (READMEs) |
-| Post-implementation review | `lesson-learned` | |
-| Skill discovery / workflow extension | `find-skills` | |
+| Domain                               | Required Skills                           | Conditional Skills                                    |
+| ------------------------------------ | ----------------------------------------- | ----------------------------------------------------- |
+| Any Rust code                        | `rust-best-practices`                     |                                                       |
+| CLI/TUI work                         | `ratatui-tui`                             | + `rust-best-practices`                               |
+| Bug fix                              | `systematic-debugging` + `no-workarounds` | + `test-anti-patterns` (test failures)                |
+| Writing tests                        | `test-anti-patterns`                      | + domain skill for code being tested                  |
+| PRD task execution                   | `executing-plans`                         | + domain skills                                       |
+| CodeRabbit reviews                   | `fix-coderabbit-review`                   | + domain skills                                       |
+| Ambiguous requirements               | `requirements-clarity`                    | + domain skills after scope is clear                  |
+| Test planning / regression design    | `qa-test-planner`                         | + `test-anti-patterns`                                |
+| High-risk change review              | `adversarial-review`                      | + `receiving-code-review` (follow-up feedback)        |
+| External libraries, SDKs, docs       | `find-docs`                               |                                                       |
+| Task completion                      | `verification-before-completion`          |                                                       |
+| Code review response                 | `receiving-code-review`                   |                                                       |
+| Git rebase/conflicts                 | `git-rebase`                              |                                                       |
+| Architecture audit                   | `architectural-analysis`                  | + `adversarial-review` (for risky structural changes) |
+| Architecture diagrams                | `mermaid-diagrams`                        |                                                       |
+| Documentation / writing              | `writing-clearly-and-concisely`           | + `crafting-effective-readmes` (READMEs)              |
+| Post-implementation review           | `lesson-learned`                          |                                                       |
+| Skill discovery / workflow extension | `find-skills`                             |                                                       |
 
 ### Step 3: Verify Before Completion
 
@@ -229,6 +231,7 @@ Before any agent marks a task as complete:
 ## MANDATORY: Live Integration Testing
 
 **After implementing any new endpoint, feature, or wiring change, you MUST run live integration tests.** Unit tests alone are not enough — they can pass while the feature is actually dead code. Live tests catch:
+
 - Missing route registrations in server.rs
 - Config fields not being deserialized from TOML
 - Type mismatches between kernel and API layers
@@ -237,6 +240,7 @@ Before any agent marks a task as complete:
 ### How to Run Live Integration Tests
 
 #### Step 1: Stop any running daemon
+
 ```bash
 tasklist | grep -i openfang
 taskkill //PID <pid> //F
@@ -245,19 +249,23 @@ sleep 3
 ```
 
 #### Step 2: Build fresh release binary
+
 ```bash
 cargo build --release -p openfang-cli
 ```
 
 #### Step 3: Start daemon with required API keys
+
 ```bash
 GROQ_API_KEY=<key> target/release/openfang.exe start &
 sleep 6  # Wait for full boot
 curl -s http://127.0.0.1:4200/api/health  # Verify it's up
 ```
+
 The daemon command is `start` (not `daemon`).
 
 #### Step 4: Test every new endpoint
+
 ```bash
 # GET endpoints — verify they return real data, not empty/null
 curl -s http://127.0.0.1:4200/api/<new-endpoint>
@@ -273,6 +281,7 @@ curl -s http://127.0.0.1:4200/api/<endpoint>  # Should reflect the update
 ```
 
 #### Step 5: Test real LLM integration
+
 ```bash
 # Get an agent ID
 curl -s http://127.0.0.1:4200/api/agents | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])"
@@ -284,13 +293,16 @@ curl -s -X POST "http://127.0.0.1:4200/api/agents/<id>/message" \
 ```
 
 #### Step 6: Verify side effects
+
 After an LLM call, verify that any metering/cost/usage tracking updated:
+
 ```bash
 curl -s http://127.0.0.1:4200/api/budget       # Cost should have increased
 curl -s http://127.0.0.1:4200/api/budget/agents  # Per-agent spend should show
 ```
 
 #### Step 7: Verify dashboard HTML
+
 ```bash
 # Check that new UI components exist in the served HTML
 curl -s http://127.0.0.1:4200/ | grep -c "newComponentName"
@@ -298,30 +310,31 @@ curl -s http://127.0.0.1:4200/ | grep -c "newComponentName"
 ```
 
 #### Step 8: Cleanup
+
 ```bash
 tasklist | grep -i openfang
 taskkill //PID <pid> //F
 ```
 
 ### Key API Endpoints for Testing
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/api/health` | GET | Basic health check |
-| `/api/agents` | GET | List all agents |
-| `/api/agents/{id}/message` | POST | Send message (triggers LLM) |
-| `/api/budget` | GET/PUT | Global budget status/update |
-| `/api/budget/agents` | GET | Per-agent cost ranking |
-| `/api/budget/agents/{id}` | GET | Single agent budget detail |
-| `/api/network/status` | GET | OFP network status |
-| `/api/peers` | GET | Connected OFP peers |
-| `/api/a2a/agents` | GET | External A2A agents |
-| `/api/a2a/discover` | POST | Discover A2A agent at URL |
-| `/api/a2a/send` | POST | Send task to external A2A agent |
-| `/api/a2a/tasks/{id}/status` | GET | Check external A2A task status |
+
+| Endpoint                     | Method  | Purpose                         |
+| ---------------------------- | ------- | ------------------------------- |
+| `/api/health`                | GET     | Basic health check              |
+| `/api/agents`                | GET     | List all agents                 |
+| `/api/agents/{id}/message`   | POST    | Send message (triggers LLM)     |
+| `/api/budget`                | GET/PUT | Global budget status/update     |
+| `/api/budget/agents`         | GET     | Per-agent cost ranking          |
+| `/api/budget/agents/{id}`    | GET     | Single agent budget detail      |
+| `/api/network/status`        | GET     | OFP network status              |
+| `/api/peers`                 | GET     | Connected OFP peers             |
+| `/api/a2a/agents`            | GET     | External A2A agents             |
+| `/api/a2a/discover`          | POST    | Discover A2A agent at URL       |
+| `/api/a2a/send`              | POST    | Send task to external A2A agent |
+| `/api/a2a/tasks/{id}/status` | GET     | Check external A2A task status  |
 
 ## Architecture Notes
 
-- **Don't touch `openfang-cli`** — user is actively building the interactive CLI
 - `KernelHandle` trait avoids circular deps between runtime and kernel
 - `AppState` in `server.rs` bridges kernel to API routes
 - New routes must be registered in `server.rs` router AND implemented in `routes.rs`

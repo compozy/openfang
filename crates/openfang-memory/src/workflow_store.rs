@@ -974,6 +974,76 @@ impl WorkflowRunRepository {
         })
     }
 
+    /// Mark a timed out HITL request, fail its dispatch, and clear the run's
+    /// active HITL marker inside one SQLite transaction.
+    pub fn persist_hitl_timeout(
+        &self,
+        current_run: &WorkflowRunRecord,
+        next_run: &WorkflowRunRecord,
+        current_dispatch: &DispatchRecord,
+        next_dispatch: &DispatchRecord,
+        hitl_request_id: &str,
+    ) -> Result<HitlRecord, WorkflowStoreError> {
+        let conn = lock_conn(&self.conn)?;
+        let transaction = conn.unchecked_transaction()?;
+        let current_hitl = load_required_hitl_request(&transaction, hitl_request_id)?;
+
+        match current_hitl.status {
+            HitlStatus::Pending => {
+                let hitl_rows = transaction.execute(
+                    "UPDATE hitl_request
+                     SET status = ?1
+                     WHERE hitl_request_id = ?2",
+                    params![HitlStatus::TimedOut.as_str(), hitl_request_id],
+                )?;
+                if hitl_rows == 0 {
+                    return Err(WorkflowStoreError::Hitl(
+                        crate::hitl::HitlStoreError::HitlRequestNotFound {
+                            hitl_request_id: hitl_request_id.to_string(),
+                        },
+                    ));
+                }
+            }
+            HitlStatus::TimedOut => {}
+            other => {
+                return Err(WorkflowStoreError::Hitl(
+                    crate::hitl::HitlStoreError::InvalidStatusTransition {
+                        hitl_request_id: hitl_request_id.to_string(),
+                        from: other,
+                        to: HitlStatus::TimedOut,
+                    },
+                ));
+            }
+        }
+
+        let dispatch_rows = update_dispatch_row(&transaction, current_dispatch, next_dispatch)?;
+        if dispatch_rows == 0 {
+            return Err(resolve_dispatch_update_conflict(
+                &transaction,
+                &current_dispatch.dispatch_id,
+                current_dispatch.status,
+            )
+            .into());
+        }
+
+        let run_rows =
+            update_workflow_run_record(&transaction, next_run, Some(current_run.status))?;
+        if run_rows == 0 {
+            return Err(resolve_update_conflict(
+                &transaction,
+                &current_run.run_id,
+                Some(current_run.status),
+            ));
+        }
+
+        transaction.commit()?;
+
+        Ok(HitlRecord {
+            status: HitlStatus::TimedOut,
+            ..current_hitl
+        })
+    }
+
     /// Cancel one dispatch, cascade any linked pending HITL requests, and
     /// optionally update the owning workflow run inside one SQLite transaction.
     pub fn persist_dispatch_cancel(

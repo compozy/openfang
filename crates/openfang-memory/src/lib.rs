@@ -33,8 +33,9 @@ pub use dispatch::{
 };
 pub use doc::{DocRepository, DocStoreError};
 pub use hitl::{
-    HitlKind, HitlListPage, HitlListQuery, HitlRecord, HitlRepository, HitlStatus, HitlStore,
-    HitlStoreError, NewHitlRequest, SqliteHitlRepository, HITL_REQUEST_MIGRATION_SQL,
+    ExpiredHitlRequest, HitlKind, HitlListPage, HitlListQuery, HitlRecord, HitlRepository,
+    HitlStatus, HitlStore, HitlStoreError, NewHitlRequest, SqliteHitlRepository,
+    HITL_REQUEST_MIGRATION_SQL,
 };
 pub use looper::{
     LooperRunRepository, LooperStoreError, LooperSubtaskRepository, NewLooperRun,

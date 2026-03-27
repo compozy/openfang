@@ -28,9 +28,9 @@ use openfang_agent_definition::{
     compile as compile_agent_definition, stage4_normalize, AgentDefinition, CompiledAgentDefinition,
 };
 use openfang_memory::{
-    AgentRuntimeRecord, AgentSessionRecord, DispatchRepository, DispatchStatus, HitlRecord,
-    HitlRepository, MemorySubstrate, NewLooperRun, RuntimeStoreSet, WorkflowSignalRecord,
-    WorkflowStoreSet,
+    AgentRuntimeRecord, AgentSessionRecord, DispatchRepository, DispatchStatus, ExpiredHitlRequest,
+    HitlRecord, HitlRepository, MemorySubstrate, NewLooperRun, RuntimeStoreSet,
+    WorkflowSignalRecord, WorkflowStoreSet,
 };
 use openfang_provider_binding::binding_to_driver_with_placeholder_install_and_session_store;
 use openfang_runtime::agent_loop::{
@@ -6269,6 +6269,68 @@ impl OpenFangKernel {
         }
     }
 
+    async fn sweep_timed_out_hitl_requests(&self) -> Result<Vec<ExpiredHitlRequest>, String> {
+        let expired = self
+            .workflow_stores
+            .hitl
+            .expire_timed_out_requests()
+            .await
+            .map_err(|error| format!("Failed to expire timed out HITL requests: {error}"))?;
+
+        if expired.is_empty() {
+            return Ok(expired);
+        }
+
+        let ids = expired
+            .iter()
+            .map(|request| request.hitl_request_id.as_str())
+            .collect::<Vec<_>>();
+        warn!(
+            count = expired.len(),
+            ids = ?ids,
+            "Expired timed-out HITL requests"
+        );
+
+        for request in &expired {
+            self.workflows
+                .timeout_hitl_request(&request.hitl_request_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Failed to transition timed out HITL request '{}': {error}",
+                        request.hitl_request_id
+                    )
+                })?;
+
+            let had_waiter = self
+                .workflows
+                .detach_hitl_waiter(&request.hitl_request_id)
+                .await;
+            if !had_waiter {
+                let run_id =
+                    WorkflowRunId(uuid::Uuid::parse_str(&request.run_id).map_err(|error| {
+                        format!(
+                            "Timed out HITL request '{}' has invalid workflow run id '{}': {error}",
+                            request.hitl_request_id, request.run_id
+                        )
+                    })?);
+                let timeout_message =
+                    format!("HITL request '{}' timed out", request.hitl_request_id);
+                self.workflows
+                    .record_hitl_resume_failure(run_id, &request.step_id, &timeout_message)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "Failed to mark timed out HITL request '{}' as a workflow failure: {error}",
+                            request.hitl_request_id
+                        )
+                    })?;
+            }
+        }
+
+        Ok(expired)
+    }
+
     pub async fn cancel_dispatch_control_plane(
         self: &Arc<Self>,
         dispatch_id: &str,
@@ -6807,6 +6869,8 @@ impl OpenFangKernel {
                 info!("Started {count} background agent loop(s) (staggered)");
             });
         }
+
+        self.spawn_hitl_timeout_monitor(std::time::Duration::from_secs(30));
 
         // Start heartbeat monitor for agent health checking
         self.start_heartbeat_monitor();
@@ -7366,6 +7430,24 @@ impl OpenFangKernel {
                     }
                 })
             });
+    }
+
+    fn spawn_hitl_timeout_monitor(self: &Arc<Self>, interval_duration: std::time::Duration) {
+        let kernel = Arc::clone(self);
+        let cancel = self.workflow_dispatch_cancel.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(interval_duration);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = kernel.sweep_timed_out_hitl_requests().await {
+                            warn!("HITL timeout sweep failed: {error}");
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Gracefully shutdown the kernel.
@@ -10930,6 +11012,303 @@ mod tests {
             entry.manifest.tool_blocklist.is_empty(),
             "hand activation should not set a runtime blocklist by default"
         );
+
+        kernel.shutdown();
+    }
+
+    fn legacy_ir(workflow: &Workflow) -> WorkflowIr {
+        WorkflowEngine::legacy_workflow_to_ir(workflow)
+    }
+
+    fn mock_dispatch_resolver(agent: &str) -> Result<(AgentId, String), String> {
+        Ok((AgentId::new(), agent.to_string()))
+    }
+
+    async fn mark_dispatch_running_for_test(
+        dispatches: &openfang_memory::SqliteDispatchRepository,
+        dispatch_id: &str,
+        provider_driver: &str,
+        session_id: &str,
+    ) -> DispatchRecord {
+        let current = dispatches
+            .find_by_id(dispatch_id)
+            .await
+            .expect("dispatch lookup should succeed")
+            .expect("dispatch should exist");
+        let mut next = current.clone();
+        next.status = DispatchStatus::Running;
+        next.provider_driver = Some(provider_driver.to_string());
+        next.session_id = Some(session_id.to_string());
+        next.updated_at = openfang_memory::now_timestamp();
+        dispatches
+            .update_status(&current, &next)
+            .await
+            .expect("dispatch should transition to running")
+    }
+
+    async fn wait_for_pending_hitl_request(
+        kernel: &Arc<OpenFangKernel>,
+        run_id: WorkflowRunId,
+    ) -> openfang_memory::HitlRecord {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let pending = kernel
+                    .workflow_stores
+                    .hitl
+                    .find_pending_for_run(&run_id.to_string())
+                    .await
+                    .expect("pending hitl lookup should succeed");
+                if let Some(record) = pending.into_iter().next() {
+                    break record;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for pending hitl request")
+    }
+
+    async fn wait_for_terminal_run(
+        kernel: &Arc<OpenFangKernel>,
+        run_id: WorkflowRunId,
+    ) -> WorkflowRunRecord {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let record = kernel
+                    .workflow_stores
+                    .workflow_run
+                    .find_by_id(&run_id.to_string())
+                    .expect("workflow run lookup should succeed")
+                    .expect("workflow run should exist");
+                if record.status.is_terminal() {
+                    break record;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for terminal workflow run")
+    }
+
+    fn update_hitl_timeout_expr(
+        kernel: &Arc<OpenFangKernel>,
+        hitl_request_id: &str,
+        timeout_expr: &str,
+    ) {
+        let conn = kernel.workflow_stores.connection();
+        let conn = conn.lock().expect("workflow store connection should lock");
+        let sql = format!(
+            "UPDATE hitl_request
+             SET timeout_at = {timeout_expr}
+             WHERE hitl_request_id = ?1"
+        );
+        conn.execute(&sql, [hitl_request_id])
+            .expect("timeout update should succeed");
+    }
+
+    async fn spawn_waiting_hitl_workflow(
+        kernel: &Arc<OpenFangKernel>,
+        workflow_name: &str,
+        question: &str,
+    ) -> (
+        WorkflowRunId,
+        tokio::task::JoinHandle<Result<String, String>>,
+    ) {
+        let workflow = single_step_workflow(workflow_name, "analyst");
+        let workflow_ir = legacy_ir(&workflow);
+        let workflow_id = kernel
+            .workflows
+            .register(workflow)
+            .await
+            .expect("workflow registration should succeed");
+        let run_id = kernel
+            .workflows
+            .create_run(workflow_id, "clarify this".to_string())
+            .await
+            .expect("workflow run should be created");
+        let dispatches = kernel.workflow_stores.dispatch.clone();
+        let kernel_for_dispatch = Arc::clone(kernel);
+        let question = question.to_string();
+        let dispatch_agent = move |request: WorkflowAgentDispatchRequest| {
+            let dispatches = dispatches.clone();
+            let kernel = Arc::clone(&kernel_for_dispatch);
+            let question = question.clone();
+            Box::pin(async move {
+                let _running = mark_dispatch_running_for_test(
+                    &dispatches,
+                    &request.dispatch_id,
+                    "openfang-openai",
+                    "session-hitl-timeout-monitor",
+                )
+                .await;
+                let (hitl_request, receiver) = kernel
+                    .workflows
+                    .request_hitl_pause(
+                        request.run_id,
+                        &request.step_id,
+                        &request.dispatch_id,
+                        WorkflowHitlSignal {
+                            kind: DurableHitlKind::Clarification,
+                            question,
+                            context: serde_json::json!({}),
+                        },
+                        None,
+                    )
+                    .await?;
+                let answer = kernel
+                    .workflows
+                    .wait_for_hitl_answer(&hitl_request.hitl_request_id, receiver)
+                    .await?;
+                Ok(WorkflowAgentDispatchOutcome::CallCompleted {
+                    output: answer.continuation_message(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                })
+            }) as crate::workflow::WorkflowDispatchFuture
+        };
+        let kernel_for_run = Arc::clone(kernel);
+        let run_handle = tokio::spawn(async move {
+            kernel_for_run
+                .workflows
+                .execute_run_with_dispatch(
+                    run_id,
+                    workflow_ir,
+                    &mock_dispatch_resolver,
+                    &dispatch_agent,
+                )
+                .await
+        });
+
+        (run_id, run_handle)
+    }
+
+    #[tokio::test]
+    async fn hitl_timeout_monitor_should_fail_waiting_workflow_after_request_expires() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let config = boot_test_config(temp_dir.path());
+        let kernel =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel should boot"));
+        kernel.set_self_handle();
+
+        let (run_id, run_handle) = spawn_waiting_hitl_workflow(
+            &kernel,
+            "hitl-timeout-monitor",
+            "This request should time out",
+        )
+        .await;
+        let pending = wait_for_pending_hitl_request(&kernel, run_id).await;
+        update_hitl_timeout_expr(
+            &kernel,
+            &pending.hitl_request_id,
+            "datetime('now', '-1 minute')",
+        );
+
+        OpenFangKernel::spawn_hitl_timeout_monitor(&kernel, std::time::Duration::from_millis(25));
+
+        let error = run_handle
+            .await
+            .expect("run task should join")
+            .expect_err("workflow should fail after hitl timeout");
+        let final_run = wait_for_terminal_run(&kernel, run_id).await;
+        let final_dispatch = kernel
+            .workflow_stores
+            .dispatch
+            .find_by_run(&run_id.to_string())
+            .await
+            .expect("dispatch lookup should succeed")
+            .into_iter()
+            .next()
+            .expect("dispatch should exist");
+        let timed_out = kernel
+            .workflow_stores
+            .hitl
+            .find_by_id(&pending.hitl_request_id)
+            .await
+            .expect("timed out hitl lookup should succeed")
+            .expect("timed out hitl request should exist");
+
+        assert!(error.contains("timed out"));
+        assert_eq!(timed_out.status, openfang_memory::HitlStatus::TimedOut);
+        assert_eq!(final_dispatch.status, DispatchStatus::Failed);
+        assert_eq!(final_run.status, WorkflowRunStatus::Failed);
+
+        kernel.shutdown();
+    }
+
+    #[tokio::test]
+    async fn hitl_timeout_sweep_and_answer_race_should_leave_consistent_terminal_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let config = boot_test_config(temp_dir.path());
+        let kernel =
+            Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel should boot"));
+        kernel.set_self_handle();
+
+        let (run_id, run_handle) = spawn_waiting_hitl_workflow(
+            &kernel,
+            "hitl-timeout-race",
+            "This request races with the timeout sweep",
+        )
+        .await;
+        let pending = wait_for_pending_hitl_request(&kernel, run_id).await;
+        update_hitl_timeout_expr(
+            &kernel,
+            &pending.hitl_request_id,
+            "datetime('now', '-1 minute')",
+        );
+
+        let kernel_for_sweep = Arc::clone(&kernel);
+        let sweep_task = tokio::spawn(async move {
+            OpenFangKernel::sweep_timed_out_hitl_requests(&kernel_for_sweep)
+                .await
+                .expect("timeout sweep should succeed")
+        });
+        let kernel_for_answer = Arc::clone(&kernel);
+        let hitl_request_id = pending.hitl_request_id.clone();
+        let answer_task = tokio::spawn(async move {
+            kernel_for_answer
+                .answer_hitl_request(
+                    &hitl_request_id,
+                    serde_json::json!({
+                        "type": "text",
+                        "value": "continue",
+                    }),
+                    serde_json::json!({ "source": "race-test" }),
+                )
+                .await
+        });
+
+        let _expired = sweep_task.await.expect("sweep task should join");
+        let answer_result = answer_task.await.expect("answer task should join");
+        let final_hitl = kernel
+            .workflow_stores
+            .hitl
+            .find_by_id(&pending.hitl_request_id)
+            .await
+            .expect("final hitl lookup should succeed")
+            .expect("final hitl request should exist");
+
+        match final_hitl.status {
+            openfang_memory::HitlStatus::Answered => {
+                let output = run_handle
+                    .await
+                    .expect("run task should join")
+                    .expect("workflow should complete after answered race");
+                assert!(answer_result.is_ok());
+                assert_eq!(output, "continue");
+            }
+            openfang_memory::HitlStatus::TimedOut => {
+                let error = run_handle
+                    .await
+                    .expect("run task should join")
+                    .expect_err("workflow should fail after timeout race");
+                assert!(answer_result.is_err());
+                assert!(error.contains("timed out"));
+            }
+            status => panic!("unexpected final hitl status after timeout race: {status:?}"),
+        }
+
+        let final_run = wait_for_terminal_run(&kernel, run_id).await;
+        assert!(final_run.status.is_terminal());
 
         kernel.shutdown();
     }

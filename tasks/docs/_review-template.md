@@ -26,7 +26,7 @@
 
 <research>
 # When you need information about a library, external API or research:
-- use .claude/commands/sourcebot.md
+- use the `find-docs` skill (up-to-date docs, API references, examples for external technologies)
 - use .claude/commands/perplexity.md
 </research>
 

@@ -1,7 +1,7 @@
 //! Typed `compozy.db` repository for durable HITL request state.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use openfang_types::error::OpenFangError;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -176,6 +176,17 @@ pub struct HitlRecord {
     pub timeout_at: Option<DateTime<Utc>>,
 }
 
+/// Summary of HITL requests expired in one sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpiredHitlRequest {
+    /// Stable HITL request identifier.
+    pub hitl_request_id: String,
+    /// Owning workflow run identifier.
+    pub run_id: String,
+    /// Workflow step that issued the request.
+    pub step_id: String,
+}
+
 /// Filter + pagination input for HITL list surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HitlListQuery {
@@ -309,6 +320,9 @@ pub trait HitlRepository: Send + Sync {
 
     /// Marks a pending request timed out.
     async fn mark_timed_out(&self, hitl_request_id: &str) -> Result<HitlRecord, HitlStoreError>;
+
+    /// Sweeps all expired pending requests in one atomic update.
+    async fn expire_timed_out_requests(&self) -> Result<Vec<ExpiredHitlRequest>, HitlStoreError>;
 }
 
 /// SQLite-backed HITL repository.
@@ -461,6 +475,28 @@ impl HitlRepository for SqliteHitlRepository {
 
         Ok(next)
     }
+
+    async fn expire_timed_out_requests(&self) -> Result<Vec<ExpiredHitlRequest>, HitlStoreError> {
+        let mut conn = lock_conn(&self.conn)?;
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut stmt = transaction.prepare(
+            "UPDATE hitl_request
+             SET status = 'timed_out'
+             WHERE status = 'pending'
+               AND timeout_at IS NOT NULL
+               AND (
+                    timeout_at < datetime('now')
+                    OR datetime(timeout_at) < datetime('now')
+               )
+             RETURNING hitl_request_id, run_id, step_id",
+        )?;
+        let rows = stmt.query_map([], read_expired_hitl_row)?;
+        let expired = collect_rows(rows)?;
+        drop(stmt);
+        transaction.commit()?;
+
+        Ok(expired)
+    }
 }
 
 fn lock_conn(conn: &Arc<Mutex<Connection>>) -> Result<MutexGuard<'_, Connection>, HitlStoreError> {
@@ -487,7 +523,7 @@ pub(crate) fn insert_hitl_request(
             created_at,
             answered_at,
             timeout_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime(?13))",
         params![
             record.hitl_request_id.as_str(),
             record.run_id.as_str(),
@@ -739,6 +775,14 @@ fn read_hitl_row(row: &rusqlite::Row<'_>) -> Result<HitlRecord, rusqlite::Error>
     })
 }
 
+fn read_expired_hitl_row(row: &rusqlite::Row<'_>) -> Result<ExpiredHitlRequest, rusqlite::Error> {
+    Ok(ExpiredHitlRequest {
+        hitl_request_id: row.get(0)?,
+        run_id: row.get(1)?,
+        step_id: row.get(2)?,
+    })
+}
+
 fn parse_json_column(value: String) -> Result<JsonValue, rusqlite::Error> {
     serde_json::from_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
@@ -753,9 +797,17 @@ fn parse_required_datetime(
     value: String,
     column: &'static str,
 ) -> Result<DateTime<Utc>, rusqlite::Error> {
-    DateTime::parse_from_rfc3339(&value)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|_| invalid_hitl_error(HitlStoreError::InvalidTimestamp { column, value }))
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(&value) {
+        return Ok(timestamp.with_timezone(&Utc));
+    }
+    if let Ok(timestamp) = NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S") {
+        return Ok(DateTime::<Utc>::from_naive_utc_and_offset(timestamp, Utc));
+    }
+
+    Err(invalid_hitl_error(HitlStoreError::InvalidTimestamp {
+        column,
+        value,
+    }))
 }
 
 fn parse_optional_datetime(
@@ -1432,5 +1484,259 @@ mod tests {
 
         assert_eq!(first.sequence_no, 1);
         assert_eq!(second.sequence_no, 2);
+    }
+
+    #[tokio::test]
+    async fn hitl_expire_timed_out_requests_should_transition_expired_pending_request() {
+        let conn = migrated_in_memory_connection();
+        seed_run_and_dispatch(
+            Arc::clone(&conn),
+            "run-hitl-timeout-expired",
+            "write-prd",
+            "dispatch-hitl-timeout-expired",
+        )
+        .await;
+        let repository = SqliteHitlRepository::new(conn);
+        let created = repository
+            .create(NewHitlRequest {
+                timeout_at: Some(timestamp("2026-03-24T01:00:00Z")),
+                ..sample_request(
+                    "hitl-timeout-expired",
+                    "run-hitl-timeout-expired",
+                    "write-prd",
+                    Some("dispatch-hitl-timeout-expired"),
+                )
+            })
+            .await
+            .expect("create expired hitl request");
+
+        let expired = repository
+            .expire_timed_out_requests()
+            .await
+            .expect("expire timed out hitl requests");
+        let reloaded = repository
+            .find_by_id(&created.hitl_request_id)
+            .await
+            .expect("reload expired hitl request")
+            .expect("expired hitl request should exist");
+
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].hitl_request_id, created.hitl_request_id);
+        assert_eq!(reloaded.status, HitlStatus::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn hitl_expire_timed_out_requests_should_leave_future_and_missing_deadlines_pending() {
+        let conn = migrated_in_memory_connection();
+        seed_run_and_dispatch(
+            Arc::clone(&conn),
+            "run-hitl-timeout-pending",
+            "write-prd",
+            "dispatch-hitl-timeout-pending",
+        )
+        .await;
+        let repository = SqliteHitlRepository::new(conn);
+        let future = repository
+            .create(NewHitlRequest {
+                timeout_at: Some(timestamp("2099-03-24T03:05:00Z")),
+                ..sample_request(
+                    "hitl-timeout-future",
+                    "run-hitl-timeout-pending",
+                    "write-prd",
+                    Some("dispatch-hitl-timeout-pending"),
+                )
+            })
+            .await
+            .expect("create future hitl request");
+        let no_timeout = repository
+            .create(NewHitlRequest {
+                timeout_at: None,
+                ..sample_request(
+                    "hitl-timeout-none",
+                    "run-hitl-timeout-pending",
+                    "write-prd",
+                    Some("dispatch-hitl-timeout-pending"),
+                )
+            })
+            .await
+            .expect("create no-timeout hitl request");
+
+        let expired = repository
+            .expire_timed_out_requests()
+            .await
+            .expect("expire timed out hitl requests");
+        let reloaded_future = repository
+            .find_by_id(&future.hitl_request_id)
+            .await
+            .expect("reload future hitl request")
+            .expect("future hitl request should exist");
+        let reloaded_no_timeout = repository
+            .find_by_id(&no_timeout.hitl_request_id)
+            .await
+            .expect("reload no-timeout hitl request")
+            .expect("no-timeout hitl request should exist");
+
+        assert!(expired.is_empty());
+        assert_eq!(reloaded_future.status, HitlStatus::Pending);
+        assert_eq!(reloaded_no_timeout.status, HitlStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn hitl_expire_timed_out_requests_should_leave_answered_request_unchanged() {
+        let conn = migrated_in_memory_connection();
+        seed_run_and_dispatch(
+            Arc::clone(&conn),
+            "run-hitl-timeout-answered",
+            "write-prd",
+            "dispatch-hitl-timeout-answered",
+        )
+        .await;
+        let repository = SqliteHitlRepository::new(conn);
+        let created = repository
+            .create(NewHitlRequest {
+                timeout_at: Some(timestamp("2026-03-24T01:00:00Z")),
+                ..sample_request(
+                    "hitl-timeout-answered",
+                    "run-hitl-timeout-answered",
+                    "write-prd",
+                    Some("dispatch-hitl-timeout-answered"),
+                )
+            })
+            .await
+            .expect("create answerable hitl request");
+        let answered = repository
+            .answer(
+                &created.hitl_request_id,
+                &serde_json::json!({
+                    "type": "text",
+                    "value": "answered before timeout sweep",
+                }),
+                timestamp("2026-03-24T02:07:00Z"),
+            )
+            .await
+            .expect("answer hitl request");
+
+        let expired = repository
+            .expire_timed_out_requests()
+            .await
+            .expect("expire timed out hitl requests");
+        let reloaded = repository
+            .find_by_id(&answered.hitl_request_id)
+            .await
+            .expect("reload answered hitl request")
+            .expect("answered hitl request should exist");
+
+        assert!(expired.is_empty());
+        assert_eq!(reloaded.status, HitlStatus::Answered);
+        assert_eq!(reloaded.response_json, answered.response_json);
+    }
+
+    #[tokio::test]
+    async fn hitl_expire_timed_out_requests_should_be_idempotent() {
+        let conn = migrated_in_memory_connection();
+        seed_run_and_dispatch(
+            Arc::clone(&conn),
+            "run-hitl-timeout-idempotent",
+            "write-prd",
+            "dispatch-hitl-timeout-idempotent",
+        )
+        .await;
+        let repository = SqliteHitlRepository::new(conn);
+        repository
+            .create(NewHitlRequest {
+                timeout_at: Some(timestamp("2026-03-24T01:00:00Z")),
+                ..sample_request(
+                    "hitl-timeout-idempotent",
+                    "run-hitl-timeout-idempotent",
+                    "write-prd",
+                    Some("dispatch-hitl-timeout-idempotent"),
+                )
+            })
+            .await
+            .expect("create expired hitl request");
+
+        let first = repository
+            .expire_timed_out_requests()
+            .await
+            .expect("first timeout sweep should succeed");
+        let second = repository
+            .expire_timed_out_requests()
+            .await
+            .expect("second timeout sweep should succeed");
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hitl_expire_timed_out_requests_should_transition_multiple_rows_in_one_sweep() {
+        let conn = migrated_in_memory_connection();
+        seed_run_and_dispatch(
+            Arc::clone(&conn),
+            "run-hitl-timeout-multi",
+            "write-prd",
+            "dispatch-hitl-timeout-multi",
+        )
+        .await;
+        let repository = SqliteHitlRepository::new(conn);
+        let first = repository
+            .create(NewHitlRequest {
+                timeout_at: Some(timestamp("2026-03-24T01:00:00Z")),
+                ..sample_request(
+                    "hitl-timeout-multi-1",
+                    "run-hitl-timeout-multi",
+                    "write-prd",
+                    Some("dispatch-hitl-timeout-multi"),
+                )
+            })
+            .await
+            .expect("create first expired hitl request");
+        let second = repository
+            .create(NewHitlRequest {
+                timeout_at: Some(timestamp("2026-03-24T01:00:00Z")),
+                ..sample_request(
+                    "hitl-timeout-multi-2",
+                    "run-hitl-timeout-multi",
+                    "write-prd",
+                    Some("dispatch-hitl-timeout-multi"),
+                )
+            })
+            .await
+            .expect("create second expired hitl request");
+
+        let expired = repository
+            .expire_timed_out_requests()
+            .await
+            .expect("expire timed out hitl requests");
+        let mut expired_ids = expired
+            .into_iter()
+            .map(|record| record.hitl_request_id)
+            .collect::<Vec<_>>();
+        expired_ids.sort();
+        let mut expected_ids = vec![
+            first.hitl_request_id.clone(),
+            second.hitl_request_id.clone(),
+        ];
+        expected_ids.sort();
+
+        assert_eq!(expired_ids, expected_ids);
+        assert_eq!(
+            repository
+                .find_by_id(&first.hitl_request_id)
+                .await
+                .expect("reload first expired hitl request")
+                .expect("first expired hitl request should exist")
+                .status,
+            HitlStatus::TimedOut
+        );
+        assert_eq!(
+            repository
+                .find_by_id(&second.hitl_request_id)
+                .await
+                .expect("reload second expired hitl request")
+                .expect("second expired hitl request should exist")
+                .status,
+            HitlStatus::TimedOut
+        );
     }
 }
