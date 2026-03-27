@@ -50,6 +50,34 @@ Tests that require a real LLM key will skip gracefully if the env var is absent.
 
 ## Building and Testing
 
+### Fast Local Feedback
+
+Use the fast targets while iterating locally. They operate on the default development
+surface from the workspace root and avoid the desktop app unless you explicitly opt in.
+
+```bash
+make check-fast
+make lint-fast
+make test-fast
+make doctor-compile
+```
+
+When your change is scoped to a single crate, use the package-specific targets:
+
+```bash
+make check-package PKG=openfang-kernel
+make lint-package PKG=openfang-api
+make test-package PKG=openfang-runtime
+```
+
+The VS Code workspace settings are also configured to keep `rust-analyzer` on a separate
+target directory and to use `cargo check` instead of `clippy` on save. That avoids build
+lock contention with terminal commands while keeping diagnostics responsive.
+
+On macOS, `make doctor-compile` also checks for first-launch stalls caused by system
+security policy (`syspolicyd`). If that pattern is detected, add your terminal or editor
+to `System Settings > Privacy & Security > Developer Tools`.
+
 ### Build the Entire Workspace
 
 ```bash
@@ -69,7 +97,7 @@ This cuts link time significantly (thin LTO, 8 codegen units, `opt-level=2`) whi
 ### Run All Tests
 
 ```bash
-cargo test --workspace
+make test
 ```
 
 The test suite is currently 1,744+ tests. All must pass before merging.
@@ -85,7 +113,7 @@ cargo test -p openfang-memory
 ### Check for Clippy Warnings
 
 ```bash
-cargo clippy --workspace --all-targets -- -D warnings
+make lint
 ```
 
 The CI pipeline enforces zero clippy warnings.
@@ -93,7 +121,7 @@ The CI pipeline enforces zero clippy warnings.
 ### Format Code
 
 ```bash
-cargo fmt --all
+make fmt
 ```
 
 Always run `cargo fmt` before committing. CI will reject unformatted code.

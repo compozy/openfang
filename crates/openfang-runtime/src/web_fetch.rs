@@ -26,8 +26,6 @@ impl WebFetchEngine {
             .user_agent(crate::USER_AGENT)
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .gzip(true)
-            .deflate(true)
-            .brotli(true)
             .build()
             .unwrap_or_default();
         Self {

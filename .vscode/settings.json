@@ -20,14 +20,12 @@
   "makefile.makefilePath": "./Makefile",
 
   // Rust Analyzer
-  "rust-analyzer.check.command": "clippy",
-  "rust-analyzer.check.allTargets": true,
-  "rust-analyzer.check.extraArgs": [
-    "--all-features",
-    "--",
-    "-D",
-    "warnings"
-  ],
+  "rust-analyzer.cargo.allTargets": false,
+  "rust-analyzer.cargo.targetDir": true,
+  "rust-analyzer.check.command": "check",
+  "rust-analyzer.check.workspace": false,
+  "rust-analyzer.check.allTargets": false,
+  "rust-analyzer.check.extraArgs": [],
   "rust-analyzer.rustfmt.extraArgs": [],
 
   // Language-specific formatters

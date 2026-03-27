@@ -2,9 +2,12 @@
   "private": true,
   "scripts": {
     "prepare": "husky",
-    "test": "cargo test --workspace",
-    "lint": "cargo clippy --workspace --all-targets -- -D warnings",
-    "typecheck": "cargo check --workspace"
+    "test:fast": "cargo test --lib --bins --tests --no-fail-fast",
+    "test": "cargo test --workspace --all-features",
+    "lint:fast": "cargo clippy --all-targets -- -D warnings",
+    "lint": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+    "typecheck:fast": "cargo check --all-targets",
+    "typecheck": "cargo check --workspace --all-targets --all-features"
   },
   "devDependencies": {
     "@commitlint/cli": "^19.0.0",

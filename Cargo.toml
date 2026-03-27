@@ -27,13 +27,39 @@ members = [
     "crates/openfang-extensions",
     "xtask", "crates/openfang-agent-definition",
 ]
+default-members = [
+    "crates/arky-error",
+    "crates/arky-protocol",
+    "crates/arky-config",
+    "crates/arky-tools",
+    "crates/arky-hooks",
+    "crates/arky-session",
+    "crates/arky-provider",
+    "crates/arky-mcp",
+    "crates/arky-codex",
+    "crates/arky-claude-code",
+    "crates/openfang-types",
+    "crates/openfang-memory",
+    "crates/openfang-runtime",
+    "crates/openfang-wire",
+    "crates/openfang-provider-binding",
+    "crates/openfang-api",
+    "crates/openfang-kernel",
+    "crates/openfang-cli",
+    "crates/openfang-channels",
+    "crates/openfang-migrate",
+    "crates/openfang-skills",
+    "crates/openfang-hands",
+    "crates/openfang-extensions",
+    "crates/openfang-agent-definition",
+]
 
 [workspace.package]
 version = "0.5.1"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/RightNow-AI/openfang"
-rust-version = "1.94.0"
+rust-version = "1.94.1"
 
 [workspace.dependencies]
 # Internal crates
@@ -103,7 +129,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
 # HTTP client (for LLM drivers)
-reqwest = { version = "0.13.2", default-features = false, features = ["json", "form", "query", "stream", "multipart", "rustls", "gzip", "deflate", "brotli"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "form", "query", "stream", "multipart", "rustls", "gzip"] }
 
 # Async trait
 async-trait = "0.1"
@@ -127,7 +153,7 @@ wasmtime = "41"
 # HTTP server (for API daemon)
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
 rmcp = "0.16"
 
 # Home directory resolution
@@ -197,11 +223,36 @@ tokio-rusqlite = "0.5.1"
 [workspace.lints.clippy]
 collapsible_if = "allow"
 
+[profile.dev]
+# Line-tables-only: enough for backtraces, much smaller/faster than full debug info
+debug = "line-tables-only"
+# Split debug info into separate files (huge macOS linking speedup)
+split-debuginfo = "unpacked"
+# More codegen units = more parallelism during compilation
+codegen-units = 256
+incremental = true
+
+[profile.dev.package."*"]
+# No debug info for third-party dependencies (you won't debug them)
+debug = false
+# Slight optimization for deps makes runtime less painful in dev
+opt-level = 1
+
+[profile.dev.build-override]
+# Optimize build scripts and proc-macros (they run at compile time)
+opt-level = 3
+
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 4
 strip = true
 opt-level = 3
+
+[profile.release-prod]
+inherits = "release"
+# Full LTO + single codegen unit for final production releases only
+lto = true
+codegen-units = 1
 
 [profile.release-fast]
 inherits = "release"

@@ -445,18 +445,36 @@ openfang start
 ## Development
 
 ```bash
+# Fast local type-check (skips the desktop app and optional features)
+make check-fast
+
+# Fast local lint/test loop
+make lint-fast
+make test-fast
+
+# Diagnose local compile-time blockers
+make doctor-compile
+
 # Build the workspace
 cargo build --workspace --lib
 
-# Run all tests (1,767+)
-cargo test --workspace
+# Run full verification before merging
+make fmt
+make lint
+make test
 
-# Lint (must be 0 warnings)
-cargo clippy --workspace --all-targets -- -D warnings
+# Narrow the loop to one package when you know the scope
+make check-package PKG=openfang-kernel
+make lint-package PKG=openfang-api
+make test-package PKG=openfang-runtime
 
 # Format
 cargo fmt --all -- --check
 ```
+
+On macOS, if new Rust binaries stall on first launch and `syspolicyd` spikes, grant your
+terminal or editor access under `System Settings > Privacy & Security > Developer Tools`.
+`make doctor-compile` checks for that pattern and also reports Cargo lock contention.
 
 ---
 
