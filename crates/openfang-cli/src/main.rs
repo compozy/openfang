@@ -158,6 +158,15 @@ enum Commands {
     /// Manage installed packs (list, inspect, install, upgrade, uninstall, fork) [*].
     #[command(subcommand)]
     Pack(PackCommands),
+    /// Manage outbound A2A agents and tasks [*].
+    #[command(subcommand)]
+    A2a(A2aCommands),
+    /// Manage OFP peers and network status [*].
+    #[command(subcommand)]
+    Peers(PeersCommands),
+    /// Manage global and per-agent budgets [*].
+    #[command(subcommand)]
+    Budget(BudgetCommands),
     /// Manage event triggers (legacy + Trigger v2 operations) [*].
     #[command(subcommand)]
     Trigger(TriggerCommands),
@@ -1071,6 +1080,103 @@ enum PackCommands {
 }
 
 #[derive(Subcommand)]
+enum A2aCommands {
+    /// List discovered external A2A agents.
+    List {
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Discover an external A2A agent by URL.
+    Discover {
+        /// Base URL for the external A2A agent.
+        url: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send a task to an external A2A agent.
+    Send {
+        /// Target A2A RPC endpoint URL.
+        url: String,
+        /// Message to send.
+        message: String,
+        /// Optional session ID for continuity.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check the status of an external A2A task.
+    Status {
+        /// Task ID to inspect.
+        id: String,
+        /// Explicit A2A RPC endpoint URL.
+        #[arg(long)]
+        url: Option<String>,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PeersCommands {
+    /// List connected and known peers.
+    List {
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show OFP network status.
+    Status {
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BudgetCommands {
+    /// Show global budget status.
+    Status {
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update the global budget limits.
+    Update {
+        /// Hourly USD limit.
+        #[arg(long)]
+        hourly: Option<f64>,
+        /// Daily USD limit.
+        #[arg(long)]
+        daily: Option<f64>,
+        /// Monthly USD limit.
+        #[arg(long)]
+        monthly: Option<f64>,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show per-agent budget rankings.
+    Agents {
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show budget status for one agent.
+    Agent {
+        /// Agent ID.
+        id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum TriggerCommands {
     /// List all triggers (optionally filtered by agent).
     List {
@@ -1654,6 +1760,32 @@ fn main() {
             PackCommands::Upgrade { pack_id, dry_run } => cmd_pack_upgrade(&pack_id, dry_run),
             PackCommands::Uninstall { pack_id } => cmd_pack_uninstall(&pack_id),
             PackCommands::Fork { pack_id } => cmd_pack_fork(&pack_id),
+        },
+        Some(Commands::A2a(sub)) => match sub {
+            A2aCommands::List { json } => cmd_a2a_list(json),
+            A2aCommands::Discover { url, json } => cmd_a2a_discover(&url, json),
+            A2aCommands::Send {
+                url,
+                message,
+                session_id,
+                json,
+            } => cmd_a2a_send(&url, &message, session_id.as_deref(), json),
+            A2aCommands::Status { id, url, json } => cmd_a2a_status(&id, url.as_deref(), json),
+        },
+        Some(Commands::Peers(sub)) => match sub {
+            PeersCommands::List { json } => cmd_peers_list(json),
+            PeersCommands::Status { json } => cmd_peers_status(json),
+        },
+        Some(Commands::Budget(sub)) => match sub {
+            BudgetCommands::Status { json } => cmd_budget_status(json),
+            BudgetCommands::Update {
+                hourly,
+                daily,
+                monthly,
+                json,
+            } => cmd_budget_update(hourly, daily, monthly, json),
+            BudgetCommands::Agents { json } => cmd_budget_agents(json),
+            BudgetCommands::Agent { id, json } => cmd_budget_agent(&id, json),
         },
         Some(Commands::Trigger(sub)) => match sub {
             TriggerCommands::List { agent_id } => cmd_trigger_list(agent_id.as_deref()),
@@ -3931,6 +4063,21 @@ fn list_items(body: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
         .or_else(|| body.as_array())
 }
 
+fn named_list_json_value(body: &serde_json::Value, key: &str) -> serde_json::Value {
+    body.get(key)
+        .cloned()
+        .unwrap_or_else(|| list_json_value(body))
+}
+
+fn named_list_items<'a>(
+    body: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a Vec<serde_json::Value>> {
+    body.get(key)
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| list_items(body))
+}
+
 fn event_effect_count(effects: &serde_json::Value) -> u64 {
     ["workflow_starts", "workflow_signals", "agent_messages"]
         .into_iter()
@@ -4307,6 +4454,354 @@ fn print_pack_upgrade_dry_run(pack_id: &str, target_version: &str, body: &serde_
             .map(yes_no_text)
             .unwrap_or("?"),
     );
+}
+
+fn a2a_skill_count(item: &serde_json::Value) -> usize {
+    item.get("skills")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn a2a_task_status_text(body: &serde_json::Value) -> String {
+    let Some(status) = body.get("status") else {
+        return "?".to_string();
+    };
+
+    if let Some(value) = status.as_str() {
+        return value.to_string();
+    }
+
+    status
+        .get("state")
+        .or_else(|| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn a2a_task_session_text(body: &serde_json::Value) -> String {
+    body.get("sessionId")
+        .or_else(|| body.get("session_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn print_a2a_agents_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<22} {:<10} {:<6} {:<32} URL",
+        "NAME", "VERSION", "SKILLS", "DESCRIPTION"
+    );
+    println!("{}", "-".repeat(120));
+    for item in items {
+        println!(
+            "{:<22} {:<10} {:<6} {:<32} {}",
+            truncate_text(
+                item.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                22,
+            ),
+            item.get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            a2a_skill_count(item),
+            truncate_text(
+                item.get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("-"),
+                32,
+            ),
+            item.get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn print_a2a_agent_detail(body: &serde_json::Value) {
+    let agent = body.get("agent").unwrap_or(body);
+    let skill_names = agent
+        .get("skills")
+        .and_then(serde_json::Value::as_array)
+        .map(|skills| {
+            skills
+                .iter()
+                .filter_map(|skill| {
+                    skill
+                        .get("name")
+                        .or_else(|| skill.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "-".to_string());
+
+    println!(
+        "Agent: {}",
+        agent
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  URL:         {}",
+        agent
+            .get("url")
+            .or_else(|| body.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Version:     {}",
+        agent
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Skills:      {}",
+        agent
+            .get("skills")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0)
+    );
+    println!("  Skill names: {}", truncate_text(&skill_names, 80));
+    println!(
+        "  Description: {}",
+        agent
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+}
+
+fn print_a2a_task_detail(body: &serde_json::Value) {
+    ui::section("A2A Task");
+    ui::blank();
+    ui::kv(
+        "Task ID",
+        body.get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?"),
+    );
+    ui::kv("Status", &a2a_task_status_text(body));
+    ui::kv("Session", &a2a_task_session_text(body));
+    ui::kv(
+        "Messages",
+        &body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .map(|messages| messages.len().to_string())
+            .unwrap_or_else(|| "0".to_string()),
+    );
+    ui::kv(
+        "Artifacts",
+        &body
+            .get("artifacts")
+            .and_then(serde_json::Value::as_array)
+            .map(|artifacts| artifacts.len().to_string())
+            .unwrap_or_else(|| "0".to_string()),
+    );
+}
+
+fn peer_agent_count(item: &serde_json::Value) -> usize {
+    item.get("agents")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn print_peers_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<20} {:<16} {:<12} {:<8} {:<24} ADDRESS",
+        "NODE_ID", "NAME", "STATE", "AGENTS", "CONNECTED"
+    );
+    println!("{}", "-".repeat(116));
+    for item in items {
+        println!(
+            "{:<20} {:<16} {:<12} {:<8} {:<24} {}",
+            truncate_text(
+                item.get("node_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                20,
+            ),
+            truncate_text(
+                item.get("node_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                16,
+            ),
+            item.get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            peer_agent_count(item),
+            item.get("connected_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-"),
+            item.get("address")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn print_network_status(body: &serde_json::Value) {
+    ui::section("Network Status");
+    ui::blank();
+    ui::kv(
+        "Enabled",
+        body.get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .map(bool_text)
+            .unwrap_or("?"),
+    );
+    ui::kv(
+        "Node ID",
+        body.get("node_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("-"),
+    );
+    ui::kv(
+        "Listen",
+        body.get("listen_address")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("-"),
+    );
+    ui::kv(
+        "Connected peers",
+        &body
+            .get("connected_peers")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .to_string(),
+    );
+    ui::kv(
+        "Known peers",
+        &body
+            .get("total_peers")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .to_string(),
+    );
+}
+
+fn budget_percent_text(value: Option<&serde_json::Value>) -> String {
+    let pct = value.and_then(serde_json::Value::as_f64).unwrap_or(0.0) * 100.0;
+    format!("{pct:.1}%")
+}
+
+fn budget_money_text(value: Option<&serde_json::Value>) -> String {
+    format!(
+        "${:.4}",
+        value.and_then(serde_json::Value::as_f64).unwrap_or(0.0)
+    )
+}
+
+fn print_budget_status(body: &serde_json::Value) {
+    println!("{:<10} {:<12} {:<12} USED", "WINDOW", "SPEND", "LIMIT");
+    println!("{}", "-".repeat(52));
+    for (label, spend_key, limit_key, pct_key) in [
+        ("hourly", "hourly_spend", "hourly_limit", "hourly_pct"),
+        ("daily", "daily_spend", "daily_limit", "daily_pct"),
+        ("monthly", "monthly_spend", "monthly_limit", "monthly_pct"),
+    ] {
+        println!(
+            "{:<10} {:<12} {:<12} {}",
+            label,
+            budget_money_text(body.get(spend_key)),
+            budget_money_text(body.get(limit_key)),
+            budget_percent_text(body.get(pct_key)),
+        );
+    }
+    println!();
+    println!(
+        "Alert threshold: {}",
+        budget_percent_text(body.get("alert_threshold"))
+    );
+    println!(
+        "Default token limit/hour: {}",
+        body.get("default_max_llm_tokens_per_hour")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+}
+
+fn print_budget_agents_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<22} {:<12} {:<12} {:<12} TOKENS/H",
+        "AGENT", "DAILY USD", "HOURLY LIM", "MONTHLY LIM"
+    );
+    println!("{}", "-".repeat(80));
+    for item in items {
+        println!(
+            "{:<22} {:<12} {:<12} {:<12} {}",
+            truncate_text(
+                item.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                22,
+            ),
+            budget_money_text(item.get("daily_cost_usd")),
+            budget_money_text(item.get("hourly_limit")),
+            budget_money_text(item.get("monthly_limit")),
+            item.get("max_llm_tokens_per_hour")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    }
+}
+
+fn print_budget_agent_detail(body: &serde_json::Value) {
+    println!(
+        "Agent: {}",
+        body.get("agent_name")
+            .or_else(|| body.get("agent_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  ID: {}",
+        body.get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!("{:<10} {:<12} {:<12} USED", "WINDOW", "SPEND", "LIMIT");
+    println!("{}", "-".repeat(52));
+    for label in ["hourly", "daily", "monthly"] {
+        let Some(window) = body.get(label) else {
+            continue;
+        };
+        println!(
+            "{:<10} {:<12} {:<12} {}",
+            label,
+            budget_money_text(window.get("spend")),
+            budget_money_text(window.get("limit")),
+            budget_percent_text(window.get("pct")),
+        );
+    }
+    if let Some(tokens) = body.get("tokens") {
+        println!(
+            "{:<10} {:<12} {:<12} {}",
+            "tokens",
+            tokens
+                .get("used")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            tokens
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            budget_percent_text(tokens.get("pct")),
+        );
+    }
 }
 
 fn versioned_resource_type_text<'a>(item: &'a serde_json::Value, type_key: &str) -> &'a str {
@@ -7585,6 +8080,297 @@ fn cmd_pack_fork(pack_id: &str) {
     for object in forked_objects.iter().take(5) {
         println!("  - {object}");
     }
+}
+
+fn resolve_a2a_task_url(
+    base: &str,
+    client: &reqwest::blocking::Client,
+    explicit_url: Option<&str>,
+) -> Result<String, String> {
+    if let Some(url) = explicit_url {
+        return Ok(url.to_string());
+    }
+
+    let body = daemon_json(client.get(format!("{base}/api/a2a/agents")).send());
+    if let Some(error) = daemon_error_message(&body) {
+        return Err(format!("Failed to resolve the A2A agent URL: {error}"));
+    }
+
+    let Some(agents) = named_list_items(&body, "agents") else {
+        return Err("Daemon returned an unexpected A2A agent list response".to_string());
+    };
+
+    match agents.as_slice() {
+        [agent] => agent
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "Discovered A2A agent is missing its endpoint URL".to_string()),
+        [] => Err(
+            "No external A2A agents are known. Run `openfang a2a discover <url>` or pass `--url`."
+                .to_string(),
+        ),
+        _ => Err("Multiple external A2A agents are known. Pass `--url` to choose one.".to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A2A / peers / budget commands
+// ---------------------------------------------------------------------------
+
+fn cmd_a2a_list(json: bool) {
+    let base = require_daemon("a2a list");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/a2a/agents")).send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list external A2A agents: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&named_list_json_value(&body, "agents"));
+        return;
+    }
+
+    match named_list_items(&body, "agents") {
+        Some(items) if items.is_empty() => println!("No external A2A agents found."),
+        Some(items) => print_a2a_agents_table(items),
+        None => println!("No external A2A agents found."),
+    }
+}
+
+fn cmd_a2a_discover(url: &str, json: bool) {
+    let base = require_daemon("a2a discover");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/a2a/discover"))
+            .json(&serde_json::json!({
+                "url": url,
+            }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to discover external A2A agent at {url}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if body.get("agent").is_none() && body.get("name").is_none() {
+        ui::error("Failed to discover A2A agent: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    ui::success(&format!("Discovered external A2A agent at {url}."));
+    print_a2a_agent_detail(&body);
+}
+
+fn cmd_a2a_send(url: &str, message: &str, session_id: Option<&str>, json: bool) {
+    let base = require_daemon("a2a send");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/a2a/send"))
+            .json(&serde_json::json!({
+                "url": url,
+                "message": message,
+                "session_id": session_id,
+            }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to send an A2A task to {url}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("id").and_then(serde_json::Value::as_str).is_none() {
+        ui::error("Failed to send A2A task: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    ui::success("A2A task submitted.");
+    println!("  Target: {url}");
+    print_a2a_task_detail(&body);
+}
+
+fn cmd_a2a_status(task_id: &str, explicit_url: Option<&str>, json: bool) {
+    let base = require_daemon("a2a status");
+    let client = daemon_client();
+    let task_url = resolve_a2a_task_url(&base, &client, explicit_url).unwrap_or_else(|error| {
+        ui::error(&error);
+        std::process::exit(1);
+    });
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/a2a/tasks/{task_id}/status"))
+            .query(&[("url", task_url.as_str())])
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to fetch A2A task {task_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("id").and_then(serde_json::Value::as_str).is_none() {
+        ui::error("Failed to fetch A2A task status: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_a2a_task_detail(&body);
+    println!("  Endpoint: {task_url}");
+}
+
+fn cmd_peers_list(json: bool) {
+    let base = require_daemon("peers list");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/peers")).send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list peers: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&named_list_json_value(&body, "peers"));
+        return;
+    }
+
+    match named_list_items(&body, "peers") {
+        Some(items) if items.is_empty() => println!("No peers found."),
+        Some(items) => print_peers_table(items),
+        None => println!("No peers found."),
+    }
+}
+
+fn cmd_peers_status(json: bool) {
+    let base = require_daemon("peers status");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/network/status")).send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to fetch network status: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_network_status(&body);
+}
+
+fn cmd_budget_status(json: bool) {
+    let base = require_daemon("budget status");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/budget")).send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to fetch budget status: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_budget_status(&body);
+}
+
+fn cmd_budget_update(hourly: Option<f64>, daily: Option<f64>, monthly: Option<f64>, json: bool) {
+    if hourly.is_none() && daily.is_none() && monthly.is_none() {
+        ui::error("Budget update requires at least one of --hourly, --daily, or --monthly.");
+        std::process::exit(1);
+    }
+
+    let base = require_daemon("budget update");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .put(format!("{base}/api/budget"))
+            .json(&serde_json::json!({
+                "max_hourly_usd": hourly,
+                "max_daily_usd": daily,
+                "max_monthly_usd": monthly,
+            }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to update the budget limits: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    ui::success("Budget limits updated.");
+    print_budget_status(&body);
+}
+
+fn cmd_budget_agents(json: bool) {
+    let base = require_daemon("budget agents");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/budget/agents")).send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to fetch agent budget rankings: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&named_list_json_value(&body, "agents"));
+        return;
+    }
+
+    match named_list_items(&body, "agents") {
+        Some(items) if items.is_empty() => println!("No agent budget activity found."),
+        Some(items) => print_budget_agents_table(items),
+        None => println!("No agent budget activity found."),
+    }
+}
+
+fn cmd_budget_agent(id: &str, json: bool) {
+    let base = require_daemon("budget agent");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/budget/agents/{id}")).send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to fetch budget status for agent {id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_budget_agent_detail(&body);
 }
 
 // ---------------------------------------------------------------------------
@@ -11901,8 +12687,160 @@ fn remove_self_binary(exe_path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{looper_progress_text, watch_event_summary};
+    use super::{
+        looper_progress_text, watch_event_summary, A2aCommands, BudgetCommands, Cli, Commands,
+        PeersCommands,
+    };
+    use clap::Parser;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn a2a_commands_should_parse_all_subcommands_correctly() {
+        let list = Cli::try_parse_from(["openfang", "a2a", "list", "--json"])
+            .expect("a2a list should parse");
+        assert!(matches!(
+            list.command,
+            Some(Commands::A2a(A2aCommands::List { json: true }))
+        ));
+
+        let discover = Cli::try_parse_from([
+            "openfang",
+            "a2a",
+            "discover",
+            "http://127.0.0.1:4201",
+            "--json",
+        ])
+        .expect("a2a discover should parse");
+        assert!(matches!(
+            discover.command,
+            Some(Commands::A2a(A2aCommands::Discover { url, json: true }))
+            if url == "http://127.0.0.1:4201"
+        ));
+
+        let send = Cli::try_parse_from([
+            "openfang",
+            "a2a",
+            "send",
+            "http://127.0.0.1:4201/rpc",
+            "hello",
+            "--session-id",
+            "session-123",
+            "--json",
+        ])
+        .expect("a2a send should parse");
+        assert!(matches!(
+            send.command,
+            Some(Commands::A2a(A2aCommands::Send {
+                url,
+                message,
+                session_id: Some(session_id),
+                json: true,
+            })) if url == "http://127.0.0.1:4201/rpc"
+                && message == "hello"
+                && session_id == "session-123"
+        ));
+
+        let status = Cli::try_parse_from([
+            "openfang",
+            "a2a",
+            "status",
+            "task-123",
+            "--url",
+            "http://127.0.0.1:4201/rpc",
+            "--json",
+        ])
+        .expect("a2a status should parse");
+        assert!(matches!(
+            status.command,
+            Some(Commands::A2a(A2aCommands::Status {
+                id,
+                url: Some(url),
+                json: true,
+            })) if id == "task-123" && url == "http://127.0.0.1:4201/rpc"
+        ));
+    }
+
+    #[test]
+    fn peers_commands_should_parse_all_subcommands_correctly() {
+        let list = Cli::try_parse_from(["openfang", "peers", "list", "--json"])
+            .expect("peers list should parse");
+        assert!(matches!(
+            list.command,
+            Some(Commands::Peers(PeersCommands::List { json: true }))
+        ));
+
+        let status = Cli::try_parse_from(["openfang", "peers", "status", "--json"])
+            .expect("peers status should parse");
+        assert!(matches!(
+            status.command,
+            Some(Commands::Peers(PeersCommands::Status { json: true }))
+        ));
+    }
+
+    #[test]
+    fn budget_commands_should_parse_all_subcommands_correctly() {
+        let status = Cli::try_parse_from(["openfang", "budget", "status", "--json"])
+            .expect("budget status should parse");
+        assert!(matches!(
+            status.command,
+            Some(Commands::Budget(BudgetCommands::Status { json: true }))
+        ));
+
+        let update = Cli::try_parse_from([
+            "openfang",
+            "budget",
+            "update",
+            "--hourly",
+            "1.5",
+            "--daily",
+            "3.0",
+            "--monthly",
+            "9.5",
+            "--json",
+        ])
+        .expect("budget update should parse");
+        assert!(matches!(
+            update.command,
+            Some(Commands::Budget(BudgetCommands::Update {
+                hourly: Some(hourly),
+                daily: Some(daily),
+                monthly: Some(monthly),
+                json: true,
+            })) if (hourly - 1.5).abs() < f64::EPSILON
+                && (daily - 3.0).abs() < f64::EPSILON
+                && (monthly - 9.5).abs() < f64::EPSILON
+        ));
+
+        let agents = Cli::try_parse_from(["openfang", "budget", "agents", "--json"])
+            .expect("budget agents should parse");
+        assert!(matches!(
+            agents.command,
+            Some(Commands::Budget(BudgetCommands::Agents { json: true }))
+        ));
+
+        let agent = Cli::try_parse_from(["openfang", "budget", "agent", "agent-123", "--json"])
+            .expect("budget agent should parse");
+        assert!(matches!(
+            agent.command,
+            Some(Commands::Budget(BudgetCommands::Agent { id, json: true }))
+            if id == "agent-123"
+        ));
+    }
+
+    #[test]
+    fn budget_update_should_reject_non_numeric_values() {
+        let error = match Cli::try_parse_from(["openfang", "budget", "update", "--hourly", "oops"])
+        {
+            Ok(_) => panic!("non-numeric budget values should fail to parse"),
+            Err(error) => error,
+        };
+        let text = error.to_string();
+
+        assert!(
+            text.contains("invalid value") || text.contains("invalid float literal"),
+            "budget update parse error should explain the numeric failure\n{text}"
+        );
+    }
 
     // --- Doctor command unit tests ---
 
