@@ -112,7 +112,7 @@ impl TaintedValue {
 }
 
 /// A destination that restricts which taint labels may flow into it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaintSink {
     /// Human-readable name of the sink (e.g. "shell_exec").
     pub name: String,
@@ -159,7 +159,7 @@ impl TaintSink {
 
 /// Describes a taint policy violation: a labelled value tried to reach a
 /// sink that blocks that label.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaintViolation {
     /// The offending label.
     pub label: TaintLabel,
@@ -183,6 +183,8 @@ impl std::error::Error for TaintViolation {}
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use super::*;
 
     #[test]
@@ -240,5 +242,37 @@ mod tests {
         // After declassification -- should pass
         assert!(tainted.check_sink(&TaintSink::shell_exec()).is_ok());
         assert!(!tainted.is_tainted());
+    }
+
+    #[test]
+    fn taint_sink_should_roundtrip_through_json() {
+        let sink = TaintSink {
+            name: "custom_sink".to_string(),
+            blocked_labels: HashSet::from([TaintLabel::ExternalNetwork, TaintLabel::Secret]),
+        };
+
+        let json = serde_json::to_string(&sink).expect("taint sink should serialize");
+        let deserialized: TaintSink =
+            serde_json::from_str(&json).expect("taint sink should deserialize");
+
+        assert_eq!(deserialized.name, sink.name);
+        assert_eq!(deserialized.blocked_labels, sink.blocked_labels);
+    }
+
+    #[test]
+    fn taint_violation_should_roundtrip_through_json() {
+        let violation = TaintViolation {
+            label: TaintLabel::Pii,
+            sink_name: "net_fetch".to_string(),
+            source: "profile.export".to_string(),
+        };
+
+        let json = serde_json::to_string(&violation).expect("taint violation should serialize");
+        let deserialized: TaintViolation =
+            serde_json::from_str(&json).expect("taint violation should deserialize");
+
+        assert_eq!(deserialized.label, violation.label);
+        assert_eq!(deserialized.sink_name, violation.sink_name);
+        assert_eq!(deserialized.source, violation.source);
     }
 }

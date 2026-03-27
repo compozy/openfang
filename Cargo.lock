@@ -4473,6 +4473,7 @@ dependencies = [
 name = "openfang-types"
 version = "0.5.1"
 dependencies = [
+ "arky-error",
  "async-trait",
  "chrono",
  "chrono-tz",

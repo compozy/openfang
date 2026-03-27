@@ -20,6 +20,7 @@ hex = { workspace = true }
 rand = { workspace = true }
 cron = "0.15.0"
 chrono-tz.workspace = true
+arky-error.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

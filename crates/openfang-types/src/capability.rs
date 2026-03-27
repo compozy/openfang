@@ -72,7 +72,7 @@ pub enum Capability {
 }
 
 /// Result of a capability check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CapabilityCheck {
     /// The capability is granted.
     Granted,
@@ -213,6 +213,8 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use super::*;
 
     #[test]
@@ -312,5 +314,29 @@ mod tests {
             Capability::ShellExec("*".to_string()),
         ];
         assert!(validate_capability_inheritance(&parent, &child).is_err());
+    }
+
+    #[test]
+    fn capability_check_granted_should_roundtrip_through_json() {
+        let json =
+            serde_json::to_string(&CapabilityCheck::Granted).expect("granted should serialize");
+        let deserialized: CapabilityCheck =
+            serde_json::from_str(&json).expect("granted should deserialize");
+
+        assert!(matches!(deserialized, CapabilityCheck::Granted));
+    }
+
+    #[test]
+    fn capability_check_denied_should_roundtrip_through_json() {
+        let reason = "missing shell_exec capability";
+        let json = serde_json::to_string(&CapabilityCheck::Denied(reason.to_string()))
+            .expect("denied should serialize");
+        let deserialized: CapabilityCheck =
+            serde_json::from_str(&json).expect("denied should deserialize");
+
+        match deserialized {
+            CapabilityCheck::Denied(actual_reason) => assert_eq!(actual_reason, reason),
+            CapabilityCheck::Granted => panic!("expected denied capability check"),
+        }
     }
 }
