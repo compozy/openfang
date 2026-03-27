@@ -1,0 +1,256 @@
+# Upstream Sync Questions
+
+## Context
+
+- Base branch: `pn/compozy`
+- Upstream ref: `upstream/main`
+- Merge base: `db86ff4ce3c01be2512196ddbe7e3deb1cb3b4bc`
+- Upstream head: `b6cb4cc2d9149d8be4bae9dcfe0efa44ba04dd7b`
+- Upstream commit count: `107`
+- Changed file count: `79`
+- Risk level: `high`
+
+## Risk Reasons
+
+- Sensitive runtime, API, configuration, or schema code changed.
+- Shared integration, documentation, or platform surfaces changed.
+- Migration, schema, or public contract files changed.
+- Upstream commit volume is high and requires review.
+- Upstream file volume is high and requires review.
+- Upstream changes overlap files already modified in the fork branch.
+- Upstream changes overlap sensitive fork-owned infrastructure files.
+
+## Overlap With Fork Changes
+
+- `Cargo.lock`
+- `Cargo.toml`
+- `crates/openfang-api/src/channel_bridge.rs`
+- `crates/openfang-api/src/middleware.rs`
+- `crates/openfang-api/src/routes.rs`
+- `crates/openfang-api/src/server.rs`
+- `crates/openfang-channels/Cargo.toml`
+- `crates/openfang-cli/Cargo.toml`
+- `crates/openfang-cli/src/main.rs`
+- `crates/openfang-desktop/gen/schemas/macOS-schema.json`
+- `crates/openfang-kernel/src/cron.rs`
+- `crates/openfang-kernel/src/kernel.rs`
+- `crates/openfang-memory/Cargo.toml`
+- `crates/openfang-memory/src/lib.rs`
+- `crates/openfang-memory/src/semantic.rs`
+- `crates/openfang-memory/src/substrate.rs`
+- `crates/openfang-runtime/src/agent_loop.rs`
+- `crates/openfang-runtime/src/drivers/anthropic.rs`
+- `crates/openfang-runtime/src/drivers/claude_code.rs`
+- `crates/openfang-runtime/src/drivers/gemini.rs`
+- `crates/openfang-runtime/src/drivers/mod.rs`
+- `crates/openfang-runtime/src/drivers/openai.rs`
+- `crates/openfang-runtime/src/llm_driver.rs`
+- `crates/openfang-runtime/src/model_catalog.rs`
+- `crates/openfang-skills/src/registry.rs`
+- `crates/openfang-types/src/config.rs`
+
+## Upstream Commits
+
+- `a95fb4a96bd308e451244afee81ac6e636cfc151` feat(feishu): add WebSocket receive mode with protobuf framing
+- `a3073007a1650bca6aca97e1bbd3c6d304be1da7` fix(docs): correct search_provider value for DuckDuckGo
+- `6ab77612f54fb6ed1240c7b215de7069a362ca18` fix: make tool allowlist/blocklist matching case-insensitive
+- `e3c05a9d47801cb114f2b3bbf498a1c60d5778de` feat(drivers): add Vertex AI driver with OAuth authentication
+- `40bdf4316bfcd0fbf91c29bd7c0183091d4b72b5` feat(agents): add LangChain code review agent with A2A protocol
+- `67b30c15498944b55ce980ccd347bad4bd1e81a6` feat: HTTP memory backend for shared memory infrastructure
+- `a039e395f5811183d84eecefa81832ab6a6a8256` fix runtime page stat card layout
+- `aed4bf62ae0ddd0a637f65f450178dd4d4dcb9cc` fix: stamp last_active before LLM call to prevent mid-iteration heartbeat timeouts
+- `13051b2f0616a965940a21d26c7c5f427ca5c2d8` fix: reset last_active on agent restore to prevent heartbeat false-positives
+- `6b788384166f33bbba193c430cc01257f404625e` fix: improve agent detail modal layout and fallback chain display
+- `972a52ff9cd8c29a8fa064572656de19b8a746eb` fix: make heartbeat interval configurable and reduce researcher max_iterations
+- `90fc171e266458bcd3d88f7ef4c7287ced858a59` fix list style in message bubble
+- `8ec3766da329cbdd6941451c72ab60cfdb949132` fix(notion): fixed the notion api call to mcp
+- `d6326d8967be95fd54999dba82c3e300137b373a` Expose Telegram slash commands
+- `4eae7502d21c0681b4934717010398c508ea84a0` fix(claude-code): pass system prompt via --system-prompt flag instead of inlining in -p
+- `ad90d417ccea0cac1721adc965169c9c06a1498f` fix(kernel): resolve "default" provider in fallback_models before driver init
+- `19260945bd8f33a51244c784aa8ce0f27d8e5717` Implement "Run Now" for cron jobs
+- `0b99ac40711c3f7d95e780f724ac96bee6a0b5fb` Replace racy get_job + reserve_run with atomic try_claim_for_run
+- `7b1057df0c70c288692ebb6a83ad42a905611a1b` Add complete JSON response examples to cron endpoint docs
+- `2915cb2113f5c87c3dc2ff6ded483aa5c3bf3141` Fix failed manual run pushing next_run and premature last_run in UI
+- `2ab31f3d3e366a9679da5e26a008e36d7611922e` Apply rustfmt to changed files
+- `1cf36241e444cebe163503c3e55f34b316a89e73` Apply rustfmt to kernel.rs (fixes CI format check)
+- `dd95f24980b047215bbe26c0d99ee3e2025af3d2` feat: add MiniMax-M2.7 as new flagship model and update default alias
+- `17f783073ebbac3c711ca1b47422949882df5c22` fix: correct MiniMax M2.7 model specifications per official docs
+- `43a92a764f404dd41d82d8dc65ddcd759387fabc` fix: resolve page-header overlap and overflow
+- `865fd28704c79625d5bc9c9ccdd6d3fb6df962b3` fix: The command succeeded, yet the model keeps calling it repeatedly.
+- `37d1c822f25bcc7a5699f7f333a61778e395eb45` fix: Fix the issue of duplicate tool calls with identical arguments in certain scenarios.
+- `842d932ae69d50e64596389b86b47d38e05ecd97` fix(matrix): prevent bot self-reply loop with user_id mismatch and event dedup
+- `f66c2525cb2aa65f80170fa9a09ba0f180f57a97` Expose agent templates in web interface
+- `ccbaf90a2415394c16d67488445883e8b891762c` Expose heartbeat default_timeout_secs in config.toml
+- `e14885fa803b7544eb69c31cbc93d39f18ccb0c2` fix: Empty string IDs are overwritten, leading to inconsistencies in certain models.
+- `7a2211d0f4d3a3f5e93457d564997d72ed45d8ca` Expose agent templates in web interface
+- `d95270da5ae6f996e137eca0cf31d93a997fcce3` Fix agent template spawning
+- `935c8cad88eb35a16af023ff1b2eb5239a0a9699` fix(mcp): handle Streamable HTTP MCP responses with SSE framing
+- `b3787e07ea4c33b1bd28394b7137f46e55ee8613` fix: replace unsafe Arc mutation in update_budget with RwLock
+- `173c843107931be9b74c63e644207bb6e88d3c5b` fix: replace unsafe-inline CSP with per-request nonce
+- `f407a41a98346bb8773418f15be009faa6d2df42` Initial plan
+- `b298c4c27336e1af25feb47f89d3c60c273f201b` feat: add NVIDIA NIM provider with ZeroClaw-recommended models
+- `1c9d53df11951e69cbc2517670f2251c1cf4ebe6` chore: remove generated linux-schema.json build artifact
+- `acf51e02a8817420d32874dc08ee884606e3895a` Fix Gemini driver crash on content entries without parts
+- `bf9066a602a3ebf9c130b977511a3fb3b5b2ea2c` Fix MCP bridge dropping tool results from servers that send notifications
+- `1a5ae4e3ce87453de70b2d2380a990d917868690` Prepend sender identity to channel messages for agent context
+- `ff00499e8e1d362238fc16f90502cb8e986bb651` Fix Gemini INVALID_ARGUMENT crash after message trimming
+- `316bbe11c3fdead2363fb37ab8a58132a93decfe` Add tests for sanitize_gemini_turns
+- `78669863b79e7f31400644ef3d9137d95e257fe4` feat: add statically compiled native-tls to binary
+- `1365fc9635ba43bff921c85bad600504ee886fa9` fix(claude-code): add #[serde(default)] to ClaudeJsonOutput.result
+- `66e6eb2509ae7100f0e041b9cb9fdb7e3ebbd65b` fix(claude-code): add message field to ClaudeStreamEvent for nested assistant content
+- `d7bd5c6636603349d2b0b1c6631f6035de0c2ed9` fix(claude-code): prevent pipe-buffer deadlock in complete() via concurrent drain
+- `4b3b60245727f5507adb4ae7b25deebd124f284f` fix(claude-code): inject HOME and null stdin in stream() subprocess
+- `62b697c90e185bb935f9e2c8dc566e866d474f24` fix(claude-code): extract assistant text from nested message.content in stream()
+- `5ae554ed51f1f6162900304d7d996182650b86b1` feat: add NVIDIA NIM to CLI provider selection wizards
+- `4c700c8d2d707da27bd812c2fb153e01bf4b5ce7` fix: use existing nvidia/llama-3.1-nemotron-70b-instruct as default model
+- `570e1941b2f0b93eb8655df553d2b19b4ec7e19a` Merge pull request #1 from ilteoood/copilot/implement-nvidia-provider-functionality
+- `715f37effc697c39d1aa94f124fb1c303c986214` feat(hands): add infisical-sync Hand
+- `c59041a09d82b4e4075d79a1566b18039e180ae9` fix(hands): workspaceId → projectId in list query string
+- `f65dc775eb5de60a50e6bfee9390ed72b0759239` fix(hands): remove deployment-specific language from infisical-sync
+- `b7c81965a136ac7a5948d9292fdd41d60f39f39a` fix: format object-type tool input correctly in formatToolJson
+- `da12f473699ef36fa79248e7bc07e234a4966084` fix: Fix the error when uploading files with Unicode characters in filenames
+- `c926372d81f8a4f80592dcf6538dfc29a1fdbc07` lint fixes for 'cargo clippy --workspace --all-targets -- -D warnings' and 'cargo test --workspace'
+- `604e4ea7e37673198bf05792ac8e1cb1290db1b0` fix: resolve 6 open bugs (#834, #805, #820, #848, #826, #836)
+- `e7b9143423409261bc523d90963b4f723767d09c` fix: resolve 6 more bugs (#845, #844, #823, #767, #802, #816)
+- `da9d8a84f1097ae59aa4e9daa72a765a9257ac07` Bump clap_complete from 4.5.66 to 4.6.0
+- `895e94ccacca04586f09fb3c2103e51e31e3f8a2` Bump openssl from 0.10.75 to 0.10.76
+- `9b7496947b3efc854b9cdd45b331f6061fedf8a3` fix: resolve 7 more bugs (#825, #828, #856, #770, #774, #851/#808, #785)
+- `25a66df41b562ca56826f0596ac823022d8155f2` Merge pull request #861 from RightNow-AI/dependabot/cargo/openssl-0.10.76
+- `6ae8dd4cfdd20bc39b451b02ce795b98d488ce05` Merge pull request #860 from RightNow-AI/dependabot/cargo/clap_complete-4.6.0
+- `5b2be80399323ef0826915abfcef3433229c5f3e` Merge pull request #803 from jam676767/fix/claude-code-empty-response-295
+- `751b420b3946023f80592e3b1be08ff6dcccb599` Merge pull request #796 from pbranchu/fix/gemini-turn-sanitization
+- `d6f857eee2a15dbb0d12de102ab22e5ca7f912fd` Merge pull request #830 from lc-soft/fix/tool-input-json-format
+- `282ad3a9600bc56951570b77f06d6a20c0165d76` Merge pull request #832 from felix307253927/pr-main-324
+- `86309c8e4012fd66b1c71382069b6adbc4735624` Merge pull request #838 from turbolego/fix_clippy_linting_errors
+- `fc7e971d7ed93e631a803ca74572a90b04697ba0` Merge pull request #806 from ilteoood/main
+- `1964545f3577f7c8f3bff25618d7cbafc2273634` Merge pull request #814 from szponeczek/feat/infisical-sync-hand-clean
+- `6083c24484d02a15213fa525fc88fd6b6e7aef15` Merge pull request #801 from b4iterdev/main
+- `a0f829383ce9fb13b875d7585236dc762e08d196` Merge pull request #776 from felix307253927/pr-main-321
+- `617b4f81d86d12ce00ba357e31b266306412b744` Merge pull request #764 from felix307253927/pr-main-320
+- `54885d8a1ca12a0d90f059c65500d56ea2384364` Merge pull request #765 from felix307253927/pr-main-0320
+- `a30cce129eaaffcd88be76b4e63e06effc94d789` Merge pull request #788 from pbranchu/fix/gemini-empty-parts
+- `51eff0d75f47b61682c215388299a7e02c6fdb13` Merge pull request #783 from rager306/fix/csp-nonce
+- `0bf2f61ab1d028acefe0e6391f444d6142bbc579` Merge pull request #782 from rager306/fix/safe-budget-mutation
+- `9993718d9cb64bf1ebe755a45e53935ef67587fa` Merge pull request #779 from Mohl/fix/streamable-http-mcp
+- `86fe4929e96c09b61c7e78e09537c89a4342b7de` Merge pull request #775 from pbranchu/config-heartbeat-timeout
+- `9b0a7d2f610006bf9dca4350082a673847181540` Merge pull request #790 from pbranchu/fix/sender-identity
+- `e58039c83eb230ce180cc81ff8c333d94b7b482f` Merge pull request #789 from pbranchu/fix/mcp-response-matching
+- `7791b3f17060d7173b6403f8438287ee0c90be7c` Merge pull request #768 from voidborne-d/fix/matrix-self-message-loop
+- `e880dfa3e777cb1231287e0ee153cd9de2cd665d` Merge pull request #777 from ANierbeck/main
+- `7410faa96dbc3691fa81dbae8dc5a2ce8801b241` fix(wizard): prevent provider reset to first item during API_KEY test
+- `0da8e32a515c6f8fbae280dd56fe180fc3d66df1` Merge pull request #870 from lc-soft/fix/wizard-provider-api-key-test
+- `b0b6f844928414e8b76811b1644feafe4a235776` Merge pull request #762 from lc-soft/fix/mobile-menu-btn-overlap
+- `77da90f3f8452a8edafe81b1cd96f3ef00499572` Merge pull request #709 from Fail-Safe/fix/touch-agent-before-llm-call
+- `f036bd54e3e9f6ce996884ee3777238176a918d2` Merge pull request #710 from Reaster0/fix/fallback-default-provider-resolution
+- `8c0cce3ac5340756a1140650da51b394386c95f8` Merge pull request #737 from octo-patch/feature/add-minimax-m2.7
+- `d95d9583b0df8510516fdefc299c95fbe4b48a9d` Merge pull request #696 from Abhishek21k/fix(#660)/notion-api-token-fix
+- `b967852891076191fdbd4840e790f713eec8d8cd` Merge pull request #690 from lc-soft/fix-list-style
+- `1d2bfff8ead34a8908ce1ceb09af6270aa7d1308` Merge pull request #680 from Fail-Safe/fix/docs-search-provider-duck-duck-go
+- `f6493e88438667c2e2b86cda94ac2bb7f6a08298` Merge pull request #682 from Fail-Safe/fix/tool-filter-case-insensitive
+- `22c08c232576cce23cdac9ec1869b1c347095b2f` Merge pull request #668 from lc-soft/fix-runtime-page-style
+- `c286b88d54f886899b3c4cf44c968c485c7c5333` Merge pull request #703 from Fail-Safe/fix/heartbeat-startup-false-positive
+- `3f72c5d91875f4c1b32a13ac76b0e6d1a7288ef2` Merge pull request #701 from Fail-Safe/fix/agent-modal-ui
+- `e21efa61ef254aada153e4b1b581ca6ea1fb6c94` Merge pull request #685 from Fail-Safe/fix/researcher-hand-defaults
+- `9fa52340618e3528fd8454600b7da80bd36f31b0` Merge pull request #705 from apestchanker/fix/claude-code-system-prompt
+- `ddd1536bcb6c1ad8b7b8d608fa78505f1953352b` Merge pull request #702 from yaroslavyaroslav/codex/tlg-chat-enhancements
+- `f56505258d4cec67fadda1c95b26ad2de110a815` Merge pull request #673 from vnz/feat/cron-run-now
+- `4582ed16b0c4f1da8c86f9954261e7f9247e7e7f` Merge pull request #659 from zamal-db/feat/vertex-ai-oauth-v2
+- `ad780b9cb42b20d32b7b527d3e9d0e528b2faf67` Merge pull request #667 from bobbiejaxn/feat/http-memory-backend
+- `827481633c2ad3aa8c2679a503078029fcc08bf1` Merge pull request #662 from lizekai-hash/feat/langchain-code-reviewer
+- `b6cb4cc2d9149d8be4bae9dcfe0efa44ba04dd7b` Merge pull request #657 from xinuxZ/feat/feishu-websocket-receive-mode
+
+## Changed Files
+
+- `Cargo.lock`
+- `Cargo.toml`
+- `agents/langchain-code-reviewer/.gitignore`
+- `agents/langchain-code-reviewer/agent.py`
+- `agents/langchain-code-reviewer/config.example.toml`
+- `agents/langchain-code-reviewer/requirements.txt`
+- `agents/langchain-code-reviewer/server.py`
+- `agents/langchain-code-reviewer/workflow.json`
+- `crates/openfang-api/src/channel_bridge.rs`
+- `crates/openfang-api/src/middleware.rs`
+- `crates/openfang-api/src/routes.rs`
+- `crates/openfang-api/src/server.rs`
+- `crates/openfang-api/src/webchat.rs`
+- `crates/openfang-api/src/ws.rs`
+- `crates/openfang-api/static/css/components.css`
+- `crates/openfang-api/static/css/layout.css`
+- `crates/openfang-api/static/index_body.html`
+- `crates/openfang-api/static/js/api.js`
+- `crates/openfang-api/static/js/pages/agents.js`
+- `crates/openfang-api/static/js/pages/chat.js`
+- `crates/openfang-api/static/js/pages/scheduler.js`
+- `crates/openfang-api/static/js/pages/wizard.js`
+- `crates/openfang-channels/Cargo.toml`
+- `crates/openfang-channels/src/bridge.rs`
+- `crates/openfang-channels/src/feishu.rs`
+- `crates/openfang-channels/src/matrix.rs`
+- `crates/openfang-channels/src/telegram.rs`
+- `crates/openfang-channels/tests/bridge_integration_test.rs`
+- `crates/openfang-cli/Cargo.toml`
+- `crates/openfang-cli/src/main.rs`
+- `crates/openfang-cli/src/tui/chat_runner.rs`
+- `crates/openfang-cli/src/tui/mod.rs`
+- `crates/openfang-cli/src/tui/screens/init_wizard.rs`
+- `crates/openfang-cli/src/tui/screens/wizard.rs`
+- `crates/openfang-desktop/gen/schemas/linux-schema.json`
+- `crates/openfang-desktop/gen/schemas/macOS-schema.json`
+- `crates/openfang-extensions/integrations/notion.toml`
+- `crates/openfang-extensions/src/installer.rs`
+- `crates/openfang-hands/bundled/browser/HAND.toml`
+- `crates/openfang-hands/bundled/infisical-sync/HAND.toml`
+- `crates/openfang-hands/bundled/infisical-sync/SKILL.md`
+- `crates/openfang-hands/bundled/researcher/HAND.toml`
+- `crates/openfang-hands/src/bundled.rs`
+- `crates/openfang-hands/src/lib.rs`
+- `crates/openfang-hands/src/registry.rs`
+- `crates/openfang-kernel/src/cron.rs`
+- `crates/openfang-kernel/src/heartbeat.rs`
+- `crates/openfang-kernel/src/kernel.rs`
+- `crates/openfang-kernel/src/metering.rs`
+- `crates/openfang-kernel/src/registry.rs`
+- `crates/openfang-kernel/src/whatsapp_gateway.rs`
+- `crates/openfang-memory/Cargo.toml`
+- `crates/openfang-memory/src/http_client.rs`
+- `crates/openfang-memory/src/lib.rs`
+- `crates/openfang-memory/src/semantic.rs`
+- `crates/openfang-memory/src/substrate.rs`
+- `crates/openfang-runtime/src/agent_loop.rs`
+- `crates/openfang-runtime/src/copilot_oauth.rs`
+- `crates/openfang-runtime/src/drivers/anthropic.rs`
+- `crates/openfang-runtime/src/drivers/claude_code.rs`
+- `crates/openfang-runtime/src/drivers/gemini.rs`
+- `crates/openfang-runtime/src/drivers/mod.rs`
+- `crates/openfang-runtime/src/drivers/openai.rs`
+- `crates/openfang-runtime/src/drivers/vertex.rs`
+- `crates/openfang-runtime/src/kernel_handle.rs`
+- `crates/openfang-runtime/src/llm_driver.rs`
+- `crates/openfang-runtime/src/loop_guard.rs`
+- `crates/openfang-runtime/src/mcp.rs`
+- `crates/openfang-runtime/src/model_catalog.rs`
+- `crates/openfang-runtime/src/tool_runner.rs`
+- `crates/openfang-skills/src/registry.rs`
+- `crates/openfang-types/src/config.rs`
+- `crates/openfang-types/src/model_catalog.rs`
+- `docs/VERTEX_AI_LOCAL_TESTING.md`
+- `docs/api-reference.md`
+- `docs/channel-adapters.md`
+- `docs/configuration.md`
+- `start-vertex.bat`
+- `test_vertex_e2e.py`
+
+## Open Questions
+
+- Which local fork-specific behavior must remain authoritative in the affected areas?
+- Does this upstream change require migration, rollout notes, or config changes in Compozy?
+- Should any upstream change be intentionally skipped or partially adapted?
+
+## Resolution Marker
+
+Use one exact marker in the PR body or comments:
+
+- `Resolution: proceed`
+- `Resolution: proceed-with-followups`
+- `Resolution: do-not-sync`
