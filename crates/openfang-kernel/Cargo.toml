@@ -41,6 +41,7 @@ openfang-provider-binding.workspace = true
 arky-session = { workspace = true, features = ["sqlite"] }
 tokio-util.workspace = true
 tempfile.workspace = true
+minijinja = "2.18.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -4,6 +4,7 @@
 //! checked structurally without booting providers, touching the network, or
 //! executing templates.
 
+use crate::template_renderer::TemplateRenderer;
 use std::collections::{BTreeMap, BTreeSet};
 
 use openfang_types::contract::{
@@ -1015,10 +1016,52 @@ fn compile_template(
     all_symbols: &BTreeMap<String, String>,
     issues: &mut Vec<ValidationIssue>,
 ) -> CompiledTemplate {
-    let segments = tokenize_template(source, path, issues);
+    validate_template_source(
+        source,
+        path,
+        input_contract,
+        available_symbols,
+        all_symbols,
+        issues,
+    );
 
-    for segment in &segments {
-        let TemplateSegment::Reference { reference } = segment else {
+    CompiledTemplate {
+        source: source.to_string(),
+        segments: Vec::new(),
+    }
+}
+
+fn validate_template_source(
+    source: &str,
+    path: &str,
+    input_contract: &ContractNode,
+    available_symbols: &BTreeMap<String, String>,
+    all_symbols: &BTreeMap<String, String>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let references = match TemplateRenderer::shared().undeclared_variables(source) {
+        Ok(references) => {
+            let mut references = references.into_iter().collect::<Vec<_>>();
+            references.sort();
+            references
+        }
+        Err(error) => {
+            issues.push(ValidationIssue::error(
+                "invalid_template_syntax",
+                path,
+                format!("invalid template syntax: {error}"),
+            ));
+            return;
+        }
+    };
+
+    for expression in references {
+        let Some(reference) = parse_template_reference(&expression) else {
+            issues.push(ValidationIssue::error(
+                "unsupported_template_expression",
+                path,
+                format!("unsupported template expression `{expression}`"),
+            ));
             continue;
         };
 
@@ -1030,7 +1073,7 @@ fn compile_template(
                         path,
                         format!(
                             "template references unknown input path `{}`",
-                            display_reference(reference)
+                            display_reference(&reference)
                         ),
                     ));
                 }
@@ -1063,11 +1106,6 @@ fn compile_template(
                 issues.push(ValidationIssue::error(code, path, message));
             }
         }
-    }
-
-    CompiledTemplate {
-        source: source.to_string(),
-        segments,
     }
 }
 
@@ -1129,7 +1167,7 @@ fn parse_template_reference(expression: &str) -> Option<TemplateReference> {
     }
 
     let parts = expression.split('.').map(str::trim).collect::<Vec<_>>();
-    if parts.iter().any(|part| part.is_empty()) {
+    if parts.iter().any(|part| !is_valid_template_identifier(part)) {
         return None;
     }
 
@@ -1143,6 +1181,16 @@ fn parse_template_reference(expression: &str) -> Option<TemplateReference> {
         namespace,
         path: parts.into_iter().skip(1).map(ToOwned::to_owned).collect(),
     })
+}
+
+fn is_valid_template_identifier(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn resolve_contract_path<'a>(
@@ -1225,18 +1273,39 @@ fn infer_template_shape<'a>(
     template: &CompiledTemplate,
     input_contract: &'a ContractNode,
 ) -> InferredTemplateShape<'a> {
-    if template.segments.len() != 1 {
+    let Some(reference) = single_template_reference(template) else {
         return InferredTemplateShape::LiteralString;
+    };
+
+    match reference.namespace {
+        TemplateNamespace::Input => resolve_contract_path(input_contract, &reference.path)
+            .map(InferredTemplateShape::KnownInput)
+            .unwrap_or(InferredTemplateShape::LiteralString),
+        TemplateNamespace::Vars => InferredTemplateShape::OpaqueVariable,
+    }
+}
+
+fn single_template_reference(template: &CompiledTemplate) -> Option<TemplateReference> {
+    if !template.segments.is_empty() {
+        if template.segments.len() != 1 {
+            return None;
+        }
+
+        return match &template.segments[0] {
+            TemplateSegment::Text { .. } => None,
+            TemplateSegment::Reference { reference } => Some(reference.clone()),
+        };
     }
 
-    match &template.segments[0] {
-        TemplateSegment::Text { .. } => InferredTemplateShape::LiteralString,
-        TemplateSegment::Reference { reference } => match reference.namespace {
-            TemplateNamespace::Input => resolve_contract_path(input_contract, &reference.path)
-                .map(InferredTemplateShape::KnownInput)
-                .unwrap_or(InferredTemplateShape::LiteralString),
-            TemplateNamespace::Vars => InferredTemplateShape::OpaqueVariable,
-        },
+    let mut issues = Vec::new();
+    let segments = tokenize_template(&template.source, "", &mut issues);
+    if !issues.is_empty() || segments.len() != 1 {
+        return None;
+    }
+
+    match &segments[0] {
+        TemplateSegment::Text { .. } => None,
+        TemplateSegment::Reference { reference } => Some(reference.clone()),
     }
 }
 
@@ -1745,6 +1814,49 @@ mod tests {
         let json = serde_json::to_string(&ir).expect("ir should serialize");
         let round_trip = serde_json::from_str(&json).expect("ir should deserialize");
         assert_eq!(ir, round_trip);
+    }
+
+    #[test]
+    fn compile_produces_source_only_templates_for_new_definitions() {
+        let definition = parse_definition(valid_definition_json());
+        let ir = compile_ok(&definition);
+
+        assert!(ir
+            .steps
+            .iter()
+            .flat_map(|step| step.with.values())
+            .all(|template| template.segments.is_empty()));
+        assert!(ir
+            .outputs
+            .values()
+            .all(|template| template.segments.is_empty()));
+        assert_eq!(ir.steps[0].with["issue_id"].source, "{{ input.issue_id }}");
+        assert_eq!(ir.outputs["result"].source, "{{ vars.result }}");
+    }
+
+    #[test]
+    fn compile_accepts_advanced_minijinja_template_syntax() {
+        let mut definition = valid_definition_json();
+        definition["steps"][1]["with"]["issue"] = json!(
+            r#"{% if vars.issue %}{{ vars.issue | upper }}{% else %}{{ input.issue_id | default("missing") }}{% endif %}"#
+        );
+
+        let ir = compile_workflow_value(&definition, &registry())
+            .expect("advanced MiniJinja syntax should compile");
+
+        assert!(ir.steps[1].with["issue"].segments.is_empty());
+    }
+
+    #[test]
+    fn compile_accepts_iteration_template_syntax() {
+        let mut definition = valid_definition_json();
+        definition["steps"][1]["with"]["issue"] =
+            json!(r#"{% for item in vars.issue %}{{ item }},{% endfor %}"#);
+
+        let ir = compile_workflow_value(&definition, &registry())
+            .expect("iteration syntax should compile");
+
+        assert!(ir.steps[1].with["issue"].segments.is_empty());
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //!
 //! Workflows are defined as Rust structs or loaded from JSON.
 
+use crate::template_renderer::TemplateRenderer;
 use crate::workflow_compiler::{
     compile_workflow_definition, WorkflowCompileError, WorkflowCompileRegistry,
 };
@@ -3093,12 +3094,37 @@ impl WorkflowEngine {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn render_template(
         template: &CompiledTemplate,
         input: &str,
         vars: &HashMap<String, String>,
     ) -> String {
+        Self::try_render_template(template, input, vars)
+            .unwrap_or_else(|_| Self::render_template_segments(template, input, vars))
+    }
+
+    fn try_render_template(
+        template: &CompiledTemplate,
+        input: &str,
+        vars: &HashMap<String, String>,
+    ) -> OpenFangResult<String> {
+        match TemplateRenderer::shared().render(template, input, vars) {
+            Ok(rendered) => Ok(rendered),
+            Err(_error) if !template.segments.is_empty() => {
+                Ok(Self::render_template_segments(template, input, vars))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn render_template_segments(
+        template: &CompiledTemplate,
+        input: &str,
+        vars: &HashMap<String, String>,
+    ) -> String {
         let mut rendered = String::new();
+
         for segment in &template.segments {
             match segment {
                 TemplateSegment::Text { value } => rendered.push_str(value),
@@ -3107,6 +3133,7 @@ impl WorkflowEngine {
                 ),
             }
         }
+
         rendered
     }
 
@@ -3148,24 +3175,30 @@ impl WorkflowEngine {
         step: &WorkflowIrStep,
         input: &str,
         vars: &HashMap<String, String>,
-    ) -> String {
+    ) -> Result<String, OpenFangError> {
         if step.with.is_empty() {
-            return input.to_string();
+            return Ok(input.to_string());
         }
 
         let resolved = step
             .with
             .iter()
-            .map(|(key, template)| (key.clone(), Self::render_template(template, input, vars)))
-            .collect::<BTreeMap<_, _>>();
+            .map(|(key, template)| {
+                Self::try_render_template(template, input, vars).map(|value| (key.clone(), value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
 
         if resolved.len() == 1 {
             if let Some(message) = resolved.get("message") {
-                return message.clone();
+                return Ok(message.clone());
             }
         }
 
-        serde_json::to_string(&resolved).unwrap_or_else(|_| input.to_string())
+        serde_json::to_string(&resolved).map_err(|error| {
+            OpenFangError::Serialization(format!(
+                "failed to serialize rendered step payload: {error}"
+            ))
+        })
     }
 
     fn flow_condition_matches(condition: &str, current_input: &str) -> bool {
@@ -3482,7 +3515,8 @@ impl WorkflowEngine {
         dispatch_agent: &WorkflowDispatchAgent,
     ) -> Result<Option<WorkflowAgentStepOutcome>, String> {
         let target_agent = Self::agent_target(step)?;
-        let prompt = Self::render_step_payload(step, current_input, variables);
+        let prompt = Self::render_step_payload(step, current_input, variables)
+            .map_err(|error| error.to_string())?;
         let dispatch = self
             .create_pending_dispatch(run_id, step, target_agent, &prompt)
             .await?;
@@ -5024,6 +5058,13 @@ mod tests {
             }
         }))
         .expect("wait signal workflow test definition should deserialize")
+    }
+
+    fn inline_template(source: &str) -> CompiledTemplate {
+        CompiledTemplate {
+            source: source.to_string(),
+            segments: Vec::new(),
+        }
     }
 
     fn legacy_ir(workflow: &Workflow) -> WorkflowIr {
@@ -9075,6 +9116,254 @@ mod tests {
         );
         let result = WorkflowEngine::render_template(&template, "main.rs", &vars);
         assert_eq!(result, "Hello Alice, please do code review on main.rs");
+    }
+
+    #[tokio::test]
+    async fn render_template_resolves_input_root() {
+        let result = WorkflowEngine::try_render_template(
+            &inline_template("{{ input }}"),
+            "payload",
+            &HashMap::new(),
+        )
+        .expect("root input template should render");
+
+        assert_eq!(result, "payload");
+    }
+
+    #[tokio::test]
+    async fn render_template_resolves_nested_input_path() {
+        let result = WorkflowEngine::try_render_template(
+            &inline_template("{{ input.nested.field }}"),
+            r#"{"nested":{"field":"main.rs"}}"#,
+            &HashMap::new(),
+        )
+        .expect("nested input template should render");
+
+        assert_eq!(result, "main.rs");
+    }
+
+    #[tokio::test]
+    async fn render_template_resolves_vars_namespace() {
+        let mut vars = HashMap::new();
+        vars.insert("symbol".to_string(), "done".to_string());
+
+        let result = WorkflowEngine::try_render_template(
+            &inline_template("{{ vars.symbol }}"),
+            "payload",
+            &vars,
+        )
+        .expect("vars template should render");
+
+        assert_eq!(result, "done");
+    }
+
+    #[tokio::test]
+    async fn render_template_resolves_mixed_content() {
+        let mut vars = HashMap::new();
+        vars.insert("name".to_string(), "Alice".to_string());
+
+        let result = WorkflowEngine::try_render_template(
+            &inline_template("Hello {{ vars.name }}, process {{ input }}"),
+            "main.rs",
+            &vars,
+        )
+        .expect("mixed template should render");
+
+        assert_eq!(result, "Hello Alice, process main.rs");
+    }
+
+    #[tokio::test]
+    async fn render_template_supports_conditionals() {
+        let mut vars = HashMap::new();
+        vars.insert("status".to_string(), "ok".to_string());
+
+        let result = WorkflowEngine::try_render_template(
+            &inline_template(r#"{% if vars.status == "ok" %}yes{% else %}no{% endif %}"#),
+            "payload",
+            &vars,
+        )
+        .expect("conditional template should render");
+
+        assert_eq!(result, "yes");
+    }
+
+    #[tokio::test]
+    async fn render_template_supports_filters() {
+        let mut vars = HashMap::new();
+        vars.insert("name".to_string(), "Alice".to_string());
+
+        let result = WorkflowEngine::try_render_template(
+            &inline_template("{{ vars.name | upper }}"),
+            "payload",
+            &vars,
+        )
+        .expect("filter template should render");
+
+        assert_eq!(result, "ALICE");
+    }
+
+    #[tokio::test]
+    async fn render_template_supports_default_values() {
+        let result = WorkflowEngine::try_render_template(
+            &inline_template(r#"{{ vars.missing | default("fallback") }}"#),
+            "payload",
+            &HashMap::new(),
+        )
+        .expect("default filter should render");
+
+        assert_eq!(result, "fallback");
+    }
+
+    #[tokio::test]
+    async fn render_template_supports_iteration() {
+        let mut vars = HashMap::new();
+        vars.insert("items".to_string(), r#"["one","two"]"#.to_string());
+
+        let result = WorkflowEngine::try_render_template(
+            &inline_template("{% for item in vars.items %}{{ item }},{% endfor %}"),
+            "payload",
+            &vars,
+        )
+        .expect("iteration template should render");
+
+        assert_eq!(result, "one,two,");
+    }
+
+    #[tokio::test]
+    async fn render_template_returns_internal_error_for_invalid_syntax() {
+        let error = WorkflowEngine::try_render_template(
+            &inline_template("{{ unclosed"),
+            "payload",
+            &HashMap::new(),
+        )
+        .expect_err("invalid template syntax should fail");
+
+        match error {
+            OpenFangError::Internal(message) => assert!(message.contains("template parse")),
+            other => panic!("expected internal template error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn render_template_renders_empty_source() {
+        let result =
+            WorkflowEngine::try_render_template(&inline_template(""), "payload", &HashMap::new())
+                .expect("empty template should render");
+
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn compiled_template_with_legacy_segments_still_renders() {
+        let template: CompiledTemplate = serde_json::from_value(json!({
+            "source": "Hello {{name}}",
+            "segments": [
+                { "kind": "text", "value": "Hello " },
+                {
+                    "kind": "reference",
+                    "reference": {
+                        "namespace": "vars",
+                        "path": ["name"]
+                    }
+                }
+            ]
+        }))
+        .expect("legacy compiled template should deserialize");
+        let mut vars = HashMap::new();
+        vars.insert("name".to_string(), "Alice".to_string());
+
+        let result = WorkflowEngine::try_render_template(&template, "payload", &vars)
+            .expect("legacy compiled template should render");
+
+        assert_eq!(result, "Hello Alice");
+    }
+
+    #[tokio::test]
+    async fn workflow_v2_conditional_step_input_executes_end_to_end() {
+        let engine = WorkflowEngine::new();
+        let workflow_id = WorkflowId::new();
+        let definition: WorkflowV2Definition = serde_json::from_value(json!({
+            "id": workflow_id.to_string(),
+            "name": "conditional-template",
+            "version": "1.0.0",
+            "description": "Conditional step input workflow",
+            "input": {
+                "kind": "object",
+                "required": ["status"],
+                "open": false,
+                "fields": {
+                    "status": { "kind": "string" }
+                }
+            },
+            "output": {
+                "kind": "object",
+                "required": ["result"],
+                "open": false,
+                "fields": {
+                    "result": { "kind": "string" }
+                }
+            },
+            "steps": [
+                {
+                    "id": "capture-status",
+                    "name": "Capture Status",
+                    "kind": "agent",
+                    "uses": { "agent": "status-reader" },
+                    "with": {
+                        "message": "{{ input.status }}"
+                    },
+                    "save_as": "status",
+                    "flow": { "mode": "sequential" }
+                },
+                {
+                    "id": "decide",
+                    "name": "Decide",
+                    "kind": "agent",
+                    "uses": { "agent": "writer" },
+                    "with": {
+                        "message": "{% if vars.status == \"ok\" %}approved{% else %}rejected{% endif %}"
+                    },
+                    "save_as": "result",
+                    "flow": { "mode": "sequential" }
+                }
+            ],
+            "outputs": {
+                "result": "{{ vars.result }}"
+            }
+        }))
+        .expect("conditional workflow definition should deserialize");
+        let mut registry = WorkflowCompileRegistry::new();
+        registry.set_agents(["status-reader".to_string(), "writer".to_string()]);
+        registry.set_workflows(std::iter::once(definition.id.clone()));
+        let workflow_ir = compile_workflow_definition(&definition, &registry)
+            .expect("conditional workflow should compile");
+        engine
+            .register(Workflow {
+                id: workflow_id,
+                name: definition.name.clone(),
+                description: definition.description.clone(),
+                steps: Vec::new(),
+                created_at: Utc::now(),
+            })
+            .await
+            .expect("workflow registration should succeed");
+
+        let run_id = engine
+            .create_run(workflow_id, r#"{"status":"ok"}"#.to_string())
+            .await
+            .expect("workflow run should be created");
+
+        let result = engine
+            .execute_run(
+                run_id,
+                workflow_ir,
+                mock_resolver,
+                |_id: AgentId, msg: String| async move { Ok((msg, 10u64, 5u64)) },
+            )
+            .await
+            .expect("workflow should execute");
+
+        assert_eq!(result, "approved");
     }
 
     #[tokio::test]

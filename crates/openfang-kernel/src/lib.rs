@@ -25,6 +25,7 @@ pub mod pairing;
 pub mod registry;
 pub mod scheduler;
 pub mod supervisor;
+pub(crate) mod template_renderer;
 pub mod trigger_v2;
 pub mod triggers;
 pub mod whatsapp_gateway;
