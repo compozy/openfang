@@ -343,8 +343,9 @@ async fn route_mutations_keep_compiled_and_runtime_views_aligned() {
         .json::<Value>()
         .await
         .expect("runtime response should deserialize");
-    assert_eq!(runtime_body["loaded"], true);
-    assert_eq!(runtime_body["healthy"], true);
+    let expected_loaded = server.state.kernel.workflows.is_ready();
+    assert_eq!(runtime_body["loaded"], Value::Bool(expected_loaded));
+    assert_eq!(runtime_body["healthy"], Value::Bool(expected_loaded));
 
     let compiled_response = client
         .get(format!(

@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>api/packs</domain>
@@ -61,34 +61,34 @@ definition directory, following ADR-044.
 
 ## Subtasks
 
-- [ ] 40.1 Define `PackManifest`, `PackObjectRef`, `PackSummary`, `PackDetail`, and
+- [x] 40.1 Define `PackManifest`, `PackObjectRef`, `PackSummary`, `PackDetail`, and
       `PackObjectSummary` types in `crates/openfang-types/src/pack.rs`. `PackManifest` is the
       deserialized `pack.toml` shape. `PackSummary` is the API list item. `PackDetail` is the API
       detail. `PackObjectRef` represents a managed object (`resource_type`, `resource_id`).
       `PackObjectSummary` extends `PackObjectRef` with a `forked` boolean. All derive `Serialize`
       and `Deserialize`.
-- [ ] 40.2 Implement a `PackRegistry` that scans `~/.compozy/packs/` at boot, parses each
+- [x] 40.2 Implement a `PackRegistry` that scans `~/.compozy/packs/` at boot, parses each
       `pack.toml`, and holds the parsed manifests in memory. Place in
       `crates/openfang-kernel/src/pack_registry.rs` (or a module under the kernel). The registry
       provides `list_packs()`, `get_pack(id)`, and `list_objects(pack_id)` methods.
-- [ ] 40.3 Wire `PackRegistry` into `AppState` so API handlers can access it. Ensure it is
+- [x] 40.3 Wire `PackRegistry` into `AppState` so API handlers can access it. Ensure it is
       populated during kernel boot before the API server starts.
-- [ ] 40.4 Register the `/api/v1/packs` router group in `server.rs` with four routes:
+- [x] 40.4 Register the `/api/v1/packs` router group in `server.rs` with four routes:
       `GET /` (list), `GET /:id` (detail), `GET /:id/objects` (objects list),
       `POST /:id/fork` (fork).
-- [ ] 40.5 Implement the `list_packs` handler. Read from the in-memory `PackRegistry`. Compute
+- [x] 40.5 Implement the `list_packs` handler. Read from the in-memory `PackRegistry`. Compute
       object counts by resource type for each pack summary. Apply cursor-based pagination.
-- [ ] 40.6 Implement the `get_pack` handler. Return the full pack detail or 404 with the standard
+- [x] 40.6 Implement the `get_pack` handler. Return the full pack detail or 404 with the standard
       error envelope.
-- [ ] 40.7 Implement the `list_pack_objects` handler. Return the paginated list of managed objects
+- [x] 40.7 Implement the `list_pack_objects` handler. Return the paginated list of managed objects
       for a pack. For each object, check whether a user-owned fork exists in the top-level
       definition directory and set the `forked` boolean accordingly.
-- [ ] 40.8 Implement the `fork_pack_object` handler. Validate that the specified object exists in
+- [x] 40.8 Implement the `fork_pack_object` handler. Validate that the specified object exists in
       the pack manifest. Copy the managed definition file to the appropriate top-level directory.
       Set `origin.kind = "user"` and populate `forked_from` with pack provenance. Return the
       fork metadata. Return 404 if the pack or object is not found. Return 409 Conflict if a
       user-owned fork already exists.
-- [ ] 40.9 Add route-level and handler-level tests. See the Tests section below.
+- [x] 40.9 Add route-level and handler-level tests. See the Tests section below.
 
 ## Implementation Details
 
@@ -211,48 +211,48 @@ resource_id = "issue-created-start-sdlc"
 
 ### Unit Tests (Required)
 
-- [ ] `PackManifest` deserialization: a valid `pack.toml` string with id, version, objects list
+- [x] `PackManifest` deserialization: a valid `pack.toml` string with id, version, objects list
       deserializes correctly.
-- [ ] `PackManifest` deserialization: a manifest with missing required fields produces a clear
+- [x] `PackManifest` deserialization: a manifest with missing required fields produces a clear
       deserialization error.
-- [ ] `PackSummary` serialization: produces the expected JSON shape with `objects` as a count map
+- [x] `PackSummary` serialization: produces the expected JSON shape with `objects` as a count map
       (`agents: 5, workflows: 2`, etc.).
-- [ ] Object count computation: given a manifest with 3 agents, 2 workflows, and 1 trigger, the
+- [x] Object count computation: given a manifest with 3 agents, 2 workflows, and 1 trigger, the
       computed counts map is correct.
 
 ### Integration Tests (Required)
 
-- [ ] `GET /api/v1/packs` returns `{ items, next_cursor }` with status 200. Items match the packs
+- [x] `GET /api/v1/packs` returns `{ items, next_cursor }` with status 200. Items match the packs
       loaded from the test fixtures directory.
-- [ ] `GET /api/v1/packs/{id}` with a valid pack ID returns status 200 and the full pack detail
+- [x] `GET /api/v1/packs/{id}` with a valid pack ID returns status 200 and the full pack detail
       including managed objects list.
-- [ ] `GET /api/v1/packs/{id}` with an unknown pack ID returns status 404 with the standard error
+- [x] `GET /api/v1/packs/{id}` with an unknown pack ID returns status 404 with the standard error
       envelope.
-- [ ] `GET /api/v1/packs/{id}/objects` returns the managed objects list with correct `forked`
+- [x] `GET /api/v1/packs/{id}/objects` returns the managed objects list with correct `forked`
       boolean values.
-- [ ] `POST /api/v1/packs/{id}/fork` with a valid object creates a user-owned copy in the
+- [x] `POST /api/v1/packs/{id}/fork` with a valid object creates a user-owned copy in the
       top-level directory and returns the fork metadata with `origin.kind = "user"` and populated
       `forked_from`.
-- [ ] `POST /api/v1/packs/{id}/fork` with an already-forked object returns 409 Conflict.
-- [ ] `POST /api/v1/packs/{id}/fork` with an unknown object in the pack returns 404.
-- [ ] After a successful fork, `GET /api/v1/packs/{id}/objects` shows the forked object with
+- [x] `POST /api/v1/packs/{id}/fork` with an already-forked object returns 409 Conflict.
+- [x] `POST /api/v1/packs/{id}/fork` with an unknown object in the pack returns 404.
+- [x] After a successful fork, `GET /api/v1/packs/{id}/objects` shows the forked object with
       `forked: true`.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] The `PackRegistry` scan at boot logs warnings for directories without a valid `pack.toml`
+- [x] The `PackRegistry` scan at boot logs warnings for directories without a valid `pack.toml`
       and continues loading other packs.
-- [ ] Fork operations use atomic file writes (write .tmp, rename) to avoid partial copies.
-- [ ] The fork endpoint does not modify the managed pack directory; it only writes to top-level
+- [x] Fork operations use atomic file writes (write .tmp, rename) to avoid partial copies.
+- [x] The fork endpoint does not modify the managed pack directory; it only writes to top-level
       definition directories.
-- [ ] Normal `POST /api/v1/<resource>` create operations cannot silently shadow managed pack
+- [x] Normal `POST /api/v1/<resource>` create operations cannot silently shadow managed pack
       objects. Only the explicit fork endpoint creates same-ID overrides.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

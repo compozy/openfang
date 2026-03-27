@@ -209,67 +209,67 @@ control) can be written against stable URL paths.
 
 ### Unit Tests (Required)
 
-- [ ] `dispatch_list_response_should_match_api_spec_summary_shape` — call `GET /api/v1/dispatches`
+- [x] `dispatch_list_response_should_match_api_spec_summary_shape` — call `GET /api/v1/dispatches`
       with a seeded repository and verify the response envelope and each item's fields match the
       summary shape from API-SPEC.md section 10 exactly.
-- [ ] `dispatch_detail_response_should_include_all_required_fields` — call
+- [x] `dispatch_detail_response_should_include_all_required_fields` — call
       `GET /api/v1/dispatches/{id}` and verify every field in the detail shape is present, including
       `kind`, `attempt`, `parent_dispatch_id` (null when absent), `spawned_agent_id` (null when absent),
       and all timestamps.
-- [ ] `hitl_answer_endpoint_should_trigger_dispatch_transition` — submit a valid answer via
+- [x] `hitl_answer_endpoint_should_trigger_dispatch_transition` — submit a valid answer via
       `POST /api/v1/hitl-requests/{id}/answer` and verify the `agent_dispatch` is `running` (or
       `completed` if execution finishes synchronously in the test) after the call returns.
-- [ ] `hitl_list_with_status_filter_should_return_only_matching_records` — seed pending and
+- [x] `hitl_list_with_status_filter_should_return_only_matching_records` — seed pending and
       answered HITL records; query with `status=pending` and verify only pending records are returned.
-- [ ] `dispatch_cancel_should_cascade_to_linked_hitl_request` — cancel a dispatch that has a
+- [x] `dispatch_cancel_should_cascade_to_linked_hitl_request` — cancel a dispatch that has a
       linked `pending` HITL request and verify the HITL request is `cancelled` after the dispatch
       cancel returns.
-- [ ] `dispatch_retry_should_increment_attempt_counter` — retry a `failed` dispatch and verify
+- [x] `dispatch_retry_should_increment_attempt_counter` — retry a `failed` dispatch and verify
       the `attempt` field is incremented in the stored record or in the new retry record.
-- [ ] `hitl_answer_on_non_pending_request_should_return_error` — attempt to answer an already-
+- [x] `hitl_answer_on_non_pending_request_should_return_error` — attempt to answer an already-
       `answered` HITL request via the API and verify a 4xx error response is returned.
-- [ ] `run_scoped_dispatch_list_should_return_404_for_missing_run` — call
+- [x] `run_scoped_dispatch_list_should_return_404_for_missing_run` — call
       `GET /api/v1/runs/nonexistent/dispatches` and verify a 404 response.
 
 ### Integration Tests (Required)
 
-- [ ] `dispatch_lifecycle_visible_through_api_after_runtime_execution` — start a real workflow
+- [x] `dispatch_lifecycle_visible_through_api_after_runtime_execution` — start a real workflow
       run with a seeded agent, let the dispatch execute, and query `GET /api/v1/dispatches` to verify
       the completed dispatch record is present with correct status and result fields.
-- [ ] `hitl_answer_end_to_end_through_api` — run a workflow step that emits a HITL question,
+- [x] `hitl_answer_end_to_end_through_api` — run a workflow step that emits a HITL question,
       submit the answer via `POST /api/v1/hitl-requests/{id}/answer`, and verify the step eventually
       completes and the workflow run advances to the next step.
-- [ ] `dispatch_children_endpoint_should_return_child_dispatches` — create a dispatch with two
+- [x] `dispatch_children_endpoint_should_return_child_dispatches` — create a dispatch with two
       child dispatches (via a `spawn` or multi-agent workflow), call
       `GET /api/v1/dispatches/{parent_id}/children`, and verify both children are returned.
-- [ ] `internal_agent_can_use_hitl_api_to_answer_own_question` — demonstrate that an internal
+- [x] `internal_agent_can_use_hitl_api_to_answer_own_question` — demonstrate that an internal
       agent (not a human) can call `POST /api/v1/hitl-requests/{id}/answer` programmatically, which
       is a valid use case per the control-plane primacy principle in DESIGN.md section 2.
-- [ ] `sse_dispatch_events_endpoint_should_return_snapshot_and_keepalive` — connect to
+- [x] `sse_dispatch_events_endpoint_should_return_snapshot_and_keepalive` — connect to
       `GET /api/v1/dispatches/{id}/events` and verify a `stream.snapshot` event is emitted followed
       by a `keepalive` heartbeat within the expected interval.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not create internal-only endpoints for dispatch or HITL control-plane actions — all
+- [x] Do not create internal-only endpoints for dispatch or HITL control-plane actions — all
       actions (cancel, retry, answer) must go through the public `/api/v1` surface, which internal
       agents use through the same contracts as humans.
-- [ ] Do not expose stale in-memory state in read endpoints — `GET /api/v1/dispatches/{id}` must
+- [x] Do not expose stale in-memory state in read endpoints — `GET /api/v1/dispatches/{id}` must
       always read from `DispatchRepository`, not from a kernel-held in-memory projection of the run.
-- [ ] Do not hide response semantics behind ad hoc JSON blobs — the `status`, `kind`, and all
+- [x] Do not hide response semantics behind ad hoc JSON blobs — the `status`, `kind`, and all
       structured fields must be explicit named fields in the response, not packed into a generic
       `metadata` blob.
-- [ ] Do not return 200 with an empty body when a dispatch or HITL request is not found — return
+- [x] Do not return 200 with an empty body when a dispatch or HITL request is not found — return
       404 with a structured error response matching the API-SPEC.md error envelope.
-- [ ] Do not trigger the HITL resume path from the answer endpoint without first verifying the
+- [x] Do not trigger the HITL resume path from the answer endpoint without first verifying the
       HITL request is `pending` — a double-answer attempt must return an error, not silently fire the
       resume logic twice.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>engine/packs/system</domain>
@@ -59,13 +59,13 @@ It depends on Task 40 for the pack list/detail/CRUD endpoints that define the pa
 
 ## Subtasks
 
-- [ ] 41.1 Create the `pack` table migration in `migrations/compozy/` if not yet present.
+- [x] 41.1 Create the `pack` table migration in `migrations/compozy/` if not yet present.
       Columns: `pack_id TEXT PRIMARY KEY`, `name TEXT NOT NULL`, `version TEXT NOT NULL`,
       `source_kind TEXT NOT NULL` (bundled/external), `installed INTEGER NOT NULL DEFAULT 1`,
       `managed INTEGER NOT NULL DEFAULT 1`, `installed_at TEXT NOT NULL`, `updated_at TEXT NOT NULL`,
       `objects_json TEXT` (JSON counts by type).
 
-- [ ] 41.2 Implement the `PackInstaller` struct with methods: `install`, `upgrade`, `upgrade_dry_run`,
+- [x] 41.2 Implement the `PackInstaller` struct with methods: `install`, `upgrade`, `upgrade_dry_run`,
       `uninstall`. The `install` method accepts a source descriptor (`kind: "bundled"` or
       `kind: "external"`, `pack_id`, `version`), resolves the pack content, writes managed
       definitions to disk (using the shared `definition_store` from the design decisions), records
@@ -74,7 +74,7 @@ It depends on Task 40 for the pack list/detail/CRUD endpoints that define the pa
       forks, and increments the version. The `upgrade_dry_run` method returns the diff without
       mutating. The `uninstall` method removes managed definitions and the pack record.
 
-- [ ] 41.3 Implement `POST /api/v1/packs/install` endpoint. The handler accepts:
+- [x] 41.3 Implement `POST /api/v1/packs/install` endpoint. The handler accepts:
       ```json
       {
         "source": {
@@ -86,7 +86,7 @@ It depends on Task 40 for the pack list/detail/CRUD endpoints that define the pa
       ```
       and calls `PackInstaller::install`.
 
-- [ ] 41.4 Implement `POST /api/v1/packs/{id}/upgrade` and
+- [x] 41.4 Implement `POST /api/v1/packs/{id}/upgrade` and
       `POST /api/v1/packs/{id}/upgrade/dry-run` endpoints. The upgrade dry-run returns:
       ```json
       {
@@ -109,21 +109,21 @@ It depends on Task 40 for the pack list/detail/CRUD endpoints that define the pa
       }
       ```
 
-- [ ] 41.5 Implement `POST /api/v1/packs/{id}/uninstall` endpoint. The handler removes managed
+- [x] 41.5 Implement `POST /api/v1/packs/{id}/uninstall` endpoint. The handler removes managed
       definitions and the pack record. If user forks exist without the `force` flag, return an
       error with the list of forked definition IDs.
 
-- [ ] 41.6 Implement built-in pack bootstrapping in the kernel boot sequence. On first kernel
+- [x] 41.6 Implement built-in pack bootstrapping in the kernel boot sequence. On first kernel
       startup when the SDLC pack is not installed, call `PackInstaller::install` with the bundled
       SDLC pack descriptor. The SDLC pack content (workflow, agent, trigger definitions) must be
       embedded in the binary or loaded from a known resource path.
 
-- [ ] 41.7 Define the SDLC built-in pack content: a minimal workflow definition, agent definitions,
+- [x] 41.7 Define the SDLC built-in pack content: a minimal workflow definition, agent definitions,
       and trigger definitions representing a basic software development lifecycle automation.
 
-- [ ] 41.8 Add tests for pack operations. See the Tests section below.
+- [x] 41.8 Add tests for pack operations. See the Tests section below.
 
-- [ ] 41.9 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] 41.9 Confirm that `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
       and `cargo test --workspace` all pass at zero warnings before marking this task complete.
 
 ## Implementation Details
@@ -184,40 +184,40 @@ install. This ensures there is no special-case install logic that could diverge 
 
 ### Unit Tests (Required)
 
-- [ ] `POST /api/v1/packs/install` with a `bundled` source descriptor for a known built-in pack
+- [x] `POST /api/v1/packs/install` with a `bundled` source descriptor for a known built-in pack
       creates the correct `pack` record in `compozy.db` and installs managed definitions under the
       pack namespace.
-- [ ] `POST /api/v1/packs/{id}/upgrade/dry-run` returns the correct `effects` object without
+- [x] `POST /api/v1/packs/{id}/upgrade/dry-run` returns the correct `effects` object without
       mutating any managed object; querying the pack after the dry-run confirms the version has not
       changed.
-- [ ] `POST /api/v1/packs/{id}/upgrade` mutates only managed pack objects; user-forked definitions
+- [x] `POST /api/v1/packs/{id}/upgrade` mutates only managed pack objects; user-forked definitions
       with the same IDs are not overwritten, and their `forked_from` provenance is preserved.
-- [ ] `POST /api/v1/packs/{id}/uninstall` removes managed definitions and the pack record.
-- [ ] `POST /api/v1/packs/{id}/uninstall` without `force` flag errors when user forks exist.
+- [x] `POST /api/v1/packs/{id}/uninstall` removes managed definitions and the pack record.
+- [x] `POST /api/v1/packs/{id}/uninstall` without `force` flag errors when user forks exist.
 
 ### Integration Tests (Required)
 
-- [ ] Pack install from a bundled source creates managed definitions; pack upgrade correctly
+- [x] Pack install from a bundled source creates managed definitions; pack upgrade correctly
       increments the version and updates managed objects without touching user forks; pack uninstall
       removes managed definitions and the pack record.
-- [ ] Built-in pack bootstrapping: start the kernel with an empty `compozy.db`; verify the SDLC
+- [x] Built-in pack bootstrapping: start the kernel with an empty `compozy.db`; verify the SDLC
       pack is installed automatically; verify the pack record exists with correct version and
       source_kind.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Pack upgrade must never overwrite user-forked definitions; the `forked_from` provenance
+- [x] Pack upgrade must never overwrite user-forked definitions; the `forked_from` provenance
       field must remain intact after an upgrade of the upstream pack.
-- [ ] Built-in pack bootstrapping must use the same code path as `POST /api/v1/packs/install`;
+- [x] Built-in pack bootstrapping must use the same code path as `POST /api/v1/packs/install`;
       there must be no special-case install logic for bundled packs that bypasses the pack system.
-- [ ] Pack install must not create duplicate managed definitions if called twice with the same
+- [x] Pack install must not create duplicate managed definitions if called twice with the same
       pack and version.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

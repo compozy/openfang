@@ -224,63 +224,63 @@ accessed via `State(state): State<Arc<AppState>>` in handlers.
 
 ### Unit Tests (Required)
 
-- [ ] `POST /api/v1/looper-runs` with a valid body and a known `task_id` returns
+- [x] `POST /api/v1/looper-runs` with a valid body and a known `task_id` returns
       HTTP 202 with `accepted: true` and a non-empty `looper_run_id`.
-- [ ] `POST /api/v1/looper-runs` with a missing `execution_policy` field returns
+- [x] `POST /api/v1/looper-runs` with a missing `execution_policy` field returns
       HTTP 422 with a structured error body that includes `code: "validation_error"`
       and a `details` array identifying the missing field.
-- [ ] `POST /api/v1/looper-runs` with `execution_policy.max_parallelism = 0`
+- [x] `POST /api/v1/looper-runs` with `execution_policy.max_parallelism = 0`
       returns HTTP 422 with a domain validation error.
-- [ ] SSE event serialization: a `run.updated` event for a running looper run
+- [x] SSE event serialization: a `run.updated` event for a running looper run
       produces a correctly formatted `text/event-stream` message with `id`,
       `event`, and `data` fields; the `data` field deserializes to a valid looper
       run summary shape.
-- [ ] `POST /api/v1/looper-runs/{id}/pause` on a looper run in `completed` state
+- [x] `POST /api/v1/looper-runs/{id}/pause` on a looper run in `completed` state
       returns HTTP 409 with a structured error indicating the run is terminal.
-- [ ] `GET /api/v1/looper-runs/{id}` for a non-existent ID returns HTTP 404 with
+- [x] `GET /api/v1/looper-runs/{id}` for a non-existent ID returns HTTP 404 with
       a structured error body.
-- [ ] `GET /api/v1/looper-runs` with `status = "running"` filter returns only
+- [x] `GET /api/v1/looper-runs` with `status = "running"` filter returns only
       looper runs in `running` status; runs in other statuses are excluded.
 
 ### Integration Tests (Required)
 
-- [ ] Full API round-trip: create a looper run via `POST /api/v1/looper-runs`,
+- [x] Full API round-trip: create a looper run via `POST /api/v1/looper-runs`,
       poll `GET /api/v1/looper-runs/{id}` until status is `completed`, verify
       `progress.completed` equals the total number of subtasks.
-- [ ] SSE endpoint streams at least one `subtask.started` and one
+- [x] SSE endpoint streams at least one `subtask.started` and one
       `subtask.completed` event during a looper run that executes one subtask;
       the `stream.snapshot` event is the first event received by a fresh subscriber.
-- [ ] `Last-Event-ID` resume within the ring buffer: connect to the SSE endpoint,
+- [x] `Last-Event-ID` resume within the ring buffer: connect to the SSE endpoint,
       receive 10 events, disconnect, reconnect with `Last-Event-ID` set to event 5,
       and verify events 6–10 are replayed before live events arrive.
-- [ ] `Last-Event-ID` beyond the buffer: connect with a `Last-Event-ID` that is
+- [x] `Last-Event-ID` beyond the buffer: connect with a `Last-Event-ID` that is
       older than the ring buffer window, and verify the server emits `stream.reset`
       then `stream.snapshot` before continuing with live events.
-- [ ] `keepalive` heartbeat: open an SSE connection to a paused looper run and
+- [x] `keepalive` heartbeat: open an SSE connection to a paused looper run and
       verify a `keepalive` event is received within 20 seconds without any looper
       state change.
-- [ ] Pause then resume round-trip via API: `POST /pause` returns `accepted`,
+- [x] Pause then resume round-trip via API: `POST /pause` returns `accepted`,
       `GET /{id}` shows `status = "paused"`, `POST /resume` returns `accepted`,
       subsequent `GET /{id}` shows `status = "running"`.
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Do not bolt on SSE as a `watch=true` query parameter on the detail
+- [x] Do not bolt on SSE as a `watch=true` query parameter on the detail
       endpoint; the watch surface must be the dedicated `/events` sub-resource per
       ADR-036.
-- [ ] Do not treat the SSE endpoint as a full event history API; events older
+- [x] Do not treat the SSE endpoint as a full event history API; events older
       than the ring buffer must trigger `stream.reset` and `stream.snapshot`, not
       unbounded backfill per ADR-039.
-- [ ] Do not re-architect the looper runtime from task 34 in this task; only
+- [x] Do not re-architect the looper runtime from task 34 in this task; only
       add the API surface and the event channel integration.
-- [ ] Do not create internal-only routes for looper control; all surfaces must
+- [x] Do not create internal-only routes for looper control; all surfaces must
       be public paths under `/api/v1/looper-runs`.
 
 ### Verification Commands
 
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo fmt --all`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
 
 ## Success Criteria
 

@@ -549,3 +549,80 @@ async fn linked_context_and_task_filters_should_work() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["slug"], json!("onboarding-prd"));
 }
+
+#[tokio::test]
+async fn task_list_source_kind_filter_should_return_matching_origin_only() {
+    let server = start_task_v1_test_server().await;
+    let client = reqwest::Client::new();
+
+    create_task(
+        &client,
+        &server,
+        "task_manual",
+        "manual-source",
+        "Manual Source Task",
+        "planned",
+        "Task created manually through the control plane",
+    )
+    .await;
+
+    let mut workflow_sourced = task_request(
+        "task_workflow",
+        "workflow-source",
+        "Workflow Source Task",
+        "planned",
+        "Task created from a workflow run",
+    );
+    workflow_sourced["source"] = json!({
+        "kind": "workflow",
+        "workflow_id": "sdlc",
+        "run_id": "run_123",
+    });
+    let workflow_created = client
+        .post(format!("{}/api/v1/tasks", server.base_url))
+        .json(&workflow_sourced)
+        .send()
+        .await
+        .expect("workflow sourced task create request should succeed");
+    assert_eq!(workflow_created.status(), reqwest::StatusCode::CREATED);
+
+    let workflow_filtered = client
+        .get(format!(
+            "{}/api/v1/tasks?source_kind=workflow",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("workflow source filter should succeed");
+    assert_eq!(workflow_filtered.status(), reqwest::StatusCode::OK);
+    let workflow_filtered = workflow_filtered
+        .json::<Value>()
+        .await
+        .expect("workflow source filter response should deserialize");
+    let workflow_items = workflow_filtered["items"]
+        .as_array()
+        .expect("workflow source items should be an array");
+    assert_eq!(workflow_items.len(), 1);
+    assert_eq!(workflow_items[0]["id"], json!("task_workflow"));
+    assert_eq!(workflow_items[0]["source"]["kind"], json!("workflow"));
+
+    let manual_filtered = client
+        .get(format!(
+            "{}/api/v1/tasks?source_kind=manual",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("manual source filter should succeed");
+    assert_eq!(manual_filtered.status(), reqwest::StatusCode::OK);
+    let manual_filtered = manual_filtered
+        .json::<Value>()
+        .await
+        .expect("manual source filter response should deserialize");
+    let manual_items = manual_filtered["items"]
+        .as_array()
+        .expect("manual source items should be an array");
+    assert_eq!(manual_items.len(), 1);
+    assert_eq!(manual_items[0]["id"], json!("task_manual"));
+    assert_eq!(manual_items[0]["source"]["kind"], json!("manual"));
+}

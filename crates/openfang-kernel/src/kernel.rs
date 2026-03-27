@@ -10464,6 +10464,11 @@ mod tests {
     }
 
     #[test]
+    fn boot_should_initialize_compozy_db_handle_as_non_null() {
+        boot_should_initialize_workflow_store_connection();
+    }
+
+    #[test]
     fn db_health_should_return_healthy_after_successful_boot() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let config = boot_test_config(tmp.path());

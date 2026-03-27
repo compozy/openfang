@@ -7268,14 +7268,15 @@ pub async fn get_workflow_runtime_v1(
         }
     };
     let (active_runs, waiting_runs, last_run_at) = workflow_runtime_counts(&runs);
-    let loaded = true;
+    let loaded = state.kernel.workflows.is_ready();
+    let healthy = loaded;
 
     (
         StatusCode::OK,
         Json(serde_json::json!(WorkflowRuntimeResponse {
             workflow_id: id,
             loaded,
-            healthy: true,
+            healthy,
             active_runs,
             waiting_runs,
             last_run_at,
@@ -25347,6 +25348,41 @@ mod agent_definition_route_tests {
                 "kind": "none"
             }
         })
+    }
+
+    #[tokio::test]
+    async fn get_workflow_runtime_v1_should_report_not_loaded_before_registry_ready() {
+        let context = route_test_context().await;
+        let workflow_id = "runtime-readiness";
+
+        let (create_status, create_body) = json_response(
+            create_workflow_definition_v1(
+                State(Arc::clone(&context.state)),
+                Ok(Json(
+                    serde_json::to_value(noop_workflow_definition(workflow_id))
+                        .expect("workflow definition should serialize"),
+                )),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(create_status, StatusCode::CREATED);
+        assert_eq!(create_body["id"], json!(workflow_id));
+
+        let (status, body) = json_response(
+            get_workflow_runtime_v1(
+                State(Arc::clone(&context.state)),
+                Path(workflow_id.to_string()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["workflow_id"], json!(workflow_id));
+        assert_eq!(body["loaded"], json!(false));
+        assert_eq!(body["healthy"], json!(false));
     }
 
     #[tokio::test]
