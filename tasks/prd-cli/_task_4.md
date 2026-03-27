@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>cli/commands</domain>
@@ -56,19 +56,19 @@ SSE consumption pattern.
 
 ## Subtasks
 
-- [ ] 4.1 Define `LooperCommands` enum with clap `#[derive(Subcommand)]` and
+- [x] 4.1 Define `LooperCommands` enum with clap `#[derive(Subcommand)]` and
       all 8 variants with their arguments
-- [ ] 4.2 Add `Looper(LooperCommands)` to the `Commands` enum and wire dispatch
-- [ ] 4.3 Implement `cmd_looper_list` with filter flags and progress column
+- [x] 4.2 Add `Looper(LooperCommands)` to the `Commands` enum and wire dispatch
+- [x] 4.3 Implement `cmd_looper_list` with filter flags and progress column
       formatting (`completed/total`)
-- [ ] 4.4 Implement `cmd_looper_get` with `--json` support
-- [ ] 4.5 Implement `cmd_looper_create` — read JSON file, POST, print accepted
+- [x] 4.4 Implement `cmd_looper_get` with `--json` support
+- [x] 4.5 Implement `cmd_looper_create` — read JSON file, POST, print accepted
       response with `looper_run_id`
-- [ ] 4.6 Implement `cmd_looper_subtasks` showing looper subtask execution view
-- [ ] 4.7 Implement `cmd_looper_pause`, `cmd_looper_resume`, `cmd_looper_cancel`
-- [ ] 4.8 Implement `cmd_looper_watch` SSE handler reusing the pattern from
+- [x] 4.6 Implement `cmd_looper_subtasks` showing looper subtask execution view
+- [x] 4.7 Implement `cmd_looper_pause`, `cmd_looper_resume`, `cmd_looper_cancel`
+- [x] 4.8 Implement `cmd_looper_watch` SSE handler reusing the pattern from
       Phase 2
-- [ ] 4.9 Run `make fmt && make lint && make test` — all must pass with zero
+- [x] 4.9 Run `make fmt && make lint && make test` — all must pass with zero
       warnings before marking done
 
 ## Implementation Details
@@ -118,27 +118,27 @@ let progress = format!("{}/{}",
 
 ### Unit Tests (Required)
 
-- [ ] `openfang looper --help` exits 0 and output contains all 8 subcommands
-- [ ] `openfang looper list` without a daemon prints "requires a running daemon"
-- [ ] `openfang looper create nonexistent.json` prints file-not-found error
+- [x] `openfang looper --help` exits 0 and output contains all 8 subcommands
+- [x] `openfang looper list` without a daemon prints "requires a running daemon"
+- [x] `openfang looper create nonexistent.json` prints file-not-found error
 
 ### Integration Tests (Required)
 
-- [ ] With daemon: `openfang looper list --json` returns valid JSON
-- [ ] With daemon: `openfang looper list --status running --json` filters correctly
-- [ ] With daemon: `openfang looper pause <nonexistent_id>` returns error
+- [x] With daemon: `openfang looper list --json` returns valid JSON
+- [x] With daemon: `openfang looper list --status running --json` filters correctly
+- [x] With daemon: `openfang looper pause <nonexistent_id>` returns error
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Progress column must not panic on missing `progress` field — default to `0/0`
-- [ ] Existing CLI commands remain unchanged
-- [ ] No `unwrap()` in handler code
+- [x] Progress column must not panic on missing `progress` field — default to `0/0`
+- [x] Existing CLI commands remain unchanged
+- [x] No `unwrap()` in handler code
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

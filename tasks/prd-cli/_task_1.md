@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>cli/commands</domain>
@@ -57,23 +57,23 @@ The backend already implements all required endpoints under `/api/v1/tasks` and
 
 ## Subtasks
 
-- [ ] 1.1 Define `TaskCommands` enum with clap `#[derive(Subcommand)]` and all
+- [x] 1.1 Define `TaskCommands` enum with clap `#[derive(Subcommand)]` and all
       9 variants with their arguments (status, priority, limit, json flags;
       task_id positional; file PathBuf for create/update/replan)
-- [ ] 1.2 Define `SubtaskCommands` enum with clap `#[derive(Subcommand)]` and
+- [x] 1.2 Define `SubtaskCommands` enum with clap `#[derive(Subcommand)]` and
       all 5 variants with their arguments
-- [ ] 1.3 Add `Task(TaskCommands)` and `Subtask(SubtaskCommands)` to the
+- [x] 1.3 Add `Task(TaskCommands)` and `Subtask(SubtaskCommands)` to the
       `Commands` enum with doc comments
-- [ ] 1.4 Add dispatch arms in the main `match` block for both command groups
-- [ ] 1.5 Implement `cmd_task_list`, `cmd_task_get`, `cmd_task_create`,
+- [x] 1.4 Add dispatch arms in the main `match` block for both command groups
+- [x] 1.5 Implement `cmd_task_list`, `cmd_task_get`, `cmd_task_create`,
       `cmd_task_update`, `cmd_task_delete` handler functions
-- [ ] 1.6 Implement `cmd_task_replan`, `cmd_task_subtasks`, `cmd_task_artifacts`,
+- [x] 1.6 Implement `cmd_task_replan`, `cmd_task_subtasks`, `cmd_task_artifacts`,
       `cmd_task_docs` handler functions
-- [ ] 1.7 Implement `cmd_subtask_list`, `cmd_subtask_get`, `cmd_subtask_create`,
+- [x] 1.7 Implement `cmd_subtask_list`, `cmd_subtask_get`, `cmd_subtask_create`,
       `cmd_subtask_update`, `cmd_subtask_delete` handler functions
-- [ ] 1.8 Verify `openfang task --help` and `openfang subtask --help` render
+- [x] 1.8 Verify `openfang task --help` and `openfang subtask --help` render
       correctly with all subcommands visible
-- [ ] 1.9 Run `make fmt && make lint && make test` — all must pass with zero
+- [x] 1.9 Run `make fmt && make lint && make test` — all must pass with zero
       warnings before marking done
 
 ## Implementation Details
@@ -119,36 +119,36 @@ file-read pattern as `cmd_workflow_create`.
 
 ### Unit Tests (Required)
 
-- [ ] `openfang task --help` exits 0 and output contains all 9 subcommands
+- [x] `openfang task --help` exits 0 and output contains all 9 subcommands
       (list, get, create, update, delete, replan, subtasks, artifacts, docs)
-- [ ] `openfang subtask --help` exits 0 and output contains all 5 subcommands
+- [x] `openfang subtask --help` exits 0 and output contains all 5 subcommands
       (list, get, create, update, delete)
-- [ ] `openfang task list` without a running daemon prints error message
+- [x] `openfang task list` without a running daemon prints error message
       containing "requires a running daemon" and exits 1
-- [ ] `openfang task create nonexistent.json` prints file-not-found error and
+- [x] `openfang task create nonexistent.json` prints file-not-found error and
       exits 1
 
 ### Integration Tests (Required)
 
-- [ ] With a running daemon: `openfang task list --json` returns valid JSON
+- [x] With a running daemon: `openfang task list --json` returns valid JSON
       array to stdout
-- [ ] With a running daemon: `openfang task create <file>` followed by
+- [x] With a running daemon: `openfang task create <file>` followed by
       `openfang task get <id> --json` returns the created task
-- [ ] With a running daemon: `openfang subtask list --task_id <id> --json`
+- [x] With a running daemon: `openfang subtask list --task_id <id> --json`
       returns valid JSON
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Existing CLI commands (agent, workflow, trigger, etc.) continue to work
+- [x] Existing CLI commands (agent, workflow, trigger, etc.) continue to work
       unchanged after adding new command groups
-- [ ] No `unwrap()` in handler code — use `unwrap_or()` or `unwrap_or_default()`
-- [ ] No new crate dependencies added
+- [x] No `unwrap()` in handler code — use `unwrap_or()` or `unwrap_or_default()`
+- [x] No new crate dependencies added
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

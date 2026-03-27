@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>cli/commands</domain>
@@ -55,17 +55,17 @@ important as it lets users preview what would change before committing.
 
 ## Subtasks
 
-- [ ] 7.1 Define `PackCommands` enum with clap `#[derive(Subcommand)]` and all
+- [x] 7.1 Define `PackCommands` enum with clap `#[derive(Subcommand)]` and all
       7 variants with their arguments (including `--dry-run` flag on `Upgrade`)
-- [ ] 7.2 Add `Pack(PackCommands)` to the `Commands` enum and wire dispatch
-- [ ] 7.3 Implement `cmd_pack_list` and `cmd_pack_get` with `--json` support
-- [ ] 7.4 Implement `cmd_pack_objects` showing managed objects inside a pack
-- [ ] 7.5 Implement `cmd_pack_install` — POST with source string
-- [ ] 7.6 Implement `cmd_pack_upgrade` with `--dry-run` branching logic:
+- [x] 7.2 Add `Pack(PackCommands)` to the `Commands` enum and wire dispatch
+- [x] 7.3 Implement `cmd_pack_list` and `cmd_pack_get` with `--json` support
+- [x] 7.4 Implement `cmd_pack_objects` showing managed objects inside a pack
+- [x] 7.5 Implement `cmd_pack_install` — POST with source string
+- [x] 7.6 Implement `cmd_pack_upgrade` with `--dry-run` branching logic:
       different endpoint + different output formatting for dry-run vs real
       upgrade
-- [ ] 7.7 Implement `cmd_pack_uninstall` and `cmd_pack_fork`
-- [ ] 7.8 Run `make fmt && make lint && make test` — all must pass with zero
+- [x] 7.7 Implement `cmd_pack_uninstall` and `cmd_pack_fork`
+- [x] 7.8 Run `make fmt && make lint && make test` — all must pass with zero
       warnings before marking done
 
 ## Implementation Details
@@ -125,30 +125,30 @@ template    bug-report-agent        available
 
 ### Unit Tests (Required)
 
-- [ ] `openfang pack --help` exits 0 and output contains all 7 subcommands
+- [x] `openfang pack --help` exits 0 and output contains all 7 subcommands
       (list, get, objects, install, upgrade, uninstall, fork)
-- [ ] `openfang pack list` without a daemon prints "requires a running daemon"
-- [ ] `openfang pack install` with no source argument prints usage help
+- [x] `openfang pack list` without a daemon prints "requires a running daemon"
+- [x] `openfang pack install` with no source argument prints usage help
 
 ### Integration Tests (Required)
 
-- [ ] With daemon: `openfang pack list --json` returns valid JSON
-- [ ] With daemon: `openfang pack upgrade <id> --dry-run` returns effects
+- [x] With daemon: `openfang pack list --json` returns valid JSON
+- [x] With daemon: `openfang pack upgrade <id> --dry-run` returns effects
       report without actually upgrading
-- [ ] With daemon: `openfang pack uninstall <nonexistent_id>` returns error
+- [x] With daemon: `openfang pack uninstall <nonexistent_id>` returns error
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] `--dry-run` must use the separate dry-run endpoint, not a query parameter
-- [ ] `install` must not silently succeed on empty source string
-- [ ] Existing CLI commands remain unchanged
-- [ ] No `unwrap()` in handler code
+- [x] `--dry-run` must use the separate dry-run endpoint, not a query parameter
+- [x] `install` must not silently succeed on empty source string
+- [x] Existing CLI commands remain unchanged
+- [x] No `unwrap()` in handler code
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

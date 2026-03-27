@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>cli/commands</domain>
@@ -60,27 +60,27 @@ the terminal using `reqwest::blocking` with line-by-line `BufReader` iteration.
 
 ## Subtasks
 
-- [ ] 2.1 Define `RunCommands` enum with clap `#[derive(Subcommand)]` and all
+- [x] 2.1 Define `RunCommands` enum with clap `#[derive(Subcommand)]` and all
       11 variants with their arguments
-- [ ] 2.2 Define `DispatchCommands` enum with clap `#[derive(Subcommand)]` and
+- [x] 2.2 Define `DispatchCommands` enum with clap `#[derive(Subcommand)]` and
       all 6 variants with their arguments
-- [ ] 2.3 Add `Run(RunCommands)` and `Dispatch(DispatchCommands)` to the
+- [x] 2.3 Add `Run(RunCommands)` and `Dispatch(DispatchCommands)` to the
       `Commands` enum and wire dispatch in the main `match` block
-- [ ] 2.4 Implement `cmd_run_list`, `cmd_run_get`, `cmd_run_dispatches`,
+- [x] 2.4 Implement `cmd_run_list`, `cmd_run_get`, `cmd_run_dispatches`,
       `cmd_run_hitl`, `cmd_run_signals`, `cmd_run_checkpoints` GET handlers
-- [ ] 2.5 Implement `cmd_run_signal` POST handler (inline JSON from positional
+- [x] 2.5 Implement `cmd_run_signal` POST handler (inline JSON from positional
       args, not file-based)
-- [ ] 2.6 Implement `cmd_run_pause`, `cmd_run_resume`, `cmd_run_cancel` POST
+- [x] 2.6 Implement `cmd_run_pause`, `cmd_run_resume`, `cmd_run_cancel` POST
       handlers returning `AcceptedActionResponse`
-- [ ] 2.7 Implement `cmd_run_watch` SSE handler — the first SSE consumer in the
+- [x] 2.7 Implement `cmd_run_watch` SSE handler — the first SSE consumer in the
       CLI. Use `reqwest::blocking` with `BufReader::new(response)` to iterate
       lines, parse `data:` prefixed lines as JSON, and pretty-print events.
-- [ ] 2.8 Implement `cmd_dispatch_list`, `cmd_dispatch_get`,
+- [x] 2.8 Implement `cmd_dispatch_list`, `cmd_dispatch_get`,
       `cmd_dispatch_children`, `cmd_dispatch_retry`, `cmd_dispatch_cancel`
       handlers
-- [ ] 2.9 Implement `cmd_dispatch_watch` SSE handler reusing the pattern from
+- [x] 2.9 Implement `cmd_dispatch_watch` SSE handler reusing the pattern from
       2.7
-- [ ] 2.10 Run `make fmt && make lint && make test` — all must pass with zero
+- [x] 2.10 Run `make fmt && make lint && make test` — all must pass with zero
        warnings before marking done
 
 ## Implementation Details
@@ -134,32 +134,32 @@ serde_json::json!({
 
 ### Unit Tests (Required)
 
-- [ ] `openfang run --help` exits 0 and output contains all 11 subcommands
-- [ ] `openfang dispatch --help` exits 0 and output contains all 6 subcommands
-- [ ] `openfang run list` without a daemon prints "requires a running daemon"
-- [ ] `openfang run signal` with missing arguments prints usage help
+- [x] `openfang run --help` exits 0 and output contains all 11 subcommands
+- [x] `openfang dispatch --help` exits 0 and output contains all 6 subcommands
+- [x] `openfang run list` without a daemon prints "requires a running daemon"
+- [x] `openfang run signal` with missing arguments prints usage help
 
 ### Integration Tests (Required)
 
-- [ ] With daemon: `openfang run list --json` returns valid JSON
-- [ ] With daemon: `openfang dispatch list --run_id <id> --json` returns valid
+- [x] With daemon: `openfang run list --json` returns valid JSON
+- [x] With daemon: `openfang dispatch list --run_id <id> --json` returns valid
       JSON filtered by run
-- [ ] With daemon: `openfang run pause <id>` on a non-existent run returns an
+- [x] With daemon: `openfang run pause <id>` on a non-existent run returns an
       error message (not a panic)
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] SSE watch handlers must not block indefinitely on connection failure —
+- [x] SSE watch handlers must not block indefinitely on connection failure —
       use a timeout on the initial connection
-- [ ] Existing CLI commands remain unchanged
-- [ ] No `unwrap()` in handler code
-- [ ] No new crate dependencies added (reqwest already supports SSE via blocking reads)
+- [x] Existing CLI commands remain unchanged
+- [x] No `unwrap()` in handler code
+- [x] No new crate dependencies added (reqwest already supports SSE via blocking reads)
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

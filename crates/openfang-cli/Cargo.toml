@@ -36,3 +36,8 @@ colored = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+chrono = "0.4"
+openfang-memory = { path = "../openfang-memory" }
+pretty_assertions.workspace = true

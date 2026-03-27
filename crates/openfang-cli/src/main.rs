@@ -16,10 +16,12 @@ mod ui;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use openfang_api::server::read_daemon_info;
+use openfang_kernel::pack_installer::BUNDLED_SDLC_PACK_VERSION;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::{AgentId, AgentManifest};
+use openfang_types::pack::{PackInstallSource, PackManifest, PackSourceKind};
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 #[cfg(windows)]
 use std::sync::atomic::Ordering;
@@ -126,7 +128,37 @@ enum Commands {
     /// Manage workflows (list, create, run) [*].
     #[command(subcommand)]
     Workflow(WorkflowCommands),
-    /// Manage event triggers (list, create, delete) [*].
+    /// Manage durable tasks (list, get, create, update, delete, replan) [*].
+    #[command(subcommand)]
+    Task(TaskCommands),
+    /// Manage durable subtasks (list, get, create, update, delete) [*].
+    #[command(subcommand)]
+    Subtask(SubtaskCommands),
+    /// Manage workflow runs (list, inspect, signal, control, watch) [*].
+    #[command(subcommand)]
+    Run(RunCommands),
+    /// Manage durable dispatches (list, inspect, retry, cancel, watch) [*].
+    #[command(subcommand)]
+    Dispatch(DispatchCommands),
+    /// Manage HITL requests (list, inspect, answer, cancel, watch) [*].
+    #[command(subcommand)]
+    Hitl(HitlCommands),
+    /// Manage looper runs (list, inspect, create, control, watch) [*].
+    #[command(subcommand)]
+    Looper(LooperCommands),
+    /// Send or simulate event ingress payloads [*].
+    #[command(subcommand)]
+    Event(EventCommands),
+    /// Browse immutable workflow artifacts (list, inspect, versions) [*].
+    #[command(subcommand)]
+    Artifact(ArtifactCommands),
+    /// Browse immutable workflow docs (list, inspect, versions) [*].
+    #[command(subcommand)]
+    Doc(DocCommands),
+    /// Manage installed packs (list, inspect, install, upgrade, uninstall, fork) [*].
+    #[command(subcommand)]
+    Pack(PackCommands),
+    /// Manage event triggers (legacy + Trigger v2 operations) [*].
     #[command(subcommand)]
     Trigger(TriggerCommands),
     /// Migrate from another agent framework to OpenFang.
@@ -551,6 +583,494 @@ enum WorkflowCommands {
 }
 
 #[derive(Subcommand)]
+enum TaskCommands {
+    /// List durable tasks with optional filters.
+    List {
+        /// Optional task status filter.
+        #[arg(long)]
+        status: Option<String>,
+        /// Optional task priority filter.
+        #[arg(long)]
+        priority: Option<String>,
+        /// Maximum number of tasks to return.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get task details by ID.
+    Get {
+        /// Task ID.
+        task_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a task from a JSON file.
+    Create {
+        /// Path to a JSON file describing the task.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Update a task from a JSON file.
+    Update {
+        /// Task ID.
+        task_id: String,
+        /// Path to a JSON file with the updated task definition.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Delete a task by ID.
+    Delete {
+        /// Task ID.
+        task_id: String,
+    },
+    /// Replan a task from a JSON file.
+    Replan {
+        /// Task ID.
+        task_id: String,
+        /// Path to a JSON file with replan operations.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// List subtasks for a task.
+    Subtasks {
+        /// Task ID.
+        task_id: String,
+        /// Optional subtask status filter.
+        #[arg(long)]
+        status: Option<String>,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List artifacts linked to a task.
+    Artifacts {
+        /// Task ID.
+        task_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List docs linked to a task.
+    Docs {
+        /// Task ID.
+        task_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SubtaskCommands {
+    /// List durable subtasks with optional filters.
+    List {
+        /// Optional parent task filter.
+        #[arg(long = "task_id")]
+        task_id: Option<String>,
+        /// Optional subtask status filter.
+        #[arg(long)]
+        status: Option<String>,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get subtask details by ID.
+    Get {
+        /// Subtask ID.
+        subtask_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a subtask from a JSON file.
+    Create {
+        /// Parent task ID.
+        task_id: String,
+        /// Path to a JSON file describing the subtask.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Update a subtask from a JSON file.
+    Update {
+        /// Subtask ID.
+        subtask_id: String,
+        /// Path to a JSON file with the updated subtask definition.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Delete a subtask by ID.
+    Delete {
+        /// Subtask ID.
+        subtask_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RunCommands {
+    /// List workflow runs with optional filters.
+    List {
+        /// Optional workflow ID filter.
+        #[arg(long = "workflow_id")]
+        workflow_id: Option<String>,
+        /// Optional run status filter.
+        #[arg(long)]
+        status: Option<String>,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get run details by ID.
+    Get {
+        /// Run ID.
+        run_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List dispatches for a run.
+    Dispatches {
+        /// Run ID.
+        run_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List HITL requests for a run.
+    Hitl {
+        /// Run ID.
+        run_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List signals for a run.
+    Signals {
+        /// Run ID.
+        run_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit a signal to a run with inline JSON payload.
+    Signal {
+        /// Run ID.
+        run_id: String,
+        /// Signal name.
+        name: String,
+        /// Signal payload encoded as JSON.
+        payload_json: String,
+    },
+    /// List checkpoints for a run.
+    Checkpoints {
+        /// Run ID.
+        run_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause a run.
+    Pause {
+        /// Run ID.
+        run_id: String,
+    },
+    /// Resume a paused run.
+    Resume {
+        /// Run ID.
+        run_id: String,
+    },
+    /// Cancel a run.
+    Cancel {
+        /// Run ID.
+        run_id: String,
+    },
+    /// Watch run events over SSE.
+    Watch {
+        /// Run ID.
+        run_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DispatchCommands {
+    /// List dispatches with optional filters.
+    List {
+        /// Optional run ID filter.
+        #[arg(long = "run_id")]
+        run_id: Option<String>,
+        /// Optional dispatch status filter.
+        #[arg(long)]
+        status: Option<String>,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get dispatch details by ID.
+    Get {
+        /// Dispatch ID.
+        dispatch_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List child dispatches for a dispatch.
+    Children {
+        /// Parent dispatch ID.
+        dispatch_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retry a failed or cancelled dispatch.
+    Retry {
+        /// Dispatch ID.
+        dispatch_id: String,
+    },
+    /// Cancel a pending or running dispatch.
+    Cancel {
+        /// Dispatch ID.
+        dispatch_id: String,
+    },
+    /// Watch dispatch events over SSE.
+    Watch {
+        /// Dispatch ID.
+        dispatch_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum HitlCommands {
+    /// List HITL requests with optional filters.
+    List {
+        /// Optional run ID filter.
+        #[arg(long = "run_id")]
+        run_id: Option<String>,
+        /// Optional HITL status filter.
+        #[arg(long)]
+        status: Option<String>,
+        /// Optional HITL kind filter.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get HITL request details by ID.
+    Get {
+        /// HITL request ID.
+        hitl_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Answer a HITL request with a plain-text response.
+    Answer {
+        /// HITL request ID.
+        hitl_id: String,
+        /// Human response text.
+        response: String,
+    },
+    /// Cancel a pending HITL request.
+    Cancel {
+        /// HITL request ID.
+        hitl_id: String,
+    },
+    /// Watch the global HITL request stream over SSE.
+    Watch,
+}
+
+#[derive(Subcommand)]
+enum LooperCommands {
+    /// List looper runs with optional filters.
+    List {
+        /// Optional task ID filter.
+        #[arg(long = "task_id")]
+        task_id: Option<String>,
+        /// Optional looper status filter.
+        #[arg(long)]
+        status: Option<String>,
+        /// Optional execution mode filter.
+        #[arg(long = "execution_mode")]
+        execution_mode: Option<String>,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get looper run details by ID.
+    Get {
+        /// Looper run ID.
+        looper_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a looper run from a JSON request file.
+    Create {
+        /// Path to the JSON request file.
+        file: PathBuf,
+    },
+    /// List the looper subtask execution view.
+    Subtasks {
+        /// Looper run ID.
+        looper_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause a looper run.
+    Pause {
+        /// Looper run ID.
+        looper_id: String,
+    },
+    /// Resume a looper run.
+    Resume {
+        /// Looper run ID.
+        looper_id: String,
+    },
+    /// Cancel a looper run.
+    Cancel {
+        /// Looper run ID.
+        looper_id: String,
+    },
+    /// Watch looper run events over SSE.
+    Watch {
+        /// Looper run ID.
+        looper_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventCommands {
+    /// Send an event payload to the ingress pipeline.
+    Send {
+        /// JSON file containing the event ingress request.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Evaluate an event payload without dispatching matched targets.
+    DryRun {
+        /// JSON file containing the event ingress request.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ArtifactCommands {
+    /// List standalone artifacts with optional filters.
+    List {
+        /// Optional artifact type filter.
+        #[arg(long = "type")]
+        type_filter: Option<String>,
+        /// Optional linked task ID filter.
+        #[arg(long = "task_id")]
+        task_id: Option<String>,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get artifact details by ID.
+    Get {
+        /// Artifact ID.
+        artifact_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List immutable version history for an artifact.
+    Versions {
+        /// Artifact ID.
+        artifact_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocCommands {
+    /// List standalone docs with optional filters.
+    List {
+        /// Optional doc type filter.
+        #[arg(long = "type")]
+        type_filter: Option<String>,
+        /// Optional linked task ID filter.
+        #[arg(long = "task_id")]
+        task_id: Option<String>,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get doc details by ID.
+    Get {
+        /// Doc ID.
+        doc_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List immutable version history for a doc.
+    Versions {
+        /// Doc ID.
+        doc_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PackCommands {
+    /// List installed packs.
+    List {
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get one installed pack by ID.
+    Get {
+        /// Pack ID.
+        pack_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List managed objects within one pack.
+    Objects {
+        /// Pack ID.
+        pack_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install a bundled pack or a staged/local/remote external pack source.
+    Install {
+        /// Pack name, local path, or URL.
+        source: String,
+    },
+    /// Upgrade one installed pack; use --dry-run to preview changes.
+    Upgrade {
+        /// Pack ID.
+        pack_id: String,
+        /// Show the upgrade effects without mutating the pack.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Uninstall one pack by ID.
+    Uninstall {
+        /// Pack ID.
+        pack_id: String,
+    },
+    /// Fork all managed objects in one pack into user-owned shadows.
+    Fork {
+        /// Pack ID.
+        pack_id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum TriggerCommands {
     /// List all triggers (optionally filtered by agent).
     List {
@@ -575,6 +1095,64 @@ enum TriggerCommands {
     Delete {
         /// Trigger ID (UUID).
         trigger_id: String,
+    },
+    /// Get one Trigger v2 definition by ID.
+    Get {
+        /// Trigger definition ID.
+        trigger_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update one Trigger v2 definition from a JSON file.
+    Update {
+        /// Trigger definition ID.
+        trigger_id: String,
+        /// Path to the trigger definition JSON file.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Enable one Trigger v2 definition.
+    Enable {
+        /// Trigger definition ID.
+        trigger_id: String,
+    },
+    /// Disable one Trigger v2 definition.
+    Disable {
+        /// Trigger definition ID.
+        trigger_id: String,
+    },
+    /// Test one Trigger v2 definition against an inline event JSON payload.
+    Test {
+        /// Trigger definition ID.
+        trigger_id: String,
+        /// Inline JSON event payload.
+        event_json: String,
+    },
+    /// Fork one managed Trigger v2 definition into a user-owned shadow copy.
+    Fork {
+        /// Trigger definition ID.
+        trigger_id: String,
+    },
+    /// Validate one Trigger v2 definition from a JSON file.
+    Validate {
+        /// Path to the trigger definition JSON file.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Compile one Trigger v2 definition from a JSON file.
+    Compile {
+        /// Path to the trigger definition JSON file.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Show runtime state for one Trigger v2 definition.
+    Runtime {
+        /// Trigger definition ID.
+        trigger_id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -946,6 +1524,137 @@ fn main() {
             WorkflowCommands::Delete { workflow_id } => cmd_workflow_delete(&workflow_id),
             WorkflowCommands::Run { workflow_id, input } => cmd_workflow_run(&workflow_id, &input),
         },
+        Some(Commands::Task(sub)) => match sub {
+            TaskCommands::List {
+                status,
+                priority,
+                limit,
+                json,
+            } => cmd_task_list(status.as_deref(), priority.as_deref(), limit, json),
+            TaskCommands::Get { task_id, json } => cmd_task_get(&task_id, json),
+            TaskCommands::Create { file } => cmd_task_create(file),
+            TaskCommands::Update { task_id, file } => cmd_task_update(&task_id, file),
+            TaskCommands::Delete { task_id } => cmd_task_delete(&task_id),
+            TaskCommands::Replan { task_id, file } => cmd_task_replan(&task_id, file),
+            TaskCommands::Subtasks {
+                task_id,
+                status,
+                json,
+            } => cmd_task_subtasks(&task_id, status.as_deref(), json),
+            TaskCommands::Artifacts { task_id, json } => cmd_task_artifacts(&task_id, json),
+            TaskCommands::Docs { task_id, json } => cmd_task_docs(&task_id, json),
+        },
+        Some(Commands::Subtask(sub)) => match sub {
+            SubtaskCommands::List {
+                task_id,
+                status,
+                json,
+            } => cmd_subtask_list(task_id.as_deref(), status.as_deref(), json),
+            SubtaskCommands::Get { subtask_id, json } => cmd_subtask_get(&subtask_id, json),
+            SubtaskCommands::Create { task_id, file } => cmd_subtask_create(&task_id, file),
+            SubtaskCommands::Update { subtask_id, file } => cmd_subtask_update(&subtask_id, file),
+            SubtaskCommands::Delete { subtask_id } => cmd_subtask_delete(&subtask_id),
+        },
+        Some(Commands::Run(sub)) => match sub {
+            RunCommands::List {
+                workflow_id,
+                status,
+                json,
+            } => cmd_run_list(workflow_id.as_deref(), status.as_deref(), json),
+            RunCommands::Get { run_id, json } => cmd_run_get(&run_id, json),
+            RunCommands::Dispatches { run_id, json } => cmd_run_dispatches(&run_id, json),
+            RunCommands::Hitl { run_id, json } => cmd_run_hitl(&run_id, json),
+            RunCommands::Signals { run_id, json } => cmd_run_signals(&run_id, json),
+            RunCommands::Signal {
+                run_id,
+                name,
+                payload_json,
+            } => cmd_run_signal(&run_id, &name, &payload_json),
+            RunCommands::Checkpoints { run_id, json } => cmd_run_checkpoints(&run_id, json),
+            RunCommands::Pause { run_id } => cmd_run_pause(&run_id),
+            RunCommands::Resume { run_id } => cmd_run_resume(&run_id),
+            RunCommands::Cancel { run_id } => cmd_run_cancel(&run_id),
+            RunCommands::Watch { run_id } => cmd_run_watch(&run_id),
+        },
+        Some(Commands::Dispatch(sub)) => match sub {
+            DispatchCommands::List {
+                run_id,
+                status,
+                json,
+            } => cmd_dispatch_list(run_id.as_deref(), status.as_deref(), json),
+            DispatchCommands::Get { dispatch_id, json } => cmd_dispatch_get(&dispatch_id, json),
+            DispatchCommands::Children { dispatch_id, json } => {
+                cmd_dispatch_children(&dispatch_id, json)
+            }
+            DispatchCommands::Retry { dispatch_id } => cmd_dispatch_retry(&dispatch_id),
+            DispatchCommands::Cancel { dispatch_id } => cmd_dispatch_cancel(&dispatch_id),
+            DispatchCommands::Watch { dispatch_id } => cmd_dispatch_watch(&dispatch_id),
+        },
+        Some(Commands::Hitl(sub)) => match sub {
+            HitlCommands::List {
+                run_id,
+                status,
+                kind,
+                json,
+            } => cmd_hitl_list(run_id.as_deref(), status.as_deref(), kind.as_deref(), json),
+            HitlCommands::Get { hitl_id, json } => cmd_hitl_get(&hitl_id, json),
+            HitlCommands::Answer { hitl_id, response } => cmd_hitl_answer(&hitl_id, &response),
+            HitlCommands::Cancel { hitl_id } => cmd_hitl_cancel(&hitl_id),
+            HitlCommands::Watch => cmd_hitl_watch(),
+        },
+        Some(Commands::Looper(sub)) => match sub {
+            LooperCommands::List {
+                task_id,
+                status,
+                execution_mode,
+                json,
+            } => cmd_looper_list(
+                task_id.as_deref(),
+                status.as_deref(),
+                execution_mode.as_deref(),
+                json,
+            ),
+            LooperCommands::Get { looper_id, json } => cmd_looper_get(&looper_id, json),
+            LooperCommands::Create { file } => cmd_looper_create(file),
+            LooperCommands::Subtasks { looper_id, json } => cmd_looper_subtasks(&looper_id, json),
+            LooperCommands::Pause { looper_id } => cmd_looper_pause(&looper_id),
+            LooperCommands::Resume { looper_id } => cmd_looper_resume(&looper_id),
+            LooperCommands::Cancel { looper_id } => cmd_looper_cancel(&looper_id),
+            LooperCommands::Watch { looper_id } => cmd_looper_watch(&looper_id),
+        },
+        Some(Commands::Event(sub)) => match sub {
+            EventCommands::Send { file } => cmd_event_send(file),
+            EventCommands::DryRun { file } => cmd_event_dry_run(file),
+        },
+        Some(Commands::Artifact(sub)) => match sub {
+            ArtifactCommands::List {
+                type_filter,
+                task_id,
+                json,
+            } => cmd_artifact_list(type_filter.as_deref(), task_id.as_deref(), json),
+            ArtifactCommands::Get { artifact_id, json } => cmd_artifact_get(&artifact_id, json),
+            ArtifactCommands::Versions { artifact_id, json } => {
+                cmd_artifact_versions(&artifact_id, json)
+            }
+        },
+        Some(Commands::Doc(sub)) => match sub {
+            DocCommands::List {
+                type_filter,
+                task_id,
+                json,
+            } => cmd_doc_list(type_filter.as_deref(), task_id.as_deref(), json),
+            DocCommands::Get { doc_id, json } => cmd_doc_get(&doc_id, json),
+            DocCommands::Versions { doc_id, json } => cmd_doc_versions(&doc_id, json),
+        },
+        Some(Commands::Pack(sub)) => match sub {
+            PackCommands::List { json } => cmd_pack_list(json),
+            PackCommands::Get { pack_id, json } => cmd_pack_get(&pack_id, json),
+            PackCommands::Objects { pack_id, json } => cmd_pack_objects(&pack_id, json),
+            PackCommands::Install { source } => cmd_pack_install(&source),
+            PackCommands::Upgrade { pack_id, dry_run } => cmd_pack_upgrade(&pack_id, dry_run),
+            PackCommands::Uninstall { pack_id } => cmd_pack_uninstall(&pack_id),
+            PackCommands::Fork { pack_id } => cmd_pack_fork(&pack_id),
+        },
         Some(Commands::Trigger(sub)) => match sub {
             TriggerCommands::List { agent_id } => cmd_trigger_list(agent_id.as_deref()),
             TriggerCommands::Create {
@@ -955,6 +1664,18 @@ fn main() {
                 max_fires,
             } => cmd_trigger_create(&agent_id, &pattern_json, &prompt, max_fires),
             TriggerCommands::Delete { trigger_id } => cmd_trigger_delete(&trigger_id),
+            TriggerCommands::Get { trigger_id, json } => cmd_trigger_get(&trigger_id, json),
+            TriggerCommands::Update { trigger_id, file } => cmd_trigger_update(&trigger_id, file),
+            TriggerCommands::Enable { trigger_id } => cmd_trigger_enable(&trigger_id),
+            TriggerCommands::Disable { trigger_id } => cmd_trigger_disable(&trigger_id),
+            TriggerCommands::Test {
+                trigger_id,
+                event_json,
+            } => cmd_trigger_test(&trigger_id, &event_json),
+            TriggerCommands::Fork { trigger_id } => cmd_trigger_fork(&trigger_id),
+            TriggerCommands::Validate { file } => cmd_trigger_validate(file),
+            TriggerCommands::Compile { file } => cmd_trigger_compile(file),
+            TriggerCommands::Runtime { trigger_id, json } => cmd_trigger_runtime(&trigger_id, json),
         },
         Some(Commands::Migrate(args)) => cmd_migrate(args),
         Some(Commands::Skill(sub)) => match sub {
@@ -1134,6 +1855,28 @@ pub(crate) fn find_daemon() -> Option<String> {
 pub(crate) fn daemon_client() -> reqwest::blocking::Client {
     let mut builder =
         reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(120));
+
+    if let Some(key) = read_api_key() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
+            headers.insert(reqwest::header::AUTHORIZATION, val);
+        }
+        builder = builder.default_headers(headers);
+    }
+
+    builder.build().expect("Failed to build HTTP client")
+}
+
+/// Build an HTTP client for daemon event streams.
+///
+/// The regular daemon client uses a 120s timeout, which is appropriate for
+/// request/response commands but wrong for indefinite SSE streams. For watch
+/// commands we only enforce a short connect timeout and otherwise disable the
+/// global request timeout so the stream can stay open.
+pub(crate) fn daemon_watch_client() -> reqwest::blocking::Client {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(Option::<std::time::Duration>::None)
+        .connect_timeout(Some(std::time::Duration::from_secs(5)));
 
     if let Some(key) = read_api_key() {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -3136,6 +3879,1755 @@ fn cmd_completion(shell: clap_complete::Shell) {
 // Workflow commands
 // ---------------------------------------------------------------------------
 
+fn read_json_file_or_exit(file: &std::path::Path, label: &str) -> serde_json::Value {
+    if !file.exists() {
+        ui::error_with_fix(
+            &format!("{label} file not found: {}", file.display()),
+            "Check the path and try again",
+        );
+        std::process::exit(1);
+    }
+
+    let contents = std::fs::read_to_string(file).unwrap_or_else(|e| {
+        ui::error_with_fix(
+            &format!("Failed to read {label} file: {}", file.display()),
+            &e.to_string(),
+        );
+        std::process::exit(1);
+    });
+
+    serde_json::from_str(&contents).unwrap_or_else(|e| {
+        ui::error_with_fix(
+            &format!("Invalid JSON in {}", file.display()),
+            &e.to_string(),
+        );
+        std::process::exit(1);
+    })
+}
+
+fn daemon_error_message(body: &serde_json::Value) -> Option<String> {
+    let error = body.get("error")?;
+    error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| error.as_str().map(str::to_string))
+}
+
+fn print_json_value(value: &serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    );
+}
+
+fn list_json_value(body: &serde_json::Value) -> serde_json::Value {
+    body.get("items").cloned().unwrap_or_else(|| body.clone())
+}
+
+fn list_items(body: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    body.get("items")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| body.as_array())
+}
+
+fn event_effect_count(effects: &serde_json::Value) -> u64 {
+    ["workflow_starts", "workflow_signals", "agent_messages"]
+        .into_iter()
+        .filter_map(|field| effects.get(field).and_then(serde_json::Value::as_u64))
+        .sum()
+}
+
+fn yes_no_text(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn bool_text(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn actor_ref_text(value: &serde_json::Value) -> Option<String> {
+    let kind = value.get("kind").and_then(serde_json::Value::as_str)?;
+    let ref_id = value
+        .get("ref")
+        .or_else(|| value.get("ref_id"))
+        .and_then(serde_json::Value::as_str)?;
+    Some(format!("{kind}:{ref_id}"))
+}
+
+fn truncate_text(text: &str, max_width: usize) -> String {
+    if text.chars().count() <= max_width {
+        return text.to_string();
+    }
+
+    let keep = max_width.saturating_sub(3);
+    format!("{}...", text.chars().take(keep).collect::<String>())
+}
+
+fn task_owner_text(item: &serde_json::Value) -> String {
+    item.get("owner")
+        .and_then(actor_ref_text)
+        .or_else(|| item.get("created_by").and_then(actor_ref_text))
+        .or_else(|| {
+            item.get("source")
+                .and_then(|source| source.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn task_created_text(item: &serde_json::Value) -> &str {
+    item.get("created_at")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| item.get("updated_at").and_then(serde_json::Value::as_str))
+        .unwrap_or("?")
+}
+
+fn subtask_kind_text(item: &serde_json::Value) -> String {
+    item.get("kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn subtask_assignee_text(item: &serde_json::Value) -> String {
+    item.get("assignee")
+        .and_then(actor_ref_text)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn print_task_list_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<24} {:<32} {:<12} {:<10} {:<20} CREATED",
+        "ID", "TITLE", "STATUS", "PRIORITY", "OWNER"
+    );
+    println!("{}", "-".repeat(122));
+    for item in items {
+        println!(
+            "{:<24} {:<32} {:<12} {:<10} {:<20} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                item.get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                32,
+            ),
+            item.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("priority")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(&task_owner_text(item), 20),
+            task_created_text(item),
+        );
+    }
+}
+
+fn print_subtask_list_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<24} {:<24} {:<28} {:<12} {:<14} ASSIGNEE",
+        "ID", "TASK_ID", "TITLE", "STATUS", "KIND"
+    );
+    println!("{}", "-".repeat(122));
+    for item in items {
+        println!(
+            "{:<24} {:<24} {:<28} {:<12} {:<14} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                item.get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                28,
+            ),
+            item.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(&subtask_kind_text(item), 14),
+            truncate_text(&subtask_assignee_text(item), 24),
+        );
+    }
+}
+
+fn print_task_link_refs_table(
+    items: &[serde_json::Value],
+    id_column: &str,
+    id_key: &str,
+    empty_message: &str,
+) {
+    if items.is_empty() {
+        println!("{empty_message}");
+        return;
+    }
+
+    println!("{:<24} {:<16} VERSION", id_column, "TYPE");
+    println!("{}", "-".repeat(72));
+    for item in items {
+        println!(
+            "{:<24} {:<16} {}",
+            item.get(id_key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("type")
+                .or_else(|| item.get("type_name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("current_version_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-"),
+        );
+    }
+}
+
+fn pack_source_kind_text(item: &serde_json::Value) -> String {
+    item.get("source")
+        .and_then(|source| source.get("kind"))
+        .or_else(|| item.get("source_kind"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn pack_object_total(item: &serde_json::Value) -> u64 {
+    item.get("objects")
+        .and_then(serde_json::Value::as_object)
+        .map(|counts| {
+            counts
+                .values()
+                .filter_map(serde_json::Value::as_u64)
+                .sum::<u64>()
+        })
+        .unwrap_or(0)
+}
+
+fn print_pack_list_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<20} {:<24} {:<10} {:<10} {:<8} INSTALLED",
+        "ID", "NAME", "VERSION", "SOURCE", "OBJECTS"
+    );
+    println!("{}", "-".repeat(88));
+    for item in items {
+        println!(
+            "{:<20} {:<24} {:<10} {:<10} {:<8} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                item.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                24,
+            ),
+            item.get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(&pack_source_kind_text(item), 10),
+            pack_object_total(item),
+            item.get("installed")
+                .and_then(serde_json::Value::as_bool)
+                .map(yes_no_text)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn print_pack_detail(body: &serde_json::Value) {
+    println!(
+        "Pack: {}",
+        body.get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Name:        {}",
+        body.get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Version:     {}",
+        body.get("version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!("  Source:      {}", pack_source_kind_text(body));
+    println!(
+        "  Installed:   {}",
+        body.get("installed")
+            .and_then(serde_json::Value::as_bool)
+            .map(yes_no_text)
+            .unwrap_or("?"),
+    );
+    println!(
+        "  Managed:     {}",
+        body.get("managed")
+            .and_then(serde_json::Value::as_bool)
+            .map(yes_no_text)
+            .unwrap_or("?"),
+    );
+    println!(
+        "  Updated at:  {}",
+        body.get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Description: {}",
+        body.get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!("  Objects:");
+    println!(
+        "    total:     {}",
+        body.get("objects")
+            .map(pack_object_total)
+            .unwrap_or_default()
+    );
+    for (label, key) in [
+        ("agents", "agents"),
+        ("workflows", "workflows"),
+        ("triggers", "triggers"),
+        ("schedules", "schedules"),
+        ("templates", "templates"),
+    ] {
+        println!(
+            "    {:<10} {}",
+            label,
+            body.get("objects")
+                .and_then(|value| value.get(key))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+    }
+}
+
+fn print_pack_objects_table(items: &[serde_json::Value]) {
+    println!("{:<12} {:<32} STATUS", "TYPE", "NAME");
+    println!("{}", "-".repeat(60));
+    for item in items {
+        println!(
+            "{:<12} {:<32} {}",
+            item.get("resource_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                item.get("resource_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                32,
+            ),
+            if item
+                .get("forked")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                "forked"
+            } else {
+                "managed"
+            },
+        );
+    }
+}
+
+fn print_pack_upgrade_dry_run(pack_id: &str, target_version: &str, body: &serde_json::Value) {
+    ui::success(&format!("Pack {pack_id} upgrade dry-run completed."));
+    println!(
+        "  Would execute:   {}",
+        body.get("would_execute")
+            .and_then(serde_json::Value::as_bool)
+            .map(yes_no_text)
+            .unwrap_or("?"),
+    );
+    println!(
+        "  From version:    {}",
+        body.get("resolved")
+            .and_then(|value| value.get("from_version"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!("  To version:      {target_version}");
+    println!(
+        "  Added:           {}",
+        body.get("effects")
+            .and_then(|value| value.get("managed_objects_added"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Updated:         {}",
+        body.get("effects")
+            .and_then(|value| value.get("managed_objects_updated"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Removed:         {}",
+        body.get("effects")
+            .and_then(|value| value.get("managed_objects_removed"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Forks untouched: {}",
+        body.get("effects")
+            .and_then(|value| value.get("forks_untouched"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Managed only:    {}",
+        body.get("explanation")
+            .and_then(|value| value.get("managed_objects_only"))
+            .and_then(serde_json::Value::as_bool)
+            .map(yes_no_text)
+            .unwrap_or("?"),
+    );
+    println!(
+        "  Forks detached:  {}",
+        body.get("explanation")
+            .and_then(|value| value.get("forks_remain_detached"))
+            .and_then(serde_json::Value::as_bool)
+            .map(yes_no_text)
+            .unwrap_or("?"),
+    );
+}
+
+fn versioned_resource_type_text<'a>(item: &'a serde_json::Value, type_key: &str) -> &'a str {
+    item.get(type_key)
+        .or_else(|| item.get("type"))
+        .or_else(|| item.get("type_name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?")
+}
+
+fn versioned_resource_task_id_text(item: &serde_json::Value) -> &str {
+    item.get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-")
+}
+
+fn versioned_resource_title_from_content(content: &serde_json::Value) -> Option<String> {
+    if let Some(title) = content.get("title").and_then(serde_json::Value::as_str) {
+        return Some(title.to_string());
+    }
+
+    if let Some(summary) = content.get("summary").and_then(serde_json::Value::as_str) {
+        return Some(summary.to_string());
+    }
+
+    if let Some(name) = content.get("name").and_then(serde_json::Value::as_str) {
+        return Some(name.to_string());
+    }
+
+    content.as_str().map(str::to_string)
+}
+
+fn versioned_resource_title_text(item: &serde_json::Value) -> String {
+    item.get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            item.get("metadata")
+                .and_then(|metadata| metadata.get("title"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            item.get("current_version")
+                .and_then(|version| version.get("content"))
+                .and_then(versioned_resource_title_from_content)
+        })
+        .or_else(|| {
+            item.get("content")
+                .and_then(versioned_resource_title_from_content)
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn versioned_resource_version_text(item: &serde_json::Value) -> &str {
+    item.get("current_version_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-")
+}
+
+fn print_versioned_resource_list_table(items: &[serde_json::Value], type_key: &str) {
+    println!(
+        "{:<24} {:<16} {:<28} {:<20} {:<24} CREATED",
+        "ID", "TYPE", "TITLE", "VERSION", "TASK_ID"
+    );
+    println!("{}", "-".repeat(148));
+    for item in items {
+        println!(
+            "{:<24} {:<16} {:<28} {:<20} {:<24} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(versioned_resource_type_text(item, type_key), 16),
+            truncate_text(&versioned_resource_title_text(item), 28),
+            truncate_text(versioned_resource_version_text(item), 20),
+            truncate_text(versioned_resource_task_id_text(item), 24),
+            task_created_text(item),
+        );
+    }
+}
+
+fn version_summary_created_by_kind_text(item: &serde_json::Value) -> &str {
+    item.get("created_by")
+        .and_then(|created_by| created_by.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-")
+}
+
+fn version_summary_created_by_ref_text(item: &serde_json::Value) -> &str {
+    item.get("created_by")
+        .and_then(|created_by| created_by.get("ref"))
+        .or_else(|| {
+            item.get("created_by")
+                .and_then(|created_by| created_by.get("ref_id"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-")
+}
+
+fn version_summary_created_by_text(item: &serde_json::Value) -> String {
+    item.get("created_by")
+        .and_then(actor_ref_text)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn print_versioned_resource_content(content: Option<&serde_json::Value>) {
+    println!("  Current content:");
+    match content {
+        Some(value) => {
+            let rendered = if value.is_string() {
+                value.as_str().map(str::to_string).unwrap_or_default()
+            } else {
+                serde_json::to_string_pretty(value).unwrap_or_default()
+            };
+            for line in rendered.lines() {
+                println!("    {line}");
+            }
+        }
+        None => println!("    <not provided by daemon API>"),
+    }
+}
+
+fn print_versioned_resource_detail(
+    resource_label: &str,
+    type_label: &str,
+    type_key: &str,
+    body: &serde_json::Value,
+) {
+    let current_version = body
+        .get("current_version")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    println!(
+        "{resource_label}: {}",
+        body.get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  {type_label:<18}{}",
+        versioned_resource_type_text(body, type_key)
+    );
+    println!(
+        "  {:<18}{}",
+        "Task ID:",
+        versioned_resource_task_id_text(body)
+    );
+    println!("  {:<18}{}", "Title:", versioned_resource_title_text(body));
+    println!(
+        "  {:<18}{}",
+        "Current version:",
+        body.get("current_version_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  {:<18}{}",
+        "Version number:",
+        current_version
+            .get("version_number")
+            .and_then(serde_json::Value::as_i64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "  {:<18}{}",
+        "Content hash:",
+        current_version
+            .get("content_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  {:<18}{}",
+        "Created by kind:",
+        version_summary_created_by_kind_text(&current_version)
+    );
+    println!(
+        "  {:<18}{}",
+        "Created by ref:",
+        version_summary_created_by_ref_text(&current_version)
+    );
+    println!(
+        "  {:<18}{}",
+        "Created:",
+        body.get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  {:<18}{}",
+        "Updated:",
+        body.get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  {:<18}{}",
+        "Version created:",
+        current_version
+            .get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    print_versioned_resource_content(
+        current_version
+            .get("content")
+            .or_else(|| body.get("content")),
+    );
+}
+
+fn print_versioned_resource_versions_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<10} {:<72} {:<24} CREATED_AT",
+        "VERSION", "HASH", "CREATED_BY"
+    );
+    println!("{}", "-".repeat(134));
+    for item in items {
+        println!(
+            "{:<10} {:<72} {:<24} {}",
+            item.get("version_number")
+                .and_then(serde_json::Value::as_i64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            item.get("content_hash")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(&version_summary_created_by_text(item), 24),
+            item.get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn print_task_detail(body: &serde_json::Value) {
+    println!(
+        "Task: {}",
+        body.get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  ID:          {}",
+        body.get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Slug:        {}",
+        body.get("slug")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Status:      {}",
+        body.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Priority:    {}",
+        body.get("priority")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Owner:       {}",
+        body.get("owner")
+            .and_then(actor_ref_text)
+            .unwrap_or_else(|| "?".to_string())
+    );
+    println!(
+        "  Created:     {}",
+        body.get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Updated:     {}",
+        body.get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Description: {}",
+        body.get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    );
+}
+
+fn print_subtask_detail(body: &serde_json::Value) {
+    println!(
+        "Subtask: {}",
+        body.get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  ID:          {}",
+        body.get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Task ID:     {}",
+        body.get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Status:      {}",
+        body.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Kind:        {}",
+        body.get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Assignee:    {}",
+        body.get("assignee")
+            .and_then(actor_ref_text)
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "  Created:     {}",
+        body.get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Updated:     {}",
+        body.get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Description: {}",
+        body.get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    );
+}
+
+fn run_steps_text(item: &serde_json::Value) -> String {
+    if let Some(step_id) = item
+        .get("current_step_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        return step_id.to_string();
+    }
+
+    if let Some(waiting_kind) = item.get("waiting_kind").and_then(serde_json::Value::as_str) {
+        return format!("wait:{waiting_kind}");
+    }
+
+    "-".to_string()
+}
+
+fn print_run_list_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<24} {:<24} {:<16} {:<24} {:<20} UPDATED",
+        "ID", "WORKFLOW", "STATUS", "STEPS", "STARTED"
+    );
+    println!("{}", "-".repeat(136));
+    for item in items {
+        println!(
+            "{:<24} {:<24} {:<16} {:<24} {:<20} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                item.get("workflow_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                24,
+            ),
+            item.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(&run_steps_text(item), 24),
+            item.get("started_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("updated_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn print_run_detail(body: &serde_json::Value) {
+    println!(
+        "Run: {}",
+        body.get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Workflow:           {}",
+        body.get("workflow_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Version:            {}",
+        body.get("workflow_version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Status:             {}",
+        body.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Current step:       {}",
+        body.get("current_step_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Waiting kind:       {}",
+        body.get("waiting_kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Waiting ref:        {}",
+        body.get("waiting_ref")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Active dispatch:    {}",
+        body.get("active_dispatch_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Active HITL:        {}",
+        body.get("active_hitl_request_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Started:            {}",
+        body.get("started_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Updated:            {}",
+        body.get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Completed:          {}",
+        body.get("completed_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    if let Some(error) = body.get("error") {
+        if !error.is_null() {
+            println!(
+                "  Error:              {}",
+                truncate_text(&error.to_string(), 72)
+            );
+        }
+    }
+}
+
+fn dispatch_step_text(item: &serde_json::Value) -> String {
+    item.get("step_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn dispatch_target_text(item: &serde_json::Value) -> &str {
+    item.get("target_agent")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?")
+}
+
+fn print_dispatch_list_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<24} {:<24} {:<18} {:<12} {:<20} {:<16} UPDATED",
+        "ID", "RUN_ID", "STEP", "KIND", "TARGET", "STATUS"
+    );
+    println!("{}", "-".repeat(140));
+    for item in items {
+        println!(
+            "{:<24} {:<24} {:<18} {:<12} {:<20} {:<16} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(&dispatch_step_text(item), 18),
+            item.get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(dispatch_target_text(item), 20),
+            item.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("updated_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn print_dispatch_detail(body: &serde_json::Value) {
+    println!(
+        "Dispatch: {}",
+        body.get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Run ID:             {}",
+        body.get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Step:               {}",
+        body.get("step_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Kind:               {}",
+        body.get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Target:             {}",
+        body.get("target_agent")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Status:             {}",
+        body.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Attempt:            {}",
+        body.get("attempt")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Parent dispatch:    {}",
+        body.get("parent_dispatch_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Spawned agent:      {}",
+        body.get("spawned_agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Started:            {}",
+        body.get("started_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Updated:            {}",
+        body.get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Completed:          {}",
+        body.get("completed_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+}
+
+fn hitl_value_text(
+    value: Option<&serde_json::Value>,
+    empty_text: &str,
+    max_width: usize,
+) -> String {
+    match value {
+        Some(value) if value.is_string() => value
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| truncate_text(&value.to_string(), max_width)),
+        Some(value) if !value.is_null() => truncate_text(&value.to_string(), max_width),
+        _ => empty_text.to_string(),
+    }
+}
+
+fn print_run_hitl_list_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<24} {:<18} {:<14} {:<12} {:<40} CREATED",
+        "ID", "STEP", "KIND", "STATUS", "QUESTION"
+    );
+    println!("{}", "-".repeat(128));
+    for item in items {
+        println!(
+            "{:<24} {:<18} {:<14} {:<12} {:<40} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                item.get("step_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("-"),
+                18,
+            ),
+            item.get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                item.get("question")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                40,
+            ),
+            item.get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn print_hitl_list_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<24} {:<24} {:<14} {:<12} {:<40} CREATED",
+        "ID", "RUN_ID", "KIND", "STATUS", "QUESTION"
+    );
+    println!("{}", "-".repeat(138));
+    for item in items {
+        println!(
+            "{:<24} {:<24} {:<14} {:<12} {:<40} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                item.get("question")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                40,
+            ),
+            item.get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn print_hitl_detail(body: &serde_json::Value) {
+    println!(
+        "HITL Request: {}",
+        body.get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Run ID:             {}",
+        body.get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Step:               {}",
+        body.get("step_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Dispatch:           {}",
+        body.get("dispatch_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Kind:               {}",
+        body.get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Status:             {}",
+        body.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Sequence:           {}",
+        body.get("sequence_no")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Created:            {}",
+        body.get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Answered:           {}",
+        body.get("answered_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Timeout:            {}",
+        body.get("timeout_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Question:           {}",
+        body.get("question")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    );
+    println!(
+        "  Response:           {}",
+        hitl_value_text(body.get("response"), "-", 72)
+    );
+    println!(
+        "  Context:            {}",
+        hitl_value_text(body.get("context"), "{}", 72)
+    );
+}
+
+fn print_signal_list_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<24} {:<18} {:<16} {:<10} CREATED",
+        "ID", "NAME", "SOURCE", "CONSUMED"
+    );
+    println!("{}", "-".repeat(92));
+    for item in items {
+        println!(
+            "{:<24} {:<18} {:<16} {:<10} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                item.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                18,
+            ),
+            truncate_text(
+                item.get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                16,
+            ),
+            item.get("consumed")
+                .and_then(serde_json::Value::as_bool)
+                .map(|value| if value { "yes" } else { "no" })
+                .unwrap_or("?"),
+            item.get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn print_checkpoint_list_table(items: &[serde_json::Value]) {
+    println!("{:<24} {:<18} {:<24} CREATED", "ID", "STEP", "KIND");
+    println!("{}", "-".repeat(92));
+    for item in items {
+        println!(
+            "{:<24} {:<18} {:<24} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                item.get("step_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("-"),
+                18,
+            ),
+            truncate_text(
+                item.get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                24,
+            ),
+            item.get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn looper_execution_mode_text(item: &serde_json::Value) -> &str {
+    item.get("execution_policy")
+        .and_then(|policy| policy.get("mode"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?")
+}
+
+fn looper_selection_text(item: &serde_json::Value) -> &str {
+    item.get("execution_policy")
+        .and_then(|policy| policy.get("selection"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?")
+}
+
+fn looper_progress_text(item: &serde_json::Value) -> String {
+    format!(
+        "{}/{}",
+        item.get("progress")
+            .and_then(|progress| progress.get("completed"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        item.get("progress")
+            .and_then(|progress| progress.get("total"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    )
+}
+
+fn looper_failed_count(item: &serde_json::Value) -> u64 {
+    item.get("progress")
+        .and_then(|progress| progress.get("failed"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn looper_current_subtask_text(item: &serde_json::Value) -> &str {
+    item.get("current_subtask_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-")
+}
+
+fn looper_max_parallelism_text(item: &serde_json::Value) -> String {
+    item.get("execution_policy")
+        .and_then(|policy| policy.get("max_parallelism"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn print_looper_list_table(items: &[serde_json::Value]) {
+    println!(
+        "{:<24} {:<24} {:<12} {:<12} {:<10} UPDATED",
+        "ID", "TASK_ID", "STATUS", "MODE", "PROGRESS"
+    );
+    println!("{}", "-".repeat(104));
+    for item in items {
+        let progress = looper_progress_text(item);
+        println!(
+            "{:<24} {:<24} {:<12} {:<12} {:<10} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            looper_execution_mode_text(item),
+            progress,
+            item.get("updated_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn print_looper_detail(body: &serde_json::Value) {
+    println!(
+        "Looper Run: {}",
+        body.get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Task ID:            {}",
+        body.get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Source run:         {}",
+        body.get("source_run_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  Status:             {}",
+        body.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!("  Mode:               {}", looper_execution_mode_text(body));
+    println!(
+        "  Max parallelism:    {}",
+        looper_max_parallelism_text(body)
+    );
+    println!("  Selection:          {}", looper_selection_text(body));
+    println!(
+        "  Current subtask:    {}",
+        looper_current_subtask_text(body)
+    );
+    println!("  Progress:           {}", looper_progress_text(body));
+    println!("  Failed:             {}", looper_failed_count(body));
+    println!(
+        "  Started:            {}",
+        body.get("started_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Updated:            {}",
+        body.get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Completed:          {}",
+        body.get("completed_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    if let Some(error) = body.get("error") {
+        if !error.is_null() {
+            println!(
+                "  Error:              {}",
+                truncate_text(&error.to_string(), 72)
+            );
+        }
+    }
+}
+
+fn print_looper_subtask_list_table(items: &[serde_json::Value]) {
+    println!("{:<24} {:<40} {:<12} UPDATED", "ID", "TITLE", "STATUS");
+    println!("{}", "-".repeat(98));
+    for item in items {
+        println!(
+            "{:<24} {:<40} {:<12} {}",
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                item.get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                40,
+            ),
+            item.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            item.get("updated_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        );
+    }
+}
+
+fn print_action_response(body: &serde_json::Value) {
+    println!(
+        "  Accepted:    {}",
+        body.get("accepted")
+            .and_then(serde_json::Value::as_bool)
+            .map(|value| if value { "true" } else { "false" })
+            .unwrap_or("?")
+    );
+    println!(
+        "  Resource ID: {}",
+        body.get("resource_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Status:      {}",
+        body.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+}
+
+fn signal_idempotency_key(run_id: &str, name: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("cli:{run_id}:{name}:{nanos}")
+}
+
+fn watch_timestamp_text(data: &serde_json::Value) -> String {
+    for key in [
+        "timestamp",
+        "updated_at",
+        "created_at",
+        "started_at",
+        "completed_at",
+    ] {
+        if let Some(value) = data.get(key).and_then(serde_json::Value::as_str) {
+            return value.to_string();
+        }
+    }
+
+    for nested_key in ["run", "dispatch", "hitl_request"] {
+        if let Some(nested) = data.get(nested_key) {
+            for key in ["updated_at", "created_at", "started_at", "completed_at"] {
+                if let Some(value) = nested.get(key).and_then(serde_json::Value::as_str) {
+                    return value.to_string();
+                }
+            }
+        }
+    }
+
+    "?".to_string()
+}
+
+fn run_watch_summary(run: &serde_json::Value) -> String {
+    format!(
+        "workflow={}, status={}, step={}",
+        run.get("workflow_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?"),
+        run.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?"),
+        run_steps_text(run),
+    )
+}
+
+fn dispatch_watch_summary(dispatch: &serde_json::Value) -> String {
+    format!(
+        "status={}, target={}, step={}",
+        dispatch
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?"),
+        dispatch
+            .get("target_agent")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?"),
+        dispatch_step_text(dispatch),
+    )
+}
+
+fn looper_watch_summary(looper_run: &serde_json::Value) -> String {
+    format!(
+        "task={}, status={}, mode={}, progress={}, current={}",
+        looper_run
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?"),
+        looper_run
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?"),
+        looper_execution_mode_text(looper_run),
+        looper_progress_text(looper_run),
+        looper_current_subtask_text(looper_run),
+    )
+}
+
+fn looper_subtask_watch_summary(subtask: &serde_json::Value) -> String {
+    format!(
+        "status={}, title={}",
+        subtask
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?"),
+        truncate_text(
+            subtask
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            48,
+        ),
+    )
+}
+
+fn watch_event_summary(event_name: &str, data: &serde_json::Value) -> String {
+    if event_name == "keepalive" {
+        return "heartbeat".to_string();
+    }
+
+    if event_name == "stream.reset" {
+        return data
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "stream reset".to_string());
+    }
+
+    if let Some(summary) = data.get("summary").and_then(serde_json::Value::as_str) {
+        return summary.to_string();
+    }
+
+    if event_name == "stream.snapshot" {
+        if data.get("execution_policy").is_some() {
+            return format!("snapshot {}", looper_watch_summary(data));
+        }
+
+        if data.get("workflow_id").is_some() {
+            return format!("snapshot {}", run_watch_summary(data));
+        }
+
+        if data.get("target_agent").is_some() {
+            return format!("snapshot {}", dispatch_watch_summary(data));
+        }
+    }
+
+    if let Some(run) = data.get("run") {
+        return format!("snapshot {}", run_watch_summary(run));
+    }
+
+    if let Some(dispatch) = data.get("dispatch") {
+        return format!("snapshot {}", dispatch_watch_summary(dispatch));
+    }
+
+    if event_name == "run.updated" {
+        if data.get("execution_policy").is_some() {
+            return looper_watch_summary(data);
+        }
+        return run_watch_summary(data);
+    }
+
+    if event_name == "dispatch.updated" {
+        return dispatch_watch_summary(data);
+    }
+
+    if event_name.starts_with("subtask.") {
+        return looper_subtask_watch_summary(data);
+    }
+
+    if event_name.starts_with("hitl.") {
+        return format!(
+            "status={}, question={}",
+            data.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            truncate_text(
+                data.get("question")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                48,
+            ),
+        );
+    }
+
+    if let Some(id) = data.get("id").and_then(serde_json::Value::as_str) {
+        return format!("id={id}");
+    }
+
+    truncate_text(&data.to_string(), 80)
+}
+
+fn print_watch_event(event_name: &str, data_text: &str) {
+    match serde_json::from_str::<serde_json::Value>(data_text) {
+        Ok(data) => {
+            let timestamp = watch_timestamp_text(&data);
+            let summary = watch_event_summary(event_name, &data);
+            println!("[{timestamp}] {event_name}: {summary}");
+        }
+        Err(_) => {
+            println!("[?] {event_name}: {}", truncate_text(data_text, 80));
+        }
+    }
+}
+
+fn hitl_watch_line(data: &serde_json::Value) -> Option<String> {
+    let status = data
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("pending");
+    if status != "pending" {
+        return None;
+    }
+
+    Some(format!(
+        "[{}] [{}] {}",
+        watch_timestamp_text(data),
+        data.get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?"),
+        truncate_text(
+            data.get("question")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            80,
+        ),
+    ))
+}
+
+fn print_hitl_watch_event(event_name: &str, data_text: &str) {
+    if matches!(event_name, "keepalive" | "stream.reset") {
+        return;
+    }
+
+    match serde_json::from_str::<serde_json::Value>(data_text) {
+        Ok(data) => {
+            if let Some(items) = data.get("items").and_then(serde_json::Value::as_array) {
+                for item in items {
+                    if let Some(line) = hitl_watch_line(item) {
+                        println!("{line}");
+                    }
+                }
+                return;
+            }
+
+            if let Some(line) = hitl_watch_line(&data) {
+                println!("{line}");
+            }
+        }
+        Err(_) => println!("[?] [?] {}", truncate_text(data_text, 80)),
+    }
+}
+
+fn watch_stream(spinner_label: &str, url: String) {
+    watch_stream_with_handler(spinner_label, url, print_watch_event);
+}
+
+fn watch_stream_with_handler(spinner_label: &str, url: String, event_handler: fn(&str, &str)) {
+    let client = daemon_watch_client();
+    let mut spinner = progress::Spinner::new(spinner_label).no_delay();
+    spinner.tick();
+
+    let response = match client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            spinner.finish();
+            ui::error(&format!("SSE connection failed: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    spinner.finish();
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.json::<serde_json::Value>().unwrap_or_default();
+        let message = daemon_error_message(&body)
+            .unwrap_or_else(|| format!("Daemon returned an unexpected status: {status}"));
+        ui::error(&message);
+        std::process::exit(1);
+    }
+
+    let reader = io::BufReader::new(response);
+    let mut event_name = "message".to_string();
+    let mut data_lines = Vec::new();
+
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(line) => line,
+            Err(error) => {
+                ui::error(&format!("SSE stream error: {error}"));
+                std::process::exit(1);
+            }
+        };
+
+        if line.is_empty() {
+            if !data_lines.is_empty() {
+                let data_text = data_lines.join("\n");
+                event_handler(&event_name, &data_text);
+                data_lines.clear();
+            }
+            event_name = "message".to_string();
+            continue;
+        }
+
+        if line.starts_with(':') {
+            continue;
+        }
+
+        if let Some(name) = line.strip_prefix("event:") {
+            event_name = name.trim().to_string();
+            continue;
+        }
+
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
+
+    if !data_lines.is_empty() {
+        let data_text = data_lines.join("\n");
+        event_handler(&event_name, &data_text);
+    }
+}
+
 fn cmd_workflow_list() {
     let base = require_daemon("workflow list");
     let client = daemon_client();
@@ -3317,6 +5809,1785 @@ fn cmd_workflow_delete(workflow_id: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Task commands
+// ---------------------------------------------------------------------------
+
+fn cmd_task_list(status: Option<&str>, priority: Option<&str>, limit: usize, json: bool) {
+    let base = require_daemon("task list");
+    let client = daemon_client();
+    let mut query = vec![("limit", limit.to_string())];
+
+    if let Some(status) = status {
+        query.push(("status", status.to_string()));
+    }
+    if let Some(priority) = priority {
+        query.push(("priority", priority.to_string()));
+    }
+
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/tasks"))
+            .query(&query)
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list tasks: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No tasks found."),
+        Some(items) => print_task_list_table(items),
+        None => println!("No tasks found."),
+    }
+}
+
+fn cmd_task_get(task_id: &str, json: bool) {
+    let base = require_daemon("task get");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/v1/tasks/{task_id}")).send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to get task {task_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_task_detail(&body);
+}
+
+fn cmd_task_create(file: PathBuf) {
+    let json_body = read_json_file_or_exit(&file, "Task");
+    let base = require_daemon("task create");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/tasks"))
+            .json(&json_body)
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to create task: {error}"));
+        std::process::exit(1);
+    }
+
+    let Some(task_id) = body.get("id").and_then(serde_json::Value::as_str) else {
+        ui::error("Failed to create task: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    ui::success("Task created successfully.");
+    println!("  ID:    {task_id}");
+    println!(
+        "  Title: {}",
+        body.get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+}
+
+fn cmd_task_update(task_id: &str, file: PathBuf) {
+    let json_body = read_json_file_or_exit(&file, "Task");
+    let base = require_daemon("task update");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .put(format!("{base}/api/v1/tasks/{task_id}"))
+            .json(&json_body)
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to update task {task_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("id").and_then(serde_json::Value::as_str).is_none() {
+        ui::error("Failed to update task: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Task {task_id} updated."));
+    println!(
+        "  Status: {}",
+        body.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+}
+
+fn cmd_task_delete(task_id: &str) {
+    let base = require_daemon("task delete");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .delete(format!("{base}/api/v1/tasks/{task_id}"))
+            .send(),
+    );
+
+    if body.is_null() {
+        ui::success(&format!("Task {task_id} deleted."));
+        return;
+    }
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to delete task {task_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Task {task_id} deleted."));
+}
+
+fn cmd_task_replan(task_id: &str, file: PathBuf) {
+    let json_body = read_json_file_or_exit(&file, "Task replan");
+    let base = require_daemon("task replan");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/tasks/{task_id}/replan"))
+            .json(&json_body)
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to replan task {task_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to replan task: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Task {task_id} replan accepted."));
+    println!(
+        "  Status:             {}",
+        body.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Created subtasks:   {}",
+        body.get("effects")
+            .and_then(|effects| effects.get("created_subtasks"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Updated subtasks:   {}",
+        body.get("effects")
+            .and_then(|effects| effects.get("updated_subtasks"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Cancelled subtasks: {}",
+        body.get("effects")
+            .and_then(|effects| effects.get("cancelled_subtasks"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+}
+
+fn cmd_task_subtasks(task_id: &str, status: Option<&str>, json: bool) {
+    let base = require_daemon("task subtasks");
+    let client = daemon_client();
+    let mut request = client.get(format!("{base}/api/v1/tasks/{task_id}/subtasks"));
+
+    if let Some(status) = status {
+        request = request.query(&[("status", status)]);
+    }
+
+    let body = daemon_json(request.send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to list subtasks for task {task_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No subtasks found."),
+        Some(items) => print_subtask_list_table(items),
+        None => println!("No subtasks found."),
+    }
+}
+
+fn cmd_task_artifacts(task_id: &str, json: bool) {
+    let base = require_daemon("task artifacts");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/tasks/{task_id}/artifacts"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to list artifacts for task {task_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) => {
+            print_task_link_refs_table(items, "ARTIFACT_ID", "artifact_id", "No artifacts linked.")
+        }
+        None => println!("No artifacts linked."),
+    }
+}
+
+fn cmd_task_docs(task_id: &str, json: bool) {
+    let base = require_daemon("task docs");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/tasks/{task_id}/docs"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list docs for task {task_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) => print_task_link_refs_table(items, "DOC_ID", "doc_id", "No docs linked."),
+        None => println!("No docs linked."),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtask commands
+// ---------------------------------------------------------------------------
+
+fn cmd_subtask_list(task_id: Option<&str>, status: Option<&str>, json: bool) {
+    let base = require_daemon("subtask list");
+    let client = daemon_client();
+    let mut query = Vec::new();
+
+    if let Some(task_id) = task_id {
+        query.push(("task_id", task_id.to_string()));
+    }
+    if let Some(status) = status {
+        query.push(("status", status.to_string()));
+    }
+
+    let request = client.get(format!("{base}/api/v1/subtasks"));
+    let body = if query.is_empty() {
+        daemon_json(request.send())
+    } else {
+        daemon_json(request.query(&query).send())
+    };
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list subtasks: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No subtasks found."),
+        Some(items) => print_subtask_list_table(items),
+        None => println!("No subtasks found."),
+    }
+}
+
+fn cmd_subtask_get(subtask_id: &str, json: bool) {
+    let base = require_daemon("subtask get");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/subtasks/{subtask_id}"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to get subtask {subtask_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_subtask_detail(&body);
+}
+
+fn cmd_subtask_create(task_id: &str, file: PathBuf) {
+    let json_body = read_json_file_or_exit(&file, "Subtask");
+    let base = require_daemon("subtask create");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/tasks/{task_id}/subtasks"))
+            .json(&json_body)
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to create subtask for task {task_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    let Some(subtask_id) = body.get("id").and_then(serde_json::Value::as_str) else {
+        ui::error("Failed to create subtask: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    ui::success(&format!("Subtask created under task {task_id}."));
+    println!("  ID:    {subtask_id}");
+    println!(
+        "  Title: {}",
+        body.get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+}
+
+fn cmd_subtask_update(subtask_id: &str, file: PathBuf) {
+    let json_body = read_json_file_or_exit(&file, "Subtask");
+    let base = require_daemon("subtask update");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .put(format!("{base}/api/v1/subtasks/{subtask_id}"))
+            .json(&json_body)
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to update subtask {subtask_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("id").and_then(serde_json::Value::as_str).is_none() {
+        ui::error("Failed to update subtask: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Subtask {subtask_id} updated."));
+    println!(
+        "  Status: {}",
+        body.get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+}
+
+fn cmd_subtask_delete(subtask_id: &str) {
+    let base = require_daemon("subtask delete");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .delete(format!("{base}/api/v1/subtasks/{subtask_id}"))
+            .send(),
+    );
+
+    if body.is_null() {
+        ui::success(&format!("Subtask {subtask_id} deleted."));
+        return;
+    }
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to delete subtask {subtask_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Subtask {subtask_id} deleted."));
+}
+
+// ---------------------------------------------------------------------------
+// Run commands
+// ---------------------------------------------------------------------------
+
+fn cmd_run_list(workflow_id: Option<&str>, status: Option<&str>, json: bool) {
+    let base = require_daemon("run list");
+    let client = daemon_client();
+    let mut query = Vec::new();
+
+    if let Some(workflow_id) = workflow_id {
+        query.push(("workflow_id", workflow_id.to_string()));
+    }
+    if let Some(status) = status {
+        query.push(("status", status.to_string()));
+    }
+
+    let request = client.get(format!("{base}/api/v1/runs"));
+    let body = if query.is_empty() {
+        daemon_json(request.send())
+    } else {
+        daemon_json(request.query(&query).send())
+    };
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list runs: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No runs found."),
+        Some(items) => print_run_list_table(items),
+        None => println!("No runs found."),
+    }
+}
+
+fn cmd_run_get(run_id: &str, json: bool) {
+    let base = require_daemon("run get");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/v1/runs/{run_id}")).send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to get run {run_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_run_detail(&body);
+}
+
+fn cmd_run_dispatches(run_id: &str, json: bool) {
+    let base = require_daemon("run dispatches");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/runs/{run_id}/dispatches"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to list dispatches for run {run_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No dispatches found."),
+        Some(items) => print_dispatch_list_table(items),
+        None => println!("No dispatches found."),
+    }
+}
+
+fn cmd_run_hitl(run_id: &str, json: bool) {
+    let base = require_daemon("run hitl");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/runs/{run_id}/hitl-requests"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to list HITL requests for run {run_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No HITL requests found."),
+        Some(items) => print_run_hitl_list_table(items),
+        None => println!("No HITL requests found."),
+    }
+}
+
+fn cmd_run_signals(run_id: &str, json: bool) {
+    let base = require_daemon("run signals");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/runs/{run_id}/signals"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list signals for run {run_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No signals found."),
+        Some(items) => print_signal_list_table(items),
+        None => println!("No signals found."),
+    }
+}
+
+fn cmd_run_signal(run_id: &str, name: &str, payload_json: &str) {
+    let payload = serde_json::from_str::<serde_json::Value>(payload_json).unwrap_or_else(|error| {
+        ui::error_with_fix("Invalid signal payload JSON", &error.to_string());
+        std::process::exit(1);
+    });
+
+    let base = require_daemon("run signal");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/runs/{run_id}/signals"))
+            .json(&serde_json::json!({
+                "name": name,
+                "payload": payload,
+                "source": "cli",
+                "idempotency_key": signal_idempotency_key(run_id, name),
+            }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to submit signal for run {run_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    let Some(signal_id) = body.get("id").and_then(serde_json::Value::as_str) else {
+        ui::error("Failed to submit signal: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    ui::success(&format!("Signal {name} submitted to run {run_id}."));
+    println!("  ID:       {signal_id}");
+    println!(
+        "  Source:   {}",
+        body.get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Consumed: {}",
+        body.get("consumed")
+            .and_then(serde_json::Value::as_bool)
+            .map(|value| if value { "yes" } else { "no" })
+            .unwrap_or("?")
+    );
+}
+
+fn cmd_run_checkpoints(run_id: &str, json: bool) {
+    let base = require_daemon("run checkpoints");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/runs/{run_id}/checkpoints"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to list checkpoints for run {run_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No checkpoints found."),
+        Some(items) => print_checkpoint_list_table(items),
+        None => println!("No checkpoints found."),
+    }
+}
+
+fn cmd_run_pause(run_id: &str) {
+    let base = require_daemon("run pause");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/runs/{run_id}/pause"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to pause run {run_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to pause run: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Run {run_id} pause accepted."));
+    print_action_response(&body);
+}
+
+fn cmd_run_resume(run_id: &str) {
+    let base = require_daemon("run resume");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/runs/{run_id}/resume"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to resume run {run_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to resume run: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Run {run_id} resume accepted."));
+    print_action_response(&body);
+}
+
+fn cmd_run_cancel(run_id: &str) {
+    let base = require_daemon("run cancel");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/runs/{run_id}/cancel"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to cancel run {run_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to cancel run: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Run {run_id} cancel accepted."));
+    print_action_response(&body);
+}
+
+fn cmd_run_watch(run_id: &str) {
+    let base = require_daemon("run watch");
+    watch_stream(
+        &format!("Watching run {run_id}..."),
+        format!("{base}/api/v1/runs/{run_id}/events"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch commands
+// ---------------------------------------------------------------------------
+
+fn cmd_dispatch_list(run_id: Option<&str>, status: Option<&str>, json: bool) {
+    let base = require_daemon("dispatch list");
+    let client = daemon_client();
+    let mut query = Vec::new();
+
+    if let Some(run_id) = run_id {
+        query.push(("run_id", run_id.to_string()));
+    }
+    if let Some(status) = status {
+        query.push(("status", status.to_string()));
+    }
+
+    let request = client.get(format!("{base}/api/v1/dispatches"));
+    let body = if query.is_empty() {
+        daemon_json(request.send())
+    } else {
+        daemon_json(request.query(&query).send())
+    };
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list dispatches: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No dispatches found."),
+        Some(items) => print_dispatch_list_table(items),
+        None => println!("No dispatches found."),
+    }
+}
+
+fn cmd_dispatch_get(dispatch_id: &str, json: bool) {
+    let base = require_daemon("dispatch get");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/dispatches/{dispatch_id}"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to get dispatch {dispatch_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_dispatch_detail(&body);
+}
+
+fn cmd_dispatch_children(dispatch_id: &str, json: bool) {
+    let base = require_daemon("dispatch children");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/dispatches/{dispatch_id}/children"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to list child dispatches for {dispatch_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No child dispatches found."),
+        Some(items) => print_dispatch_list_table(items),
+        None => println!("No child dispatches found."),
+    }
+}
+
+fn cmd_dispatch_retry(dispatch_id: &str) {
+    let base = require_daemon("dispatch retry");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/dispatches/{dispatch_id}/retry"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to retry dispatch {dispatch_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to retry dispatch: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Dispatch {dispatch_id} retry accepted."));
+    print_action_response(&body);
+}
+
+fn cmd_dispatch_cancel(dispatch_id: &str) {
+    let base = require_daemon("dispatch cancel");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/dispatches/{dispatch_id}/cancel"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to cancel dispatch {dispatch_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to cancel dispatch: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Dispatch {dispatch_id} cancel accepted."));
+    print_action_response(&body);
+}
+
+fn cmd_dispatch_watch(dispatch_id: &str) {
+    let base = require_daemon("dispatch watch");
+    watch_stream(
+        &format!("Watching dispatch {dispatch_id}..."),
+        format!("{base}/api/v1/dispatches/{dispatch_id}/events"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// HITL commands
+// ---------------------------------------------------------------------------
+
+fn cmd_hitl_list(run_id: Option<&str>, status: Option<&str>, kind: Option<&str>, json: bool) {
+    let base = require_daemon("hitl list");
+    let client = daemon_client();
+    let mut query = Vec::new();
+
+    if let Some(run_id) = run_id {
+        query.push(("run_id", run_id.to_string()));
+    }
+    if let Some(status) = status {
+        query.push(("status", status.to_string()));
+    }
+    if let Some(kind) = kind {
+        query.push(("kind", kind.to_string()));
+    }
+
+    let request = client.get(format!("{base}/api/v1/hitl-requests"));
+    let body = if query.is_empty() {
+        daemon_json(request.send())
+    } else {
+        daemon_json(request.query(&query).send())
+    };
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list HITL requests: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No HITL requests found."),
+        Some(items) => print_hitl_list_table(items),
+        None => println!("No HITL requests found."),
+    }
+}
+
+fn cmd_hitl_get(hitl_id: &str, json: bool) {
+    let base = require_daemon("hitl get");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/hitl-requests/{hitl_id}"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to get HITL request {hitl_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_hitl_detail(&body);
+}
+
+fn cmd_hitl_answer(hitl_id: &str, response: &str) {
+    let base = require_daemon("hitl answer");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/hitl-requests/{hitl_id}/answer"))
+            .json(&serde_json::json!({
+                "response": response,
+            }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to answer HITL request {hitl_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to answer HITL request: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Answer submitted for HITL request {hitl_id}."));
+    print_action_response(&body);
+}
+
+fn cmd_hitl_cancel(hitl_id: &str) {
+    let base = require_daemon("hitl cancel");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/hitl-requests/{hitl_id}/cancel"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to cancel HITL request {hitl_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to cancel HITL request: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!(
+        "Cancellation submitted for HITL request {hitl_id}."
+    ));
+    print_action_response(&body);
+}
+
+fn cmd_hitl_watch() {
+    let base = require_daemon("hitl watch");
+    watch_stream_with_handler(
+        "Watching HITL requests...",
+        format!("{base}/api/v1/hitl-requests/stream"),
+        print_hitl_watch_event,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Looper commands
+// ---------------------------------------------------------------------------
+
+fn cmd_looper_list(
+    task_id: Option<&str>,
+    status: Option<&str>,
+    execution_mode: Option<&str>,
+    json: bool,
+) {
+    let base = require_daemon("looper list");
+    let client = daemon_client();
+    let mut query = Vec::new();
+
+    if let Some(task_id) = task_id {
+        query.push(("task_id", task_id.to_string()));
+    }
+    if let Some(status) = status {
+        query.push(("status", status.to_string()));
+    }
+    if let Some(execution_mode) = execution_mode {
+        query.push(("execution_mode", execution_mode.to_string()));
+    }
+
+    let request = client.get(format!("{base}/api/v1/looper-runs"));
+    let body = if query.is_empty() {
+        daemon_json(request.send())
+    } else {
+        daemon_json(request.query(&query).send())
+    };
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list looper runs: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No looper runs found."),
+        Some(items) => print_looper_list_table(items),
+        None => println!("No looper runs found."),
+    }
+}
+
+fn cmd_looper_get(looper_id: &str, json: bool) {
+    let base = require_daemon("looper get");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/looper-runs/{looper_id}"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to get looper run {looper_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_looper_detail(&body);
+}
+
+fn cmd_looper_create(file: PathBuf) {
+    if !file.exists() {
+        ui::error(&format!(
+            "Looper request file not found: {}",
+            file.display()
+        ));
+        std::process::exit(1);
+    }
+
+    let contents = std::fs::read_to_string(&file).unwrap_or_else(|error| {
+        ui::error(&format!(
+            "Failed to read looper request file {}: {error}",
+            file.display()
+        ));
+        std::process::exit(1);
+    });
+    let json_body = serde_json::from_str::<serde_json::Value>(&contents).unwrap_or_else(|error| {
+        ui::error(&format!("Invalid looper request JSON: {error}"));
+        std::process::exit(1);
+    });
+
+    let base = require_daemon("looper create");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/looper-runs"))
+            .json(&json_body)
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to create looper run: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to create looper run: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    let Some(looper_run_id) = body
+        .get("looper_run_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        ui::error("Failed to create looper run: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    ui::success("Looper run creation accepted.");
+    println!("  Looper Run:  {looper_run_id}");
+    print_action_response(&body);
+}
+
+fn cmd_looper_subtasks(looper_id: &str, json: bool) {
+    let base = require_daemon("looper subtasks");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/looper-runs/{looper_id}/subtasks"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to list looper subtasks for {looper_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No looper subtasks found."),
+        Some(items) => print_looper_subtask_list_table(items),
+        None => println!("No looper subtasks found."),
+    }
+}
+
+fn cmd_looper_pause(looper_id: &str) {
+    let base = require_daemon("looper pause");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/looper-runs/{looper_id}/pause"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to pause looper run {looper_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to pause looper run: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Looper run {looper_id} pause accepted."));
+    print_action_response(&body);
+}
+
+fn cmd_looper_resume(looper_id: &str) {
+    let base = require_daemon("looper resume");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/looper-runs/{looper_id}/resume"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to resume looper run {looper_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to resume looper run: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Looper run {looper_id} resume accepted."));
+    print_action_response(&body);
+}
+
+fn cmd_looper_cancel(looper_id: &str) {
+    let base = require_daemon("looper cancel");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/looper-runs/{looper_id}/cancel"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to cancel looper run {looper_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error("Failed to cancel looper run: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Looper run {looper_id} cancel accepted."));
+    print_action_response(&body);
+}
+
+fn cmd_looper_watch(looper_id: &str) {
+    let base = require_daemon("looper watch");
+    watch_stream(
+        &format!("Watching looper run {looper_id}..."),
+        format!("{base}/api/v1/looper-runs/{looper_id}/events"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Event commands
+// ---------------------------------------------------------------------------
+
+fn cmd_event_send(file: PathBuf) {
+    let json_body = read_json_file_or_exit(&file, "Event");
+    let base = require_daemon("event send");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/events"))
+            .json(&json_body)
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to send event: {error}"));
+        std::process::exit(1);
+    }
+
+    let Some(event_id) = body.get("event_id").and_then(serde_json::Value::as_str) else {
+        ui::error("Failed to send event: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    let matched_triggers = body
+        .get("matched_triggers")
+        .and_then(serde_json::Value::as_array)
+        .map(std::vec::Vec::len)
+        .unwrap_or(0);
+    let effects = body.get("effects").map(event_effect_count).unwrap_or(0);
+    let failures = body
+        .get("failures")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    ui::success(&format!("Event accepted: {event_id}"));
+    println!("  Matched triggers: {matched_triggers}");
+    println!("  Effects: {effects}");
+    println!("  Failures: {}", failures.len());
+
+    if !failures.is_empty() {
+        ui::error(&format!("{} trigger(s) failed", failures.len()));
+        for failure in failures {
+            let trigger_id = failure
+                .get("trigger_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let target_kind = failure
+                .get("target_kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let message = failure
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown failure");
+            println!("    {trigger_id} [{target_kind}]: {message}");
+        }
+    }
+}
+
+fn cmd_event_dry_run(file: PathBuf) {
+    let json_body = read_json_file_or_exit(&file, "Event");
+    let base = require_daemon("event dry-run");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/events/dry-run"))
+            .json(&json_body)
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to dry-run event: {error}"));
+        std::process::exit(1);
+    }
+
+    let Some(would_execute) = body
+        .get("would_execute")
+        .and_then(serde_json::Value::as_bool)
+    else {
+        ui::error("Failed to dry-run event: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    let resolved_triggers = body
+        .get("effects")
+        .and_then(|effects| effects.get("matched_triggers"))
+        .and_then(serde_json::Value::as_array)
+        .map(std::vec::Vec::len)
+        .unwrap_or(0);
+    let effects = body.get("effects").map(event_effect_count).unwrap_or(0);
+    let explanation = body
+        .get("explanation")
+        .and_then(|value| value.get("matching_mode"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+
+    ui::success("Event dry-run completed.");
+    println!("  Would execute: {}", yes_no_text(would_execute));
+    println!("  Resolved triggers: {resolved_triggers}");
+    println!("  Effects: {effects}");
+    println!("  Explanation: {explanation}");
+}
+
+fn cmd_versioned_resource_list(
+    command: &str,
+    resource_label_plural: &str,
+    endpoint: &str,
+    type_param_key: &str,
+    type_filter: Option<&str>,
+    task_id: Option<&str>,
+    json: bool,
+) {
+    let base = require_daemon(command);
+    let client = daemon_client();
+    let mut query = Vec::new();
+
+    if let Some(type_filter) = type_filter {
+        query.push((type_param_key, type_filter.to_string()));
+    }
+    if let Some(task_id) = task_id {
+        query.push(("task_id", task_id.to_string()));
+    }
+
+    let request = client.get(format!("{base}/api/v1/{endpoint}"));
+    let body = if query.is_empty() {
+        daemon_json(request.send())
+    } else {
+        daemon_json(request.query(&query).send())
+    };
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list {resource_label_plural}: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No {resource_label_plural} found."),
+        Some(items) => print_versioned_resource_list_table(items, type_param_key),
+        None => println!("No {resource_label_plural} found."),
+    }
+}
+
+fn cmd_versioned_resource_get(
+    command: &str,
+    resource_label: &str,
+    endpoint: &str,
+    resource_id: &str,
+    json: bool,
+    type_label: &str,
+    type_key: &str,
+) {
+    let base = require_daemon(command);
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/{endpoint}/{resource_id}"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to get {resource_label} {resource_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    let title_case = match resource_label {
+        "artifact" => "Artifact",
+        "doc" => "Doc",
+        _ => resource_label,
+    };
+    print_versioned_resource_detail(title_case, type_label, type_key, &body);
+}
+
+fn cmd_versioned_resource_versions(
+    command: &str,
+    resource_label: &str,
+    endpoint: &str,
+    resource_id: &str,
+    json: bool,
+) {
+    let base = require_daemon(command);
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/{endpoint}/{resource_id}/versions"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to list versions for {resource_label} {resource_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => {
+            println!("No versions found for {resource_label} {resource_id}.")
+        }
+        Some(items) => print_versioned_resource_versions_table(items),
+        None => println!("No versions found for {resource_label} {resource_id}."),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Artifact/doc commands
+// ---------------------------------------------------------------------------
+
+fn cmd_artifact_list(type_filter: Option<&str>, task_id: Option<&str>, json: bool) {
+    cmd_versioned_resource_list(
+        "artifact list",
+        "artifacts",
+        "artifacts",
+        "artifact_type",
+        type_filter,
+        task_id,
+        json,
+    );
+}
+
+fn cmd_artifact_get(artifact_id: &str, json: bool) {
+    cmd_versioned_resource_get(
+        "artifact get",
+        "artifact",
+        "artifacts",
+        artifact_id,
+        json,
+        "Artifact type:",
+        "artifact_type",
+    );
+}
+
+fn cmd_artifact_versions(artifact_id: &str, json: bool) {
+    cmd_versioned_resource_versions(
+        "artifact versions",
+        "artifact",
+        "artifacts",
+        artifact_id,
+        json,
+    );
+}
+
+fn cmd_doc_list(type_filter: Option<&str>, task_id: Option<&str>, json: bool) {
+    cmd_versioned_resource_list(
+        "doc list",
+        "docs",
+        "docs",
+        "doc_type",
+        type_filter,
+        task_id,
+        json,
+    );
+}
+
+fn cmd_doc_get(doc_id: &str, json: bool) {
+    cmd_versioned_resource_get(
+        "doc get",
+        "doc",
+        "docs",
+        doc_id,
+        json,
+        "Doc type:",
+        "doc_type",
+    );
+}
+
+fn cmd_doc_versions(doc_id: &str, json: bool) {
+    cmd_versioned_resource_versions("doc versions", "doc", "docs", doc_id, json);
+}
+
+// ---------------------------------------------------------------------------
+// Pack commands
+// ---------------------------------------------------------------------------
+
+fn cmd_pack_list(json: bool) {
+    let base = require_daemon("pack list");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/v1/packs")).send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to list packs: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No packs found."),
+        Some(items) => print_pack_list_table(items),
+        None => println!("No packs found."),
+    }
+}
+
+fn cmd_pack_get(pack_id: &str, json: bool) {
+    let base = require_daemon("pack get");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/v1/packs/{pack_id}")).send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to get pack {pack_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_pack_detail(&body);
+}
+
+fn cmd_pack_objects(pack_id: &str, json: bool) {
+    let base = require_daemon("pack objects");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/packs/{pack_id}/objects"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to list managed objects for pack {pack_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&list_json_value(&body));
+        return;
+    }
+
+    match list_items(&body) {
+        Some(items) if items.is_empty() => println!("No managed pack objects found."),
+        Some(items) => print_pack_objects_table(items),
+        None => println!("No managed pack objects found."),
+    }
+}
+
+fn cmd_pack_install(source: &str) {
+    let base = require_daemon("pack install");
+    let prepared = prepare_pack_install_source(source).unwrap_or_else(|error| {
+        ui::error(&format!("Failed to prepare pack source: {error}"));
+        std::process::exit(1);
+    });
+
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/packs/install"))
+            .json(&serde_json::json!({
+                "source": {
+                    "kind": prepared.source.kind.as_str(),
+                    "pack_id": &prepared.source.pack_id,
+                    "version": &prepared.source.version,
+                }
+            }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to install pack from {}: {error}", source));
+        std::process::exit(1);
+    }
+
+    let Some(resource_id) = body.get("resource_id").and_then(serde_json::Value::as_str) else {
+        ui::error("Failed to install pack: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    ui::success(&format!("Pack {resource_id} install accepted."));
+    println!("  Source:  {}", prepared.display_source);
+    println!("  Kind:    {}", prepared.source.kind.as_str());
+    println!("  Version: {}", prepared.source.version);
+}
+
+fn cmd_pack_upgrade(pack_id: &str, dry_run: bool) {
+    let resolved = resolve_pack_upgrade_target(pack_id).unwrap_or_else(|error| {
+        ui::error(&format!(
+            "Failed to resolve the upgrade target for pack {pack_id}: {error}"
+        ));
+        std::process::exit(1);
+    });
+
+    let base = require_daemon("pack upgrade");
+    let client = daemon_client();
+
+    if !dry_run && resolved.target_version == resolved.current_version {
+        ui::success(&format!(
+            "Pack {pack_id} is already at version {}.",
+            resolved.current_version
+        ));
+        return;
+    }
+
+    let endpoint = if dry_run {
+        format!("{base}/api/v1/packs/{pack_id}/upgrade/dry-run")
+    } else {
+        format!("{base}/api/v1/packs/{pack_id}/upgrade")
+    };
+    let body = daemon_json(
+        client
+            .post(endpoint)
+            .json(&serde_json::json!({
+                "target_version": &resolved.target_version,
+            }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to upgrade pack {pack_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if dry_run {
+        if body
+            .get("resolved")
+            .and_then(|value| value.get("pack_id"))
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            ui::error("Failed to dry-run pack upgrade: daemon returned an unexpected response");
+            std::process::exit(1);
+        }
+        print_pack_upgrade_dry_run(pack_id, &resolved.target_version, &body);
+        return;
+    }
+
+    let Some(resource_id) = body.get("resource_id").and_then(serde_json::Value::as_str) else {
+        ui::error("Failed to upgrade pack: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    ui::success(&format!("Pack {resource_id} upgrade accepted."));
+    println!("  From: {}", resolved.current_version);
+    println!("  To:   {}", resolved.target_version);
+}
+
+fn cmd_pack_uninstall(pack_id: &str) {
+    let base = require_daemon("pack uninstall");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/packs/{pack_id}/uninstall"))
+            .json(&serde_json::json!({
+                "force": false,
+            }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to uninstall pack {pack_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    let Some(resource_id) = body.get("resource_id").and_then(serde_json::Value::as_str) else {
+        ui::error("Failed to uninstall pack: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    ui::success(&format!("Pack {resource_id} uninstall accepted."));
+}
+
+fn cmd_pack_fork(pack_id: &str) {
+    let base = require_daemon("pack fork");
+    let client = daemon_client();
+    let objects_body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/packs/{pack_id}/objects"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&objects_body) {
+        ui::error(&format!(
+            "Failed to enumerate managed objects for pack {pack_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    let Some(items) = list_items(&objects_body) else {
+        ui::error("Failed to fork pack: daemon returned an unexpected object list");
+        std::process::exit(1);
+    };
+
+    let mut forked_objects = Vec::new();
+    let mut skipped = 0usize;
+
+    for item in items {
+        let Some(resource_type) = item
+            .get("resource_type")
+            .and_then(serde_json::Value::as_str)
+        else {
+            ui::error("Failed to fork pack: pack object list is missing resource_type");
+            std::process::exit(1);
+        };
+        let Some(resource_id) = item.get("resource_id").and_then(serde_json::Value::as_str) else {
+            ui::error("Failed to fork pack: pack object list is missing resource_id");
+            std::process::exit(1);
+        };
+
+        if item
+            .get("forked")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            skipped += 1;
+            continue;
+        }
+
+        let body = daemon_json(
+            client
+                .post(format!("{base}/api/v1/packs/{pack_id}/fork"))
+                .json(&serde_json::json!({
+                    "resource_type": resource_type,
+                    "resource_id": resource_id,
+                    "mode": "shadow",
+                }))
+                .send(),
+        );
+
+        if let Some(error) = daemon_error_message(&body) {
+            ui::error(&format!(
+                "Failed to fork {resource_type} {resource_id} from pack {pack_id}: {error}"
+            ));
+            std::process::exit(1);
+        }
+
+        if body.get("id").and_then(serde_json::Value::as_str).is_none() {
+            ui::error("Failed to fork pack: daemon returned an unexpected response");
+            std::process::exit(1);
+        }
+
+        forked_objects.push(format!("{resource_type}:{resource_id}"));
+    }
+
+    ui::success(&format!("Pack {pack_id} fork completed."));
+    println!("  Forked objects: {}", forked_objects.len());
+    println!("  Already forked: {skipped}");
+    for object in forked_objects.iter().take(5) {
+        println!("  - {object}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Trigger commands
 // ---------------------------------------------------------------------------
 
@@ -3408,6 +7679,537 @@ fn cmd_trigger_delete(trigger_id: &str) {
             body["error"].as_str().unwrap_or("Unknown error")
         );
         std::process::exit(1);
+    }
+}
+
+fn cmd_trigger_get(trigger_id: &str, json: bool) {
+    let base = require_daemon("trigger get");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/triggers/{trigger_id}"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to get trigger {trigger_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_trigger_resource(&body);
+}
+
+fn cmd_trigger_update(trigger_id: &str, file: PathBuf) {
+    let json_body = read_json_file_or_exit(&file, "Trigger definition");
+    let base = require_daemon("trigger update");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .put(format!("{base}/api/v1/triggers/{trigger_id}"))
+            .json(&json_body)
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to update trigger {trigger_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("id").and_then(serde_json::Value::as_str).is_none() {
+        ui::error("Failed to update trigger: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Trigger {trigger_id} updated."));
+    println!(
+        "  Name:    {}",
+        body.get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Enabled: {}",
+        body.get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .map(yes_no_text)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Updated: {}",
+        body.get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+}
+
+fn cmd_trigger_enable(trigger_id: &str) {
+    cmd_trigger_set_enabled(trigger_id, true);
+}
+
+fn cmd_trigger_disable(trigger_id: &str) {
+    cmd_trigger_set_enabled(trigger_id, false);
+}
+
+fn cmd_trigger_set_enabled(trigger_id: &str, enabled: bool) {
+    let action = if enabled { "enable" } else { "disable" };
+    let base = require_daemon(&format!("trigger {action}"));
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/triggers/{trigger_id}/{action}"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to {action} trigger {trigger_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        ui::error(&format!(
+            "Failed to {action} trigger: daemon returned an unexpected response"
+        ));
+        std::process::exit(1);
+    }
+
+    ui::success(&format!("Trigger {trigger_id} {action} accepted."));
+    print_action_response(&body);
+}
+
+fn cmd_trigger_test(trigger_id: &str, event_json: &str) {
+    let base = require_daemon("trigger test");
+    let event = serde_json::from_str::<serde_json::Value>(event_json).unwrap_or_else(|error| {
+        ui::error(&format!("Invalid event JSON: {error}"));
+        std::process::exit(1);
+    });
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/triggers/{trigger_id}/test"))
+            .json(&serde_json::json!({ "event": event }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to test trigger {trigger_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    if body
+        .get("matched")
+        .and_then(serde_json::Value::as_bool)
+        .is_none()
+    {
+        ui::error("Failed to test trigger: daemon returned an unexpected response");
+        std::process::exit(1);
+    }
+
+    ui::success("Trigger dry-run completed.");
+    println!(
+        "  Matched:         {}",
+        body.get("matched")
+            .and_then(serde_json::Value::as_bool)
+            .map(bool_text)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Resolved target: {}",
+        trigger_target_summary(body.get("resolved_target"))
+    );
+    println!(
+        "  Would dispatch:  {}",
+        body.get("would_dispatch")
+            .and_then(serde_json::Value::as_bool)
+            .map(bool_text)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Explanation:     {}",
+        body.get("explanation")
+            .and_then(|value| value.get("match"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Target kind:     {}",
+        body.get("explanation")
+            .and_then(|value| value.get("target_kind"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    if let Some(blocked_by) = body
+        .get("explanation")
+        .and_then(|value| value.get("blocked_by"))
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("  Blocked by:      {blocked_by}");
+    }
+}
+
+fn cmd_trigger_fork(trigger_id: &str) {
+    let base = require_daemon("trigger fork");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/triggers/{trigger_id}/fork"))
+            .json(&serde_json::json!({ "mode": "shadow" }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to fork trigger {trigger_id}: {error}"));
+        std::process::exit(1);
+    }
+
+    let Some(forked_id) = body.get("id").and_then(serde_json::Value::as_str) else {
+        ui::error("Failed to fork trigger: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    ui::success(&format!("Trigger {trigger_id} fork completed."));
+    println!("  Trigger ID: {}", forked_id);
+    println!(
+        "  Origin:     {}",
+        body.get("origin")
+            .and_then(|value| value.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    if let Some(resource_id) = body
+        .get("forked_from")
+        .and_then(|value| value.get("resource_id"))
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("  Forked from: {resource_id}");
+    }
+}
+
+fn cmd_trigger_validate(file: PathBuf) {
+    let definition = read_json_file_or_exit(&file, "Trigger definition");
+    let base = require_daemon("trigger validate");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/triggers/validate"))
+            .json(&serde_json::json!({ "definition": definition }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to validate trigger definition: {error}"));
+        std::process::exit(1);
+    }
+
+    let Some(valid) = body.get("valid").and_then(serde_json::Value::as_bool) else {
+        ui::error("Failed to validate trigger definition: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    println!(
+        "Validation result: {}",
+        if valid { "VALID" } else { "INVALID" }
+    );
+    print_trigger_validation_issues(&body);
+
+    if let Some(normalized) = body.get("normalized") {
+        println!("Normalized definition:");
+        print_json_value(normalized);
+    }
+}
+
+fn cmd_trigger_compile(file: PathBuf) {
+    let definition = read_json_file_or_exit(&file, "Trigger definition");
+    let base = require_daemon("trigger compile");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/v1/triggers/compile"))
+            .json(&serde_json::json!({ "definition": definition }))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!("Failed to compile trigger definition: {error}"));
+        std::process::exit(1);
+    }
+
+    let Some(definition_id) = body
+        .get("definition_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        ui::error("Failed to compile trigger definition: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    let compiled = body
+        .get("compiled")
+        .and_then(|value| value.get("trigger_ir"));
+    let Some(compiled) = compiled else {
+        ui::error("Failed to compile trigger definition: daemon returned an unexpected response");
+        std::process::exit(1);
+    };
+
+    ui::success("Trigger definition compiled.");
+    println!("  Definition ID:   {definition_id}");
+    println!(
+        "  Dispatch action: {}",
+        compiled
+            .get("dispatch_action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Event:           {}",
+        compiled
+            .get("match")
+            .and_then(|value| value.get("event"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("*")
+    );
+    println!(
+        "  Source:          {}",
+        compiled
+            .get("match")
+            .and_then(|value| value.get("source"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("*")
+    );
+    println!(
+        "  Target:          {}",
+        trigger_target_summary(compiled.get("target"))
+    );
+    println!(
+        "  Enabled:         {}",
+        compiled
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .map(yes_no_text)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Max fires:       {}",
+        compiled
+            .get("max_fires")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Cooldown secs:   {}",
+        compiled
+            .get("cooldown_secs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+}
+
+fn cmd_trigger_runtime(trigger_id: &str, json: bool) {
+    let base = require_daemon("trigger runtime");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/v1/triggers/{trigger_id}/runtime"))
+            .send(),
+    );
+
+    if let Some(error) = daemon_error_message(&body) {
+        ui::error(&format!(
+            "Failed to load runtime state for trigger {trigger_id}: {error}"
+        ));
+        std::process::exit(1);
+    }
+
+    if json {
+        print_json_value(&body);
+        return;
+    }
+
+    print_trigger_runtime_status(&body);
+}
+
+fn print_trigger_resource(body: &serde_json::Value) {
+    println!(
+        "Trigger: {}",
+        body.get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  ID:          {}",
+        body.get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Description: {}",
+        body.get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    );
+    println!(
+        "  Enabled:     {}",
+        body.get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .map(yes_no_text)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Max fires:   {}",
+        body.get("max_fires")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Cooldown:    {}s",
+        body.get("cooldown_secs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Event:       {}",
+        body.get("match")
+            .and_then(|value| value.get("event"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("*")
+    );
+    println!(
+        "  Source:      {}",
+        body.get("match")
+            .and_then(|value| value.get("source"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("*")
+    );
+    println!(
+        "  Target:      {}",
+        trigger_target_summary(body.get("target"))
+    );
+    println!(
+        "  Origin:      {}",
+        body.get("origin")
+            .and_then(|value| value.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Updated:     {}",
+        body.get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+}
+
+fn print_trigger_runtime_status(body: &serde_json::Value) {
+    println!(
+        "Trigger runtime: {}",
+        body.get("trigger_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Enabled:       {}",
+        body.get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .map(yes_no_text)
+            .unwrap_or("?")
+    );
+    println!(
+        "  Fire count:    {}",
+        body.get("fire_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Max fires:     {}",
+        body.get("max_fires")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Cooldown secs: {}",
+        body.get("cooldown_secs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "  Last fired at: {}",
+        body.get("last_fired_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("never")
+    );
+}
+
+fn trigger_target_summary(value: Option<&serde_json::Value>) -> String {
+    let Some(target) = value else {
+        return "none".to_string();
+    };
+
+    let kind = target
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    match kind {
+        "workflow_start" => {
+            let workflow = target
+                .get("workflow")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            format!("workflow_start({workflow})")
+        }
+        "agent_message" => {
+            let agent = target
+                .get("agent")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            format!("agent_message({agent})")
+        }
+        "workflow_signal" => {
+            let workflow = target
+                .get("selector")
+                .and_then(|value| value.get("workflow_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let signal = target
+                .get("signal")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            format!("workflow_signal({workflow}/{signal})")
+        }
+        _ => kind.to_string(),
+    }
+}
+
+fn print_trigger_validation_issues(body: &serde_json::Value) {
+    let Some(issues) = body.get("issues").and_then(serde_json::Value::as_array) else {
+        println!("Issues: none");
+        return;
+    };
+
+    if issues.is_empty() {
+        println!("Issues: none");
+        return;
+    }
+
+    println!("Issues:");
+    for issue in issues {
+        let severity = issue
+            .get("severity")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let message = issue
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown issue");
+        let path = issue
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default();
+        println!("  - [{severity}] {message}{path}");
     }
 }
 
@@ -4990,6 +9792,385 @@ pub(crate) fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) {
             }
         }
     }
+}
+
+struct PreparedPackInstall {
+    source: PackInstallSource,
+    display_source: String,
+}
+
+struct LoadedPackManifest {
+    root_dir: PathBuf,
+    manifest: PackManifest,
+}
+
+struct ResolvedPackUpgradeTarget {
+    current_version: String,
+    target_version: String,
+}
+
+fn prepare_pack_install_source(source: &str) -> Result<PreparedPackInstall, String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err("pack source cannot be empty".to_string());
+    }
+
+    let source_path = PathBuf::from(trimmed);
+    if source_path.exists() {
+        return prepare_local_pack_source(&source_path);
+    }
+
+    if looks_like_url(trimmed) {
+        return prepare_remote_pack_source(trimmed);
+    }
+
+    if looks_like_path(trimmed) {
+        return Err(format!("Pack source path not found: {trimmed}"));
+    }
+
+    prepare_named_pack_source(trimmed)
+}
+
+fn prepare_named_pack_source(source: &str) -> Result<PreparedPackInstall, String> {
+    let (kind, remainder) = match source.split_once(':') {
+        Some(("bundled", value)) => (PackSourceKind::Bundled, value),
+        Some(("external", value)) => (PackSourceKind::External, value),
+        _ => (PackSourceKind::Bundled, source),
+    };
+
+    let (pack_id, version) = match remainder.rsplit_once('@') {
+        Some((pack_id, version)) if !pack_id.is_empty() && !version.is_empty() => {
+            (pack_id.to_string(), Some(version.to_string()))
+        }
+        _ => (remainder.to_string(), None),
+    };
+
+    if pack_id.trim().is_empty() {
+        return Err("pack ID cannot be empty".to_string());
+    }
+
+    let version = match kind {
+        PackSourceKind::Bundled => version
+            .or_else(|| default_bundled_install_version(&pack_id).map(str::to_string))
+            .ok_or_else(|| format!("Unknown bundled pack '{pack_id}'"))?,
+        PackSourceKind::External => version
+            .or_else(|| latest_staged_external_version(&pack_id))
+            .ok_or_else(|| {
+                format!("External pack '{pack_id}' requires an explicit version or a staged source")
+            })?,
+    };
+
+    Ok(PreparedPackInstall {
+        source: PackInstallSource {
+            kind,
+            pack_id: pack_id.clone(),
+            version,
+        },
+        display_source: source.to_string(),
+    })
+}
+
+fn prepare_local_pack_source(path: &Path) -> Result<PreparedPackInstall, String> {
+    let loaded = load_pack_manifest_from_path(path)?;
+    stage_external_pack_source(
+        &loaded.manifest,
+        loaded.manifest.objects.iter().map(|object| {
+            let relative_path = pack_object_relative_path(object);
+            let object_path = loaded.root_dir.join(&relative_path);
+            let contents = std::fs::read_to_string(&object_path).map_err(|error| {
+                format!(
+                    "Failed to read pack object '{}': {error}",
+                    object_path.display()
+                )
+            })?;
+            Ok((relative_path, contents))
+        }),
+    )?;
+
+    Ok(PreparedPackInstall {
+        source: PackInstallSource {
+            kind: PackSourceKind::External,
+            pack_id: loaded.manifest.id.clone(),
+            version: loaded.manifest.version.clone(),
+        },
+        display_source: path.display().to_string(),
+    })
+}
+
+fn prepare_remote_pack_source(source: &str) -> Result<PreparedPackInstall, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|error| format!("Failed to build HTTP client for pack download: {error}"))?;
+    let manifest_url = resolve_pack_manifest_url(source)?;
+    let manifest_text = fetch_remote_text(&client, manifest_url.as_str(), "pack manifest")?;
+    let manifest: PackManifest = toml::from_str(&manifest_text)
+        .map_err(|error| format!("Failed to parse remote pack manifest: {error}"))?;
+
+    stage_external_pack_source(
+        &manifest,
+        manifest.objects.iter().map(|object| {
+            let relative_path = pack_object_relative_path(object);
+            let object_url = manifest_url
+                .join(relative_path.to_string_lossy().as_ref())
+                .map_err(|error| {
+                    format!(
+                        "Failed to resolve '{}' relative to '{}': {error}",
+                        relative_path.display(),
+                        manifest_url
+                    )
+                })?;
+            let contents = fetch_remote_text(
+                &client,
+                object_url.as_str(),
+                &format!("{} {}", object.resource_type.as_str(), object.resource_id),
+            )?;
+            Ok((relative_path, contents))
+        }),
+    )?;
+
+    Ok(PreparedPackInstall {
+        source: PackInstallSource {
+            kind: PackSourceKind::External,
+            pack_id: manifest.id.clone(),
+            version: manifest.version.clone(),
+        },
+        display_source: source.to_string(),
+    })
+}
+
+fn load_pack_manifest_from_path(path: &Path) -> Result<LoadedPackManifest, String> {
+    let (root_dir, manifest_path) = if path.is_dir() {
+        (path.to_path_buf(), path.join("pack.toml"))
+    } else if path.file_name().and_then(|name| name.to_str()) == Some("pack.toml") {
+        let Some(parent) = path.parent() else {
+            return Err(format!(
+                "Failed to determine the pack root for '{}'",
+                path.display()
+            ));
+        };
+        (parent.to_path_buf(), path.to_path_buf())
+    } else {
+        return Err(format!(
+            "Pack source '{}' must be a directory containing pack.toml or a pack.toml file",
+            path.display()
+        ));
+    };
+
+    let manifest_text = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        format!(
+            "Failed to read pack manifest '{}': {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: PackManifest = toml::from_str(&manifest_text).map_err(|error| {
+        format!(
+            "Failed to parse pack manifest '{}': {error}",
+            manifest_path.display()
+        )
+    })?;
+
+    for object in &manifest.objects {
+        let object_path = root_dir.join(pack_object_relative_path(object));
+        if !object_path.is_file() {
+            return Err(format!(
+                "Pack object file not found: {}",
+                object_path.display()
+            ));
+        }
+    }
+
+    Ok(LoadedPackManifest { root_dir, manifest })
+}
+
+fn resolve_pack_upgrade_target(pack_id: &str) -> Result<ResolvedPackUpgradeTarget, String> {
+    let base = require_daemon("pack upgrade");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/v1/packs/{pack_id}")).send());
+
+    if let Some(error) = daemon_error_message(&body) {
+        return Err(error);
+    }
+
+    let current_version = body
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "daemon response did not include the current pack version".to_string())?
+        .to_string();
+    let source_kind = body
+        .get("source")
+        .and_then(|source| source.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "daemon response did not include the pack source kind".to_string())?;
+
+    let target_version = match source_kind {
+        "bundled" => latest_bundled_upgrade_version(pack_id, &current_version)
+            .unwrap_or_else(|| current_version.clone()),
+        "external" => latest_staged_external_version(pack_id).unwrap_or(current_version.clone()),
+        _ => current_version.clone(),
+    };
+
+    Ok(ResolvedPackUpgradeTarget {
+        current_version,
+        target_version,
+    })
+}
+
+fn default_bundled_install_version(pack_id: &str) -> Option<&'static str> {
+    match pack_id {
+        "sdlc" => Some(BUNDLED_SDLC_PACK_VERSION),
+        _ => None,
+    }
+}
+
+fn latest_bundled_upgrade_version(pack_id: &str, current_version: &str) -> Option<String> {
+    match pack_id {
+        "sdlc" if current_version == BUNDLED_SDLC_PACK_VERSION => Some("1.3.0".to_string()),
+        "sdlc" => Some(current_version.to_string()),
+        _ => None,
+    }
+}
+
+fn latest_staged_external_version(pack_id: &str) -> Option<String> {
+    let stage_root = openfang_home().join(".pack-staging").join(pack_id);
+    let entries = std::fs::read_dir(stage_root).ok()?;
+    let mut versions = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    versions.sort_by(|left, right| compare_pack_versions(left, right));
+    versions.pop()
+}
+
+fn compare_pack_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left_segments = left.split(['.', '-', '_']);
+    let mut right_segments = right.split(['.', '-', '_']);
+
+    loop {
+        match (left_segments.next(), right_segments.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(left_segment), Some(right_segment)) => {
+                let ordering = match (left_segment.parse::<u64>(), right_segment.parse::<u64>()) {
+                    (Ok(left_number), Ok(right_number)) => left_number.cmp(&right_number),
+                    _ => left_segment.cmp(right_segment),
+                };
+                if ordering != std::cmp::Ordering::Equal {
+                    return ordering;
+                }
+            }
+        }
+    }
+}
+
+fn stage_external_pack_source<I>(manifest: &PackManifest, object_files: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = Result<(PathBuf, String), String>>,
+{
+    let stage_root = staged_external_pack_root(&manifest.id, &manifest.version);
+    reset_directory(&stage_root)?;
+    let mut staged_manifest = manifest.clone();
+    staged_manifest.source.kind = PackSourceKind::External;
+    let staged_manifest_text = toml::to_string_pretty(&staged_manifest)
+        .map_err(|error| format!("Failed to serialize staged pack manifest: {error}"))?;
+    write_text_file(&stage_root.join("pack.toml"), &staged_manifest_text)?;
+
+    for object_file in object_files {
+        let (relative_path, contents) = object_file?;
+        write_text_file(&stage_root.join(relative_path), &contents)?;
+    }
+
+    Ok(())
+}
+
+fn staged_external_pack_root(pack_id: &str, version: &str) -> PathBuf {
+    openfang_home()
+        .join(".pack-staging")
+        .join(pack_id)
+        .join(version)
+}
+
+fn reset_directory(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        std::fs::remove_dir_all(path)
+            .map_err(|error| format!("Failed to reset '{}': {error}", path.display()))?;
+    }
+    std::fs::create_dir_all(path)
+        .map_err(|error| format!("Failed to create '{}': {error}", path.display()))
+}
+
+fn write_text_file(path: &Path, contents: &str) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err(format!(
+            "Failed to determine the parent directory for '{}'",
+            path.display()
+        ));
+    };
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "Failed to create parent directory '{}': {error}",
+            parent.display()
+        )
+    })?;
+    std::fs::write(path, contents)
+        .map_err(|error| format!("Failed to write '{}': {error}", path.display()))
+}
+
+fn pack_object_relative_path(object: &openfang_types::pack::PackObjectRef) -> PathBuf {
+    PathBuf::from(object.resource_type.directory()).join(format!("{}.toml", object.resource_id))
+}
+
+fn looks_like_url(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
+}
+
+fn looks_like_path(source: &str) -> bool {
+    source.contains(std::path::MAIN_SEPARATOR)
+        || source.contains('/')
+        || source.contains('\\')
+        || source.starts_with('.')
+        || source.ends_with(".toml")
+}
+
+fn resolve_pack_manifest_url(source: &str) -> Result<reqwest::Url, String> {
+    let mut url =
+        reqwest::Url::parse(source).map_err(|error| format!("Invalid pack source URL: {error}"))?;
+    if url.path().ends_with(".toml") {
+        return Ok(url);
+    }
+
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+
+    url.join("pack.toml").map_err(|error| {
+        format!(
+            "Failed to resolve pack.toml relative to '{}': {error}",
+            source
+        )
+    })
+}
+
+fn fetch_remote_text(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    label: &str,
+) -> Result<String, String> {
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|error| format!("Failed to download {label} from {url}: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "Failed to download {label} from {url}: HTTP {status}"
+        ));
+    }
+    response
+        .text()
+        .map_err(|error| format!("Failed to read {label} response body from {url}: {error}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -6720,8 +11901,55 @@ fn remove_self_binary(exe_path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    use super::{looper_progress_text, watch_event_summary};
+    use pretty_assertions::assert_eq;
 
     // --- Doctor command unit tests ---
+
+    #[test]
+    fn looper_progress_text_should_default_to_zero_when_progress_is_missing() {
+        let item = serde_json::json!({
+            "id": "loop_missing_progress",
+            "task_id": "task_missing_progress",
+            "status": "pending",
+            "execution_policy": {
+                "mode": "parallel",
+                "max_parallelism": 2,
+                "selection": "priority"
+            }
+        });
+
+        assert_eq!(looper_progress_text(&item), "0/0");
+    }
+
+    #[test]
+    fn watch_event_summary_should_pretty_print_looper_run_events() {
+        let event = serde_json::json!({
+            "id": "loop_watch",
+            "task_id": "task_watch",
+            "status": "running",
+            "execution_policy": {
+                "mode": "parallel",
+                "max_parallelism": 4,
+                "selection": "priority"
+            },
+            "current_subtask_id": "subtask_007",
+            "progress": {
+                "completed": 3,
+                "total": 12,
+                "failed": 0
+            }
+        });
+
+        assert_eq!(
+            watch_event_summary("run.updated", &event),
+            "task=task_watch, status=running, mode=parallel, progress=3/12, current=subtask_007"
+        );
+        assert_eq!(
+            watch_event_summary("stream.snapshot", &event),
+            "snapshot task=task_watch, status=running, mode=parallel, progress=3/12, current=subtask_007"
+        );
+    }
 
     #[test]
     fn test_doctor_skill_registry_loads_bundled() {

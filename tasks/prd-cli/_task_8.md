@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>cli/commands</domain>
@@ -60,23 +60,23 @@ firing any workflows.
 
 ## Subtasks
 
-- [ ] 8.1 Add 9 new variants to the existing `TriggerCommands` enum with their
+- [x] 8.1 Add 9 new variants to the existing `TriggerCommands` enum with their
       arguments. Ensure existing `List`, `Create`, `Delete` variants are not
       modified.
-- [ ] 8.2 Add dispatch arms for all 9 new variants in the existing trigger
+- [x] 8.2 Add dispatch arms for all 9 new variants in the existing trigger
       match block
-- [ ] 8.3 Implement `cmd_trigger_get` and `cmd_trigger_runtime` GET handlers
+- [x] 8.3 Implement `cmd_trigger_get` and `cmd_trigger_runtime` GET handlers
       with `--json` support
-- [ ] 8.4 Implement `cmd_trigger_update` — read JSON file, PUT to
+- [x] 8.4 Implement `cmd_trigger_update` — read JSON file, PUT to
       `/api/v1/triggers/{id}`
-- [ ] 8.5 Implement `cmd_trigger_enable` and `cmd_trigger_disable` — simple
+- [x] 8.5 Implement `cmd_trigger_enable` and `cmd_trigger_disable` — simple
       POST with success/error output
-- [ ] 8.6 Implement `cmd_trigger_test` — takes inline event JSON string, POSTs
+- [x] 8.6 Implement `cmd_trigger_test` — takes inline event JSON string, POSTs
       to test endpoint, prints match result with explanation
-- [ ] 8.7 Implement `cmd_trigger_fork` — POST and print new trigger ID
-- [ ] 8.8 Implement `cmd_trigger_validate` and `cmd_trigger_compile` — read
+- [x] 8.7 Implement `cmd_trigger_fork` — POST and print new trigger ID
+- [x] 8.8 Implement `cmd_trigger_validate` and `cmd_trigger_compile` — read
       JSON file, POST, print validation/compilation results
-- [ ] 8.9 Run `make fmt && make lint && make test` — all must pass with zero
+- [x] 8.9 Run `make fmt && make lint && make test` — all must pass with zero
       warnings before marking done
 
 ## Implementation Details
@@ -147,35 +147,35 @@ Issues:
 
 ### Unit Tests (Required)
 
-- [ ] `openfang trigger --help` exits 0 and output contains all 12 subcommands
+- [x] `openfang trigger --help` exits 0 and output contains all 12 subcommands
       (3 existing + 9 new)
-- [ ] Existing `openfang trigger list` behavior is unchanged
-- [ ] `openfang trigger test` with missing arguments prints usage help
-- [ ] `openfang trigger validate nonexistent.json` prints file-not-found error
+- [x] Existing `openfang trigger list` behavior is unchanged
+- [x] `openfang trigger test` with missing arguments prints usage help
+- [x] `openfang trigger validate nonexistent.json` prints file-not-found error
 
 ### Integration Tests (Required)
 
-- [ ] With daemon: `openfang trigger get <id> --json` returns valid JSON
-- [ ] With daemon: `openfang trigger test <id> <event_json>` returns match
+- [x] With daemon: `openfang trigger get <id> --json` returns valid JSON
+- [x] With daemon: `openfang trigger test <id> <event_json>` returns match
       result with explanation
-- [ ] With daemon: `openfang trigger enable <id>` and `openfang trigger
+- [x] With daemon: `openfang trigger enable <id>` and `openfang trigger
       disable <id>` toggle trigger state
-- [ ] With daemon: `openfang trigger validate <file>` returns valid/invalid
+- [x] With daemon: `openfang trigger validate <file>` returns valid/invalid
       with issues list
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] Existing `list`, `create`, `delete` handlers must not be modified
-- [ ] `test` command must use inline JSON, not file input
-- [ ] `validate` and `compile` must use file input, not inline JSON
-- [ ] No `unwrap()` in handler code
-- [ ] No new crate dependencies
+- [x] Existing `list`, `create`, `delete` handlers must not be modified
+- [x] `test` command must use inline JSON, not file input
+- [x] `validate` and `compile` must use file input, not inline JSON
+- [x] No `unwrap()` in handler code
+- [x] No new crate dependencies
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

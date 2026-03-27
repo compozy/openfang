@@ -4206,6 +4206,7 @@ dependencies = [
 name = "openfang-cli"
 version = "0.5.1"
 dependencies = [
+ "chrono",
  "clap",
  "clap_complete",
  "colored",
@@ -4213,10 +4214,12 @@ dependencies = [
  "openfang-api",
  "openfang-extensions",
  "openfang-kernel",
+ "openfang-memory",
  "openfang-migrate",
  "openfang-runtime",
  "openfang-skills",
  "openfang-types",
+ "pretty_assertions",
  "ratatui",
  "reqwest",
  "serde",

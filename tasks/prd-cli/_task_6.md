@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>cli/commands</domain>
@@ -48,16 +48,16 @@ parallel API endpoints under `/api/v1/artifacts` and `/api/v1/docs`.
 
 ## Subtasks
 
-- [ ] 6.1 Define `ArtifactCommands` enum with clap `#[derive(Subcommand)]` and
+- [x] 6.1 Define `ArtifactCommands` enum with clap `#[derive(Subcommand)]` and
       all 3 variants
-- [ ] 6.2 Define `DocCommands` enum with clap `#[derive(Subcommand)]` and all
+- [x] 6.2 Define `DocCommands` enum with clap `#[derive(Subcommand)]` and all
       3 variants
-- [ ] 6.3 Add `Artifact(ArtifactCommands)` and `Doc(DocCommands)` to the
+- [x] 6.3 Add `Artifact(ArtifactCommands)` and `Doc(DocCommands)` to the
       `Commands` enum and wire dispatch
-- [ ] 6.4 Implement `cmd_artifact_list`, `cmd_artifact_get`,
+- [x] 6.4 Implement `cmd_artifact_list`, `cmd_artifact_get`,
       `cmd_artifact_versions` handlers
-- [ ] 6.5 Implement `cmd_doc_list`, `cmd_doc_get`, `cmd_doc_versions` handlers
-- [ ] 6.6 Run `make fmt && make lint && make test` — all must pass with zero
+- [x] 6.5 Implement `cmd_doc_list`, `cmd_doc_get`, `cmd_doc_versions` handlers
+- [x] 6.6 Run `make fmt && make lint && make test` — all must pass with zero
       warnings before marking done
 
 ## Implementation Details
@@ -100,27 +100,27 @@ summary including the current version content and provenance metadata.
 
 ### Unit Tests (Required)
 
-- [ ] `openfang artifact --help` exits 0 and output contains all 3 subcommands
-- [ ] `openfang doc --help` exits 0 and output contains all 3 subcommands
-- [ ] `openfang artifact list` without a daemon prints "requires a running daemon"
+- [x] `openfang artifact --help` exits 0 and output contains all 3 subcommands
+- [x] `openfang doc --help` exits 0 and output contains all 3 subcommands
+- [x] `openfang artifact list` without a daemon prints "requires a running daemon"
 
 ### Integration Tests (Required)
 
-- [ ] With daemon: `openfang artifact list --json` returns valid JSON
-- [ ] With daemon: `openfang doc list --task_id <id> --json` filters by task
-- [ ] With daemon: `openfang artifact versions <nonexistent_id>` returns error
+- [x] With daemon: `openfang artifact list --json` returns valid JSON
+- [x] With daemon: `openfang doc list --task_id <id> --json` filters by task
+- [x] With daemon: `openfang artifact versions <nonexistent_id>` returns error
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] SHA-256 hash display must be the full hash, not truncated
-- [ ] Existing CLI commands remain unchanged
-- [ ] No `unwrap()` in handler code
+- [x] SHA-256 hash display must be the full hash, not truncated
+- [x] Existing CLI commands remain unchanged
+- [x] No `unwrap()` in handler code
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

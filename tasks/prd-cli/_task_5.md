@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>cli/commands</domain>
@@ -47,15 +47,15 @@ any triggers without actually firing them. Both accept a JSON file as input.
 
 ## Subtasks
 
-- [ ] 5.1 Define `EventCommands` enum with clap `#[derive(Subcommand)]` and
+- [x] 5.1 Define `EventCommands` enum with clap `#[derive(Subcommand)]` and
       both variants
-- [ ] 5.2 Add `Event(EventCommands)` to the `Commands` enum and wire dispatch
-- [ ] 5.3 Implement `cmd_event_send` — read JSON file, POST to `/api/v1/events`,
+- [x] 5.2 Add `Event(EventCommands)` to the `Commands` enum and wire dispatch
+- [x] 5.3 Implement `cmd_event_send` — read JSON file, POST to `/api/v1/events`,
       print summary (event_id, matched_triggers count, effects count, failures)
-- [ ] 5.4 Implement `cmd_event_dry_run` — read JSON file, POST to
+- [x] 5.4 Implement `cmd_event_dry_run` — read JSON file, POST to
       `/api/v1/events/dry-run`, print summary (would_execute, resolved count,
       explanation)
-- [ ] 5.5 Run `make fmt && make lint && make test` — all must pass with zero
+- [x] 5.5 Run `make fmt && make lint && make test` — all must pass with zero
       warnings before marking done
 
 ## Implementation Details
@@ -109,29 +109,29 @@ if let Some(id) = body["event_id"].as_str() {
 
 ### Unit Tests (Required)
 
-- [ ] `openfang event --help` exits 0 and output contains both subcommands
+- [x] `openfang event --help` exits 0 and output contains both subcommands
       (send, dry-run)
-- [ ] `openfang event send nonexistent.json` prints file-not-found error
-- [ ] `openfang event send` with no file argument prints usage help
+- [x] `openfang event send nonexistent.json` prints file-not-found error
+- [x] `openfang event send` with no file argument prints usage help
 
 ### Integration Tests (Required)
 
-- [ ] With daemon: `openfang event dry-run <valid_file>` returns response
+- [x] With daemon: `openfang event dry-run <valid_file>` returns response
       without triggering any actual workflow execution
-- [ ] With daemon: `openfang event send <file>` with invalid JSON content
+- [x] With daemon: `openfang event send <file>` with invalid JSON content
       returns a structured error
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] File must be validated as valid JSON before sending to API
-- [ ] Existing CLI commands remain unchanged
-- [ ] No `unwrap()` in handler code
+- [x] File must be validated as valid JSON before sending to API
+- [x] Existing CLI commands remain unchanged
+- [x] No `unwrap()` in handler code
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

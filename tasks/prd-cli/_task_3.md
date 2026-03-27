@@ -1,6 +1,6 @@
 ## markdown
 
-## status: pending
+## status: completed
 
 <task_context>
 <domain>cli/commands</domain>
@@ -57,18 +57,18 @@ SSE consumption pattern.
 
 ## Subtasks
 
-- [ ] 3.1 Define `HitlCommands` enum with clap `#[derive(Subcommand)]` and all
+- [x] 3.1 Define `HitlCommands` enum with clap `#[derive(Subcommand)]` and all
       5 variants with their arguments
-- [ ] 3.2 Add `Hitl(HitlCommands)` to the `Commands` enum and wire dispatch in
+- [x] 3.2 Add `Hitl(HitlCommands)` to the `Commands` enum and wire dispatch in
       the main `match` block
-- [ ] 3.3 Implement `cmd_hitl_list` and `cmd_hitl_get` GET handlers with
+- [x] 3.3 Implement `cmd_hitl_list` and `cmd_hitl_get` GET handlers with
       `--json` support and columnar table output
-- [ ] 3.4 Implement `cmd_hitl_answer` POST handler — takes plain-text response
+- [x] 3.4 Implement `cmd_hitl_answer` POST handler — takes plain-text response
       string and sends as JSON body
-- [ ] 3.5 Implement `cmd_hitl_cancel` POST handler
-- [ ] 3.6 Implement `cmd_hitl_watch` SSE handler reusing the pattern from Phase
+- [x] 3.5 Implement `cmd_hitl_cancel` POST handler
+- [x] 3.6 Implement `cmd_hitl_watch` SSE handler reusing the pattern from Phase
       2, targeting `/api/v1/hitl-requests/stream`
-- [ ] 3.7 Run `make fmt && make lint && make test` — all must pass with zero
+- [x] 3.7 Run `make fmt && make lint && make test` — all must pass with zero
       warnings before marking done
 
 ## Implementation Details
@@ -115,29 +115,29 @@ pending requests that need human attention.
 
 ### Unit Tests (Required)
 
-- [ ] `openfang hitl --help` exits 0 and output contains all 5 subcommands
+- [x] `openfang hitl --help` exits 0 and output contains all 5 subcommands
       (list, get, answer, cancel, watch)
-- [ ] `openfang hitl list` without a daemon prints "requires a running daemon"
-- [ ] `openfang hitl answer` with missing arguments prints usage help
+- [x] `openfang hitl list` without a daemon prints "requires a running daemon"
+- [x] `openfang hitl answer` with missing arguments prints usage help
 
 ### Integration Tests (Required)
 
-- [ ] With daemon: `openfang hitl list --json` returns valid JSON
-- [ ] With daemon: `openfang hitl list --status pending --json` filters correctly
-- [ ] With daemon: `openfang hitl cancel <nonexistent_id>` returns error (not panic)
+- [x] With daemon: `openfang hitl list --json` returns valid JSON
+- [x] With daemon: `openfang hitl list --status pending --json` filters correctly
+- [x] With daemon: `openfang hitl cancel <nonexistent_id>` returns error (not panic)
 
 ### Regression and Anti-Pattern Guards
 
-- [ ] `answer` command must send response as JSON body, not as URL parameter
-- [ ] `QUESTION` column in table output must be truncated to prevent terminal overflow
-- [ ] Existing CLI commands remain unchanged
-- [ ] No `unwrap()` in handler code
+- [x] `answer` command must send response as JSON body, not as URL parameter
+- [x] `QUESTION` column in table output must be truncated to prevent terminal overflow
+- [x] Existing CLI commands remain unchanged
+- [x] No `unwrap()` in handler code
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 
