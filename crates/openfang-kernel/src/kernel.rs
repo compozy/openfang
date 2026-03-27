@@ -1527,7 +1527,7 @@ impl OpenFangKernel {
             state: entry.state,
             mode: entry.mode,
             healthy: !matches!(entry.state, AgentState::Crashed | AgentState::Terminated),
-            active_session_id: Some(entry.session_id),
+            active_session_id: Some(entry.session_id.clone()),
             active_dispatches: 0,
             last_active_at: Some(entry.last_active.to_rfc3339()),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1543,7 +1543,7 @@ impl OpenFangKernel {
 
         session_id
             .parse::<uuid::Uuid>()
-            .map(SessionId)
+            .map(SessionId::from_uuid)
             .map_err(|error| {
                 KernelError::OpenFang(OpenFangError::Internal(format!(
                     "invalid session_id in runtime projection: {error}"
@@ -1569,7 +1569,7 @@ impl OpenFangKernel {
             .min(u64::from(u32::MAX)) as u32;
 
         AgentSessionRecord {
-            session_id: session.id,
+            session_id: session.id.clone(),
             agent_id: entry.id,
             label: session.label.clone().or_else(|| {
                 session_meta
@@ -1608,7 +1608,7 @@ impl OpenFangKernel {
             let session_id = Self::parse_session_id_value(session_meta)?;
             let Some(session) = self
                 .memory
-                .get_session(session_id)
+                .get_session(session_id.clone())
                 .map_err(KernelError::OpenFang)?
             else {
                 continue;
@@ -1622,7 +1622,7 @@ impl OpenFangKernel {
                 .map_err(KernelError::OpenFang)?;
             self.runtime_stores
                 .agent_message
-                .replace_messages_for_session(agent_id, session_id, &session.messages)
+                .replace_messages_for_session(agent_id, session_id.clone(), &session.messages)
                 .map_err(KernelError::OpenFang)?;
             seen_sessions.insert(session_id);
         }
@@ -1636,14 +1636,15 @@ impl OpenFangKernel {
             if seen_sessions.contains(&record.session_id) {
                 continue;
             }
+            let session_id = record.session_id;
 
             self.runtime_stores
                 .agent_message
-                .delete_messages_for_session(record.session_id)
+                .delete_messages_for_session(session_id.clone())
                 .map_err(KernelError::OpenFang)?;
             self.runtime_stores
                 .agent_session
-                .remove_agent_session(record.session_id)
+                .remove_agent_session(session_id)
                 .map_err(KernelError::OpenFang)?;
         }
 
@@ -2036,7 +2037,7 @@ impl OpenFangKernel {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
         if let Some(session_id) = session_id {
-            self.ensure_session_belongs_to_agent(agent_id, session_id)?;
+            self.ensure_session_belongs_to_agent(agent_id, &session_id)?;
             entry.session_id = session_id;
         }
 
@@ -2159,7 +2160,7 @@ impl OpenFangKernel {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
         if let Some(session_id) = session_id {
-            self.ensure_session_belongs_to_agent(agent_id, session_id)?;
+            self.ensure_session_belongs_to_agent(agent_id, &session_id)?;
             entry.session_id = session_id;
         }
 
@@ -2227,10 +2228,10 @@ impl OpenFangKernel {
         // LLM agent: true streaming via agent loop
         let mut session = self
             .memory
-            .get_session(entry.session_id)
+            .get_session(entry.session_id.clone())
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
+                id: entry.session_id.clone(),
                 agent_id,
                 messages: Vec::new(),
                 context_window_tokens: 0,
@@ -2440,7 +2441,7 @@ impl OpenFangKernel {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
                         // Reload the session after compaction
-                        if let Ok(Some(reloaded)) = memory.get_session(session.id) {
+                        if let Ok(Some(reloaded)) = memory.get_session(session.id.clone()) {
                             session = reloaded;
                         }
                     }
@@ -2826,10 +2827,10 @@ impl OpenFangKernel {
 
         let mut session = self
             .memory
-            .get_session(entry.session_id)
+            .get_session(entry.session_id.clone())
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
+                id: entry.session_id.clone(),
                 agent_id,
                 messages: Vec::new(),
                 context_window_tokens: 0,
@@ -2861,7 +2862,7 @@ impl OpenFangKernel {
                 match self.compact_agent_session_for_entry(entry).await {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
-                        if let Ok(Some(reloaded)) = self.memory.get_session(session.id) {
+                        if let Ok(Some(reloaded)) = self.memory.get_session(session.id.clone()) {
                             session = reloaded;
                         }
                     }
@@ -3221,7 +3222,7 @@ impl OpenFangKernel {
         })?;
 
         // Auto-save session context to workspace memory before clearing
-        if let Ok(Some(old_session)) = self.memory.get_session(entry.session_id) {
+        if let Ok(Some(old_session)) = self.memory.get_session(entry.session_id.clone()) {
             if old_session.messages.len() >= 2 {
                 self.save_session_summary(agent_id, &entry, &old_session);
             }
@@ -3307,7 +3308,7 @@ impl OpenFangKernel {
                 let is_active = obj
                     .get("session_id")
                     .and_then(|v| v.as_str())
-                    .map(|sid| sid == entry.session_id.0.to_string())
+                    .map(|sid| sid == entry.session_id.to_string())
                     .unwrap_or(false);
                 obj.insert("active".to_string(), serde_json::json!(is_active));
             }
@@ -3334,7 +3335,7 @@ impl OpenFangKernel {
 
         // Switch to the new session
         self.registry
-            .update_session_id(agent_id, session.id)
+            .update_session_id(agent_id, session.id.clone())
             .map_err(KernelError::OpenFang)?;
         if let Some(updated_entry) = self.registry.get(agent_id) {
             self.memory
@@ -3346,7 +3347,7 @@ impl OpenFangKernel {
         info!(agent_id = %agent_id, label = ?label, "Created new session");
 
         Ok(serde_json::json!({
-            "session_id": session.id.0.to_string(),
+            "session_id": session.id.to_string(),
             "label": session.label,
         }))
     }
@@ -3365,7 +3366,7 @@ impl OpenFangKernel {
         // Verify session exists and belongs to this agent
         let session = self
             .memory
-            .get_session(session_id)
+            .get_session(session_id.clone())
             .map_err(KernelError::OpenFang)?
             .ok_or_else(|| {
                 KernelError::OpenFang(OpenFangError::Internal("Session not found".to_string()))
@@ -3378,7 +3379,7 @@ impl OpenFangKernel {
         }
 
         self.registry
-            .update_session_id(agent_id, session_id)
+            .update_session_id(agent_id, session_id.clone())
             .map_err(KernelError::OpenFang)?;
         if let Some(updated_entry) = self.registry.get(agent_id) {
             self.memory
@@ -3387,18 +3388,18 @@ impl OpenFangKernel {
         }
         self.sync_agent_runtime_projection(agent_id)?;
 
-        info!(agent_id = %agent_id, session_id = %session_id.0, "Switched session");
+        info!(agent_id = %agent_id, session_id = %session_id, "Switched session");
         Ok(())
     }
 
     fn ensure_session_belongs_to_agent(
         &self,
         agent_id: AgentId,
-        session_id: SessionId,
+        session_id: &SessionId,
     ) -> KernelResult<()> {
         let session = self
             .memory
-            .get_session(session_id)
+            .get_session(session_id.clone())
             .map_err(KernelError::OpenFang)?
             .ok_or_else(|| {
                 KernelError::OpenFang(OpenFangError::Internal("Session not found".to_string()))
@@ -3728,10 +3729,10 @@ impl OpenFangKernel {
         let agent_id = entry.id;
         let session = self
             .memory
-            .get_session(entry.session_id)
+            .get_session(entry.session_id.clone())
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
+                id: entry.session_id.clone(),
                 agent_id,
                 messages: Vec::new(),
                 context_window_tokens: 0,
@@ -3818,10 +3819,10 @@ impl OpenFangKernel {
 
         let session = self
             .memory
-            .get_session(entry.session_id)
+            .get_session(entry.session_id.clone())
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
+                id: entry.session_id.clone(),
                 agent_id,
                 messages: Vec::new(),
                 context_window_tokens: 0,
@@ -5150,14 +5151,14 @@ impl OpenFangKernel {
             .as_deref()
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| entry.session_id.to_string());
-        let parsed_session_id = SessionId(uuid::Uuid::parse_str(&dispatch_session_id).map_err(
-            |error| {
+        let parsed_session_id = SessionId::from_uuid(
+            uuid::Uuid::parse_str(&dispatch_session_id).map_err(|error| {
                 format!(
                     "Stored session id '{}' for dispatch '{}' is invalid: {error}",
                     dispatch_session_id, request.dispatch_id
                 )
-            },
-        )?);
+            })?,
+        );
 
         self.ensure_dispatch_running(
             &request.dispatch_id,
@@ -6148,7 +6149,7 @@ impl OpenFangKernel {
         }
 
         let session_id =
-            SessionId(uuid::Uuid::parse_str(dispatch_session_id).map_err(|error| {
+            SessionId::from_uuid(uuid::Uuid::parse_str(dispatch_session_id).map_err(|error| {
                 format!(
                     "Stored legacy session id '{}' for dispatch '{}' is invalid: {error}",
                     dispatch_session_id, resume.dispatch.dispatch_id
@@ -6156,7 +6157,7 @@ impl OpenFangKernel {
             })?);
         let session = self
             .memory
-            .get_session(session_id)
+            .get_session(session_id.clone())
             .map_err(|error| {
                 format!(
                     "Failed to load legacy session '{}' for dispatch '{}': {error}",
@@ -10079,7 +10080,7 @@ mod tests {
         kernel
             .memory
             .save_session_async(&openfang_memory::session::Session {
-                id: entry.session_id,
+                id: entry.session_id.clone(),
                 agent_id: entry.id,
                 messages: Vec::new(),
                 context_window_tokens: 0,

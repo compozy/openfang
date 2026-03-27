@@ -251,7 +251,7 @@ impl AgentRuntimeStore {
                 encode_agent_state(record.state),
                 encode_agent_mode(record.mode),
                 bool_to_sql(record.healthy),
-                record.active_session_id.map(|value| value.to_string()),
+                record.active_session_id.as_ref().map(ToString::to_string),
                 i64::from(record.active_dispatches),
                 record.last_active_at.as_deref(),
                 record.updated_at.as_str(),
@@ -545,7 +545,7 @@ impl AgentMessageStore {
             let payload_json = serde_json::to_string(message)
                 .map_err(|error| OpenFangError::Serialization(error.to_string()))?;
             let direction = direction_for_message(message);
-            let message_id = deterministic_message_id(session_id, index, &direction);
+            let message_id = deterministic_message_id(&session_id, index, &direction);
             let created_at = (Utc::now() + Duration::microseconds(index as i64)).to_rfc3339();
 
             transaction
@@ -945,21 +945,29 @@ fn parse_agent_id(value: String) -> Result<AgentId, rusqlite::Error> {
 fn parse_session_id(value: Option<String>) -> Result<Option<SessionId>, rusqlite::Error> {
     value
         .map(|value| {
-            Uuid::parse_str(&value).map(SessionId).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })
+            Uuid::parse_str(&value)
+                .map(SessionId::from_uuid)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
         })
         .transpose()
 }
 
 fn parse_required_session_id(value: &str) -> Result<SessionId, rusqlite::Error> {
-    Uuid::parse_str(value).map(SessionId).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
-    })
+    Uuid::parse_str(value)
+        .map(SessionId::from_uuid)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
 }
 
 fn i64_to_u32(value: i64) -> Result<u32, rusqlite::Error> {
@@ -1044,7 +1052,7 @@ fn direction_for_message(message: &Message) -> String {
     }
 }
 
-fn deterministic_message_id(session_id: SessionId, index: usize, direction: &str) -> String {
+fn deterministic_message_id(session_id: &SessionId, index: usize, direction: &str) -> String {
     let key = format!("{session_id}:{index}:{direction}");
     Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string()
 }
@@ -1243,7 +1251,7 @@ mod tests {
         let inbound = AgentMessageRecord {
             message_id: "message-inbound".to_string(),
             agent_id,
-            session_id,
+            session_id: session_id.clone(),
             direction: "inbound".to_string(),
             payload_json: "{\"text\":\"hello\"}".to_string(),
             status: "completed".to_string(),
@@ -1253,7 +1261,7 @@ mod tests {
         let outbound = AgentMessageRecord {
             message_id: "message-outbound".to_string(),
             agent_id,
-            session_id,
+            session_id: session_id.clone(),
             direction: "outbound".to_string(),
             payload_json: "{\"text\":\"hi\"}".to_string(),
             status: "completed".to_string(),

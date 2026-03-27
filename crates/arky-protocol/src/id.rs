@@ -47,6 +47,14 @@ impl fmt::Display for SessionId {
     }
 }
 
+impl std::str::FromStr for SessionId {
+    type Err = uuid::Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Self::parse_str(input)
+    }
+}
+
 impl From<Uuid> for SessionId {
     fn from(value: Uuid) -> Self {
         Self::from_uuid(value)
@@ -179,6 +187,19 @@ mod tests {
             (session_id.to_string(), decoded),
             (session_id.to_string(), session_id)
         );
+    }
+
+    #[test]
+    fn session_id_should_round_trip_uuid_and_parse_from_display() {
+        let uuid = uuid::Uuid::new_v4();
+        let session_id = SessionId::from_uuid(uuid);
+        let parsed: SessionId = session_id
+            .to_string()
+            .parse()
+            .expect("session id display should parse");
+
+        assert_eq!(session_id.as_uuid(), &uuid);
+        assert_eq!(parsed, session_id);
     }
 
     #[test]

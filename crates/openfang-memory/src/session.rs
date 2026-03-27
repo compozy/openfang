@@ -46,7 +46,7 @@ impl SessionStore {
             .prepare("SELECT agent_id, messages, context_window_tokens, label FROM sessions WHERE id = ?1")
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-        let result = stmt.query_row(rusqlite::params![session_id.0.to_string()], |row| {
+        let result = stmt.query_row(rusqlite::params![session_id.to_string()], |row| {
             let agent_str: String = row.get(0)?;
             let messages_blob: Vec<u8> = row.get(1)?;
             let tokens: i64 = row.get(2)?;
@@ -88,7 +88,7 @@ impl SessionStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
              ON CONFLICT(id) DO UPDATE SET messages = ?3, context_window_tokens = ?4, label = ?5, updated_at = ?6",
             rusqlite::params![
-                session.id.0.to_string(),
+                session.id.to_string(),
                 session.agent_id.0.to_string(),
                 messages_blob,
                 session.context_window_tokens as i64,
@@ -108,7 +108,7 @@ impl SessionStore {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         conn.execute(
             "DELETE FROM sessions WHERE id = ?1",
-            rusqlite::params![session_id.0.to_string()],
+            rusqlite::params![session_id.to_string()],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
@@ -207,7 +207,7 @@ impl SessionStore {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         conn.execute(
             "UPDATE sessions SET label = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![label, Utc::now().to_rfc3339(), session_id.0.to_string()],
+            rusqlite::params![label, Utc::now().to_rfc3339(), session_id.to_string()],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
@@ -241,7 +241,7 @@ impl SessionStore {
         match result {
             Ok((id_str, messages_blob, tokens, lbl)) => {
                 let session_id = uuid::Uuid::parse_str(&id_str)
-                    .map(SessionId)
+                    .map(SessionId::from_uuid)
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
                 let messages: Vec<Message> = rmp_serde::from_slice(&messages_blob)
                     .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
@@ -536,7 +536,7 @@ impl SessionStore {
         sessions_dir: &Path,
     ) -> Result<(), std::io::Error> {
         std::fs::create_dir_all(sessions_dir)?;
-        let path = sessions_dir.join(format!("{}.jsonl", session.id.0));
+        let path = sessions_dir.join(format!("{}.jsonl", session.id));
         let mut file = std::fs::File::create(&path)?;
         let now = Utc::now().to_rfc3339();
 
@@ -665,8 +665,8 @@ mod tests {
         let agent_id = AgentId::new();
         let session = store.create_session(agent_id).unwrap();
         let sid = session.id;
-        assert!(store.get_session(sid).unwrap().is_some());
-        store.delete_session(sid).unwrap();
+        assert!(store.get_session(sid.clone()).unwrap().is_some());
+        store.delete_session(sid.clone()).unwrap();
         assert!(store.get_session(sid).unwrap().is_none());
     }
 
@@ -676,8 +676,8 @@ mod tests {
         let agent_id = AgentId::new();
         let s1 = store.create_session(agent_id).unwrap();
         let s2 = store.create_session(agent_id).unwrap();
-        assert!(store.get_session(s1.id).unwrap().is_some());
-        assert!(store.get_session(s2.id).unwrap().is_some());
+        assert!(store.get_session(s1.id.clone()).unwrap().is_some());
+        assert!(store.get_session(s2.id.clone()).unwrap().is_some());
         store.delete_agent_sessions(agent_id).unwrap();
         assert!(store.get_session(s1.id).unwrap().is_none());
         assert!(store.get_session(s2.id).unwrap().is_none());
@@ -792,7 +792,7 @@ mod tests {
         let sessions_dir = dir.path().join("sessions");
         store.write_jsonl_mirror(&session, &sessions_dir).unwrap();
 
-        let jsonl_path = sessions_dir.join(format!("{}.jsonl", session.id.0));
+        let jsonl_path = sessions_dir.join(format!("{}.jsonl", session.id));
         assert!(jsonl_path.exists());
 
         let content = std::fs::read_to_string(&jsonl_path).unwrap();

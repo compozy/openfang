@@ -4474,6 +4474,7 @@ name = "openfang-types"
 version = "0.5.1"
 dependencies = [
  "arky-error",
+ "arky-protocol",
  "async-trait",
  "chrono",
  "chrono-tz",

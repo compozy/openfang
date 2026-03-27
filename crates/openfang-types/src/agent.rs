@@ -1,6 +1,7 @@
 //! Agent-related types: identity, manifests, state, and scheduling.
 
 use crate::tool::ToolDefinition;
+pub use arky_protocol::SessionId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -143,29 +144,6 @@ impl std::str::FromStr for AgentId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self(Uuid::parse_str(s)?))
-    }
-}
-
-/// Unique identifier for a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(pub Uuid);
-
-impl SessionId {
-    /// Create a new random SessionId.
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for SessionId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for SessionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 
@@ -677,6 +655,50 @@ mod tests {
         let json = serde_json::to_string(&id).unwrap();
         let deserialized: AgentId = serde_json::from_str(&json).unwrap();
         assert_eq!(id, deserialized);
+    }
+
+    #[test]
+    fn test_session_id_new_creates_a_valid_uuid() {
+        let session_id = SessionId::new();
+        assert_ne!(session_id.to_string(), uuid::Uuid::nil().to_string());
+    }
+
+    #[test]
+    fn test_session_id_roundtrips_uuid() {
+        let uuid = uuid::Uuid::new_v4();
+        let session_id = SessionId::from_uuid(uuid);
+        assert_eq!(session_id.as_uuid(), &uuid);
+    }
+
+    #[test]
+    fn test_session_id_serde_roundtrip() {
+        let session_id = SessionId::new();
+        let json = serde_json::to_string(&session_id).unwrap();
+        let deserialized: SessionId = serde_json::from_str(&json).unwrap();
+        assert_eq!(session_id, deserialized);
+    }
+
+    #[test]
+    fn test_session_id_display_and_parse_roundtrip() {
+        let session_id = SessionId::new();
+        let display = session_id.to_string();
+        let parsed: SessionId = display.parse().unwrap();
+        assert_eq!(session_id, parsed);
+    }
+
+    #[test]
+    fn test_session_id_serde_shape_matches_uuid() {
+        let uuid = uuid::Uuid::new_v4();
+        let session_id = SessionId::from_uuid(uuid);
+
+        assert_eq!(
+            serde_json::to_string(&session_id).unwrap(),
+            serde_json::to_string(&uuid).unwrap()
+        );
+        assert_eq!(
+            rmp_serde::to_vec_named(&session_id).unwrap(),
+            rmp_serde::to_vec_named(&uuid).unwrap()
+        );
     }
 
     #[test]

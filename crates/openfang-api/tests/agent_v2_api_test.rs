@@ -288,7 +288,7 @@ fn message_request(session_id: &str, text: &str) -> Value {
 }
 
 fn seed_session_message(server: &TestServer, definition_id: &str, session_id: &str) {
-    let session_id = SessionId(
+    let session_id = SessionId::from_uuid(
         session_id
             .parse::<uuid::Uuid>()
             .expect("session_id should parse as UUID"),

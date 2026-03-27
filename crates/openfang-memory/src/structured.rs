@@ -149,7 +149,7 @@ impl StructuredStore {
                 state_str,
                 entry.created_at.to_rfc3339(),
                 now,
-                entry.session_id.0.to_string(),
+                entry.session_id.to_string(),
                 identity_json,
             ],
         )
@@ -212,7 +212,7 @@ impl StructuredStore {
                     .unwrap_or_else(|_| Utc::now());
                 let session_id = session_id_str
                     .and_then(|s| uuid::Uuid::parse_str(&s).ok())
-                    .map(openfang_types::agent::SessionId)
+                    .map(openfang_types::agent::SessionId::from_uuid)
                     .unwrap_or_else(openfang_types::agent::SessionId::new);
                 let identity = identity_str
                     .and_then(|s| serde_json::from_str(&s).ok())
@@ -375,7 +375,7 @@ impl StructuredStore {
                 .unwrap_or_else(|_| Utc::now());
             let session_id = session_id_str
                 .and_then(|s| uuid::Uuid::parse_str(&s).ok())
-                .map(openfang_types::agent::SessionId)
+                .map(openfang_types::agent::SessionId::from_uuid)
                 .unwrap_or_else(openfang_types::agent::SessionId::new);
 
             let identity = identity_str

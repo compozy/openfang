@@ -2840,7 +2840,7 @@ fn parse_session_id_path(
 ) -> Result<SessionId, (StatusCode, Json<serde_json::Value>)> {
     session_id
         .parse::<uuid::Uuid>()
-        .map(SessionId)
+        .map(SessionId::from_uuid)
         .map_err(|_| {
             agent_error_response(
                 StatusCode::BAD_REQUEST,
@@ -2914,7 +2914,12 @@ fn runtime_response(
         })
     });
     let active_session_id = record
-        .and_then(|runtime| runtime.active_session_id.map(|value| value.to_string()))
+        .and_then(|runtime| {
+            runtime
+                .active_session_id
+                .clone()
+                .map(|value| value.to_string())
+        })
         .or_else(|| entry.map(|runtime_entry| runtime_entry.session_id.to_string()));
     let active_dispatches = record.map(|runtime| runtime.active_dispatches).unwrap_or(0);
     let last_active_at = record
@@ -2936,13 +2941,13 @@ fn runtime_response(
 
 fn session_messages(
     state: &AppState,
-    session_id: SessionId,
+    session_id: &SessionId,
 ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let messages = state
         .kernel
         .runtime_stores
         .agent_message
-        .list_messages_for_session(session_id)
+        .list_messages_for_session(session_id.clone())
         .map_err(|error| {
             runtime_store_error(
                 "session_load_failed",
@@ -3067,13 +3072,13 @@ fn new_message_id() -> String {
 fn load_session_record_for_agent(
     state: &AppState,
     agent_id: AgentId,
-    session_id: SessionId,
+    session_id: &SessionId,
 ) -> Result<AgentSessionRecord, (StatusCode, Json<serde_json::Value>)> {
     let record = state
         .kernel
         .runtime_stores
         .agent_session
-        .get_agent_session(session_id)
+        .get_agent_session(session_id.clone())
         .map_err(|error| {
             runtime_store_error("session_load_failed", "Failed to load agent session", error)
         })?
@@ -3164,13 +3169,13 @@ fn resolve_dry_run_tool_names(compiled: &CompiledAgentDefinition) -> Vec<String>
 fn estimate_message_effects(
     state: &AppState,
     compiled: &CompiledAgentDefinition,
-    session_id: SessionId,
+    session_id: &SessionId,
     input_text: &str,
 ) -> MessageDryRunEffects {
     let mut messages = state
         .kernel
         .memory
-        .get_session(session_id)
+        .get_session(session_id.clone())
         .ok()
         .flatten()
         .map(|session| session.messages)
@@ -4095,7 +4100,7 @@ pub async fn create_agent_session_v1(
         .kernel
         .runtime_stores
         .agent_session
-        .get_agent_session(session_id)
+        .get_agent_session(session_id.clone())
     {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -4149,7 +4154,7 @@ pub async fn get_agent_session_v1(
         .kernel
         .runtime_stores
         .agent_session
-        .get_agent_session(session_id)
+        .get_agent_session(session_id.clone())
     {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -4182,7 +4187,7 @@ pub async fn get_agent_session_v1(
     }
 
     let messages = if query.wants_messages() {
-        match session_messages(&state, session_id) {
+        match session_messages(&state, &session_id) {
             Ok(messages) => Some(messages),
             Err(response) => return response,
         }
@@ -4218,7 +4223,7 @@ pub async fn activate_agent_session(
         .kernel
         .runtime_stores
         .agent_session
-        .get_agent_session(session_id)
+        .get_agent_session(session_id.clone())
     {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -4247,7 +4252,10 @@ pub async fn activate_agent_session(
         );
     }
 
-    if let Err(error) = state.kernel.switch_agent_session(agent_id, session_id) {
+    if let Err(error) = state
+        .kernel
+        .switch_agent_session(agent_id, session_id.clone())
+    {
         return agent_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "session_activate_failed",
@@ -4283,7 +4291,7 @@ pub async fn reset_agent_session(
         .kernel
         .runtime_stores
         .agent_session
-        .get_agent_session(session_id)
+        .get_agent_session(session_id.clone())
     {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -4313,7 +4321,10 @@ pub async fn reset_agent_session(
     }
 
     if !session_record.active {
-        if let Err(error) = state.kernel.switch_agent_session(agent_id, session_id) {
+        if let Err(error) = state
+            .kernel
+            .switch_agent_session(agent_id, session_id.clone())
+        {
             return agent_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "session_reset_failed",
@@ -4378,7 +4389,7 @@ pub async fn compact_agent_session_v1(
         .kernel
         .runtime_stores
         .agent_session
-        .get_agent_session(session_id)
+        .get_agent_session(session_id.clone())
     {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -4408,7 +4419,10 @@ pub async fn compact_agent_session_v1(
     }
 
     if !session_record.active {
-        if let Err(error) = state.kernel.switch_agent_session(agent_id, session_id) {
+        if let Err(error) = state
+            .kernel
+            .switch_agent_session(agent_id, session_id.clone())
+        {
             return agent_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "session_compact_failed",
@@ -4473,7 +4487,8 @@ pub async fn submit_agent_message(
         Ok(entry) => entry,
         Err(response) => return response,
     };
-    let session_record = match load_session_record_for_agent(&state, runtime_entry.id, session_id) {
+    let session_record = match load_session_record_for_agent(&state, runtime_entry.id, &session_id)
+    {
         Ok(record) => record,
         Err(response) => return response,
     };
@@ -4497,7 +4512,7 @@ pub async fn submit_agent_message(
         if let Err(error) = kernel
             .send_message_with_handle_and_blocks_for_session(AgentMessageDispatch {
                 agent_id: runtime_entry.id,
-                session_id: Some(session_id),
+                session_id: Some(session_id.clone()),
                 message: &message,
                 kernel_handle: Some(kernel_handle),
                 content_blocks: None,
@@ -4617,7 +4632,8 @@ pub async fn stream_agent_message(
             );
         }
     };
-    let session_record = match load_session_record_for_agent(&state, runtime_entry.id, session_id) {
+    let session_record = match load_session_record_for_agent(&state, runtime_entry.id, &session_id)
+    {
         Ok(record) => record,
         Err(response) => {
             return single_sse_event_response(
@@ -4637,7 +4653,7 @@ pub async fn stream_agent_message(
             .kernel
             .send_message_streaming_for_session(AgentMessageDispatch {
                 agent_id: runtime_entry.id,
-                session_id: Some(session_id),
+                session_id: Some(session_id.clone()),
                 message: &input_text,
                 kernel_handle: Some(kernel_handle),
                 content_blocks: None,
@@ -4821,12 +4837,12 @@ pub async fn dry_run_agent_message(
     };
     let runtime_entry = find_runtime_agent_for_definition(&state, &id);
     let session_record = match runtime_entry.as_ref() {
-        Some(entry) => load_session_record_for_agent(&state, entry.id, session_id),
+        Some(entry) => load_session_record_for_agent(&state, entry.id, &session_id),
         None => match state
             .kernel
             .runtime_stores
             .agent_session
-            .get_agent_session(session_id)
+            .get_agent_session(session_id.clone())
         {
             Ok(Some(record)) => {
                 if record.agent_id != stable_runtime_agent_id(&id) {
@@ -4849,7 +4865,7 @@ pub async fn dry_run_agent_message(
     };
 
     let tools = resolve_dry_run_tool_names(&compiled);
-    let effects = estimate_message_effects(&state, &compiled, session_id, &input_text);
+    let effects = estimate_message_effects(&state, &compiled, &session_id, &input_text);
     let capabilities = serde_json::json!({
         "network": resource.definition.capabilities.network,
         "workspace": resource.definition.capabilities.workspace,
@@ -5175,10 +5191,10 @@ pub fn inject_attachments_into_session(
         None => return,
     };
 
-    let mut session = match kernel.memory.get_session(entry.session_id) {
+    let mut session = match kernel.memory.get_session(entry.session_id.clone()) {
         Ok(Some(s)) => s,
         _ => openfang_memory::session::Session {
-            id: entry.session_id,
+            id: entry.session_id.clone(),
             agent_id,
             messages: Vec::new(),
             context_window_tokens: 0,
@@ -5329,7 +5345,7 @@ pub async fn get_agent_session(
         }
     };
 
-    match state.kernel.memory.get_session(entry.session_id) {
+    match state.kernel.memory.get_session(entry.session_id.clone()) {
         Ok(Some(session)) => {
             // Two-pass approach: ToolUse blocks live in Assistant messages while
             // ToolResult blocks arrive in subsequent User messages.  Pass 1
@@ -5466,7 +5482,7 @@ pub async fn get_agent_session(
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
-                    "session_id": session.id.0.to_string(),
+                    "session_id": session.id.to_string(),
                     "agent_id": session.agent_id.0.to_string(),
                     "message_count": session.messages.len(),
                     "context_window_tokens": session.context_window_tokens,
@@ -5478,7 +5494,7 @@ pub async fn get_agent_session(
         Ok(None) => (
             StatusCode::OK,
             Json(serde_json::json!({
-                "session_id": entry.session_id.0.to_string(),
+                "session_id": entry.session_id.to_string(),
                 "agent_id": agent_id.to_string(),
                 "message_count": 0,
                 "context_window_tokens": 0,
@@ -10951,7 +10967,7 @@ fn ensure_event_dispatch_session(
         .ok_or_else(|| "created agent session did not include session_id".to_string())?;
     session_id
         .parse::<uuid::Uuid>()
-        .map(SessionId)
+        .map(SessionId::from_uuid)
         .map_err(|error| format!("created session id was invalid: {error}"))
 }
 
@@ -10982,7 +10998,7 @@ async fn dispatch_event_agent_message(
         if let Err(error) = kernel
             .send_message_with_handle_and_blocks_for_session(AgentMessageDispatch {
                 agent_id,
-                session_id: Some(session_id),
+                session_id: Some(session_id.clone()),
                 message: &message,
                 kernel_handle: Some(kernel_handle),
                 content_blocks: None,
@@ -11567,8 +11583,8 @@ pub async fn get_agent_legacy(
         .unwrap_or(entry.mode);
     let session_id = runtime_projection
         .as_ref()
-        .and_then(|record| record.active_session_id)
-        .unwrap_or(entry.session_id);
+        .and_then(|record| record.active_session_id.clone())
+        .unwrap_or(entry.session_id.clone());
 
     (
         StatusCode::OK,
@@ -11579,7 +11595,7 @@ pub async fn get_agent_legacy(
             "mode": mode_value,
             "profile": entry.manifest.profile,
             "created_at": entry.created_at.to_rfc3339(),
-            "session_id": session_id.0.to_string(),
+            "session_id": session_id.to_string(),
             "model": {
                 "provider": entry.manifest.model.provider,
                 "model": entry.manifest.model.model,
@@ -17311,7 +17327,7 @@ pub async fn delete_session(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let session_id = match id.parse::<uuid::Uuid>() {
-        Ok(u) => openfang_types::agent::SessionId(u),
+        Ok(u) => openfang_types::agent::SessionId::from_uuid(u),
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -17320,8 +17336,13 @@ pub async fn delete_session(
         }
     };
 
-    let existing_session = state.kernel.memory.get_session(session_id).ok().flatten();
-    match state.kernel.memory.delete_session(session_id) {
+    let existing_session = state
+        .kernel
+        .memory
+        .get_session(session_id.clone())
+        .ok()
+        .flatten();
+    match state.kernel.memory.delete_session(session_id.clone()) {
         Ok(()) => {
             if let Some(session) = existing_session {
                 if let Some(entry) = state.kernel.registry.get(session.agent_id) {
@@ -17354,7 +17375,7 @@ pub async fn set_session_label(
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let session_id = match id.parse::<uuid::Uuid>() {
-        Ok(u) => openfang_types::agent::SessionId(u),
+        Ok(u) => openfang_types::agent::SessionId::from_uuid(u),
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -17378,7 +17399,7 @@ pub async fn set_session_label(
     let agent_id = state
         .kernel
         .memory
-        .get_session(session_id)
+        .get_session(session_id.clone())
         .ok()
         .flatten()
         .map(|session| session.agent_id);
@@ -17430,7 +17451,7 @@ pub async fn find_session_by_label(
         Ok(Some(session)) => (
             StatusCode::OK,
             Json(serde_json::json!({
-                "session_id": session.id.0.to_string(),
+                "session_id": session.id.to_string(),
                 "agent_id": session.agent_id.0.to_string(),
                 "label": session.label,
                 "message_count": session.messages.len(),
@@ -18682,7 +18703,7 @@ pub async fn switch_agent_session(
         }
     };
     let session_id = match session_id_str.parse::<uuid::Uuid>() {
-        Ok(uuid) => openfang_types::agent::SessionId(uuid),
+        Ok(uuid) => openfang_types::agent::SessionId::from_uuid(uuid),
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
