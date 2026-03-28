@@ -1,16 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/arky-error",
-    "crates/arky-protocol",
-    "crates/arky-config",
-    "crates/arky-tools",
-    "crates/arky-hooks",
-    "crates/arky-session",
-    "crates/arky-provider",
-    "crates/arky-mcp",
-    "crates/arky-codex",
-    "crates/arky-claude-code",
     "crates/openfang-types",
     "crates/openfang-memory",
     "crates/openfang-runtime",
@@ -25,19 +15,10 @@ members = [
     "crates/openfang-desktop",
     "crates/openfang-hands",
     "crates/openfang-extensions",
-    "xtask", "crates/openfang-agent-definition",
+    "crates/openfang-agent-definition",
+    "xtask",
 ]
 default-members = [
-    "crates/arky-error",
-    "crates/arky-protocol",
-    "crates/arky-config",
-    "crates/arky-tools",
-    "crates/arky-hooks",
-    "crates/arky-session",
-    "crates/arky-provider",
-    "crates/arky-mcp",
-    "crates/arky-codex",
-    "crates/arky-claude-code",
     "crates/openfang-types",
     "crates/openfang-memory",
     "crates/openfang-runtime",
@@ -78,16 +59,16 @@ openfang-skills = { path = "crates/openfang-skills" }
 openfang-desktop = { path = "crates/openfang-desktop" }
 openfang-hands = { path = "crates/openfang-hands" }
 openfang-extensions = { path = "crates/openfang-extensions" }
-arky-error = { path = "crates/arky-error" }
-arky-protocol = { path = "crates/arky-protocol" }
-arky-config = { path = "crates/arky-config" }
-arky-tools = { path = "crates/arky-tools" }
-arky-hooks = { path = "crates/arky-hooks" }
-arky-session = { path = "crates/arky-session" }
-arky-provider = { path = "crates/arky-provider" }
-arky-mcp = { path = "crates/arky-mcp" }
-arky-codex = { path = "crates/arky-codex" }
-arky-claude-code = { path = "crates/arky-claude-code" }
+arky-error = { git = "https://github.com/compozy/arky.git", branch = "main" }
+arky-protocol = { git = "https://github.com/compozy/arky.git", branch = "main" }
+arky-config = { git = "https://github.com/compozy/arky.git", branch = "main" }
+arky-tools = { git = "https://github.com/compozy/arky.git", branch = "main" }
+arky-hooks = { git = "https://github.com/compozy/arky.git", branch = "main" }
+arky-session = { git = "https://github.com/compozy/arky.git", branch = "main" }
+arky-provider = { git = "https://github.com/compozy/arky.git", branch = "main" }
+arky-mcp = { git = "https://github.com/compozy/arky.git", branch = "main" }
+arky-codex = { git = "https://github.com/compozy/arky.git", branch = "main" }
+arky-claude-code = { git = "https://github.com/compozy/arky.git", branch = "main" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

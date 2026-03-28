@@ -191,7 +191,8 @@ dependencies = [
 
 [[package]]
 name = "arky-claude-code"
-version = "0.5.1"
+version = "0.1.0"
+source = "git+https://github.com/compozy/arky.git?branch=main#2396161bd7004c7c684f965ca306392a5fc3e041"
 dependencies = [
  "arky-error",
  "arky-mcp",
@@ -201,10 +202,8 @@ dependencies = [
  "async-stream",
  "async-trait",
  "futures",
- "pretty_assertions",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -213,7 +212,8 @@ dependencies = [
 
 [[package]]
 name = "arky-codex"
-version = "0.5.1"
+version = "0.1.0"
+source = "git+https://github.com/compozy/arky.git?branch=main#2396161bd7004c7c684f965ca306392a5fc3e041"
 dependencies = [
  "arky-error",
  "arky-mcp",
@@ -223,10 +223,8 @@ dependencies = [
  "async-stream",
  "async-trait",
  "futures",
- "pretty_assertions",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -236,18 +234,17 @@ dependencies = [
 
 [[package]]
 name = "arky-config"
-version = "0.5.1"
+version = "0.1.0"
+source = "git+https://github.com/compozy/arky.git?branch=main#2396161bd7004c7c684f965ca306392a5fc3e041"
 dependencies = [
  "arky-claude-code",
  "arky-codex",
  "arky-error",
  "arky-protocol",
  "arky-provider",
- "pretty_assertions",
  "serde",
  "serde_json",
  "serde_norway",
- "tempfile",
  "thiserror 2.0.18",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
@@ -255,27 +252,25 @@ dependencies = [
 
 [[package]]
 name = "arky-error"
-version = "0.5.1"
+version = "0.1.0"
+source = "git+https://github.com/compozy/arky.git?branch=main#2396161bd7004c7c684f965ca306392a5fc3e041"
 dependencies = [
- "pretty_assertions",
  "regex",
  "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "arky-hooks"
-version = "0.5.1"
+version = "0.1.0"
+source = "git+https://github.com/compozy/arky.git?branch=main#2396161bd7004c7c684f965ca306392a5fc3e041"
 dependencies = [
  "arky-error",
  "arky-protocol",
  "async-trait",
  "futures",
- "pretty_assertions",
  "regex",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -284,7 +279,8 @@ dependencies = [
 
 [[package]]
 name = "arky-mcp"
-version = "0.5.1"
+version = "0.1.0"
+source = "git+https://github.com/compozy/arky.git?branch=main#2396161bd7004c7c684f965ca306392a5fc3e041"
 dependencies = [
  "arky-error",
  "arky-protocol",
@@ -293,12 +289,10 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures",
- "pretty_assertions",
  "reqwest",
  "rmcp",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -307,11 +301,11 @@ dependencies = [
 
 [[package]]
 name = "arky-protocol"
-version = "0.5.1"
+version = "0.1.0"
+source = "git+https://github.com/compozy/arky.git?branch=main#2396161bd7004c7c684f965ca306392a5fc3e041"
 dependencies = [
  "arky-error",
  "chrono",
- "pretty_assertions",
  "serde",
  "serde_json",
  "uuid",
@@ -319,7 +313,8 @@ dependencies = [
 
 [[package]]
 name = "arky-provider"
-version = "0.5.1"
+version = "0.1.0"
+source = "git+https://github.com/compozy/arky.git?branch=main#2396161bd7004c7c684f965ca306392a5fc3e041"
 dependencies = [
  "arky-error",
  "arky-hooks",
@@ -328,7 +323,6 @@ dependencies = [
  "arky-tools",
  "async-trait",
  "futures",
- "pretty_assertions",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -339,16 +333,15 @@ dependencies = [
 
 [[package]]
 name = "arky-session"
-version = "0.5.1"
+version = "0.1.0"
+source = "git+https://github.com/compozy/arky.git?branch=main#2396161bd7004c7c684f965ca306392a5fc3e041"
 dependencies = [
  "arky-error",
  "arky-protocol",
  "async-trait",
- "pretty_assertions",
  "rusqlite",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rusqlite",
@@ -356,17 +349,16 @@ dependencies = [
 
 [[package]]
 name = "arky-tools"
-version = "0.5.1"
+version = "0.1.0"
+source = "git+https://github.com/compozy/arky.git?branch=main#2396161bd7004c7c684f965ca306392a5fc3e041"
 dependencies = [
  "arky-error",
  "arky-protocol",
  "async-trait",
- "pretty_assertions",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tokio",
  "tokio-util",
 ]
 
