@@ -19,6 +19,7 @@ Final polish phase covering: new Integrations page, A2A management in Comms, enh
 - **ALWAYS READ** `tasks/prd-ui/techspec.md` and `tasks/prd-ui/analysis_api_routes.md`
 - **YOU CAN ONLY** finish when `make fmt && make lint && make test` pass AND manual browser verification confirms all features work
 - **IF YOU DON'T CHECK SKILLS** your task will be invalid
+- **DASHBOARD / ALPINE** — use `alpine-js` skill for static HTML, Alpine components, and JS under `static/`
 </critical>
 
 <requirements>

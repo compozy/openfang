@@ -5,6 +5,7 @@
 > Design doc: `docs/plans/2026-03-27-ui-integration-design.md`
 > Tech spec: `tasks/prd-ui/techspec.md`
 > ADRs: `tasks/prd-ui/adr-001.md` through `adr-009.md`
+> Agent skills: use **`alpine-js`** for dashboard static HTML, Alpine.js, and JS under `static/` (tasks 1–11, 13–18). Task **12** is Rust backend only — **`rust-best-practices`** (no `alpine-js`).
 
 ---
 

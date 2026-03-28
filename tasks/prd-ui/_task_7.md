@@ -19,6 +19,7 @@ Rebuild the Workflows page on the `/api/v1/workflows` API. This is the most comp
 - **ALWAYS READ** `tasks/prd-ui/techspec.md`, `tasks/prd-ui/analysis_prd_tasks_1_15.md` (tasks 13-15), and `tasks/prd-ui/analysis_prd_tasks_16_30.md` (task 25)
 - **YOU CAN ONLY** finish when `make fmt && make lint && make test` pass AND manual browser verification confirms page works
 - **IF YOU DON'T CHECK SKILLS** your task will be invalid
+- **DASHBOARD / ALPINE** — use `alpine-js` skill for static HTML, Alpine components, and JS under `static/`
 </critical>
 
 <requirements>

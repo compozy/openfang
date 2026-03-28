@@ -27,6 +27,7 @@ OpenFang is an open-source Agent Operating System written in Rust (14+ crates).
 - **USE** `executing-plans` skill when working through PRD task files
 - **USE** `fix-coderabbit-review` skill when addressing CodeRabbit review issues
 - **USE** `ratatui-tui` skill when working on the interactive CLI/TUI
+- **USE** `alpine-js` skill when working on the dashboard, static HTML, or Alpine.js under `static/`
 - **THIRD PARTY LIBRARIES** (just applied when needing external resources):
   - **MANDATORY** Use the `find-docs` skill for **EXTERNAL** libraries, frameworks, SDKs, APIs, and code patterns when you need up-to-date documentation, references, or examples
   - **NEVER** use `find-docs` (or other external-documentation workflows) to search **local** project code. For local code, use `codebase_search` or `Grep`/`Glob` instead
@@ -164,6 +165,7 @@ Every agent MUST follow this protocol before writing code:
 - **Runtime/Workflow**: workflow engine, dispatch, HITL -> `rust-best-practices`
 - **Provider/Arky**: provider trait, bindings, adapters -> `rust-best-practices`
 - **CLI/TUI**: interactive terminal UI -> `ratatui-tui` + `rust-best-practices`
+- **Dashboard / Alpine.js SPA**: static HTML, Alpine components, dashboard UI -> `alpine-js`
 - **Bug fix**: any domain -> `systematic-debugging` + `no-workarounds` + domain skills
 - **Tests**: any domain -> `test-anti-patterns` + domain skills
 - **PRD task execution** -> `executing-plans` + domain skills
@@ -182,6 +184,7 @@ Every agent MUST follow this protocol before writing code:
 | ------------------------------------ | ----------------------------------------- | ----------------------------------------------------- |
 | Any Rust code                        | `rust-best-practices`                     |                                                       |
 | CLI/TUI work                         | `ratatui-tui`                             | + `rust-best-practices`                               |
+| Dashboard / Alpine.js SPA            | `alpine-js`                               | + `rust-best-practices` when editing Rust for UI      |
 | Bug fix                              | `systematic-debugging` + `no-workarounds` | + `test-anti-patterns` (test failures)                |
 | Writing tests                        | `test-anti-patterns`                      | + domain skill for code being tested                  |
 | PRD task execution                   | `executing-plans`                         | + domain skills                                       |

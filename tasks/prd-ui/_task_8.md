@@ -19,6 +19,7 @@ Build a new Triggers v2 page replacing the broken trigger tab in the old schedul
 - **ALWAYS READ** `tasks/prd-ui/techspec.md` and `tasks/prd-ui/analysis_prd_tasks_31_43.md` (tasks 35, 36)
 - **YOU CAN ONLY** finish when `make fmt && make lint && make test` pass AND manual browser verification confirms page works
 - **IF YOU DON'T CHECK SKILLS** your task will be invalid
+- **DASHBOARD / ALPINE** — use `alpine-js` skill for static HTML, Alpine components, and JS under `static/`
 </critical>
 
 <requirements>

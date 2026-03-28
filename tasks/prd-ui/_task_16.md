@@ -19,6 +19,7 @@ Build two new pages for browsing artifacts and documents independently. Both fol
 - **ALWAYS READ** `tasks/prd-ui/techspec.md` and `tasks/prd-ui/analysis_prd_tasks_31_43.md` (tasks 37, 38)
 - **YOU CAN ONLY** finish when `make fmt && make lint && make test` pass AND manual browser verification confirms pages work
 - **IF YOU DON'T CHECK SKILLS** your task will be invalid
+- **DASHBOARD / ALPINE** — use `alpine-js` skill for static HTML, Alpine components, and JS under `static/`
 </critical>
 
 <requirements>

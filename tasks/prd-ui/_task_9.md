@@ -19,6 +19,7 @@ Build two related pages: Schedules v2 (replacing the cron tab in the old schedul
 - **ALWAYS READ** `tasks/prd-ui/techspec.md` and `tasks/prd-ui/analysis_prd_tasks_16_30.md` (task 26) and `tasks/prd-ui/analysis_prd_tasks_31_43.md` (task 36)
 - **YOU CAN ONLY** finish when `make fmt && make lint && make test` pass AND manual browser verification confirms both pages work
 - **IF YOU DON'T CHECK SKILLS** your task will be invalid
+- **DASHBOARD / ALPINE** — use `alpine-js` skill for static HTML, Alpine components, and JS under `static/`
 </critical>
 
 <requirements>

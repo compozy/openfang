@@ -19,6 +19,7 @@ Add budget management to the analytics/usage page. The existing analytics page s
 - **ALWAYS READ** `tasks/prd-ui/techspec.md` and `tasks/prd-ui/analysis_api_routes.md` (Budget section)
 - **YOU CAN ONLY** finish when `make fmt && make lint && make test` pass AND manual browser verification confirms budget features work
 - **IF YOU DON'T CHECK SKILLS** your task will be invalid
+- **DASHBOARD / ALPINE** — use `alpine-js` skill for static HTML, Alpine components, and JS under `static/`
 </critical>
 
 <requirements>

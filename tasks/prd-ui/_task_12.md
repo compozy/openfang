@@ -19,7 +19,7 @@ Create the missing `/api/v1/provider-profiles` CRUD endpoint in the Rust backend
 - **ALWAYS READ** `tasks/prd-ui/adr-009-arky-providers.md` and `tasks/prd-ui/analysis_arky_providers.md`
 - **YOU CAN ONLY** finish when `make fmt && make lint && make test` pass
 - **IF YOU DON'T CHECK SKILLS** your task will be invalid
-- **THIS IS A RUST TASK** — use `rust-best-practices` skill
+- **THIS IS A RUST TASK** — use `rust-best-practices` skill only (no `alpine-js`; no dashboard JS/HTML in this task)
 </critical>
 
 <requirements>

@@ -19,6 +19,7 @@ Build the Arky provider UI: provider profiles management page, upgrade the agent
 - **ALWAYS READ** `tasks/prd-ui/adr-009-arky-providers.md` and `tasks/prd-ui/analysis_arky_providers.md`
 - **YOU CAN ONLY** finish when `make fmt && make lint && make test` pass AND manual browser verification confirms all features work
 - **IF YOU DON'T CHECK SKILLS** your task will be invalid
+- **DASHBOARD / ALPINE** — use `alpine-js` skill for static HTML, Alpine components, and JS under `static/`
 </critical>
 
 <requirements>

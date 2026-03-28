@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "alpine-js": {
+      "source": "mindrally/skills",
+      "sourceType": "github",
+      "computedHash": "529e2ee02bf6e2adece466e7148b9288182637fefc3b5d4f3eeb18e12906445c"
+    }
+  }
+}
