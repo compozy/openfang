@@ -39,21 +39,16 @@ function commsPage() {
     startSSE() {
       if (this.sseSource) this.sseSource.close();
       var self = this;
-      var url = OpenFangAPI.baseUrl + '/api/comms/events/stream';
-      if (OpenFangAPI.apiKey) url += '?token=' + encodeURIComponent(OpenFangAPI.apiKey);
-      this.sseSource = new EventSource(url);
-      this.sseSource.onmessage = function(ev) {
-        if (ev.data === 'ping') return;
-        try {
-          var event = JSON.parse(ev.data);
-          self.events.unshift(event);
+      this.sseSource = OpenFangSSE.connect('/api/comms/events/stream', {
+        message: function(data) {
+          if (!data) return;
+          self.events.unshift(data);
           if (self.events.length > 200) self.events.length = 200;
-          // Refresh topology on spawn/terminate events
-          if (event.kind === 'agent_spawned' || event.kind === 'agent_terminated') {
+          if (data.kind === 'agent_spawned' || data.kind === 'agent_terminated') {
             self.refreshTopology();
           }
-        } catch(e) { /* ignore parse errors */ }
-      };
+        }
+      });
     },
 
     stopSSE() {

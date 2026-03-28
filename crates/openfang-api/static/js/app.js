@@ -136,6 +136,7 @@ document.addEventListener('alpine:init', function() {
     agentCount: 0,
     pendingApprovalCount: 0,
     lastPendingApprovalSignature: '',
+    pendingHitlCount: 0,
     pendingAgent: null,
     focusMode: localStorage.getItem('openfang-focus') === 'true',
     showOnboarding: false,
@@ -313,13 +314,29 @@ function app() {
       });
 
       // Hash routing
-      var validPages = ['overview','agents','sessions','approvals','comms','workflows','scheduler','channels','skills','hands','analytics','logs','runtime','settings','wizard'];
+      var validPages = ['overview','agents','sessions','approvals','comms','workflows','scheduler','channels','skills','hands','analytics','logs','runtime','settings','wizard','hitl','runs','dispatches','looper','tasks','triggers','schedules','events','packs','artifacts','documents','integrations'];
       var pageRedirects = {
         'chat': 'agents',
+        'agent': 'agents',
         'templates': 'agents',
-        'triggers': 'workflows',
+        'session': 'sessions',
         'cron': 'scheduler',
-        'schedules': 'scheduler',
+        'workflow': 'workflows',
+        'run': 'runs',
+        'dispatch': 'dispatches',
+        'task': 'tasks',
+        'trigger': 'triggers',
+        'schedule': 'schedules',
+        'event': 'events',
+        'channel': 'channels',
+        'skill': 'skills',
+        'hand': 'hands',
+        'pack': 'packs',
+        'artifact': 'artifacts',
+        'document': 'documents',
+        'integration': 'integrations',
+        'setting': 'settings',
+        'log': 'logs',
         'memory': 'sessions',
         'audit': 'logs',
         'security': 'settings',

@@ -826,6 +826,31 @@ pub async fn build_router(
             "/api/network/status",
             axum::routing::get(routes::network_status),
         )
+        // Legacy workflow endpoints (handlers exist in routes.rs)
+        .route(
+            "/api/workflows",
+            axum::routing::get(routes::list_workflows).post(routes::create_workflow),
+        )
+        .route(
+            "/api/workflows/{id}",
+            axum::routing::get(routes::get_workflow)
+                .put(routes::update_workflow)
+                .delete(routes::delete_workflow),
+        )
+        .route(
+            "/api/workflows/{id}/run",
+            axum::routing::post(routes::run_workflow),
+        )
+        .route(
+            "/api/workflows/{id}/runs",
+            axum::routing::get(routes::list_workflow_runs),
+        )
+        // Legacy trigger endpoints (handlers exist in routes.rs)
+        .route("/api/triggers", axum::routing::get(routes::list_triggers))
+        .route(
+            "/api/triggers/{id}",
+            axum::routing::put(routes::update_trigger).delete(routes::delete_trigger),
+        )
         // Agent communication (Comms) endpoints
         .route(
             "/api/comms/topology",

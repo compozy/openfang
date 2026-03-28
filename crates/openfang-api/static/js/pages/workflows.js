@@ -78,15 +78,17 @@ function workflowsPage() {
       }
     },
 
-    async deleteWorkflow(wf) {
-      if (!confirm('Delete workflow "' + wf.name + '"? This cannot be undone.')) return;
-      try {
-        await OpenFangAPI.delete('/api/workflows/' + wf.id);
-        OpenFangToast.success('Workflow "' + wf.name + '" deleted');
-        await this.loadWorkflows();
-      } catch(e) {
-        OpenFangToast.error('Failed to delete workflow: ' + e.message);
-      }
+    deleteWorkflow(wf) {
+      var self = this;
+      OpenFangToast.confirm('Delete Workflow', 'Delete workflow "' + wf.name + '"? This cannot be undone.', async function() {
+        try {
+          await OpenFangAPI.delete('/api/workflows/' + wf.id);
+          OpenFangToast.success('Workflow "' + wf.name + '" deleted');
+          await self.loadWorkflows();
+        } catch(e) {
+          OpenFangToast.error('Failed to delete workflow: ' + e.message);
+        }
+      });
     },
 
     async showEditModal(wf) {
