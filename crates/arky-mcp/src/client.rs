@@ -390,13 +390,16 @@ impl McpClient {
             }
         };
 
+        let request = arguments.map_or_else(
+            || CallToolRequestParams::new(imported_tool.remote_name.clone()),
+            |arguments| {
+                CallToolRequestParams::new(imported_tool.remote_name.clone())
+                    .with_arguments(arguments)
+            },
+        );
+
         let result = peer
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: imported_tool.remote_name.clone().into(),
-                arguments,
-                task: None,
-            })
+            .call_tool(request)
             .await
             .map_err(|error| self.map_service_error(error))?;
 

@@ -31,8 +31,7 @@ openfang-runtime = { workspace = true }
 uuid = { workspace = true }
 ratatui = { workspace = true }
 colored = { workspace = true }
-
-
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

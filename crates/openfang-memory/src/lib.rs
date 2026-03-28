@@ -12,6 +12,8 @@ pub mod consolidation;
 pub mod dispatch;
 pub mod doc;
 pub mod hitl;
+#[cfg(feature = "http-memory")]
+pub mod http_client;
 pub mod knowledge;
 pub mod looper;
 pub mod migration;

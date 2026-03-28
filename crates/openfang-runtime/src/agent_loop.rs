@@ -9,8 +9,8 @@ use crate::context_overflow::{recover_from_overflow, RecoveryStage};
 use crate::embedding::EmbeddingDriver;
 use crate::kernel_handle::KernelHandle;
 use crate::llm_driver::{
-    CompletionMetadata, CompletionRequest, CompletionSessionContext, LlmDriver, LlmError,
-    StreamEvent,
+    CompletionMetadata, CompletionRequest, CompletionSessionContext, DriverConfig, LlmDriver,
+    LlmError, StreamEvent,
 };
 use crate::llm_errors;
 use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
@@ -20,7 +20,7 @@ use crate::web_search::WebToolsContext;
 use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
-use openfang_types::agent::AgentManifest;
+use openfang_types::agent::{AgentManifest, FallbackModel};
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{Memory, MemoryFilter, MemoryFragment, MemorySource};
 use openfang_types::message::{
@@ -46,6 +46,20 @@ const BASE_RETRY_DELAY_MS: u64 = 1000;
 /// Timeout for individual tool executions (seconds).
 /// Raised from 60s to 120s for browser automation and long-running builds.
 const TOOL_TIMEOUT_SECS: u64 = 120;
+
+/// Timeout for inter-agent tool calls (seconds).
+/// Agent delegation (agent_send, agent_spawn) can involve a full agent loop on the
+/// target, so these need a significantly longer timeout than regular tools.
+const AGENT_TOOL_TIMEOUT_SECS: u64 = 600;
+
+/// Returns the appropriate timeout duration for a given tool name.
+/// Inter-agent calls get a longer timeout since they may trigger full agent loops.
+fn tool_timeout_for(tool_name: &str) -> Duration {
+    match tool_name {
+        "agent_send" | "agent_spawn" => Duration::from_secs(AGENT_TOOL_TIMEOUT_SECS),
+        _ => Duration::from_secs(TOOL_TIMEOUT_SECS),
+    }
+}
 
 /// Maximum consecutive MaxTokens continuations before returning partial response.
 /// Raised from 3 to 5 to allow longer-form generation.
@@ -503,9 +517,22 @@ pub async fn run_agent_loop(
             cb(LoopPhase::Thinking);
         }
 
+        // Stamp last_active before the (potentially long) LLM call so the
+        // heartbeat monitor doesn't flag us as unresponsive mid-iteration.
+        if let Some(k) = &kernel {
+            k.touch_agent(&agent_id_str);
+        }
+
         // Call LLM with retry, error classification, and circuit breaker
         let provider_name = manifest.model.provider.as_str();
-        let mut response = call_with_retry(&*driver, request, Some(provider_name), None).await?;
+        let mut response = call_with_retry(
+            &*driver,
+            request,
+            Some(provider_name),
+            None,
+            &manifest.fallback_models,
+        )
+        .await?;
         if response.metadata.is_some() {
             completion_metadata = response.metadata.clone();
         }
@@ -761,7 +788,7 @@ pub async fn run_agent_loop(
 
                 // Execute each tool call with loop guard, timeout, and truncation
                 let mut tool_result_blocks = Vec::new();
-                for tool_call in &response.tool_calls {
+                for tool_call in deduplicate_tool_calls(&response) {
                     // Loop guard check
                     let verdict = loop_guard.check(&tool_call.name, &tool_call.input);
                     match &verdict {
@@ -843,8 +870,10 @@ pub async fn run_agent_loop(
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
                     // Timeout-wrapped execution
+                    let timeout = tool_timeout_for(&tool_call.name);
+                    let timeout_secs = timeout.as_secs();
                     let result = match tokio::time::timeout(
-                        Duration::from_secs(TOOL_TIMEOUT_SECS),
+                        timeout,
                         tool_runner::execute_tool(
                             &tool_call.id,
                             &tool_call.name,
@@ -873,12 +902,12 @@ pub async fn run_agent_loop(
                     {
                         Ok(result) => result,
                         Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", TOOL_TIMEOUT_SECS);
+                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", timeout_secs);
                             openfang_types::tool::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
                                 content: format!(
                                     "Tool '{}' timed out after {}s.",
-                                    tool_call.name, TOOL_TIMEOUT_SECS
+                                    tool_call.name, timeout_secs
                                 ),
                                 is_error: true,
                             }
@@ -1054,11 +1083,15 @@ pub async fn run_agent_loop(
 ///
 /// Uses the `llm_errors` classifier for smart error handling and the
 /// `ProviderCooldown` circuit breaker to prevent request storms.
+///
+/// When the primary model returns a `ModelNotFound` error and `fallback_models`
+/// is non-empty, each fallback is tried in order before propagating the error.
 async fn call_with_retry(
     driver: &dyn LlmDriver,
     request: CompletionRequest,
     provider: Option<&str>,
     cooldown: Option<&ProviderCooldown>,
+    fallback_models: &[FallbackModel],
 ) -> OpenFangResult<crate::llm_driver::CompletionResponse> {
     // Check circuit breaker before calling
     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
@@ -1147,6 +1180,73 @@ async fn call_with_retry(
                     cooldown.record_failure(provider, classified.is_billing);
                 }
 
+                // --- ModelNotFound fallback chain (issue #845) ---
+                // If the primary model was not found and fallback models are
+                // configured, try each fallback before giving up.
+                if classified.category == llm_errors::LlmErrorCategory::ModelNotFound
+                    && !fallback_models.is_empty()
+                {
+                    warn!(
+                        "Primary model not found, trying {} fallback model(s)",
+                        fallback_models.len()
+                    );
+                    for (fb_idx, fb) in fallback_models.iter().enumerate() {
+                        let api_key = fb
+                            .api_key_env
+                            .as_deref()
+                            .and_then(|env_name| std::env::var(env_name).ok());
+                        let fb_config = DriverConfig {
+                            provider: fb.provider.clone(),
+                            api_key,
+                            base_url: fb.base_url.clone(),
+                            skip_permissions: true,
+                        };
+                        let fb_driver = match crate::drivers::create_driver(&fb_config) {
+                            Ok(d) => d,
+                            Err(driver_err) => {
+                                warn!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    error = %driver_err,
+                                    "Failed to create fallback driver, skipping"
+                                );
+                                continue;
+                            }
+                        };
+                        let mut fb_request = request.clone();
+                        fb_request.model = fb.model.clone();
+                        warn!(
+                            fallback_index = fb_idx,
+                            provider = %fb.provider,
+                            model = %fb.model,
+                            "Trying fallback model"
+                        );
+                        match fb_driver.complete(fb_request).await {
+                            Ok(response) => {
+                                info!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    "Fallback model succeeded"
+                                );
+                                return Ok(response);
+                            }
+                            Err(fb_err) => {
+                                warn!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    error = %fb_err,
+                                    "Fallback model failed"
+                                );
+                            }
+                        }
+                    }
+                    // All fallbacks exhausted — fall through to return the
+                    // original ModelNotFound error below.
+                }
+
                 // Include raw error detail so dashboard users can debug
                 let user_msg = if classified.category == llm_errors::LlmErrorCategory::Format {
                     format!("{} — raw: {}", classified.sanitized_message, raw_error)
@@ -1166,12 +1266,16 @@ async fn call_with_retry(
 /// Call an LLM driver in streaming mode with automatic retry on rate-limit and overload errors.
 ///
 /// Uses the `llm_errors` classifier and `ProviderCooldown` circuit breaker.
+///
+/// When the primary model returns a `ModelNotFound` error and `fallback_models`
+/// is non-empty, each fallback is tried in order before propagating the error.
 async fn stream_with_retry(
     driver: &dyn LlmDriver,
     request: CompletionRequest,
     tx: mpsc::Sender<StreamEvent>,
     provider: Option<&str>,
     cooldown: Option<&ProviderCooldown>,
+    fallback_models: &[FallbackModel],
 ) -> OpenFangResult<crate::llm_driver::CompletionResponse> {
     // Check circuit breaker before calling
     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
@@ -1259,6 +1363,69 @@ async fn stream_with_retry(
 
                 if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                     cooldown.record_failure(provider, classified.is_billing);
+                }
+
+                // --- ModelNotFound fallback chain (issue #845) ---
+                if classified.category == llm_errors::LlmErrorCategory::ModelNotFound
+                    && !fallback_models.is_empty()
+                {
+                    warn!(
+                        "Primary model not found (stream), trying {} fallback model(s)",
+                        fallback_models.len()
+                    );
+                    for (fb_idx, fb) in fallback_models.iter().enumerate() {
+                        let api_key = fb
+                            .api_key_env
+                            .as_deref()
+                            .and_then(|env_name| std::env::var(env_name).ok());
+                        let fb_config = DriverConfig {
+                            provider: fb.provider.clone(),
+                            api_key,
+                            base_url: fb.base_url.clone(),
+                            skip_permissions: true,
+                        };
+                        let fb_driver = match crate::drivers::create_driver(&fb_config) {
+                            Ok(d) => d,
+                            Err(driver_err) => {
+                                warn!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    error = %driver_err,
+                                    "Failed to create fallback stream driver, skipping"
+                                );
+                                continue;
+                            }
+                        };
+                        let mut fb_request = request.clone();
+                        fb_request.model = fb.model.clone();
+                        warn!(
+                            fallback_index = fb_idx,
+                            provider = %fb.provider,
+                            model = %fb.model,
+                            "Trying fallback model (stream)"
+                        );
+                        match fb_driver.stream(fb_request, tx.clone()).await {
+                            Ok(response) => {
+                                info!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    "Fallback model succeeded (stream)"
+                                );
+                                return Ok(response);
+                            }
+                            Err(fb_err) => {
+                                warn!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    error = %fb_err,
+                                    "Fallback model failed (stream)"
+                                );
+                            }
+                        }
+                    }
                 }
 
                 let user_msg = if classified.category == llm_errors::LlmErrorCategory::Format {
@@ -1468,6 +1635,14 @@ pub async fn run_agent_loop_streaming(
             }
         }
 
+        // Re-validate tool_call/tool_result pairing after overflow drains
+        // which may have broken assistant→tool ordering invariants.
+        // (Matches the non-streaming loop; fixes Qwen3.5-plus "tool_calls must
+        // be followed by tool messages" errors after context overflow recovery.)
+        if recovery != RecoveryStage::None {
+            messages = crate::session_repair::validate_and_repair(&messages);
+        }
+
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
 
@@ -1504,6 +1679,7 @@ pub async fn run_agent_loop_streaming(
             stream_tx.clone(),
             Some(provider_name),
             None,
+            &manifest.fallback_models,
         )
         .await?;
         if response.metadata.is_some() {
@@ -1734,7 +1910,7 @@ pub async fn run_agent_loop_streaming(
 
                 // Execute each tool call with loop guard, timeout, and truncation
                 let mut tool_result_blocks = Vec::new();
-                for tool_call in &response.tool_calls {
+                for tool_call in deduplicate_tool_calls(&response) {
                     // Loop guard check
                     let verdict = loop_guard.check(&tool_call.name, &tool_call.input);
                     match &verdict {
@@ -1815,8 +1991,10 @@ pub async fn run_agent_loop_streaming(
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
                     // Timeout-wrapped execution
+                    let timeout = tool_timeout_for(&tool_call.name);
+                    let timeout_secs = timeout.as_secs();
                     let result = match tokio::time::timeout(
-                        Duration::from_secs(TOOL_TIMEOUT_SECS),
+                        timeout,
                         tool_runner::execute_tool(
                             &tool_call.id,
                             &tool_call.name,
@@ -1845,12 +2023,12 @@ pub async fn run_agent_loop_streaming(
                     {
                         Ok(result) => result,
                         Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", TOOL_TIMEOUT_SECS);
+                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", timeout_secs);
                             openfang_types::tool::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
                                 content: format!(
                                     "Tool '{}' timed out after {}s.",
-                                    tool_call.name, TOOL_TIMEOUT_SECS
+                                    tool_call.name, timeout_secs
                                 ),
                                 is_error: true,
                             }
@@ -1886,6 +2064,7 @@ pub async fn run_agent_loop_streaming(
                     let preview: String = final_content.chars().take(300).collect();
                     if stream_tx
                         .send(StreamEvent::ToolExecutionResult {
+                            id: tool_call.id.clone(),
                             name: tool_call.name.clone(),
                             result_preview: preview,
                             is_error: result.is_error,
@@ -2839,6 +3018,20 @@ fn try_parse_bare_json_tool_call(
     parse_json_tool_call_object(&text[..end], tool_names)
 }
 
+/// Deduplicate tool calls from the response.
+/// Returns a reference to the deduplicated tool calls.
+pub fn deduplicate_tool_calls(response: &crate::llm_driver::CompletionResponse) -> Vec<&ToolCall> {
+    let mut hash_set = std::collections::HashSet::new();
+    let mut deduplicated = Vec::new();
+    for tool_call in &response.tool_calls {
+        let hash = LoopGuard::compute_hash(&tool_call.name, &tool_call.input);
+        if hash_set.insert(hash) {
+            deduplicated.push(tool_call);
+        }
+    }
+    deduplicated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2900,6 +3093,15 @@ mod tests {
     #[test]
     fn test_tool_timeout_constant() {
         assert_eq!(TOOL_TIMEOUT_SECS, 120);
+        assert_eq!(AGENT_TOOL_TIMEOUT_SECS, 600);
+    }
+
+    #[test]
+    fn test_tool_timeout_for_agent_tools() {
+        assert_eq!(tool_timeout_for("agent_send"), Duration::from_secs(600));
+        assert_eq!(tool_timeout_for("agent_spawn"), Duration::from_secs(600));
+        assert_eq!(tool_timeout_for("file_read"), Duration::from_secs(120));
+        assert_eq!(tool_timeout_for("shell_exec"), Duration::from_secs(120));
     }
 
     #[test]

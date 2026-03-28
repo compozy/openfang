@@ -483,11 +483,13 @@ impl TurnCollector {
                 }
             }
             AgentEvent::ToolExecutionEnd {
+                tool_call_id,
                 tool_name,
                 result,
                 is_error,
                 ..
             } => emitted.push(StreamEvent::ToolExecutionResult {
+                id: tool_call_id.clone(),
                 name: tool_name.clone(),
                 result_preview: tool_execution_preview(result),
                 is_error: *is_error,

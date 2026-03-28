@@ -377,11 +377,13 @@ pub fn agent_event_to_stream_event(event: &arky_protocol::AgentEvent) -> Option<
             name: tool_name.clone(),
         }),
         arky_protocol::AgentEvent::ToolExecutionEnd {
+            tool_call_id,
             tool_name,
             result,
             is_error,
             ..
         } => Some(StreamEvent::ToolExecutionResult {
+            id: tool_call_id.clone(),
             name: tool_name.clone(),
             result_preview: result_preview(result),
             is_error: *is_error,

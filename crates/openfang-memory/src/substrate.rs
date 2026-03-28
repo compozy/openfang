@@ -13,6 +13,7 @@ use crate::usage::UsageStore;
 
 use async_trait::async_trait;
 use openfang_types::agent::{AgentEntry, AgentId, SessionId};
+use openfang_types::config::MemoryConfig;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
     ConsolidationReport, Entity, ExportFormat, GraphMatch, GraphPattern, ImportReport, Memory,
@@ -23,6 +24,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tracing::{info, warn};
 
 /// The unified memory substrate. Implements the `Memory` trait by delegating
 /// to specialized stores backed by a shared SQLite connection.
@@ -38,12 +40,20 @@ pub struct MemorySubstrate {
 
 impl MemorySubstrate {
     /// Open or create a memory substrate at the given database path.
-    pub fn open(db_path: &Path, decay_rate: f32) -> OpenFangResult<Self> {
+    ///
+    /// When `memory_config.backend == "http"` and `http_url`/`http_token_env` are set,
+    /// the semantic store routes `remember`/`recall` to the memory-api gateway.
+    /// All other stores (KV, knowledge graph, sessions) remain local SQLite.
+    pub fn open(
+        db_path: &Path,
+        decay_rate: f32,
+        memory_config: &MemoryConfig,
+    ) -> OpenFangResult<Self> {
         let conn = Connection::open(db_path).map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Self::configure_connection(&conn)?;
         let shared = Arc::new(Mutex::new(conn));
 
-        Self::from_shared_connection(shared, decay_rate)
+        Self::from_shared_connection(shared, decay_rate, memory_config)
     }
 
     /// Build a memory substrate from an already-opened shared connection.
@@ -53,6 +63,7 @@ impl MemorySubstrate {
     pub fn from_shared_connection(
         shared: Arc<Mutex<Connection>>,
         decay_rate: f32,
+        memory_config: &MemoryConfig,
     ) -> OpenFangResult<Self> {
         {
             let conn = shared.lock().map_err(|error| {
@@ -63,10 +74,12 @@ impl MemorySubstrate {
             run_migrations(&conn).map_err(|e| OpenFangError::Memory(e.to_string()))?;
         }
 
+        let semantic = Self::create_semantic_store(Arc::clone(&shared), memory_config);
+
         Ok(Self {
             conn: Arc::clone(&shared),
             structured: StructuredStore::new(Arc::clone(&shared)),
-            semantic: SemanticStore::new(Arc::clone(&shared)),
+            semantic,
             knowledge: KnowledgeStore::new(Arc::clone(&shared)),
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
@@ -74,13 +87,50 @@ impl MemorySubstrate {
         })
     }
 
-    /// Create an in-memory substrate (for testing).
+    /// Create the semantic store, optionally with HTTP backend.
+    fn create_semantic_store(
+        conn: Arc<Mutex<Connection>>,
+        memory_config: &MemoryConfig,
+    ) -> SemanticStore {
+        #[cfg(feature = "http-memory")]
+        if memory_config.backend == "http" {
+            if let (Some(url), Some(token_env)) =
+                (&memory_config.http_url, &memory_config.http_token_env)
+            {
+                match crate::http_client::MemoryApiClient::new(url, token_env) {
+                    Ok(client) => {
+                        // Best-effort health check on startup
+                        match client.health_check() {
+                            Ok(()) => info!(url = %url, "HTTP memory backend connected"),
+                            Err(e) => {
+                                warn!(url = %url, error = %e, "HTTP memory backend health check failed, will retry on use")
+                            }
+                        }
+                        return SemanticStore::new_with_http(conn, client);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to create HTTP memory client, falling back to SQLite");
+                    }
+                }
+            } else {
+                warn!("backend=http but http_url/http_token_env not set, falling back to SQLite");
+            }
+        }
+
+        #[cfg(not(feature = "http-memory"))]
+        let _ = memory_config;
+
+        SemanticStore::new(conn)
+    }
+
+    /// Create an in-memory substrate (for testing). Always uses SQLite backend.
     pub fn open_in_memory(decay_rate: f32) -> OpenFangResult<Self> {
         let conn =
             Connection::open_in_memory().map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Self::configure_connection(&conn)?;
         let shared = Arc::new(Mutex::new(conn));
 
-        Self::from_shared_connection(shared, decay_rate)
+        Self::from_shared_connection(shared, decay_rate, &MemoryConfig::default())
     }
 
     /// Get a reference to the usage store.

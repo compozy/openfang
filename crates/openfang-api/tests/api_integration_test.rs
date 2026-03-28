@@ -83,6 +83,7 @@ async fn start_test_server_with_provider(
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
     kernel.bootstrap_workflow_definitions().await;
+    let budget_config = Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone()));
 
     let state = Arc::new(AppState {
         pack_registry: kernel.pack_registry.clone(),
@@ -100,6 +101,7 @@ async fn start_test_server_with_provider(
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config,
     });
 
     let app = Router::new()
@@ -1078,6 +1080,7 @@ async fn test_v1_recovered_run_is_paused_after_restart() {
     let kernel = Arc::new(OpenFangKernel::boot_with_config(config).expect("second boot"));
     kernel.set_self_handle();
     kernel.bootstrap_workflow_definitions().await;
+    let budget_config = Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone()));
     let state = Arc::new(AppState {
         pack_registry: kernel.pack_registry.clone(),
         kernel: Arc::clone(&kernel),
@@ -1094,6 +1097,7 @@ async fn test_v1_recovered_run_is_paused_after_restart() {
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config,
     });
     let app = Router::new()
         .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))
@@ -1201,6 +1205,7 @@ async fn get_run_list_reflects_recovered_state() {
     let kernel = Arc::new(OpenFangKernel::boot_with_config(config).expect("second boot"));
     kernel.set_self_handle();
     kernel.bootstrap_workflow_definitions().await;
+    let budget_config = Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone()));
     let state = Arc::new(AppState {
         pack_registry: kernel.pack_registry.clone(),
         kernel: Arc::clone(&kernel),
@@ -1217,6 +1222,7 @@ async fn get_run_list_reflects_recovered_state() {
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config,
     });
     let app = Router::new()
         .route("/api/v1/runs", axum::routing::get(routes::list_runs_v1))
@@ -1592,6 +1598,7 @@ async fn restart_preserves_waiting_state_and_outstanding_signals() {
     let kernel = Arc::new(OpenFangKernel::boot_with_config(config).expect("second boot"));
     kernel.set_self_handle();
     kernel.bootstrap_workflow_definitions().await;
+    let budget_config = Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone()));
     let state = Arc::new(AppState {
         pack_registry: kernel.pack_registry.clone(),
         kernel: Arc::clone(&kernel),
@@ -1608,6 +1615,7 @@ async fn restart_preserves_waiting_state_and_outstanding_signals() {
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config,
     });
     let app = Router::new()
         .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))
@@ -1783,6 +1791,7 @@ async fn waiting_signal_run_still_accepts_signal_after_restart() {
         .register_workflow_v2_definition(definition, Vec::<String>::new())
         .await
         .expect("workflow definition should be re-registered after restart");
+    let budget_config = Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone()));
 
     let state = Arc::new(AppState {
         pack_registry: kernel.pack_registry.clone(),
@@ -1800,6 +1809,7 @@ async fn waiting_signal_run_still_accepts_signal_after_restart() {
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config,
     });
     let app = Router::new()
         .route("/api/v1/runs/{id}", axum::routing::get(routes::get_run_v1))
@@ -2202,6 +2212,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
     kernel.bootstrap_workflow_definitions().await;
+    let budget_config = Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone()));
 
     let state = Arc::new(AppState {
         pack_registry: kernel.pack_registry.clone(),
@@ -2219,6 +2230,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config,
     });
 
     let api_key = state.kernel.config.api_key.trim().to_string();

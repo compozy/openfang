@@ -13,7 +13,7 @@ use arky_error::ClassifiedError;
 use arky_tools::ToolRegistry;
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, Implementation, InitializeResult, ListToolsResult,
+        CallToolRequestParams, CallToolResult, Implementation, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerInfo,
     },
     service::{RequestContext, RoleServer},
@@ -125,11 +125,9 @@ impl McpServer {
         let service = StreamableHttpService::new(
             move || Ok(handler.clone()),
             session_manager,
-            StreamableHttpServerConfig {
-                stateful_mode: true,
-                cancellation_token: cancellation.child_token(),
-                ..Default::default()
-            },
+            StreamableHttpServerConfig::default()
+                .with_stateful_mode(true)
+                .with_cancellation_token(cancellation.child_token()),
         );
 
         let router = axum::Router::new().nest_service(&path, service);
@@ -327,18 +325,15 @@ impl RegistryMcpServerHandler {
 
 impl ServerHandler for RegistryMcpServerHandler {
     fn get_info(&self) -> ServerInfo {
-        InitializeResult {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: self.name.clone(),
-                title: None,
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-            instructions: self.instructions.clone(),
-            ..Default::default()
+        let server_info =
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+                Implementation::new(self.name.clone(), env!("CARGO_PKG_VERSION")),
+            );
+
+        if let Some(instructions) = &self.instructions {
+            server_info.with_instructions(instructions.clone())
+        } else {
+            server_info
         }
     }
 
