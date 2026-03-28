@@ -5751,16 +5751,359 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
       </div>
     </template>
 
-    <!-- Placeholder: Dispatches -->
+    <!-- Page: Dispatches -->
     <template x-if="page === 'dispatches'">
-      <div>
-        <div class="page-header"><h2>Dispatches</h2></div>
-        <div class="page-body">
-          <div class="empty-state">
-            <div class="empty-state-icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg></div>
-            <h3>Coming Soon</h3>
-            <p class="text-dim text-xs">Dispatched tasks and their status will appear here.</p>
+      <div x-data="dispatchesPage()" x-init="init()">
+        <div class="page-header">
+          <div>
+            <h2>Dispatches</h2>
+            <div class="text-xs text-dim">Durable agent executions with delegation lineage, retry/cancel controls, and live dispatch SSE.</div>
           </div>
+          <div class="flex items-center gap-2">
+            <span class="badge badge-run-pending" x-show="dispatches.length" x-text="dispatches.length + ' loaded'"></span>
+            <button class="btn btn-ghost btn-sm" @click="loadDispatches({ refreshDetail: true })">Refresh</button>
+          </div>
+        </div>
+        <div class="page-body">
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading dispatches...</span></div>
+          <div x-show="!loading && loadError" class="error-state">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
+          </div>
+
+          <template x-if="!loading && !loadError">
+            <div class="dispatches-layout">
+              <section class="dispatches-list">
+                <div class="card dispatches-filters">
+                  <div class="dispatches-filter-grid">
+                    <div class="form-group">
+                      <label>Status</label>
+                      <select class="form-select" x-model="filterStatus" @change="loadDispatches({ refreshDetail: true })">
+                        <option value="">All Statuses</option>
+                        <option value="pending">Pending</option>
+                        <option value="running">Running</option>
+                        <option value="waiting_hitl">Waiting HITL</option>
+                        <option value="completed">Completed</option>
+                        <option value="failed">Failed</option>
+                        <option value="cancelled">Cancelled</option>
+                      </select>
+                    </div>
+                    <div class="form-group">
+                      <label>Kind</label>
+                      <select class="form-select" x-model="filterKind" @change="loadDispatches({ refreshDetail: true })">
+                        <option value="">All Kinds</option>
+                        <option value="call">Call</option>
+                        <option value="send">Send</option>
+                        <option value="spawn">Spawn</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="text-xs text-dim">List data comes from <span class="font-mono">/api/v1/dispatches</span> with durable status and kind filters.</div>
+                </div>
+
+                <div x-show="dispatches.length === 0" class="empty-state dispatches-empty">
+                  <div class="empty-state-icon">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+                  </div>
+                  <h4>No matching dispatches</h4>
+                  <p class="hint">Adjust the status or kind filters to inspect a different slice of workflow execution history.</p>
+                </div>
+
+                <div class="table-wrap" x-show="dispatches.length > 0">
+                  <table class="dispatches-table">
+                    <thead>
+                      <tr>
+                        <th>ID</th>
+                        <th>Kind</th>
+                        <th>Status</th>
+                        <th>Agent</th>
+                        <th>Attempt</th>
+                        <th>Started</th>
+                        <th>Updated</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <template x-for="dispatch in dispatches" :key="dispatch.id">
+                        <tr class="dispatches-table-row" :class="{ 'is-selected': selectedDispatchId === dispatch.id }" @click="selectDispatch(dispatch.id)">
+                          <td>
+                            <div class="dispatches-table-cell-primary">
+                              <span class="font-mono" x-text="dispatch.id"></span>
+                              <span class="text-xs text-dim">Run <span class="font-mono" x-text="dispatch.run_id"></span></span>
+                              <span class="text-xs text-dim" x-text="dispatch.step_id || 'No step id'"></span>
+                            </div>
+                          </td>
+                          <td><span :class="kindBadgeClass(dispatch.kind)" x-text="kindLabel(dispatch.kind)"></span></td>
+                          <td><span :class="statusBadgeClass(dispatch.status)" x-text="statusLabel(dispatch.status)"></span></td>
+                          <td class="font-mono" x-text="dispatch.target_agent || dispatch.spawned_agent_id || '-'"></td>
+                          <td x-text="attemptLabel(dispatch)"></td>
+                          <td class="text-xs" x-text="formatDateTime(dispatch.started_at) || '-'"></td>
+                          <td class="text-xs" x-text="formatDateTime(dispatch.updated_at) || '-'"></td>
+                          <td>
+                            <div class="run-action-row">
+                              <button class="btn btn-ghost btn-sm" @click.stop="confirmRetryDispatch(dispatch)" :disabled="dispatchActionId || !dispatchCanRetry(dispatch)">
+                                <span x-text="dispatchActionId === 'retry:' + dispatch.id ? 'Retrying...' : 'Retry'"></span>
+                              </button>
+                              <button class="btn btn-danger btn-sm" @click.stop="confirmCancelDispatch(dispatch)" :disabled="dispatchActionId || !dispatchCanCancel(dispatch)">
+                                <span x-text="dispatchActionId === 'cancel:' + dispatch.id ? 'Cancelling...' : 'Cancel'"></span>
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <aside class="card dispatches-detail">
+                <template x-if="!selectedDispatchId">
+                  <div class="empty-state dispatches-empty-inline">
+                    <div class="empty-state-icon">
+                      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18"/><path d="M12 3v18"/></svg>
+                    </div>
+                    <h4>Select a dispatch</h4>
+                    <p class="hint">Choose a dispatch from the list to inspect the target agent, retry/cancel controls, direct children, lineage tree, and live SSE events.</p>
+                  </div>
+                </template>
+
+                <template x-if="selectedDispatchId">
+                  <div>
+                    <div x-show="detailLoading" class="loading-state"><div class="spinner"></div><span>Loading dispatch detail...</span></div>
+                    <div x-show="!detailLoading && detailError" class="error-state">
+                      <span class="error-icon">!</span>
+                      <p x-text="detailError"></p>
+                      <button class="btn btn-ghost btn-sm" @click="refreshSelectedDispatch({ force: true })">Retry</button>
+                    </div>
+
+                    <template x-if="!detailLoading && !detailError && selectedDispatch">
+                      <div>
+                        <div class="dispatches-detail-header">
+                          <div class="dispatches-detail-heading">
+                            <div class="text-xs text-dim">Selected Dispatch</div>
+                            <h3 class="runs-detail-title font-mono" x-text="selectedDispatch.id"></h3>
+                            <div class="run-card-subtitle">
+                              <span class="run-card-chip">Run <span class="font-mono" x-text="selectedDispatch.run_id"></span></span>
+                              <span class="run-card-chip" x-show="selectedDispatch.step_id">Step <span class="font-mono" x-text="selectedDispatch.step_id"></span></span>
+                              <span class="run-card-chip" x-show="selectedDispatch.spawned_agent_id">Spawned <span class="font-mono" x-text="selectedDispatch.spawned_agent_id"></span></span>
+                            </div>
+                          </div>
+                          <div class="dispatches-detail-actions">
+                            <div class="run-card-badges">
+                              <span :class="kindBadgeClass(selectedDispatch.kind)" x-text="kindLabel(selectedDispatch.kind)"></span>
+                              <span :class="statusBadgeClass(selectedDispatch.status)" x-text="statusLabel(selectedDispatch.status)"></span>
+                              <span :class="eventConnectionBadgeClass()" x-text="eventConnectionState === 'connected' ? 'Live SSE' : (eventConnectionState === 'connecting' ? 'Connecting' : 'Stopped')"></span>
+                            </div>
+                            <div class="run-action-row">
+                              <button class="btn btn-ghost btn-sm" @click="copyDispatchId(selectedDispatch)">Copy ID</button>
+                              <button class="btn btn-ghost btn-sm" @click="confirmRetryDispatch(selectedDispatch)" :disabled="dispatchActionId || !dispatchCanRetry(selectedDispatch)">
+                                <span x-text="dispatchActionId === 'retry:' + selectedDispatch.id ? 'Retrying...' : 'Retry'"></span>
+                              </button>
+                              <button class="btn btn-danger btn-sm" @click="confirmCancelDispatch(selectedDispatch)" :disabled="dispatchActionId || !dispatchCanCancel(selectedDispatch)">
+                                <span x-text="dispatchActionId === 'cancel:' + selectedDispatch.id ? 'Cancelling...' : 'Cancel'"></span>
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div class="detail-grid dispatches-detail-grid">
+                          <div class="detail-row"><span class="detail-label">Kind</span><span :class="kindBadgeClass(selectedDispatch.kind)" x-text="kindLabel(selectedDispatch.kind)"></span></div>
+                          <div class="detail-row"><span class="detail-label">Status</span><span :class="statusBadgeClass(selectedDispatch.status)" x-text="statusLabel(selectedDispatch.status)"></span></div>
+                          <div class="detail-row"><span class="detail-label">Target Agent</span><span class="detail-value font-mono" x-text="selectedDispatch.target_agent || '-'"></span></div>
+                          <div class="detail-row"><span class="detail-label">Attempt</span><span class="detail-value" x-text="attemptLabel(selectedDispatch)"></span></div>
+                          <div class="detail-row"><span class="detail-label">Run</span><span class="detail-value font-mono" x-text="selectedDispatch.run_id"></span></div>
+                          <div class="detail-row"><span class="detail-label">Step</span><span class="detail-value" x-text="selectedDispatch.step_id || '-'"></span></div>
+                          <div class="detail-row">
+                            <span class="detail-label">Parent</span>
+                            <span class="detail-value">
+                              <button
+                                type="button"
+                                class="dispatches-link-btn font-mono"
+                                x-show="selectedDispatch.parent_dispatch_id"
+                                @click="selectParentDispatch()"
+                                x-text="selectedDispatch.parent_dispatch_id"
+                              ></button>
+                              <span x-show="!selectedDispatch.parent_dispatch_id">-</span>
+                            </span>
+                          </div>
+                          <div class="detail-row"><span class="detail-label">Spawned Agent</span><span class="detail-value font-mono" x-text="selectedDispatch.spawned_agent_id || '-'"></span></div>
+                          <div class="detail-row"><span class="detail-label">Started</span><span class="detail-value" x-text="formatDateTime(selectedDispatch.started_at) || '-'"></span></div>
+                          <div class="detail-row"><span class="detail-label">Updated</span><span class="detail-value" x-text="formatDateTime(selectedDispatch.updated_at) || '-'"></span></div>
+                          <div class="detail-row"><span class="detail-label">Completed</span><span class="detail-value" x-text="formatDateTime(selectedDispatch.completed_at) || '-'"></span></div>
+                        </div>
+
+                        <div class="dispatches-section" x-show="selectedDispatch.input !== undefined && selectedDispatch.input !== null">
+                          <div class="dispatches-section-header">
+                            <div class="runs-json-label">Input</div>
+                          </div>
+                          <pre class="tool-pre" x-text="formatJson(selectedDispatch.input)"></pre>
+                        </div>
+
+                        <div class="dispatches-section" x-show="selectedDispatch.result !== undefined && selectedDispatch.result !== null">
+                          <div class="dispatches-section-header">
+                            <div class="runs-json-label">Result</div>
+                          </div>
+                          <pre class="tool-pre" x-text="formatJson(selectedDispatch.result)"></pre>
+                        </div>
+
+                        <div class="dispatches-section" x-show="selectedDispatch.error !== undefined && selectedDispatch.error !== null">
+                          <div class="dispatches-section-header">
+                            <div class="runs-json-label">Error</div>
+                          </div>
+                          <pre class="tool-pre tool-pre-error" x-text="formatJson(selectedDispatch.error)"></pre>
+                        </div>
+
+                        <div class="dispatches-section">
+                          <div class="dispatches-section-header">
+                            <div>
+                              <div class="runs-json-label">Direct Children</div>
+                              <div class="text-xs text-dim">Loaded from <span class="font-mono">OpenFangAPI.v1.dispatches.children(id)</span>.</div>
+                            </div>
+                            <span class="badge badge-info" x-text="selectedChildren.length + ' child' + (selectedChildren.length === 1 ? '' : 'ren')"></span>
+                          </div>
+
+                          <div x-show="selectedChildren.length === 0" class="empty-state dispatches-empty-inline">
+                            <h4>No child dispatches</h4>
+                            <p class="hint">This dispatch has not delegated work to another agent yet.</p>
+                          </div>
+
+                          <div class="dispatches-child-list" x-show="selectedChildren.length > 0">
+                            <template x-for="child in selectedChildren" :key="child.id">
+                              <button type="button" class="dispatches-child-item" @click="selectDispatch(child.id)">
+                                <div class="flex justify-between items-start gap-2">
+                                  <div class="dispatches-table-cell-primary">
+                                    <span class="font-mono" x-text="child.id"></span>
+                                    <span class="text-xs text-dim" x-text="child.step_id || 'No step id'"></span>
+                                  </div>
+                                  <div class="dispatches-tree-badges">
+                                    <span :class="kindBadgeClass(child.kind)" x-text="kindLabel(child.kind)"></span>
+                                    <span :class="statusBadgeClass(child.status)" x-text="statusLabel(child.status)"></span>
+                                  </div>
+                                </div>
+                                <div class="dispatches-child-meta">
+                                  <span class="run-card-chip">Target <span class="font-mono" x-text="child.target_agent || child.spawned_agent_id || '-'"></span></span>
+                                  <span class="run-card-chip">Attempt <span x-text="attemptLabel(child)"></span></span>
+                                  <span class="run-card-chip">Updated <span x-text="relativeTime(child.updated_at) || '-'"></span></span>
+                                </div>
+                              </button>
+                            </template>
+                          </div>
+                        </div>
+
+                        <div class="dispatches-section">
+                          <div class="dispatches-section-header">
+                            <div>
+                              <div class="runs-json-label">Delegation Lineage</div>
+                              <div class="text-xs text-dim">Recursive tree from the root parent through all child delegations.</div>
+                            </div>
+                            <span class="badge badge-info" x-show="lineageRows.length" x-text="lineageRows.length + ' nodes'"></span>
+                          </div>
+
+                          <div x-show="lineageRows.length === 0" class="empty-state dispatches-empty-inline">
+                            <h4>No lineage yet</h4>
+                            <p class="hint">Parent and child dispatch chains will render here once delegation occurs.</p>
+                          </div>
+
+                          <div class="dispatches-tree" x-show="lineageRows.length > 0">
+                            <template x-for="row in lineageRows" :key="row.key">
+                              <button type="button" class="dispatches-tree-row" :class="{ 'is-selected': row.isSelected }" @click="selectDispatch(row.dispatch.id)">
+                                <span class="dispatches-tree-prefix" x-text="row.branchPrefix"></span>
+                                <div class="dispatches-tree-content">
+                                  <div class="flex justify-between items-start gap-2">
+                                    <div class="dispatches-table-cell-primary">
+                                      <span class="font-mono" x-text="row.dispatch.id"></span>
+                                      <span class="text-xs text-dim" x-text="row.dispatch.step_id || 'No step id'"></span>
+                                    </div>
+                                    <div class="dispatches-tree-badges">
+                                      <span :class="kindBadgeClass(row.dispatch.kind)" x-text="kindLabel(row.dispatch.kind)"></span>
+                                      <span :class="statusBadgeClass(row.dispatch.status)" x-text="statusLabel(row.dispatch.status)"></span>
+                                    </div>
+                                  </div>
+                                  <div class="dispatches-child-meta">
+                                    <span class="run-card-chip">Target <span class="font-mono" x-text="row.dispatch.target_agent || row.dispatch.spawned_agent_id || '-'"></span></span>
+                                    <span class="run-card-chip">Attempt <span x-text="attemptLabel(row.dispatch)"></span></span>
+                                    <span class="run-card-chip" x-show="childCountLabel(row)" x-text="childCountLabel(row)"></span>
+                                    <span class="run-card-chip" x-show="row.cycleDetected">Cycle guarded</span>
+                                  </div>
+                                </div>
+                              </button>
+                            </template>
+                          </div>
+                        </div>
+
+                        <div class="dispatches-section">
+                          <div class="dispatches-section-header">
+                            <div>
+                              <div class="runs-json-label">Related HITL Requests</div>
+                              <div class="text-xs text-dim">Requests scoped to this dispatch.</div>
+                            </div>
+                            <span class="badge badge-warn" x-show="relatedHitlRequests.length" x-text="relatedHitlRequests.length + ' linked'"></span>
+                          </div>
+
+                          <div x-show="relatedHitlRequests.length === 0" class="empty-state dispatches-empty-inline">
+                            <h4>No HITL requests</h4>
+                            <p class="hint">Human clarifications and approvals tied to this dispatch will appear here.</p>
+                          </div>
+
+                          <div class="runs-hitl-stack" x-show="relatedHitlRequests.length > 0">
+                            <template x-for="request in relatedHitlRequests" :key="request.id">
+                              <article class="card runs-hitl-card">
+                                <div class="flex justify-between items-start gap-2">
+                                  <div class="run-card-badges">
+                                    <span :class="hitlKindBadgeClass(request.kind)" x-text="hitlKindLabel(request.kind)"></span>
+                                    <span :class="statusBadgeClass(request.status)" x-text="statusLabel(request.status)"></span>
+                                  </div>
+                                  <span class="text-xs text-dim" x-text="formatDateTime(request.created_at) || '-'" :title="request.created_at"></span>
+                                </div>
+                                <h4 class="runs-hitl-question" x-text="request.question"></h4>
+                                <div class="run-card-meta">
+                                  <span class="run-card-chip">Seq <span class="font-mono" x-text="request.sequence_no"></span></span>
+                                  <span class="run-card-chip">Created <span x-text="relativeTime(request.created_at) || '-'"></span></span>
+                                </div>
+                                <pre class="tool-pre" x-show="request.context && Object.keys(request.context).length !== 0" x-text="formatJson(request.context)"></pre>
+                                <div class="runs-hitl-terminal" x-show="request.response">
+                                  <div class="runs-json-label">Recorded Response</div>
+                                  <pre class="tool-pre" x-text="formatJson(request.response)"></pre>
+                                </div>
+                              </article>
+                            </template>
+                          </div>
+                        </div>
+
+                        <div class="dispatches-section">
+                          <div class="runs-events-toolbar">
+                            <span :class="eventConnectionBadgeClass()" x-text="eventConnectionState === 'connected' ? 'Live' : (eventConnectionState === 'connecting' ? 'Connecting' : 'Stopped')"></span>
+                            <button class="btn btn-ghost btn-sm" @click="toggleAutoScrollEvents()" x-text="autoScrollEvents ? 'Auto-scroll on' : 'Auto-scroll off'"></button>
+                          </div>
+
+                          <div class="runs-events-log" x-ref="eventLog">
+                            <div x-show="eventEntries.length === 0" class="empty-state dispatches-empty-inline">
+                              <h4>Listening for dispatch events</h4>
+                              <p class="hint">The SSE stream will replay snapshots, dispatch updates, linked HITL events, and keepalives for this dispatch.</p>
+                            </div>
+
+                            <template x-for="entry in eventEntries" :key="entry.key">
+                              <article class="runs-event-entry">
+                                <div class="flex justify-between items-center gap-2">
+                                  <div class="run-card-badges">
+                                    <span class="badge badge-info" x-text="entry.name"></span>
+                                    <span class="run-card-chip" x-show="entry.id">Event <span class="font-mono" x-text="entry.id"></span></span>
+                                  </div>
+                                  <span class="text-xs text-dim" x-text="formatDateTime(entry.received_at) || '-'" :title="entry.received_at"></span>
+                                </div>
+                                <pre class="tool-pre runs-event-pre" x-text="formatJson(entry.data)"></pre>
+                              </article>
+                            </template>
+                          </div>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </aside>
+            </div>
+          </template>
         </div>
       </div>
     </template>
