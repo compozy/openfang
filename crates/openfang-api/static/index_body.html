@@ -5273,16 +5273,480 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
       </div>
     </template>
 
-    <!-- Placeholder: Runs -->
+    <!-- Page: Runs -->
     <template x-if="page === 'runs'">
-      <div>
-        <div class="page-header"><h2>Runs</h2></div>
-        <div class="page-body">
-          <div class="empty-state">
-            <div class="empty-state-icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg></div>
-            <h3>Coming Soon</h3>
-            <p class="text-dim text-xs">Workflow and agent run history will appear here.</p>
+      <div x-data="runsPage()" x-init="init()">
+        <div class="page-header">
+          <div>
+            <h2>Runs</h2>
+            <div class="text-xs text-dim">Execution visibility for durable workflow runs, dispatches, signals, and HITL.</div>
           </div>
+          <div class="flex items-center gap-2">
+            <span class="badge badge-run-pending" x-show="runs.length" x-text="runs.length + ' loaded'"></span>
+            <button class="btn btn-ghost btn-sm" @click="loadRuns({ refreshDetail: true })">Refresh</button>
+          </div>
+        </div>
+        <div class="page-body">
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading workflow runs...</span></div>
+          <div x-show="!loading && loadError" class="error-state">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
+          </div>
+          <template x-if="!loading && !loadError">
+            <div class="runs-layout">
+              <section class="runs-list">
+                <div class="card runs-filters">
+                  <div class="runs-filter-grid">
+                    <div class="form-group">
+                      <label>Status</label>
+                      <select class="form-select" x-model="filterStatus" @change="loadRuns({ refreshDetail: true })">
+                        <template x-for="option in statusOptions" :key="'status-' + option.value">
+                          <option :value="option.value" x-text="option.label"></option>
+                        </template>
+                      </select>
+                    </div>
+                    <div class="form-group">
+                      <label>Workflow</label>
+                      <select class="form-select" x-model="filterWorkflowId" @change="loadRuns({ refreshDetail: true })">
+                        <option value="">All Workflows</option>
+                        <template x-for="workflow in workflowOptions" :key="'workflow-' + workflow.id">
+                          <option :value="workflow.id" x-text="workflow.name"></option>
+                        </template>
+                      </select>
+                    </div>
+                    <div class="form-group">
+                      <label>Search</label>
+                      <div class="search-input">
+                        <input
+                          type="text"
+                          x-model="searchQuery"
+                          placeholder="Search run ID, workflow ID, or labels..."
+                          @input.debounce.300ms="loadRuns({ refreshDetail: true })"
+                        >
+                        <button x-show="searchQuery" @click="searchQuery = ''; loadRuns({ refreshDetail: true })" class="search-clear-btn" title="Clear search">&times;</button>
+                      </div>
+                    </div>
+                  </div>
+                  <p class="text-xs text-dim" x-show="workflowLoadError" x-text="'Workflow metadata unavailable: ' + workflowLoadError"></p>
+                </div>
+
+                <div x-show="runs.length === 0" class="empty-state runs-empty">
+                  <div class="empty-state-icon">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                  </div>
+                  <h4>No matching runs</h4>
+                  <p class="hint">Adjust the status, workflow, or search filters to load a different slice of workflow history.</p>
+                </div>
+
+                <div class="runs-list-stack" x-show="runs.length > 0">
+                  <template x-for="run in runs" :key="run.id">
+                    <article class="card run-card" :class="{ 'is-selected': selectedRunId === run.id }" @click="selectRun(run.id, true)">
+                      <div class="flex justify-between items-start gap-2">
+                        <div class="runs-card-head">
+                          <h3 class="run-card-title" x-text="workflowName(run.workflow_id)"></h3>
+                          <div class="run-card-subtitle">
+                            <span class="font-mono" x-text="run.id"></span>
+                          </div>
+                        </div>
+                        <div class="run-card-badges">
+                          <span :class="statusBadgeClass(run.status)" x-text="statusLabel(run.status)"></span>
+                          <span class="badge badge-run-paused" x-show="showRecoveryIndicator(run)" :title="recoveryTooltip()">Recovered</span>
+                        </div>
+                      </div>
+
+                      <div class="run-card-meta">
+                        <span class="run-card-chip">
+                          Workflow <span class="font-mono" x-text="run.workflow_id"></span>
+                        </span>
+                        <span class="run-card-chip" x-show="run.current_step_id">
+                          Step <span class="font-mono" x-text="currentStepLabel(run)"></span>
+                        </span>
+                        <span class="run-card-chip" x-show="run.waiting_kind">
+                          Waiting <span x-text="waitingKindLabel(run.waiting_kind)"></span>
+                        </span>
+                      </div>
+
+                      <div class="run-card-summary">
+                        <p x-text="waitingSummary(run) || workflowDescription(run.workflow_id) || 'No additional run context available yet.'"></p>
+                      </div>
+
+                      <div class="run-card-footer">
+                        <span class="text-xs text-dim" x-text="'Started ' + (relativeTime(run.started_at) || 'unknown')"></span>
+                        <span class="text-xs text-dim" x-text="'Updated ' + (relativeTime(run.updated_at) || 'unknown')" :title="formatDateTime(run.updated_at)"></span>
+                      </div>
+                    </article>
+                  </template>
+                </div>
+              </section>
+
+              <aside class="card runs-detail">
+                <template x-if="!selectedRunId">
+                  <div class="empty-state runs-detail-empty">
+                    <div class="empty-state-icon">
+                      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18"/><path d="M12 3v18"/></svg>
+                    </div>
+                    <h4>Select a run</h4>
+                    <p class="hint">Choose a run from the list to inspect checkpoints, signals, dispatches, HITL, and live event activity.</p>
+                  </div>
+                </template>
+
+                <template x-if="selectedRunId">
+                  <div>
+                    <div x-show="detailLoading" class="loading-state"><div class="spinner"></div><span>Loading run detail...</span></div>
+                    <div x-show="!detailLoading && detailError" class="error-state">
+                      <span class="error-icon">!</span>
+                      <p x-text="detailError"></p>
+                      <button class="btn btn-ghost btn-sm" @click="refreshSelectedRun()">Retry</button>
+                    </div>
+
+                    <template x-if="!detailLoading && !detailError && selectedRun">
+                      <div>
+                        <div class="runs-detail-header">
+                          <div class="runs-detail-heading">
+                            <div class="text-xs text-dim">Workflow Run</div>
+                            <h3 class="runs-detail-title" x-text="workflowName(selectedRun.workflow_id)"></h3>
+                            <div class="run-card-subtitle">
+                              <span class="font-mono" x-text="selectedRun.id"></span>
+                              <span class="run-card-chip">
+                                Workflow <span class="font-mono" x-text="selectedRun.workflow_id"></span>
+                              </span>
+                            </div>
+                          </div>
+                          <div class="runs-detail-actions">
+                            <div class="run-card-badges">
+                              <span :class="statusBadgeClass(selectedRun.status)" x-text="statusLabel(selectedRun.status)"></span>
+                              <span class="badge badge-run-paused" x-show="selectedRunHasRecoveryCheckpoint" :title="recoveryTooltip()">Recovered</span>
+                            </div>
+                            <div class="run-action-row">
+                              <button class="btn btn-ghost btn-sm" @click="executeRunAction('pause')" :disabled="runAction || !canPause(selectedRun)">
+                                <span x-text="runAction === 'pause' ? 'Pausing...' : 'Pause'"></span>
+                              </button>
+                              <button class="btn btn-primary btn-sm" @click="executeRunAction('resume')" :disabled="runAction || !canResume(selectedRun)">
+                                <span x-text="runAction === 'resume' ? 'Resuming...' : 'Resume'"></span>
+                              </button>
+                              <button class="btn btn-danger btn-sm" @click="confirmCancelRun()" :disabled="runAction || !canCancel(selectedRun)">
+                                <span x-text="runAction === 'cancel' ? 'Cancelling...' : 'Cancel'"></span>
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div class="run-status-banner" x-show="waitingSummary(selectedRun)">
+                          <span class="badge badge-run-waiting-signal" x-show="selectedRun.status === 'waiting_signal'">Signal Wait</span>
+                          <span class="badge badge-run-waiting-hitl" x-show="selectedRun.status === 'waiting_hitl'">HITL Wait</span>
+                          <span class="badge badge-run-paused" x-show="selectedRun.status === 'paused'">Paused</span>
+                          <p x-text="waitingSummary(selectedRun)"></p>
+                        </div>
+
+                        <div class="tabs runs-tabs">
+                          <button class="tab" :class="{ active: selectedTab === 'overview' }" @click="setTab('overview')">Overview</button>
+                          <button class="tab" :class="{ active: selectedTab === 'checkpoints' }" @click="setTab('checkpoints')">Checkpoints</button>
+                          <button class="tab" :class="{ active: selectedTab === 'signals' }" @click="setTab('signals')">Signals</button>
+                          <button class="tab" :class="{ active: selectedTab === 'dispatches' }" @click="setTab('dispatches')">Dispatches</button>
+                          <button class="tab" :class="{ active: selectedTab === 'hitl' }" @click="setTab('hitl')">HITL</button>
+                          <button class="tab" :class="{ active: selectedTab === 'events' }" @click="setTab('events')">Events</button>
+                        </div>
+
+                        <div class="runs-tab-panel" x-show="selectedTab === 'overview'">
+                          <div class="card run-progress-card">
+                            <div class="flex justify-between items-center gap-2">
+                              <div>
+                                <div class="card-header" style="margin-bottom:4px">Execution Progress</div>
+                                <div class="text-xs text-dim" x-text="progressLabel(selectedRun)"></div>
+                              </div>
+                              <span class="font-mono text-xs" x-text="progressPercent(selectedRun) + '%'"></span>
+                            </div>
+                            <div class="run-progress-bar">
+                              <div class="run-progress-fill" :style="'width:' + progressPercent(selectedRun) + '%'"></div>
+                            </div>
+                          </div>
+
+                          <div class="detail-grid runs-detail-grid">
+                            <div class="detail-row"><span class="detail-label">Status</span><span :class="statusBadgeClass(selectedRun.status)" x-text="statusLabel(selectedRun.status)"></span></div>
+                            <div class="detail-row"><span class="detail-label">Workflow</span><span class="detail-value" x-text="workflowName(selectedRun.workflow_id)"></span></div>
+                            <div class="detail-row"><span class="detail-label">Version</span><span class="detail-value" x-text="selectedRun.workflow_version || '-'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Current Step</span><span class="detail-value" x-text="currentStepLabel(selectedRun)"></span></div>
+                            <div class="detail-row"><span class="detail-label">Started</span><span class="detail-value" x-text="formatDateTime(selectedRun.started_at) || '-'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Updated</span><span class="detail-value" x-text="formatDateTime(selectedRun.updated_at) || '-'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Completed</span><span class="detail-value" x-text="formatDateTime(selectedRun.completed_at) || '-'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Waiting Kind</span><span class="detail-value" x-text="waitingKindLabel(selectedRun.waiting_kind) || '-'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Waiting Ref</span><span class="detail-value" x-text="selectedRun.waiting_ref || '-'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Active Dispatch</span><span class="detail-value font-mono" x-text="selectedRun.active_dispatch_id || '-'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Active HITL</span><span class="detail-value font-mono" x-text="selectedRun.active_hitl_request_id || '-'"></span></div>
+                          </div>
+
+                          <div class="runs-json-grid">
+                            <div class="runs-json-card">
+                              <div class="runs-json-label">Input</div>
+                              <pre class="tool-pre" x-text="formatJson(selectedRun.input)"></pre>
+                            </div>
+                            <div class="runs-json-card">
+                              <div class="runs-json-label">Vars</div>
+                              <pre class="tool-pre" x-text="formatJson(selectedRun.vars)"></pre>
+                            </div>
+                            <div class="runs-json-card" x-show="selectedRun.labels && Object.keys(selectedRun.labels).length !== 0">
+                              <div class="runs-json-label">Labels</div>
+                              <pre class="tool-pre" x-text="formatJson(selectedRun.labels)"></pre>
+                            </div>
+                            <div class="runs-json-card" x-show="selectedRun.metadata && Object.keys(selectedRun.metadata).length !== 0">
+                              <div class="runs-json-label">Metadata</div>
+                              <pre class="tool-pre" x-text="formatJson(selectedRun.metadata)"></pre>
+                            </div>
+                            <div class="runs-json-card" x-show="selectedRun.error">
+                              <div class="runs-json-label">Error</div>
+                              <pre class="tool-pre tool-pre-error" x-text="formatJson(selectedRun.error)"></pre>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div class="runs-tab-panel" x-show="selectedTab === 'checkpoints'">
+                          <div class="run-checkpoint-note" x-show="selectedRunHasRecoveryCheckpoint">
+                            <span class="badge badge-run-paused">Recovered</span>
+                            <p>This run was recovered after a restart and requires an operator resume.</p>
+                          </div>
+
+                          <div x-show="checkpoints.length === 0" class="empty-state runs-empty-inline">
+                            <h4>No checkpoints yet</h4>
+                            <p class="hint">Lifecycle checkpoints will appear here as the workflow progresses.</p>
+                          </div>
+
+                          <div class="runs-timeline" x-show="checkpoints.length > 0">
+                            <template x-for="checkpoint in checkpoints" :key="checkpoint.id">
+                              <article class="runs-timeline-item">
+                                <div class="runs-timeline-marker"></div>
+                                <div class="runs-timeline-body">
+                                  <div class="flex justify-between items-start gap-2">
+                                    <div class="run-card-badges">
+                                      <span class="badge badge-info" x-text="checkpointKindLabel(checkpoint.kind)"></span>
+                                      <span class="badge badge-run-paused" x-show="checkpoint.kind === 'run_recovered_needs_resume'">Recovery</span>
+                                    </div>
+                                    <span class="text-xs text-dim" x-text="formatDateTime(checkpoint.created_at) || '-'" :title="checkpoint.created_at"></span>
+                                  </div>
+                                  <p class="runs-timeline-summary" x-text="checkpointSummary(checkpoint)"></p>
+                                  <div class="run-card-meta">
+                                    <span class="run-card-chip" x-show="checkpoint.step_id">
+                                      Step <span class="font-mono" x-text="checkpoint.step_id"></span>
+                                    </span>
+                                  </div>
+                                  <pre class="tool-pre" x-show="checkpoint.data && Object.keys(checkpoint.data).length !== 0" x-text="formatJson(checkpoint.data)"></pre>
+                                </div>
+                              </article>
+                            </template>
+                          </div>
+                        </div>
+
+                        <div class="runs-tab-panel" x-show="selectedTab === 'signals'">
+                          <div class="card runs-inline-card">
+                            <div class="card-header">Send Signal</div>
+                            <div class="text-xs text-dim" x-show="selectedRun.status === 'waiting_signal'">
+                              This run is currently waiting for the signal named <span class="font-mono" x-text="selectedRun.waiting_ref || 'unknown'"></span>.
+                            </div>
+                            <div class="runs-form-grid">
+                              <div class="form-group">
+                                <label>Name</label>
+                                <input class="form-input" x-model="signalForm.name" placeholder="approval">
+                              </div>
+                              <div class="form-group">
+                                <label>Source</label>
+                                <input class="form-input" x-model="signalForm.source" placeholder="dashboard">
+                              </div>
+                              <div class="form-group runs-form-full">
+                                <label>Payload JSON</label>
+                                <textarea class="form-textarea runs-code-input" x-model="signalForm.payload" placeholder='{"value":"approved"}'></textarea>
+                              </div>
+                            </div>
+                            <div class="run-action-row">
+                              <button class="btn btn-primary btn-sm" @click="submitSignal()" :disabled="signalSubmitting">
+                                <span x-text="signalSubmitting ? 'Sending...' : 'Send Signal'"></span>
+                              </button>
+                            </div>
+                          </div>
+
+                          <div x-show="signals.length === 0" class="empty-state runs-empty-inline">
+                            <h4>No signals recorded</h4>
+                            <p class="hint">Signals sent to this run will appear here with consumption status and timestamps.</p>
+                          </div>
+
+                          <div class="table-wrap" x-show="signals.length > 0">
+                            <table>
+                              <thead>
+                                <tr>
+                                  <th>Name</th>
+                                  <th>Status</th>
+                                  <th>Source</th>
+                                  <th>Created</th>
+                                  <th>Consumed</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                <template x-for="signal in signals" :key="signal.id">
+                                  <tr>
+                                    <td>
+                                      <div class="font-mono" x-text="signal.name"></div>
+                                      <div class="text-xs text-dim" x-text="signal.id"></div>
+                                    </td>
+                                    <td><span :class="signalStatusClass(signal)" x-text="signalStatusLabel(signal)"></span></td>
+                                    <td x-text="signal.source || '-'"></td>
+                                    <td class="text-xs" x-text="formatDateTime(signal.created_at) || '-'"></td>
+                                    <td class="text-xs" x-text="formatDateTime(signal.consumed_at) || '-'"></td>
+                                  </tr>
+                                </template>
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+
+                        <div class="runs-tab-panel" x-show="selectedTab === 'dispatches'">
+                          <div x-show="dispatches.length === 0" class="empty-state runs-empty-inline">
+                            <h4>No dispatches yet</h4>
+                            <p class="hint">Agent dispatches for this run will appear here as steps execute.</p>
+                          </div>
+
+                          <div class="table-wrap" x-show="dispatches.length > 0">
+                            <table>
+                              <thead>
+                                <tr>
+                                  <th>Dispatch</th>
+                                  <th>Kind</th>
+                                  <th>Target</th>
+                                  <th>Status</th>
+                                  <th>Updated</th>
+                                  <th>Actions</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                <template x-for="dispatch in dispatches" :key="dispatch.id">
+                                  <tr>
+                                    <td>
+                                      <div class="font-mono" x-text="dispatch.id"></div>
+                                      <div class="text-xs text-dim" x-text="dispatch.step_id || '-'"></div>
+                                    </td>
+                                    <td x-text="statusLabel(dispatch.kind)"></td>
+                                    <td class="font-mono" x-text="dispatch.target_agent || '-'"></td>
+                                    <td><span :class="statusBadgeClass(dispatch.status)" x-text="statusLabel(dispatch.status)"></span></td>
+                                    <td class="text-xs" x-text="formatDateTime(dispatch.updated_at) || '-'"></td>
+                                    <td>
+                                      <div class="run-action-row">
+                                        <button class="btn btn-ghost btn-sm" @click="retryDispatch(dispatch)" :disabled="dispatchActionId || !dispatchCanRetry(dispatch)">
+                                          <span x-text="dispatchActionId === 'retry:' + dispatch.id ? 'Retrying...' : 'Retry'"></span>
+                                        </button>
+                                        <button class="btn btn-danger btn-sm" @click="confirmCancelDispatch(dispatch)" :disabled="dispatchActionId || !dispatchCanCancel(dispatch)">
+                                          <span x-text="dispatchActionId === 'cancel:' + dispatch.id ? 'Cancelling...' : 'Cancel'"></span>
+                                        </button>
+                                      </div>
+                                    </td>
+                                  </tr>
+                                </template>
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+
+                        <div class="runs-tab-panel" x-show="selectedTab === 'hitl'">
+                          <div x-show="hitlRequests.length === 0" class="empty-state runs-empty-inline">
+                            <h4>No HITL requests</h4>
+                            <p class="hint">Human approvals and clarification prompts for this run will appear here.</p>
+                          </div>
+
+                          <div class="runs-hitl-stack" x-show="hitlRequests.length > 0">
+                            <template x-for="request in hitlRequests" :key="request.id">
+                              <article class="card runs-hitl-card">
+                                <div class="flex justify-between items-start gap-2">
+                                  <div class="run-card-badges">
+                                    <span :class="hitlKindBadgeClass(request.kind)" x-text="hitlKindLabel(request.kind)"></span>
+                                    <span :class="statusBadgeClass(request.status)" x-text="statusLabel(request.status)"></span>
+                                  </div>
+                                  <span class="text-xs text-dim" x-text="formatDateTime(request.created_at) || '-'" :title="request.created_at"></span>
+                                </div>
+
+                                <h4 class="runs-hitl-question" x-text="request.question"></h4>
+
+                                <div class="run-card-meta">
+                                  <span class="run-card-chip">Step <span class="font-mono" x-text="request.step_id"></span></span>
+                                  <span class="run-card-chip">Seq <span class="font-mono" x-text="request.sequence_no"></span></span>
+                                  <span class="run-card-chip" x-show="request.dispatch_id">Dispatch <span class="font-mono" x-text="request.dispatch_id"></span></span>
+                                </div>
+
+                                <pre class="tool-pre" x-show="request.context && Object.keys(request.context).length !== 0" x-text="formatJson(request.context)"></pre>
+
+                                <div class="runs-hitl-actions" x-show="request.status === 'pending'">
+                                  <template x-if="isTextHitl(request.kind)">
+                                    <div>
+                                      <div class="form-group">
+                                        <label>Answer</label>
+                                        <textarea class="form-textarea hitl-answer-input" x-model="hitlDrafts[request.id]" placeholder="Provide the human response that should resume this step."></textarea>
+                                      </div>
+                                      <div class="run-action-row">
+                                        <button class="btn btn-primary btn-sm" @click="submitTextHitl(request)" :disabled="hitlSubmittingId === request.id">
+                                          <span x-text="hitlSubmittingId === request.id ? 'Submitting...' : 'Submit Answer'"></span>
+                                        </button>
+                                      </div>
+                                    </div>
+                                  </template>
+
+                                  <template x-if="isApprovalHitl(request.kind)">
+                                    <div class="run-action-row">
+                                      <button class="btn btn-success btn-sm" @click="submitApprovalHitl(request, 'approved')" :disabled="hitlSubmittingId === request.id">Approve</button>
+                                      <button class="btn btn-danger btn-sm" @click="submitApprovalHitl(request, 'rejected')" :disabled="hitlSubmittingId === request.id">Reject</button>
+                                    </div>
+                                  </template>
+
+                                  <template x-if="isChoiceHitl(request.kind)">
+                                    <div class="hitl-choice-grid">
+                                      <template x-for="choice in choicesFor(request)" :key="request.id + ':' + choice.value">
+                                        <button class="btn btn-ghost btn-sm hitl-choice-btn" @click="submitChoiceHitl(request, choice)" :disabled="hitlSubmittingId === request.id" :title="choice.description || choice.label">
+                                          <span x-text="choice.label"></span>
+                                        </button>
+                                      </template>
+                                    </div>
+                                  </template>
+                                </div>
+
+                                <div class="runs-hitl-terminal" x-show="request.response">
+                                  <div class="runs-json-label">Recorded Response</div>
+                                  <pre class="tool-pre" x-text="formatJson(request.response)"></pre>
+                                </div>
+                              </article>
+                            </template>
+                          </div>
+                        </div>
+
+                        <div class="runs-tab-panel" x-show="selectedTab === 'events'">
+                          <div class="runs-events-toolbar">
+                            <span :class="eventConnectionBadgeClass()" x-text="eventConnectionState === 'connected' ? 'Live' : (eventConnectionState === 'connecting' ? 'Connecting' : 'Stopped')"></span>
+                            <button class="btn btn-ghost btn-sm" @click="toggleAutoScrollEvents()" x-text="autoScrollEvents ? 'Auto-scroll on' : 'Auto-scroll off'"></button>
+                          </div>
+
+                          <div class="runs-events-log" x-ref="eventLog">
+                            <div x-show="eventEntries.length === 0" class="empty-state runs-empty-inline">
+                              <h4>Listening for events</h4>
+                              <p class="hint">The stream will log snapshots, run updates, dispatch changes, HITL activity, and keepalives for this run.</p>
+                            </div>
+
+                            <template x-for="entry in eventEntries" :key="entry.key">
+                              <article class="runs-event-entry">
+                                <div class="flex justify-between items-center gap-2">
+                                  <div class="run-card-badges">
+                                    <span class="badge badge-info" x-text="entry.name"></span>
+                                    <span class="run-card-chip" x-show="entry.id">
+                                      Event <span class="font-mono" x-text="entry.id"></span>
+                                    </span>
+                                  </div>
+                                  <span class="text-xs text-dim" x-text="formatDateTime(entry.received_at) || '-'" :title="entry.received_at"></span>
+                                </div>
+                                <pre class="tool-pre runs-event-pre" x-text="formatJson(entry.data)"></pre>
+                              </article>
+                            </template>
+                          </div>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </aside>
+            </div>
+          </template>
         </div>
       </div>
     </template>

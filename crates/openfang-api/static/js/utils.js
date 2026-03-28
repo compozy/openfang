@@ -65,21 +65,30 @@ var OpenFangUtils = (function() {
     if (!status) return 'badge badge-dim';
     var s = String(status).toLowerCase();
 
+    if (s === 'pending') return 'badge badge-run-pending';
+    if (s === 'running') return 'badge badge-run-running';
+    if (s === 'waiting_signal') return 'badge badge-run-waiting-signal';
+    if (s === 'waiting_hitl') return 'badge badge-run-waiting-hitl';
+    if (s === 'paused') return 'badge badge-run-paused';
+    if (s === 'completed') return 'badge badge-run-completed';
+    if (s === 'failed' || s === 'timed_out') return 'badge badge-run-failed';
+    if (s === 'cancelled') return 'badge badge-run-cancelled';
+
     // Success states
-    if (s === 'running' || s === 'active' || s === 'enabled' || s === 'online') {
+    if (s === 'active' || s === 'enabled' || s === 'online') {
       return 'badge badge-success';
     }
-    if (s === 'completed' || s === 'done' || s === 'answered' || s === 'installed') {
+    if (s === 'done' || s === 'answered' || s === 'installed') {
       return 'badge badge-success';
     }
 
     // Error states
-    if (s === 'failed' || s === 'error' || s === 'rejected' || s === 'dead') {
+    if (s === 'error' || s === 'rejected' || s === 'dead') {
       return 'badge badge-error';
     }
 
     // Warning states
-    if (s === 'paused' || s === 'waiting' || s === 'pending' || s === 'suspended') {
+    if (s === 'waiting' || s === 'suspended') {
       return 'badge badge-warn';
     }
 
@@ -89,7 +98,7 @@ var OpenFangUtils = (function() {
     }
 
     // Cancelled / inactive
-    if (s === 'cancelled' || s === 'disabled' || s === 'stopped' || s === 'offline') {
+    if (s === 'disabled' || s === 'stopped' || s === 'offline') {
       return 'badge badge-dim';
     }
 
