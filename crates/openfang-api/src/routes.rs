@@ -6114,6 +6114,7 @@ fn trigger_list_item(resource: TriggerResponse, runtime: TriggerRuntimeStatus) -
         enabled: resource.definition.enabled,
         trigger_match: resource.definition.trigger_match,
         target: resource.definition.target,
+        origin: resource.origin,
         runtime_status: TriggerListRuntimeStatus {
             enabled: runtime.enabled,
             fire_count: runtime.fire_count,
@@ -10390,17 +10391,10 @@ pub async fn update_trigger_definition_v1(
         );
     }
 
-    let store = trigger_definition_store(&state);
-    let existing = match store.load(&id) {
+    let existing = match load_trigger_definition_resource(&state, &id) {
         Ok(Some(resource)) => resource,
         Ok(None) => return trigger_definition_not_found_response(),
-        Err(error) => {
-            return trigger_store_load_error_response(
-                "definition_load_failed",
-                "Failed to load trigger definition",
-                error,
-            )
-        }
+        Err(response) => return response,
     };
     if existing.origin.kind == TriggerOriginKind::Pack {
         return trigger_pack_conflict_response(&id, existing.origin.pack_id.as_deref());
@@ -10418,7 +10412,7 @@ pub async fn update_trigger_definition_v1(
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    if let Err(error) = store.persist(&resource) {
+    if let Err(error) = trigger_definition_store(&state).persist(&resource) {
         return trigger_store_load_error_response(
             "definition_persist_failed",
             "Failed to persist trigger definition",
@@ -10621,17 +10615,10 @@ pub async fn fork_trigger_definition_v1(
         );
     }
 
-    let store = trigger_definition_store(&state);
-    let existing = match store.load(&id) {
+    let existing = match load_trigger_definition_resource(&state, &id) {
         Ok(Some(resource)) => resource,
         Ok(None) => return trigger_definition_not_found_response(),
-        Err(error) => {
-            return trigger_store_load_error_response(
-                "definition_load_failed",
-                "Failed to load trigger definition",
-                error,
-            )
-        }
+        Err(response) => return response,
     };
     if existing.origin.kind != TriggerOriginKind::Pack {
         return workflow_v2_error_response(
@@ -10659,7 +10646,7 @@ pub async fn fork_trigger_definition_v1(
         updated_at: timestamp,
     };
 
-    if let Err(error) = store.persist(&resource) {
+    if let Err(error) = trigger_definition_store(&state).persist(&resource) {
         return trigger_store_load_error_response(
             "definition_persist_failed",
             "Failed to persist trigger definition",

@@ -1151,6 +1151,7 @@ pub struct TriggerListItem {
     #[serde(rename = "match")]
     pub trigger_match: openfang_types::trigger::TriggerMatch,
     pub target: TriggerTarget,
+    pub origin: TriggerOrigin,
     pub runtime_status: TriggerListRuntimeStatus,
     pub updated_at: String,
 }

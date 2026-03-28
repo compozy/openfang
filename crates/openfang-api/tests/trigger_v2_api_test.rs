@@ -1,11 +1,19 @@
 //! Real HTTP integration tests for the Trigger v2 API surface.
 
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 
 use openfang_api::routes::AppState;
 use openfang_api::server::build_router;
+use openfang_api::types::{
+    PackManifest, PackObjectRef, PackResourceType, PackSource, PackSourceKind,
+};
 use openfang_kernel::OpenFangKernel;
 use openfang_types::config::{DefaultModelConfig, KernelConfig};
+use openfang_types::trigger::TriggerV2Definition;
+use openfang_types::workflow::WorkflowV2Definition;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 struct TestServer {
@@ -20,8 +28,69 @@ impl Drop for TestServer {
     }
 }
 
-async fn start_trigger_v2_test_server() -> TestServer {
+fn write_file(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("parent directory should exist");
+    }
+    fs::write(path, content).expect("fixture file should be written");
+}
+
+fn write_toml_file<T: Serialize>(path: &Path, value: &T) {
+    let payload = toml::to_string_pretty(value).expect("fixture should serialize to TOML");
+    write_file(path, &payload);
+}
+
+fn pack_workflow_definition(id: &str) -> WorkflowV2Definition {
+    serde_json::from_value(noop_workflow_definition(id))
+        .expect("workflow fixture should deserialize")
+}
+
+fn pack_trigger_definition(id: &str, workflow_id: &str) -> TriggerV2Definition {
+    serde_json::from_value(workflow_start_trigger(
+        id,
+        workflow_id,
+        true,
+        "issue.created",
+    ))
+    .expect("trigger fixture should deserialize")
+}
+
+fn seed_pack_trigger_fixture(home_dir: &Path) {
+    let manifest = PackManifest {
+        id: "analytics".to_string(),
+        name: "Analytics".to_string(),
+        version: "1.2.0".to_string(),
+        description: "Analytics pack fixture".to_string(),
+        source: PackSource {
+            kind: PackSourceKind::Bundled,
+        },
+        objects: vec![
+            PackObjectRef {
+                resource_type: PackResourceType::Workflow,
+                resource_id: "analytics-main".to_string(),
+            },
+            PackObjectRef {
+                resource_type: PackResourceType::Trigger,
+                resource_id: "analytics-trigger".to_string(),
+            },
+        ],
+    };
+    write_toml_file(&home_dir.join("packs/analytics/pack.toml"), &manifest);
+    write_toml_file(
+        &home_dir.join("packs/analytics/workflows/analytics-main.toml"),
+        &pack_workflow_definition("analytics-main"),
+    );
+    write_toml_file(
+        &home_dir.join("packs/analytics/triggers/analytics-trigger.toml"),
+        &pack_trigger_definition("analytics-trigger", "analytics-main"),
+    );
+}
+
+async fn start_trigger_v2_test_server_with_fixtures(seed_pack_fixture: bool) -> TestServer {
     let tmp = tempfile::tempdir().expect("temporary directory should be created");
+    if seed_pack_fixture {
+        seed_pack_trigger_fixture(tmp.path());
+    }
     let config = KernelConfig {
         home_dir: tmp.path().to_path_buf(),
         data_dir: tmp.path().join("data"),
@@ -57,6 +126,10 @@ async fn start_trigger_v2_test_server() -> TestServer {
         state,
         _tmp: tmp,
     }
+}
+
+async fn start_trigger_v2_test_server() -> TestServer {
+    start_trigger_v2_test_server_with_fixtures(false).await
 }
 
 fn noop_workflow_definition(id: &str) -> Value {
@@ -397,6 +470,87 @@ async fn trigger_test_should_report_non_matching_event() {
     assert_eq!(body["matched"], json!(false));
     assert_eq!(body["would_dispatch"], json!(false));
     assert!(body["resolved_target"].is_null());
+}
+
+#[tokio::test]
+async fn trigger_fork_should_shadow_managed_pack_trigger() {
+    let server = start_trigger_v2_test_server_with_fixtures(true).await;
+    let client = reqwest::Client::new();
+
+    assert!(server.state.pack_registry.get_pack("analytics").is_some());
+    assert!(server
+        .state
+        .pack_registry
+        .find_pack_for_object(PackResourceType::Trigger, "analytics-trigger")
+        .is_some());
+
+    let (fork_status, fork_body) = post_json(
+        &client,
+        &server,
+        "/api/v1/triggers/analytics-trigger/fork",
+        json!({ "mode": "shadow" }),
+    )
+    .await;
+
+    assert_eq!(fork_status, reqwest::StatusCode::OK);
+    assert_eq!(fork_body["id"], json!("analytics-trigger"));
+    assert_eq!(fork_body["origin"]["kind"], json!("user"));
+    assert_eq!(fork_body["forked_from"]["kind"], json!("pack"));
+    assert_eq!(fork_body["forked_from"]["pack_id"], json!("analytics"));
+
+    let (detail_status, detail_body) =
+        get_json(&client, &server, "/api/v1/triggers/analytics-trigger").await;
+
+    assert_eq!(detail_status, reqwest::StatusCode::OK);
+    assert_eq!(detail_body["origin"]["kind"], json!("user"));
+    assert_eq!(detail_body["forked_from"]["kind"], json!("pack"));
+    assert_eq!(
+        detail_body["forked_from"]["resource_id"],
+        json!("analytics-trigger")
+    );
+}
+
+#[tokio::test]
+async fn trigger_list_should_include_origin_for_user_and_pack_definitions() {
+    let server = start_trigger_v2_test_server_with_fixtures(true).await;
+    let client = reqwest::Client::new();
+
+    create_workflow(&client, &server, "trigger-origin-workflow").await;
+
+    let (create_status, _) = post_json(
+        &client,
+        &server,
+        "/api/v1/triggers",
+        workflow_start_trigger(
+            "trigger-origin-user",
+            "trigger-origin-workflow",
+            true,
+            "issue.created",
+        ),
+    )
+    .await;
+    assert_eq!(create_status, reqwest::StatusCode::CREATED);
+
+    let (list_status, list_body) = get_json(&client, &server, "/api/v1/triggers").await;
+    assert_eq!(list_status, reqwest::StatusCode::OK);
+
+    let items = list_body["items"]
+        .as_array()
+        .expect("trigger list response should return items");
+
+    let pack_item = items
+        .iter()
+        .find(|item| item["id"] == json!("analytics-trigger"))
+        .expect("pack-managed trigger should be listed");
+    assert_eq!(pack_item["origin"]["kind"], json!("pack"));
+    assert_eq!(pack_item["origin"]["pack_id"], json!("analytics"));
+
+    let user_item = items
+        .iter()
+        .find(|item| item["id"] == json!("trigger-origin-user"))
+        .expect("user trigger should be listed");
+    assert_eq!(user_item["origin"]["kind"], json!("user"));
+    assert!(user_item["origin"]["pack_id"].is_null());
 }
 
 #[tokio::test]

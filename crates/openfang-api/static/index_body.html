@@ -6991,16 +6991,453 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
       </div>
     </template>
 
-    <!-- Placeholder: Triggers -->
+    <!-- Page: Triggers -->
     <template x-if="page === 'triggers'">
-      <div>
-        <div class="page-header"><h2>Triggers</h2></div>
-        <div class="page-body">
-          <div class="empty-state">
-            <div class="empty-state-icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
-            <h3>Coming Soon</h3>
-            <p class="text-dim text-xs">Event-driven trigger definitions will appear here.</p>
+      <div x-data="triggersPage()" x-init="init()">
+        <div class="page-header">
+          <div>
+            <h2>Triggers</h2>
+            <div class="text-xs text-dim">Trigger v2 authoring, runtime inspection, validation, compile previews, dry-run tests, and pack forks on the v1 API.</div>
           </div>
+          <div class="flex gap-2">
+            <button class="btn btn-ghost btn-sm" @click="loadTriggers({ preserveSelection: true, refreshDetail: true })">Refresh</button>
+            <button class="btn btn-primary btn-sm" @click="createTriggerDraft()">New Trigger</button>
+          </div>
+        </div>
+
+        <div class="page-body">
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading trigger definitions...</span></div>
+          <div x-show="!loading && loadError" class="error-state">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
+          </div>
+
+          <template x-if="!loading && !loadError">
+            <div class="tr2-stack">
+              <div class="card">
+                <div class="tr2-toolbar">
+                  <div>
+                    <div class="card-header">Catalog</div>
+                    <p class="text-xs text-dim">List items come from <code>/api/v1/triggers</code> and expose runtime status, target kind, and pack ownership.</p>
+                  </div>
+                  <div class="tr2-filter-grid">
+                    <div class="form-group">
+                      <label>Search</label>
+                      <div class="search-input">
+                        <input type="text" x-model="searchQuery" placeholder="Search trigger names, targets, origin...">
+                        <button x-show="searchQuery" @click="searchQuery = ''" class="search-clear-btn" title="Clear search">&times;</button>
+                      </div>
+                    </div>
+                    <div class="form-group">
+                      <label>Enabled</label>
+                      <select class="form-select" x-model="filterEnabled">
+                        <option value="">All</option>
+                        <option value="enabled">Enabled</option>
+                        <option value="disabled">Disabled</option>
+                      </select>
+                    </div>
+                    <div class="form-group">
+                      <label>Target Kind</label>
+                      <select class="form-select" x-model="filterTargetKind">
+                        <option value="">All Targets</option>
+                        <template x-for="option in targetKindOptions" :key="'trigger-filter-' + option.value">
+                          <option :value="option.value" x-text="option.label"></option>
+                        </template>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="table-wrap" x-show="filteredTriggers.length > 0">
+                <table class="tr2-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Event Match</th>
+                      <th>Target</th>
+                      <th>Enabled</th>
+                      <th>Fire Count</th>
+                      <th>Last Fired</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="trigger in filteredTriggers" :key="trigger.id">
+                      <tr class="tr2-table-row" :class="{ 'is-selected': selectedTriggerId === trigger.id }" @click="selectTrigger(trigger.id, false)">
+                        <td>
+                          <div class="tr2-name-cell">
+                            <div class="tr2-name-header">
+                              <span class="font-bold" x-text="trigger.name"></span>
+                              <span class="badge" :class="originBadgeClass(trigger.origin)" x-text="originLabel(trigger.origin)"></span>
+                            </div>
+                            <div class="text-xs text-dim font-mono" x-text="trigger.id"></div>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="text-xs" x-text="matchSummary(trigger.match || trigger.trigger_match)"></div>
+                        </td>
+                        <td>
+                          <div class="tr2-target-cell">
+                            <span class="badge badge-info" x-text="targetKindLabel(trigger.target)"></span>
+                            <div class="text-xs text-dim" x-text="targetSummary(trigger.target)"></div>
+                          </div>
+                        </td>
+                        <td>
+                          <div
+                            class="toggle"
+                            :class="{
+                              active: runtimeForListItem(trigger).enabled,
+                              'is-disabled': togglingId === trigger.id || (trigger.origin && trigger.origin.kind === 'pack')
+                            }"
+                            @click.stop="toggleTriggerEnabled(trigger)"
+                            :title="trigger.origin && trigger.origin.kind === 'pack'
+                              ? 'Pack-managed triggers must be forked before changes.'
+                              : (runtimeForListItem(trigger).enabled ? 'Disable trigger' : 'Enable trigger')"
+                          ></div>
+                        </td>
+                        <td x-text="runtimeForListItem(trigger).fire_count"></td>
+                        <td>
+                          <div class="text-xs" x-text="lastFiredLabel(trigger)"></div>
+                          <div class="text-xs text-dim" x-show="runtimeForListItem(trigger).last_fired_at" x-text="relativeTime(runtimeForListItem(trigger).last_fired_at)"></div>
+                        </td>
+                        <td>
+                          <div class="run-action-row">
+                            <button class="btn btn-ghost btn-sm" @click.stop="selectTrigger(trigger.id, true)">Open</button>
+                          </div>
+                        </td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+
+              <div class="empty-state" x-show="filteredTriggers.length === 0">
+                <div class="empty-state-icon">
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                </div>
+                <h4>No triggers loaded</h4>
+                <p class="hint">Create a new trigger, or clear the active filters to inspect the rest of the catalog.</p>
+                <button class="btn btn-primary btn-sm" @click="createTriggerDraft()">Create Trigger</button>
+              </div>
+
+              <div x-show="detailLoading" class="loading-state"><div class="spinner"></div><span>Loading trigger detail...</span></div>
+              <div x-show="!detailLoading && detailError" class="error-state">
+                <span class="error-icon">!</span>
+                <p x-text="detailError"></p>
+                <button class="btn btn-ghost btn-sm" @click="selectedTriggerId ? selectTrigger(selectedTriggerId, true) : createTriggerDraft()">Retry</button>
+              </div>
+
+              <div x-show="!detailLoading && !detailError" class="tr2-main-grid">
+                <section class="tr2-editor-stack">
+                  <div class="card">
+                    <div class="tr2-section-header">
+                      <div>
+                        <div class="card-header" x-text="selectedTriggerId ? 'Edit Trigger' : 'New Trigger Draft'"></div>
+                        <p class="text-xs text-dim" x-text="selectedTriggerId ? 'Persisted trigger definition loaded from /api/v1/triggers.' : 'Draft a trigger definition and save it to the v1 control plane.'"></p>
+                      </div>
+                      <div class="flex gap-2 flex-wrap">
+                        <button class="btn btn-ghost btn-sm" @click="validateTrigger()" :disabled="validating"><span x-show="!validating">Validate</span><span x-show="validating">Validating...</span></button>
+                        <button class="btn btn-ghost btn-sm" @click="compileTrigger()" :disabled="compiling"><span x-show="!compiling">Compile</span><span x-show="compiling">Compiling...</span></button>
+                        <button class="btn btn-primary btn-sm" @click="saveTrigger()" :disabled="saving || !canSaveSelected"><span x-show="!saving">Save</span><span x-show="saving">Saving...</span></button>
+                        <button class="btn btn-ghost btn-sm" @click="forkSelectedTrigger()" :disabled="forkingId === selectedTriggerId" x-show="canForkSelected">Fork</button>
+                        <button class="btn btn-danger btn-sm" @click="confirmDeleteSelected()" :disabled="deletingId === selectedTriggerId" x-show="canDeleteSelected">Delete</button>
+                      </div>
+                    </div>
+
+                    <div class="tr2-readonly-banner" x-show="selectedTriggerId && !canSaveSelected">
+                      <strong>Pack-managed trigger:</strong> fork this definition before editing, deleting, or toggling it.
+                    </div>
+
+                    <div class="tr2-form-grid">
+                      <div class="form-group">
+                        <label>ID</label>
+                        <input class="form-input font-mono" x-model="form.id" placeholder="issue-created-start-sdlc">
+                      </div>
+                      <div class="form-group">
+                        <label>Name</label>
+                        <input class="form-input" x-model="form.name" placeholder="Issue Created Trigger">
+                      </div>
+                      <div class="form-group">
+                        <label>Enabled</label>
+                        <label class="form-checkbox">
+                          <input type="checkbox" x-model="form.enabled">
+                          <span>Participates in live matching.</span>
+                        </label>
+                      </div>
+                      <div class="form-group">
+                        <label>Max Fires</label>
+                        <input class="form-input" type="number" min="0" x-model.number="form.max_fires" placeholder="0">
+                      </div>
+                      <div class="form-group">
+                        <label>Cooldown (secs)</label>
+                        <input class="form-input" type="number" min="0" x-model.number="form.cooldown_secs" placeholder="0">
+                      </div>
+                      <div class="form-group tr2-span-full">
+                        <label>Description</label>
+                        <textarea class="form-textarea" x-model="form.description" placeholder="Describe which event should fire this trigger and why."></textarea>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="card" :class="{ 'tr2-has-issues': issuesForPath('match').length }">
+                    <div class="tr2-section-header">
+                      <div>
+                        <div class="card-header">Match Expression</div>
+                        <p class="text-xs text-dim">Use exact event and source matches, optional substring matching, and dotted payload filters.</p>
+                      </div>
+                    </div>
+
+                    <div class="tr2-form-grid">
+                      <div class="form-group">
+                        <label>Event</label>
+                        <input class="form-input font-mono" x-model="form.match_event" placeholder="issue.created">
+                      </div>
+                      <div class="form-group">
+                        <label>Source</label>
+                        <input class="form-input font-mono" x-model="form.match_source" placeholder="api">
+                      </div>
+                      <div class="form-group tr2-span-full">
+                        <label>Contains</label>
+                        <input class="form-input" x-model="form.match_contains" placeholder="Optional case-insensitive payload substring match">
+                      </div>
+                      <div class="form-group tr2-span-full">
+                        <label>Filters JSON</label>
+                        <textarea class="form-textarea font-mono tr2-code-input" x-model="form.match_filters_text" placeholder='{"issue.id":42}'></textarea>
+                        <div class="text-xs text-dim mt-2">Dotted paths match against <code>event.payload</code>. Example: <code>{"issue.id":42}</code>.</div>
+                      </div>
+                    </div>
+
+                    <div class="tr2-inline-issues" x-show="issuesForPath('match').length">
+                      <template x-for="issue in issuesForPath('match')" :key="'match-' + issue.path + issue.code">
+                        <div class="tr2-inline-issue">
+                          <span class="badge" :class="issueSeverityClass(issue)" x-text="issue.severity"></span>
+                          <div>
+                            <div class="font-mono text-xs" x-text="issue.path"></div>
+                            <div class="text-xs text-dim" x-text="issue.message"></div>
+                          </div>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+
+                  <div class="card" :class="{ 'tr2-has-issues': issuesForPath('target').length }">
+                    <div class="tr2-section-header">
+                      <div>
+                        <div class="card-header">Target</div>
+                        <p class="text-xs text-dim">Choose the dispatch target kind and complete the dynamic fields for that destination.</p>
+                      </div>
+                    </div>
+
+                    <div class="tr2-form-grid">
+                      <div class="form-group">
+                        <label>Target Kind</label>
+                        <select class="form-select" x-model="form.target_kind">
+                          <template x-for="option in targetKindOptions" :key="'target-kind-' + option.value">
+                            <option :value="option.value" x-text="option.label"></option>
+                          </template>
+                        </select>
+                      </div>
+                    </div>
+
+                    <template x-if="form.target_kind === 'agent_message'">
+                      <div class="tr2-form-grid">
+                        <div class="form-group">
+                          <label>Agent</label>
+                          <input class="form-input font-mono" x-model="form.target_agent" placeholder="writer-agent">
+                        </div>
+                        <div class="form-group tr2-span-full">
+                          <label>Message Body</label>
+                          <textarea class="form-textarea" x-model="form.target_message_text" placeholder="Summarize the new issue and prepare a response."></textarea>
+                        </div>
+                        <div class="form-group tr2-span-full">
+                          <label>Metadata JSON</label>
+                          <textarea class="form-textarea font-mono tr2-code-input" x-model="form.target_metadata_text" placeholder='{"channel":"triage"}'></textarea>
+                        </div>
+                      </div>
+                    </template>
+
+                    <template x-if="form.target_kind === 'workflow_start'">
+                      <div class="tr2-form-grid">
+                        <div class="form-group">
+                          <label>Workflow</label>
+                          <input class="form-input font-mono" x-model="form.target_workflow" placeholder="sdlc-workflow">
+                        </div>
+                        <div class="form-group tr2-span-full">
+                          <label>Input JSON</label>
+                          <textarea class="form-textarea font-mono tr2-code-input" x-model="form.target_input_text" placeholder='{"scope":"issues"}'></textarea>
+                        </div>
+                      </div>
+                    </template>
+
+                    <template x-if="form.target_kind === 'workflow_signal'">
+                      <div class="tr2-form-grid">
+                        <div class="form-group">
+                          <label>Signal</label>
+                          <input class="form-input font-mono" x-model="form.target_signal" placeholder="resume">
+                        </div>
+                        <div class="form-group">
+                          <label>Workflow ID</label>
+                          <input class="form-input font-mono" x-model="form.target_selector_workflow_id" placeholder="sdlc-workflow">
+                        </div>
+                        <div class="form-group tr2-span-full">
+                          <label>Payload JSON</label>
+                          <textarea class="form-textarea font-mono tr2-code-input" x-model="form.target_payload_text" placeholder='{"approved":true}'></textarea>
+                        </div>
+                      </div>
+                    </template>
+
+                    <div class="tr2-inline-issues" x-show="issuesForPath('target').length">
+                      <template x-for="issue in issuesForPath('target')" :key="'target-' + issue.path + issue.code">
+                        <div class="tr2-inline-issue">
+                          <span class="badge" :class="issueSeverityClass(issue)" x-text="issue.severity"></span>
+                          <div>
+                            <div class="font-mono text-xs" x-text="issue.path"></div>
+                            <div class="text-xs text-dim" x-text="issue.message"></div>
+                          </div>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+
+                  <div class="card" x-show="validationResult">
+                    <div class="tr2-section-header">
+                      <div>
+                        <div class="card-header">Validation Result</div>
+                        <p class="text-xs text-dim">Returned by <code>/api/v1/triggers/validate</code>.</p>
+                      </div>
+                      <span class="badge" :class="validationResult && validationResult.valid ? 'badge-success' : 'badge-warn'" x-text="validationResult && validationResult.valid ? 'valid' : 'issues found'"></span>
+                    </div>
+
+                    <div class="tr2-inline-issues" x-show="validationIssues.length">
+                      <template x-for="issue in validationIssues" :key="'validation-' + issue.path + issue.code">
+                        <div class="tr2-inline-issue">
+                          <span class="badge" :class="issueSeverityClass(issue)" x-text="issue.severity"></span>
+                          <div>
+                            <div class="font-mono text-xs" x-text="issue.path"></div>
+                            <div class="text-xs text-dim" x-text="issue.message"></div>
+                          </div>
+                        </div>
+                      </template>
+                    </div>
+
+                    <div x-show="validationResult && validationResult.normalized">
+                      <div class="tr2-block-label">Normalized Definition</div>
+                      <pre class="tool-pre" x-text="JSON.stringify(validationResult.normalized, null, 2)"></pre>
+                    </div>
+                  </div>
+
+                  <div class="card" x-show="compileResult">
+                    <div class="tr2-section-header">
+                      <div>
+                        <div class="card-header">Compiled Output</div>
+                        <p class="text-xs text-dim">Returned by <code>/api/v1/triggers/compile</code>.</p>
+                      </div>
+                      <span class="badge badge-success" x-show="compileSummary" x-text="compileSummary ? compileSummary.dispatch_action : ''"></span>
+                    </div>
+
+                    <div class="tr2-result-grid" x-show="compileSummary">
+                      <div><span class="tr2-metric-label">Trigger ID</span><span class="tr2-metric-value" x-text="compileSummary ? compileSummary.trigger_id : ''"></span></div>
+                      <div><span class="tr2-metric-label">Target Kind</span><span class="tr2-metric-value" x-text="compileSummary ? compileSummary.target_kind : ''"></span></div>
+                      <div><span class="tr2-metric-label">Event</span><span class="tr2-metric-value" x-text="compileSummary && compileSummary.event ? compileSummary.event : 'any'"></span></div>
+                      <div><span class="tr2-metric-label">Dispatch Action</span><span class="tr2-metric-value" x-text="compileSummary ? compileSummary.dispatch_action : ''"></span></div>
+                    </div>
+
+                    <div class="tr2-json-grid">
+                      <div>
+                        <div class="tr2-block-label">Normalized</div>
+                        <pre class="tool-pre" x-text="JSON.stringify(compileResult.normalized, null, 2)"></pre>
+                      </div>
+                      <div>
+                        <div class="tr2-block-label">Trigger IR</div>
+                        <pre class="tool-pre" x-text="JSON.stringify(compileResult.compiled.trigger_ir, null, 2)"></pre>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+                <aside class="tr2-side-stack">
+                  <div class="card">
+                    <div class="tr2-section-header">
+                      <div>
+                        <div class="card-header">Runtime Status</div>
+                        <p class="text-xs text-dim">Snapshot from <code>/api/v1/triggers/{id}/runtime</code>.</p>
+                      </div>
+                      <div class="card-flex" x-show="selectedRuntimeSnapshot">
+                        <span class="badge" :class="selectedRuntimeSnapshot && selectedRuntimeSnapshot.enabled ? 'badge-success' : 'badge-dim'" x-text="selectedRuntimeSnapshot && selectedRuntimeSnapshot.enabled ? 'enabled' : 'disabled'"></span>
+                        <span class="badge" :class="selectedTrigger && selectedTrigger.origin && selectedTrigger.origin.kind === 'pack' ? 'badge-info' : 'badge-dim'" x-text="selectedTrigger ? originLabel(selectedTrigger.origin) : 'draft'"></span>
+                      </div>
+                    </div>
+
+                    <div class="tr2-runtime-grid" x-show="selectedRuntimeSnapshot">
+                      <div><span class="tr2-metric-label">Fire Count</span><span class="tr2-metric-value" x-text="selectedRuntimeSnapshot ? selectedRuntimeSnapshot.fire_count : 0"></span></div>
+                      <div><span class="tr2-metric-label">Max Fires</span><span class="tr2-metric-value" x-text="selectedRuntimeSnapshot ? selectedRuntimeSnapshot.max_fires : 0"></span></div>
+                      <div><span class="tr2-metric-label">Cooldown</span><span class="tr2-metric-value" x-text="selectedRuntimeSnapshot ? selectedRuntimeSnapshot.cooldown_secs + 's' : '0s'"></span></div>
+                      <div><span class="tr2-metric-label">Last Fired</span><span class="tr2-metric-value" x-text="selectedRuntimeSnapshot && selectedRuntimeSnapshot.last_fired_at ? formatDateTime(selectedRuntimeSnapshot.last_fired_at) : 'Never'"></span></div>
+                    </div>
+
+                    <div class="text-xs text-dim mt-3" x-show="selectedRuntimeSnapshot && selectedRuntimeSnapshot.last_fired_at" x-text="'Relative: ' + relativeTime(selectedRuntimeSnapshot.last_fired_at)"></div>
+                    <div class="text-xs text-dim mt-3" x-show="!selectedTriggerId">Save the draft to load runtime state and test it against synthetic events.</div>
+                    <div class="mt-4" x-show="selectedRuntimeSnapshot && selectedRuntimeSnapshot.fire_count > 0">
+                      <button class="btn btn-ghost btn-sm" @click="openRunHistory()">Inspect Runs</button>
+                    </div>
+                  </div>
+
+                  <div class="card">
+                    <div class="tr2-section-header">
+                      <div>
+                        <div class="card-header">Test Panel</div>
+                        <p class="text-xs text-dim">Dry-run one saved trigger against a synthetic event via <code>/api/v1/triggers/{id}/test</code>.</p>
+                      </div>
+                      <button class="btn btn-ghost btn-sm" @click="resetTestEventFromForm()">Use Match Defaults</button>
+                    </div>
+
+                    <div class="form-group">
+                      <label>Synthetic Event JSON</label>
+                      <textarea class="form-textarea font-mono tr2-code-input" x-model="testForm.event_json" placeholder='{"event":"issue.created","source":"api","payload":{}}'></textarea>
+                    </div>
+
+                    <div class="run-action-row">
+                      <button class="btn btn-primary btn-sm" @click="runTriggerTest()" :disabled="testing || !selectedTriggerId">
+                        <span x-show="!testing">Run Test</span>
+                        <span x-show="testing">Testing...</span>
+                      </button>
+                    </div>
+
+                    <div class="tr2-test-result" x-show="testResult">
+                      <div class="tr2-result-grid">
+                        <div><span class="tr2-metric-label">Matched</span><span class="tr2-metric-value" x-text="testResult && testResult.matched ? 'true' : 'false'"></span></div>
+                        <div><span class="tr2-metric-label">Would Dispatch</span><span class="tr2-metric-value" x-text="testResult && testResult.would_dispatch ? 'true' : 'false'"></span></div>
+                        <div><span class="tr2-metric-label">Target Kind</span><span class="tr2-metric-value" x-text="testResult && testResult.explanation ? testResult.explanation.target_kind : '-'"></span></div>
+                        <div><span class="tr2-metric-label">Blocked By</span><span class="tr2-metric-value" x-text="testResult && testResult.explanation && testResult.explanation.blocked_by ? testResult.explanation.blocked_by : '-'"></span></div>
+                      </div>
+
+                      <div class="tr2-block">
+                        <div class="tr2-block-label">Explanation</div>
+                        <div class="text-xs text-dim" x-text="testResult && testResult.explanation ? testResult.explanation.match : ''"></div>
+                      </div>
+
+                      <div class="tr2-block" x-show="testResult && testResult.resolved_target">
+                        <div class="tr2-block-label">Resolved Target</div>
+                        <pre class="tool-pre" x-text="JSON.stringify(testResult.resolved_target, null, 2)"></pre>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="card" x-show="selectedTrigger && selectedTrigger.forked_from">
+                    <div class="card-header">Fork Provenance</div>
+                    <div class="detail-grid">
+                      <div class="detail-row"><span class="detail-label">Kind</span><span class="detail-value" x-text="selectedTrigger && selectedTrigger.forked_from ? selectedTrigger.forked_from.kind : '-'"></span></div>
+                      <div class="detail-row"><span class="detail-label">Pack</span><span class="detail-value font-mono" x-text="selectedTrigger && selectedTrigger.forked_from ? (selectedTrigger.forked_from.pack_id || '-') : '-'"></span></div>
+                      <div class="detail-row"><span class="detail-label">Version</span><span class="detail-value font-mono" x-text="selectedTrigger && selectedTrigger.forked_from ? (selectedTrigger.forked_from.pack_version || '-') : '-'"></span></div>
+                      <div class="detail-row"><span class="detail-label">Resource</span><span class="detail-value font-mono" x-text="selectedTrigger && selectedTrigger.forked_from ? selectedTrigger.forked_from.resource_id : '-'"></span></div>
+                    </div>
+                  </div>
+                </aside>
+              </div>
+            </div>
+          </template>
         </div>
       </div>
     </template>

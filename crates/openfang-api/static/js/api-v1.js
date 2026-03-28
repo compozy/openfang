@@ -205,8 +205,8 @@
 
     // ── Triggers ──
     triggers: {
-      list: function() {
-        return unwrap(OpenFangAPI.get('/api/v1/triggers'));
+      list: function(params) {
+        return unwrap(OpenFangAPI.get('/api/v1/triggers' + qs(params)));
       },
       get: function(id) {
         return unwrap(OpenFangAPI.get('/api/v1/triggers/' + id));
@@ -229,8 +229,13 @@
       compiled: function(id) {
         return unwrap(OpenFangAPI.get('/api/v1/triggers/' + id + '/compiled'));
       },
-      fork: function(id) {
-        return unwrap(OpenFangAPI.post('/api/v1/triggers/' + id + '/fork'));
+      fork: function(id, body) {
+        return unwrap(
+          OpenFangAPI.post(
+            '/api/v1/triggers/' + id + '/fork',
+            body || { mode: 'shadow' }
+          )
+        );
       },
       runtime: function(id) {
         return unwrap(OpenFangAPI.get('/api/v1/triggers/' + id + '/runtime'));
