@@ -1,8 +1,10 @@
-package main
+package app
 
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -51,7 +53,8 @@ func TestLineFilterWriterSuppressesOnlyKnownCodexNoise(t *testing.T) {
 func TestBuildCodexCommandUsesExecJSONOrder(t *testing.T) {
 	t.Parallel()
 	cmd := buildCodexCommand("", nil, "medium")
-	want := "codex --dangerously-bypass-approvals-and-sandbox -m gpt-5.3-codex -c model_reasoning_effort=medium exec --json -"
+	want := "codex --dangerously-bypass-approvals-and-sandbox -m " + defaultCodexModel +
+		" -c model_reasoning_effort=medium exec --json -"
 	if cmd != want {
 		t.Fatalf("unexpected codex command string\nwant: %s\ngot:  %s", want, cmd)
 	}
@@ -62,7 +65,7 @@ func TestBuildCodexCommandIncludesAddDirsBeforeExec(t *testing.T) {
 
 	cmd := buildCodexCommand("", []string{"../shared", "../docs"}, "medium")
 
-	want := "codex --dangerously-bypass-approvals-and-sandbox -m gpt-5.3-codex " +
+	want := "codex --dangerously-bypass-approvals-and-sandbox -m " + defaultCodexModel + " " +
 		"-c model_reasoning_effort=medium --add-dir ../shared --add-dir ../docs exec --json -"
 	if cmd != want {
 		t.Fatalf("unexpected codex command string\nwant: %s\ngot:  %s", want, cmd)
@@ -262,5 +265,133 @@ func TestBuildAfterFinishBlockRespectsAutoCommitFlag(t *testing.T) {
 	}
 	if !strings.Contains(withoutAutoCommit, "--auto-commit=false") {
 		t.Fatalf("expected no-auto-commit after-finish block to mention --auto-commit=false")
+	}
+}
+
+func TestConfigValidateRejectsPRDTaskBatching(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config{
+		mode:      ExecutionModePRDTasks,
+		ide:       ideCodex,
+		batchSize: 2,
+	}
+
+	err := cfg.validate()
+	if err == nil {
+		t.Fatalf("expected validation error for prd-tasks batch size > 1")
+	}
+	if !strings.Contains(err.Error(), "batch size must be 1") {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+}
+
+func TestReadTaskEntriesSortsNumericallyAndFiltersCompleted(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	files := map[string]string{
+		"_task_10.md": "## status: pending\n<task_context><domain>x</domain><type>feature</type><scope>s</scope><complexity>low</complexity></task_context>\n",
+		"_task_2.md":  "## status: pending\n<task_context><domain>x</domain><type>feature</type><scope>s</scope><complexity>low</complexity></task_context>\n",
+		"_task_3.md":  "## status: completed\n<task_context><domain>x</domain><type>feature</type><scope>s</scope><complexity>low</complexity></task_context>\n",
+		"notes.md":    "ignored\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	entries, err := readTaskEntries(dir, false)
+	if err != nil {
+		t.Fatalf("readTaskEntries: %v", err)
+	}
+
+	gotNames := []string{entries[0].name, entries[1].name}
+	wantNames := []string{"_task_2.md", "_task_10.md"}
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("unexpected task order\nwant: %#v\ngot:  %#v", wantNames, gotNames)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected completed tasks to be filtered, got %d entries", len(entries))
+	}
+}
+
+func TestResolveInputsUsesDefaultPRDDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	if err := os.MkdirAll(filepath.Join("tasks", "prd-demo"), 0o755); err != nil {
+		t.Fatalf("mkdir prd dir: %v", err)
+	}
+
+	prValue, inputDir, resolved, err := resolveInputs(&config{
+		pr:   "demo",
+		mode: ExecutionModePRDTasks,
+	})
+	if err != nil {
+		t.Fatalf("resolveInputs: %v", err)
+	}
+	if prValue != "demo" {
+		t.Fatalf("unexpected pr value: %q", prValue)
+	}
+	if inputDir != "tasks/prd-demo" {
+		t.Fatalf("unexpected input dir: %q", inputDir)
+	}
+	wantResolved := filepath.Join(tmp, "tasks", "prd-demo")
+	if resolved != wantResolved {
+		t.Fatalf("unexpected resolved dir\nwant: %q\ngot:  %q", wantResolved, resolved)
+	}
+}
+
+func TestPrepareJobsForPRDTasksForcesSingleBatchWithoutGroupedSummaries(t *testing.T) {
+	t.Parallel()
+
+	promptRoot := t.TempDir()
+	issuesDir := t.TempDir()
+	groups := map[string][]issueEntry{
+		"_task_1": {
+			{
+				name:     "_task_1.md",
+				absPath:  filepath.Join(issuesDir, "_task_1.md"),
+				content:  "## status: pending\n<task_context><domain>backend</domain><type>feature</type><scope>small</scope><complexity>low</complexity></task_context>\n",
+				codeFile: "_task_1",
+			},
+		},
+		"_task_2": {
+			{
+				name:     "_task_2.md",
+				absPath:  filepath.Join(issuesDir, "_task_2.md"),
+				content:  "## status: pending\n<task_context><domain>backend</domain><type>feature</type><scope>small</scope><complexity>low</complexity></task_context>\n",
+				codeFile: "_task_2",
+			},
+		},
+	}
+
+	jobs, groupedWritten, err := prepareJobs(
+		"demo",
+		groups,
+		promptRoot,
+		issuesDir,
+		5,
+		true,
+		false,
+		ExecutionModePRDTasks,
+	)
+	if err != nil {
+		t.Fatalf("prepareJobs: %v", err)
+	}
+	if groupedWritten {
+		t.Fatalf("expected grouped summaries to be disabled in prd mode")
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("expected one batch per task in prd mode, got %d", len(jobs))
+	}
+	for _, job := range jobs {
+		if len(job.codeFiles) != 1 {
+			t.Fatalf("expected single-file jobs in prd mode, got %#v", job.codeFiles)
+		}
+		if _, err := os.Stat(job.outPromptPath); err != nil {
+			t.Fatalf("expected prompt artifact to be written: %v", err)
+		}
 	}
 }
