@@ -5,6 +5,10 @@ use crate::sse::{BoundedSseHandle, BufferedSseEvent, ResourceSseRegistry};
 use crate::trigger_definitions::{canonicalize_trigger_definition, TriggerDefinitionStore};
 use crate::types::*;
 use crate::workflow_definitions::{canonicalize_workflow_definition, WorkflowDefinitionStore};
+use arky_config::{
+    normalize_driver as normalize_arky_driver, ConfigError as ArkyConfigError,
+    ProviderBehaviorLayer,
+};
 use axum::extract::{
     rejection::{JsonRejection, QueryRejection},
     Multipart, Path, Query, State,
@@ -532,6 +536,7 @@ static WORKFLOW_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mu
 static TRIGGER_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SCHEDULE_DEFINITION_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static PACK_TEMPLATE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static PROVIDER_PROFILE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 type JsonErrorResponse = (StatusCode, Json<serde_json::Value>);
 type ValidatedLooperCreateRequest = (TaskId, Option<Vec<SubtaskId>>, LooperExecutionPolicy);
 pub type RunEventStreamRegistry = ResourceSseRegistry<RUN_EVENT_RING_BUFFER_CAPACITY>;
@@ -2643,6 +2648,7 @@ fn agent_validation_context(
 ) -> Result<AgentValidationContext, (StatusCode, Json<serde_json::Value>)> {
     let _ = store;
     let stored_definitions = load_all_agent_definition_resources(state)?;
+    let provider_profiles = load_provider_profile_store(state)?;
 
     let mut known_agents = BTreeSet::new();
     for definition in stored_definitions {
@@ -2652,6 +2658,13 @@ fn agent_validation_context(
     for entry in state.kernel.registry.list() {
         known_agents.insert(entry.id.to_string());
         known_agents.insert(entry.name);
+    }
+
+    let mut known_profiles = BTreeSet::new();
+    let mut known_profile_drivers = BTreeMap::new();
+    for (profile_name, profile) in provider_profiles.profiles() {
+        known_profiles.insert(profile_name.clone());
+        known_profile_drivers.insert(profile_name.clone(), profile.driver().to_owned());
     }
 
     let known_skills = state
@@ -2664,6 +2677,8 @@ fn agent_validation_context(
         .collect::<BTreeSet<_>>();
 
     Ok(AgentValidationContext {
+        known_profiles,
+        known_profile_drivers,
         known_skills,
         known_agents,
         ..AgentValidationContext::default()
@@ -11331,6 +11346,900 @@ pub async fn dry_run_event_ingress_v1(
             },
         })),
     )
+}
+
+fn provider_profile_id_is_safe(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn ensure_safe_provider_profile_id(id: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if provider_profile_id_is_safe(id) {
+        Ok(())
+    } else {
+        Err(agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Provider profile IDs may only contain ASCII letters, digits, `.`, `_`, or `-`",
+            Some(serde_json::json!([{
+                "path": "id",
+                "value": id,
+            }])),
+        ))
+    }
+}
+
+fn provider_profile_not_found_response(id: &str) -> (StatusCode, Json<serde_json::Value>) {
+    agent_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Provider profile not found",
+        Some(serde_json::json!([{
+            "path": "id",
+            "value": id,
+        }])),
+    )
+}
+
+fn provider_profile_conflict_response(id: &str) -> (StatusCode, Json<serde_json::Value>) {
+    agent_error_response(
+        StatusCode::CONFLICT,
+        "already_exists",
+        "Provider profile already exists",
+        Some(serde_json::json!([{
+            "path": "id",
+            "value": id,
+        }])),
+    )
+}
+
+fn provider_profile_config_path(state: &AppState) -> PathBuf {
+    state.kernel.config.home_dir.join("config.toml")
+}
+
+fn load_openfang_config_document(path: &std::path::Path) -> Result<toml::Value, ArkyConfigError> {
+    let content = if path.exists() {
+        std::fs::read_to_string(path).map_err(|error| ArkyConfigError::ParseFailed {
+            message: format!("failed to read config file `{}`: {error}", path.display()),
+            path: Some(path.to_path_buf()),
+            format: Some("toml"),
+        })?
+    } else {
+        String::new()
+    };
+
+    if content.trim().is_empty() {
+        Ok(toml::Value::Table(toml::map::Map::new()))
+    } else {
+        toml::from_str(&content).map_err(|error| ArkyConfigError::ParseFailed {
+            message: format!("failed to parse config file `{}`: {error}", path.display()),
+            path: Some(path.to_path_buf()),
+            format: Some("toml"),
+        })
+    }
+}
+
+fn persist_openfang_config_document(
+    path: &std::path::Path,
+    document: &toml::Value,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let Some(parent) = path.parent() else {
+        return Err(agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_persist_failed",
+            "Failed to determine config directory",
+            Some(serde_json::json!([{
+                "path": path.display().to_string(),
+            }])),
+        ));
+    };
+
+    std::fs::create_dir_all(parent).map_err(|error| {
+        agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_persist_failed",
+            "Failed to create config directory",
+            Some(serde_json::json!([{
+                "path": parent.display().to_string(),
+                "message": error.to_string(),
+            }])),
+        )
+    })?;
+
+    let rendered = toml::to_string_pretty(document).map_err(|error| {
+        agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_persist_failed",
+            "Failed to serialize provider profile config",
+            Some(serde_json::json!([{
+                "path": path.display().to_string(),
+                "message": error.to_string(),
+            }])),
+        )
+    })?;
+
+    let mut temp_file = tempfile::Builder::new()
+        .prefix("openfang-config")
+        .suffix(".toml.tmp")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_persist_failed",
+                "Failed to create temporary config file",
+                Some(serde_json::json!([{
+                    "path": parent.display().to_string(),
+                    "message": error.to_string(),
+                }])),
+            )
+        })?;
+    temp_file.write_all(rendered.as_bytes()).map_err(|error| {
+        agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_persist_failed",
+            "Failed to write temporary config file",
+            Some(serde_json::json!([{
+                "path": path.display().to_string(),
+                "message": error.to_string(),
+            }])),
+        )
+    })?;
+    temp_file.flush().map_err(|error| {
+        agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_persist_failed",
+            "Failed to flush temporary config file",
+            Some(serde_json::json!([{
+                "path": path.display().to_string(),
+                "message": error.to_string(),
+            }])),
+        )
+    })?;
+    temp_file.persist(path).map_err(|error| {
+        agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_persist_failed",
+            "Failed to persist config file",
+            Some(serde_json::json!([{
+                "path": path.display().to_string(),
+                "message": error.error.to_string(),
+            }])),
+        )
+    })?;
+
+    Ok(())
+}
+
+fn extract_provider_profile_document(
+    document: &toml::Value,
+) -> Result<toml::Value, ArkyConfigError> {
+    let Some(root) = document.as_table() else {
+        return Err(ArkyConfigError::ParseFailed {
+            message: "OpenFang config must be a TOML table".to_owned(),
+            path: None,
+            format: Some("toml"),
+        });
+    };
+
+    let workspace_profiles = match root.get("workspace") {
+        Some(workspace) => {
+            let Some(workspace_table) = workspace.as_table() else {
+                return Err(ArkyConfigError::ParseFailed {
+                    message: "`workspace` must be a TOML table".to_owned(),
+                    path: None,
+                    format: Some("toml"),
+                });
+            };
+            workspace_table.get("profiles").cloned()
+        }
+        None => None,
+    };
+
+    let mut extracted_root = toml::map::Map::new();
+    if let Some(workspace_profiles) = workspace_profiles {
+        if !workspace_profiles.is_table() {
+            return Err(ArkyConfigError::ParseFailed {
+                message: "`workspace.profiles` must be a TOML table".to_owned(),
+                path: None,
+                format: Some("toml"),
+            });
+        }
+
+        let mut workspace = toml::map::Map::new();
+        workspace.insert("profiles".to_string(), workspace_profiles);
+        extracted_root.insert("workspace".to_string(), toml::Value::Table(workspace));
+    }
+
+    if let Some(profiles) = root.get("profiles") {
+        if !profiles.is_table() {
+            return Err(ArkyConfigError::ParseFailed {
+                message: "`profiles` must be a TOML table".to_owned(),
+                path: None,
+                format: Some("toml"),
+            });
+        }
+        extracted_root.insert("profiles".to_string(), profiles.clone());
+    }
+
+    Ok(toml::Value::Table(extracted_root))
+}
+
+fn load_provider_profile_store_from_document(
+    document: &toml::Value,
+) -> Result<arky_config::ArkyConfig, ArkyConfigError> {
+    let extracted = extract_provider_profile_document(document)?;
+    let mut temp_file = tempfile::Builder::new()
+        .prefix("openfang-provider-profiles")
+        .suffix(".toml")
+        .tempfile()
+        .map_err(|error| ArkyConfigError::ParseFailed {
+            message: format!("failed to create temporary Arky config: {error}"),
+            path: None,
+            format: Some("toml"),
+        })?;
+    let rendered =
+        toml::to_string_pretty(&extracted).map_err(|error| ArkyConfigError::ParseFailed {
+            message: format!("failed to serialize extracted provider profiles: {error}"),
+            path: None,
+            format: Some("toml"),
+        })?;
+    temp_file
+        .write_all(rendered.as_bytes())
+        .map_err(|error| ArkyConfigError::ParseFailed {
+            message: format!("failed to write temporary Arky config: {error}"),
+            path: None,
+            format: Some("toml"),
+        })?;
+    temp_file
+        .flush()
+        .map_err(|error| ArkyConfigError::ParseFailed {
+            message: format!("failed to flush temporary Arky config: {error}"),
+            path: None,
+            format: Some("toml"),
+        })?;
+
+    arky_config::ConfigLoader::from_path(temp_file.path()).load()
+}
+
+fn provider_profile_error_details(error: &ArkyConfigError) -> serde_json::Value {
+    match error {
+        ArkyConfigError::ValidationFailed { issues, .. } => serde_json::json!(issues
+            .iter()
+            .map(|issue| serde_json::json!({
+                "path": issue.field(),
+                "message": issue.message(),
+                "suggestion": issue.suggestion(),
+            }))
+            .collect::<Vec<_>>()),
+        ArkyConfigError::ParseFailed {
+            message,
+            path,
+            format,
+        } => serde_json::json!([{
+            "message": message,
+            "path": path.as_ref().map(|value| value.display().to_string()),
+            "format": format,
+        }]),
+        ArkyConfigError::NotFound { path } => serde_json::json!([{
+            "path": path.display().to_string(),
+        }]),
+        ArkyConfigError::MissingBinary { provider, binary } => serde_json::json!([{
+            "provider": provider,
+            "binary": binary,
+        }]),
+    }
+}
+
+fn provider_profile_store_error_response(
+    error: &ArkyConfigError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    agent_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "provider_profile_store_invalid",
+        "Provider profile store is invalid",
+        Some(provider_profile_error_details(error)),
+    )
+}
+
+fn provider_profile_validation_error_response(
+    error: &ArkyConfigError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    agent_error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_provider_profile",
+        "Provider profile configuration is invalid",
+        Some(provider_profile_error_details(error)),
+    )
+}
+
+fn load_provider_profile_store(
+    state: &AppState,
+) -> Result<arky_config::ArkyConfig, (StatusCode, Json<serde_json::Value>)> {
+    let path = provider_profile_config_path(state);
+    let document = load_openfang_config_document(&path)
+        .map_err(|error| provider_profile_store_error_response(&error))?;
+    load_provider_profile_store_from_document(&document)
+        .map_err(|error| provider_profile_store_error_response(&error))
+}
+
+fn resolve_provider_profile_id(
+    request: &UpsertProviderProfileRequest,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let body_id = request
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let body_name = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (body_id, body_name) {
+        (Some(id), Some(name)) if id != name => Err(agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Provider profile `id` and `name` must match when both are provided",
+            Some(serde_json::json!([{
+                "path": "id",
+                "value": id,
+            }, {
+                "path": "name",
+                "value": name,
+            }])),
+        )),
+        (Some(id), _) => Ok(id.to_owned()),
+        (None, Some(name)) => Ok(name.to_owned()),
+        (None, None) => Err(agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Provider profile requests must include `id` or `name`",
+            Some(serde_json::json!([{
+                "path": "id",
+            }, {
+                "path": "name",
+            }])),
+        )),
+    }
+}
+
+fn ensure_provider_profile_request_matches_path(
+    path_id: &str,
+    request: &UpsertProviderProfileRequest,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let body_id = request
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let body_name = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if body_id.is_some_and(|value| value != path_id)
+        || body_name.is_some_and(|value| value != path_id)
+    {
+        return Err(agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Provider profile `id` and `name` must match the route parameter",
+            Some(serde_json::json!([{
+                "path": "id",
+                "value": request.id.as_deref(),
+            }, {
+                "path": "name",
+                "value": request.name.as_deref(),
+            }, {
+                "path": "route.id",
+                "value": path_id,
+            }])),
+        ));
+    }
+
+    Ok(())
+}
+
+fn provider_profile_defaults_is_empty(defaults: &ProviderProfileDefaultsPayload) -> bool {
+    defaults.max_tokens.is_none() && defaults.reasoning_effort.is_none()
+}
+
+fn provider_profile_config_namespace(driver: &str) -> Option<&'static str> {
+    let normalized_driver = normalize_arky_driver(driver);
+    match normalized_driver.as_str() {
+        "codex" => Some("codex"),
+        "claude-code" => Some("claude_code"),
+        "openrouter" | "bedrock" | "vertex" | "ollama" | "zai" | "vercel" | "moonshot"
+        | "minimax" => Some("claude_compatible"),
+        _ => None,
+    }
+}
+
+fn json_to_toml_value_recursive(value: &serde_json::Value) -> Result<toml::Value, String> {
+    match value {
+        serde_json::Value::Null => Err("null values are not supported in TOML".to_owned()),
+        serde_json::Value::Bool(value) => Ok(toml::Value::Boolean(*value)),
+        serde_json::Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Ok(toml::Value::Integer(integer))
+            } else if let Some(integer) = value.as_u64() {
+                i64::try_from(integer)
+                    .map(toml::Value::Integer)
+                    .map_err(|_| format!("integer `{integer}` exceeds TOML integer range"))
+            } else if let Some(float) = value.as_f64() {
+                Ok(toml::Value::Float(float))
+            } else {
+                Err(format!("number `{value}` is not representable in TOML"))
+            }
+        }
+        serde_json::Value::String(value) => Ok(toml::Value::String(value.clone())),
+        serde_json::Value::Array(values) => {
+            let mut array = Vec::with_capacity(values.len());
+            for value in values {
+                array.push(json_to_toml_value_recursive(value)?);
+            }
+            Ok(toml::Value::Array(array))
+        }
+        serde_json::Value::Object(values) => {
+            let mut table = toml::map::Map::new();
+            for (key, value) in values {
+                table.insert(key.clone(), json_to_toml_value_recursive(value)?);
+            }
+            Ok(toml::Value::Table(table))
+        }
+    }
+}
+
+fn provider_profile_request_to_toml_value(
+    request: &UpsertProviderProfileRequest,
+) -> Result<toml::Value, (StatusCode, Json<serde_json::Value>)> {
+    let mut profile = toml::map::Map::new();
+    profile.insert(
+        "driver".to_string(),
+        toml::Value::String(request.driver.trim().to_owned()),
+    );
+
+    if let Some(model) = request.model.as_ref() {
+        profile.insert("model".to_string(), toml::Value::String(model.clone()));
+    }
+
+    if !provider_profile_defaults_is_empty(&request.defaults) {
+        let defaults_value = serde_json::to_value(&request.defaults).map_err(|error| {
+            agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "provider_profile_serialize_failed",
+                "Failed to encode provider profile defaults",
+                Some(serde_json::json!([{
+                    "path": "defaults",
+                    "message": error.to_string(),
+                }])),
+            )
+        })?;
+        let defaults = json_to_toml_value_recursive(&defaults_value).map_err(|error| {
+            agent_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_provider_profile",
+                "Provider profile defaults are invalid",
+                Some(serde_json::json!([{
+                    "path": "defaults",
+                    "message": error,
+                }])),
+            )
+        })?;
+        profile.insert("defaults".to_string(), defaults);
+    }
+
+    if let Some(config) = request.config.as_ref() {
+        let Some(namespace) = provider_profile_config_namespace(request.driver.trim()) else {
+            return Err(agent_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_provider_profile",
+                "Provider profile config requires a supported driver",
+                Some(serde_json::json!([{
+                    "path": "driver",
+                    "value": request.driver.trim(),
+                }])),
+            ));
+        };
+
+        let Some(_) = config.as_object() else {
+            return Err(agent_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_provider_profile",
+                "Provider profile config must be a JSON object",
+                Some(serde_json::json!([{
+                    "path": "config",
+                }])),
+            ));
+        };
+
+        let config_value = json_to_toml_value_recursive(config).map_err(|error| {
+            agent_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_provider_profile",
+                "Provider profile config contains TOML-incompatible values",
+                Some(serde_json::json!([{
+                    "path": "config",
+                    "message": error,
+                }])),
+            )
+        })?;
+
+        let mut namespaced = toml::map::Map::new();
+        namespaced.insert(namespace.to_string(), config_value);
+        profile.insert("config".to_string(), toml::Value::Table(namespaced));
+    }
+
+    Ok(toml::Value::Table(profile))
+}
+
+fn remove_provider_profile_from_document(
+    document: &mut toml::Value,
+    id: &str,
+) -> Result<bool, ArkyConfigError> {
+    let Some(root) = document.as_table_mut() else {
+        return Err(ArkyConfigError::ParseFailed {
+            message: "OpenFang config must be a TOML table".to_owned(),
+            path: None,
+            format: Some("toml"),
+        });
+    };
+
+    let mut removed = false;
+    let mut remove_root_profiles = false;
+    if let Some(profiles) = root.get_mut("profiles") {
+        let Some(table) = profiles.as_table_mut() else {
+            return Err(ArkyConfigError::ParseFailed {
+                message: "`profiles` must be a TOML table".to_owned(),
+                path: None,
+                format: Some("toml"),
+            });
+        };
+        removed = table.remove(id).is_some();
+        remove_root_profiles = table.is_empty();
+    }
+    if remove_root_profiles {
+        root.remove("profiles");
+    }
+
+    let mut remove_workspace = false;
+    let mut remove_workspace_profiles = false;
+    if let Some(workspace) = root.get_mut("workspace") {
+        let Some(workspace_table) = workspace.as_table_mut() else {
+            return Err(ArkyConfigError::ParseFailed {
+                message: "`workspace` must be a TOML table".to_owned(),
+                path: None,
+                format: Some("toml"),
+            });
+        };
+        if let Some(profiles) = workspace_table.get_mut("profiles") {
+            let Some(table) = profiles.as_table_mut() else {
+                return Err(ArkyConfigError::ParseFailed {
+                    message: "`workspace.profiles` must be a TOML table".to_owned(),
+                    path: None,
+                    format: Some("toml"),
+                });
+            };
+            removed |= table.remove(id).is_some();
+            remove_workspace_profiles = table.is_empty();
+        }
+        if remove_workspace_profiles {
+            workspace_table.remove("profiles");
+        }
+        remove_workspace = workspace_table.is_empty();
+    }
+    if remove_workspace {
+        root.remove("workspace");
+    }
+
+    Ok(removed)
+}
+
+fn upsert_provider_profile_in_document(
+    document: &mut toml::Value,
+    id: &str,
+    profile: toml::Value,
+) -> Result<(), ArkyConfigError> {
+    let Some(root) = document.as_table_mut() else {
+        return Err(ArkyConfigError::ParseFailed {
+            message: "OpenFang config must be a TOML table".to_owned(),
+            path: None,
+            format: Some("toml"),
+        });
+    };
+
+    if !root.contains_key("profiles") {
+        root.insert(
+            "profiles".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
+    }
+
+    let profiles = root
+        .get_mut("profiles")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| ArkyConfigError::ParseFailed {
+            message: "`profiles` must be a TOML table".to_owned(),
+            path: None,
+            format: Some("toml"),
+        })?;
+    profiles.insert(id.to_owned(), profile);
+    Ok(())
+}
+
+fn provider_profile_response(
+    id: &str,
+    profile: &arky_config::ProviderProfileConfig,
+) -> Result<ProviderProfileResponse, ArkyConfigError> {
+    let defaults =
+        serde_json::from_value(serde_json::to_value(profile.defaults()).map_err(|error| {
+            ArkyConfigError::ParseFailed {
+                message: format!("failed to encode defaults for profile `{id}`: {error}"),
+                path: None,
+                format: Some("json"),
+            }
+        })?)
+        .map_err(|error| ArkyConfigError::ParseFailed {
+            message: format!("failed to decode defaults for profile `{id}`: {error}"),
+            path: None,
+            format: Some("json"),
+        })?;
+
+    let config = match profile.config() {
+        Some(ProviderBehaviorLayer::Codex(config)) => Some(serde_json::to_value(config).map_err(
+            |error| ArkyConfigError::ParseFailed {
+                message: format!("failed to encode config for profile `{id}`: {error}"),
+                path: None,
+                format: Some("json"),
+            },
+        )?),
+        Some(ProviderBehaviorLayer::ClaudeCode(config)) => Some(
+            serde_json::to_value(config).map_err(|error| ArkyConfigError::ParseFailed {
+                message: format!("failed to encode config for profile `{id}`: {error}"),
+                path: None,
+                format: Some("json"),
+            })?,
+        ),
+        Some(ProviderBehaviorLayer::ClaudeCompatible(config)) => Some(
+            serde_json::to_value(config).map_err(|error| ArkyConfigError::ParseFailed {
+                message: format!("failed to encode config for profile `{id}`: {error}"),
+                path: None,
+                format: Some("json"),
+            })?,
+        ),
+        None => None,
+    };
+
+    Ok(ProviderProfileResponse {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        driver: profile.driver().to_owned(),
+        model: profile.model().map(ToOwned::to_owned),
+        defaults,
+        config,
+    })
+}
+
+/// GET /api/v1/provider-profiles — List merged provider profiles from config.
+pub async fn list_provider_profiles(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let store = match load_provider_profile_store(&state) {
+        Ok(store) => store,
+        Err(response) => return response.into_response(),
+    };
+
+    let mut items = Vec::with_capacity(store.profiles().len());
+    for (profile_name, profile) in store.profiles() {
+        match provider_profile_response(profile_name, profile) {
+            Ok(item) => items.push(item),
+            Err(error) => return provider_profile_store_error_response(&error).into_response(),
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(ProviderProfileListResponse {
+            items,
+            next_cursor: None,
+        })),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/provider-profiles/{id} — Fetch one provider profile.
+pub async fn get_provider_profile(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_provider_profile_id(&id) {
+        return response.into_response();
+    }
+
+    let store = match load_provider_profile_store(&state) {
+        Ok(store) => store,
+        Err(response) => return response.into_response(),
+    };
+    let Some(profile) = store.profile(&id) else {
+        return provider_profile_not_found_response(&id).into_response();
+    };
+
+    match provider_profile_response(&id, profile) {
+        Ok(profile) => (StatusCode::OK, Json(serde_json::json!(profile))).into_response(),
+        Err(error) => provider_profile_store_error_response(&error).into_response(),
+    }
+}
+
+/// POST /api/v1/provider-profiles — Create a provider profile.
+pub async fn create_provider_profile(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<UpsertProviderProfileRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return agent_json_rejection(rejection).into_response(),
+    };
+    let id = match resolve_provider_profile_id(&request) {
+        Ok(id) => id,
+        Err(response) => return response.into_response(),
+    };
+    if let Err(response) = ensure_safe_provider_profile_id(&id) {
+        return response.into_response();
+    }
+
+    let _write_guard = PROVIDER_PROFILE_WRITE_LOCK.lock().await;
+    let path = provider_profile_config_path(&state);
+    let mut document = match load_openfang_config_document(&path) {
+        Ok(document) => document,
+        Err(error) => return provider_profile_store_error_response(&error).into_response(),
+    };
+    let existing_store = match load_provider_profile_store_from_document(&document) {
+        Ok(store) => store,
+        Err(error) => return provider_profile_store_error_response(&error).into_response(),
+    };
+    if existing_store.profile(&id).is_some() {
+        return provider_profile_conflict_response(&id).into_response();
+    }
+
+    let profile = match provider_profile_request_to_toml_value(&request) {
+        Ok(profile) => profile,
+        Err(response) => return response.into_response(),
+    };
+    if let Err(error) = upsert_provider_profile_in_document(&mut document, &id, profile) {
+        return provider_profile_store_error_response(&error).into_response();
+    }
+
+    let validated_store = match load_provider_profile_store_from_document(&document) {
+        Ok(store) => store,
+        Err(error) => return provider_profile_validation_error_response(&error).into_response(),
+    };
+    if let Err(response) = persist_openfang_config_document(&path, &document) {
+        return response.into_response();
+    }
+
+    let Some(profile) = validated_store.profile(&id) else {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider_profile_create_failed",
+            "Created provider profile could not be reloaded",
+            Some(serde_json::json!([{
+                "path": "id",
+                "value": id,
+            }])),
+        )
+        .into_response();
+    };
+
+    match provider_profile_response(&id, profile) {
+        Ok(profile) => (StatusCode::CREATED, Json(serde_json::json!(profile))).into_response(),
+        Err(error) => provider_profile_store_error_response(&error).into_response(),
+    }
+}
+
+/// PUT /api/v1/provider-profiles/{id} — Replace a provider profile.
+pub async fn update_provider_profile(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<UpsertProviderProfileRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_provider_profile_id(&id) {
+        return response.into_response();
+    }
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return agent_json_rejection(rejection).into_response(),
+    };
+    if let Err(response) = ensure_provider_profile_request_matches_path(&id, &request) {
+        return response.into_response();
+    }
+
+    let _write_guard = PROVIDER_PROFILE_WRITE_LOCK.lock().await;
+    let path = provider_profile_config_path(&state);
+    let mut document = match load_openfang_config_document(&path) {
+        Ok(document) => document,
+        Err(error) => return provider_profile_store_error_response(&error).into_response(),
+    };
+    let existing_store = match load_provider_profile_store_from_document(&document) {
+        Ok(store) => store,
+        Err(error) => return provider_profile_store_error_response(&error).into_response(),
+    };
+    if existing_store.profile(&id).is_none() {
+        return provider_profile_not_found_response(&id).into_response();
+    }
+
+    if let Err(error) = remove_provider_profile_from_document(&mut document, &id) {
+        return provider_profile_store_error_response(&error).into_response();
+    }
+    let profile = match provider_profile_request_to_toml_value(&request) {
+        Ok(profile) => profile,
+        Err(response) => return response.into_response(),
+    };
+    if let Err(error) = upsert_provider_profile_in_document(&mut document, &id, profile) {
+        return provider_profile_store_error_response(&error).into_response();
+    }
+
+    let validated_store = match load_provider_profile_store_from_document(&document) {
+        Ok(store) => store,
+        Err(error) => return provider_profile_validation_error_response(&error).into_response(),
+    };
+    if let Err(response) = persist_openfang_config_document(&path, &document) {
+        return response.into_response();
+    }
+
+    let Some(profile) = validated_store.profile(&id) else {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider_profile_update_failed",
+            "Updated provider profile could not be reloaded",
+            Some(serde_json::json!([{
+                "path": "id",
+                "value": id,
+            }])),
+        )
+        .into_response();
+    };
+
+    match provider_profile_response(&id, profile) {
+        Ok(profile) => (StatusCode::OK, Json(serde_json::json!(profile))).into_response(),
+        Err(error) => provider_profile_store_error_response(&error).into_response(),
+    }
+}
+
+/// DELETE /api/v1/provider-profiles/{id} — Remove all config layers for a provider profile.
+pub async fn delete_provider_profile(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = ensure_safe_provider_profile_id(&id) {
+        return response.into_response();
+    }
+
+    let _write_guard = PROVIDER_PROFILE_WRITE_LOCK.lock().await;
+    let path = provider_profile_config_path(&state);
+    let mut document = match load_openfang_config_document(&path) {
+        Ok(document) => document,
+        Err(error) => return provider_profile_store_error_response(&error).into_response(),
+    };
+    let existing_store = match load_provider_profile_store_from_document(&document) {
+        Ok(store) => store,
+        Err(error) => return provider_profile_store_error_response(&error).into_response(),
+    };
+    if existing_store.profile(&id).is_none() {
+        return provider_profile_not_found_response(&id).into_response();
+    }
+
+    match remove_provider_profile_from_document(&mut document, &id) {
+        Ok(true) => {}
+        Ok(false) => return provider_profile_not_found_response(&id).into_response(),
+        Err(error) => return provider_profile_store_error_response(&error).into_response(),
+    }
+    if let Err(response) = persist_openfang_config_document(&path, &document) {
+        return response.into_response();
+    }
+
+    StatusCode::NO_CONTENT.into_response()
 }
 
 // ---------------------------------------------------------------------------

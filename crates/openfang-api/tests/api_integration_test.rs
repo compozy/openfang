@@ -25,6 +25,7 @@ use openfang_types::workflow::{
     FlowBlock, FlowMode, ResolvedRuntimeSettings, WorkflowIr, WorkflowIrStep, WorkflowIrStepKind,
     WorkflowV2Definition,
 };
+use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
@@ -108,6 +109,21 @@ async fn start_test_server_with_provider(
         .route("/api/health", axum::routing::get(routes::health))
         .route("/api/status", axum::routing::get(routes::status))
         .route("/api/config", axum::routing::get(routes::get_config))
+        .route(
+            "/api/v1/agents/validate",
+            axum::routing::post(routes::validate_agent_definition),
+        )
+        .route(
+            "/api/v1/provider-profiles",
+            axum::routing::get(routes::list_provider_profiles)
+                .post(routes::create_provider_profile),
+        )
+        .route(
+            "/api/v1/provider-profiles/{id}",
+            axum::routing::get(routes::get_provider_profile)
+                .put(routes::update_provider_profile)
+                .delete(routes::delete_provider_profile),
+        )
         .route(
             "/api/agents",
             axum::routing::get(routes::list_agents_legacy).post(routes::spawn_agent),
@@ -239,6 +255,60 @@ tools = ["file_read"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 "#;
+
+fn write_test_config(server: &TestServer, contents: &str) {
+    let config_path = server.state.kernel.config.home_dir.join("config.toml");
+    std::fs::write(&config_path, contents).expect("test config should be written");
+}
+
+fn provider_profile_agent_definition_value(id: &str, profile: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "name": "Profile Validation Agent",
+        "version": "1.0.0",
+        "description": "Validates provider profile references",
+        "enabled": true,
+        "tags": ["profiles"],
+        "provider": {
+            "driver": "claude_code",
+            "model": "sonnet",
+            "profile": profile,
+            "defaults": {
+                "reasoning_effort": "high",
+                "max_tokens": 4000
+            },
+            "config": {
+                "continue_conversation": true,
+                "fork_session": false,
+                "allowed_tools": ["Read", "Write"]
+            }
+        },
+        "prompt": {
+            "system": "You validate provider references.",
+            "instructions": "Keep responses short.",
+            "skills": []
+        },
+        "capabilities": {
+            "tools": ["*"],
+            "primitives": ["artifact.*"],
+            "delegation": ["call"],
+            "workspace": "none",
+            "network": false
+        },
+        "runtime": {
+            "autonomous": false,
+            "memory_policy": "session",
+            "hitl": "explicit_only"
+        },
+        "input": {
+            "kind": "object"
+        },
+        "output": {
+            "kind": "artifact_ref",
+            "artifact_type": "report"
+        }
+    })
+}
 
 async fn create_empty_workflow(
     client: &reqwest::Client,
@@ -2340,6 +2410,215 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         state,
         _tmp: tmp,
     }
+}
+
+#[tokio::test]
+async fn provider_profile_crud_endpoints_should_round_trip_file_backed_profiles() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let list_response = client
+        .get(format!("{}/api/v1/provider-profiles", server.base_url))
+        .send()
+        .await
+        .expect("provider profile list request should succeed");
+    assert_eq!(list_response.status(), 200);
+    let list_body: serde_json::Value = list_response
+        .json()
+        .await
+        .expect("provider profile list body should decode");
+    assert_eq!(list_body["items"], serde_json::json!([]));
+
+    let create_payload = serde_json::json!({
+        "id": "research",
+        "name": "research",
+        "driver": "codex",
+        "model": "gpt-5",
+        "defaults": {
+            "max_tokens": 2048,
+            "reasoning_effort": "high"
+        },
+        "config": {
+            "sandbox_mode": "workspace-write",
+            "include_plan_tool": true
+        }
+    });
+    let create_response = client
+        .post(format!("{}/api/v1/provider-profiles", server.base_url))
+        .json(&create_payload)
+        .send()
+        .await
+        .expect("provider profile create request should succeed");
+    assert_eq!(create_response.status(), 201);
+    let created: serde_json::Value = create_response
+        .json()
+        .await
+        .expect("provider profile create body should decode");
+    assert_eq!(created["id"], serde_json::json!("research"));
+    assert_eq!(created["name"], serde_json::json!("research"));
+    assert_eq!(created["driver"], serde_json::json!("codex"));
+    assert_eq!(created["model"], serde_json::json!("gpt-5"));
+    assert_eq!(created["defaults"]["max_tokens"], serde_json::json!(2048));
+    assert_eq!(
+        created["defaults"]["reasoning_effort"],
+        serde_json::json!("high")
+    );
+    assert_eq!(
+        created["config"]["include_plan_tool"],
+        serde_json::json!(true)
+    );
+
+    let config_path = server.state.kernel.config.home_dir.join("config.toml");
+    let config_text = std::fs::read_to_string(&config_path)
+        .expect("config.toml should exist after provider profile creation");
+    assert!(config_text.contains("[profiles.research]"));
+    assert!(config_text.contains("driver = \"codex\""));
+    assert!(config_text.contains("sandbox_mode = \"workspace-write\""));
+
+    let get_response = client
+        .get(format!(
+            "{}/api/v1/provider-profiles/research",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("provider profile get request should succeed");
+    assert_eq!(get_response.status(), 200);
+    let fetched: serde_json::Value = get_response
+        .json()
+        .await
+        .expect("provider profile get body should decode");
+    assert_eq!(fetched["id"], serde_json::json!("research"));
+    assert_eq!(fetched["driver"], serde_json::json!("codex"));
+
+    let update_payload = serde_json::json!({
+        "id": "research",
+        "name": "research",
+        "driver": "claude-code",
+        "model": "claude-sonnet-4",
+        "defaults": {
+            "max_tokens": 1024,
+            "reasoning_effort": "medium"
+        },
+        "config": {
+            "continue_conversation": true,
+            "allowed_tools": ["Read", "Write"]
+        }
+    });
+    let update_response = client
+        .put(format!(
+            "{}/api/v1/provider-profiles/research",
+            server.base_url
+        ))
+        .json(&update_payload)
+        .send()
+        .await
+        .expect("provider profile update request should succeed");
+    assert_eq!(update_response.status(), 200);
+    let updated: serde_json::Value = update_response
+        .json()
+        .await
+        .expect("provider profile update body should decode");
+    assert_eq!(updated["driver"], serde_json::json!("claude-code"));
+    assert_eq!(updated["model"], serde_json::json!("claude-sonnet-4"));
+    assert_eq!(updated["defaults"]["max_tokens"], serde_json::json!(1024));
+    assert_eq!(
+        updated["defaults"]["reasoning_effort"],
+        serde_json::json!("medium")
+    );
+    assert_eq!(
+        updated["config"]["continue_conversation"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        updated["config"]["allowed_tools"],
+        serde_json::json!(["Read", "Write"])
+    );
+
+    let list_after_update = client
+        .get(format!("{}/api/v1/provider-profiles", server.base_url))
+        .send()
+        .await
+        .expect("provider profile list after update should succeed");
+    assert_eq!(list_after_update.status(), 200);
+    let list_after_update_body: serde_json::Value = list_after_update
+        .json()
+        .await
+        .expect("provider profile list after update should decode");
+    assert_eq!(
+        list_after_update_body["items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        list_after_update_body["items"][0]["driver"],
+        serde_json::json!("claude-code")
+    );
+
+    let delete_response = client
+        .delete(format!(
+            "{}/api/v1/provider-profiles/research",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("provider profile delete request should succeed");
+    assert_eq!(delete_response.status(), 204);
+
+    let final_list_response = client
+        .get(format!("{}/api/v1/provider-profiles", server.base_url))
+        .send()
+        .await
+        .expect("provider profile final list request should succeed");
+    assert_eq!(final_list_response.status(), 200);
+    let final_list_body: serde_json::Value = final_list_response
+        .json()
+        .await
+        .expect("provider profile final list body should decode");
+    assert_eq!(final_list_body["items"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn agent_validation_should_reject_unknown_profiles_when_profile_store_is_seeded() {
+    let server = start_test_server().await;
+    write_test_config(
+        &server,
+        r#"
+        [profiles.default]
+        driver = "claude-code"
+        model = "claude-sonnet-4"
+        "#,
+    );
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{}/api/v1/agents/validate", server.base_url))
+        .json(&serde_json::json!({
+            "definition": provider_profile_agent_definition_value(
+                "profile-validation",
+                "missing-profile"
+            ),
+            "strict": false
+        }))
+        .send()
+        .await
+        .expect("agent validation request should succeed");
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .expect("agent validation body should decode");
+    assert_eq!(body["valid"], serde_json::json!(false));
+    assert!(
+        body["issues"]
+            .as_array()
+            .expect("issues should be an array")
+            .iter()
+            .any(|issue| {
+                issue["code"] == serde_json::json!("unknown_profile")
+                    && issue["path"] == serde_json::json!("provider.profile")
+            }),
+        "expected unknown_profile validation issue, got {body}"
+    );
 }
 
 #[tokio::test]

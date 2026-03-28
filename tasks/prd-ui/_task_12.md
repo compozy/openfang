@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/src</domain>
@@ -35,17 +35,17 @@ Create the missing `/api/v1/provider-profiles` CRUD endpoint in the Rust backend
 
 ## Subtasks
 
-- [ ] 12.1 Define `ProviderProfile` API types in `crates/openfang-api/src/routes.rs` or a dedicated types module
-- [ ] 12.2 Implement profile storage — determine whether file-backed (like workflows) or DB-backed (like tasks)
-- [ ] 12.3 Implement `list_provider_profiles` handler
-- [ ] 12.4 Implement `get_provider_profile` handler
-- [ ] 12.5 Implement `create_provider_profile` handler
-- [ ] 12.6 Implement `update_provider_profile` handler
-- [ ] 12.7 Implement `delete_provider_profile` handler
-- [ ] 12.8 Register routes in `server.rs` under `/api/v1/provider-profiles`
-- [ ] 12.9 Fix `ValidationContext.known_profiles` — seed from profile store in agent validate/compile handlers
-- [ ] 12.10 Write integration tests for all 5 CRUD endpoints
-- [ ] 12.11 Write test for profile validation seeding
+- [x] 12.1 Define `ProviderProfile` API types in `crates/openfang-api/src/routes.rs` or a dedicated types module
+- [x] 12.2 Implement profile storage — determine whether file-backed (like workflows) or DB-backed (like tasks)
+- [x] 12.3 Implement `list_provider_profiles` handler
+- [x] 12.4 Implement `get_provider_profile` handler
+- [x] 12.5 Implement `create_provider_profile` handler
+- [x] 12.6 Implement `update_provider_profile` handler
+- [x] 12.7 Implement `delete_provider_profile` handler
+- [x] 12.8 Register routes in `server.rs` under `/api/v1/provider-profiles`
+- [x] 12.9 Fix `ValidationContext.known_profiles` — seed from profile store in agent validate/compile handlers
+- [x] 12.10 Write integration tests for all 5 CRUD endpoints
+- [x] 12.11 Write test for profile validation seeding
 
 ## Implementation Details
 
@@ -88,23 +88,23 @@ struct ProviderRequestDefaultsResponse {
 
 ### Unit Tests (Required)
 
-- [ ] Profile CRUD: create, read, update, delete
-- [ ] Profile validation: verify `known_profiles` seeding affects validation output
+- [x] Profile CRUD: create, read, update, delete
+- [x] Profile validation: verify `known_profiles` seeding affects validation output
 
 ### Integration Tests (Required)
 
-- [ ] `GET /api/v1/provider-profiles` returns list
-- [ ] `POST /api/v1/provider-profiles` creates profile, returns 201
-- [ ] `GET /api/v1/provider-profiles/{id}` returns profile
-- [ ] `PUT /api/v1/provider-profiles/{id}` updates profile
-- [ ] `DELETE /api/v1/provider-profiles/{id}` removes profile, returns 204
-- [ ] Agent validation with `known_profiles` seeded rejects unknown profile references
+- [x] `GET /api/v1/provider-profiles` returns list
+- [x] `POST /api/v1/provider-profiles` creates profile, returns 201
+- [x] `GET /api/v1/provider-profiles/{id}` returns profile
+- [x] `PUT /api/v1/provider-profiles/{id}` updates profile
+- [x] `DELETE /api/v1/provider-profiles/{id}` removes profile, returns 204
+- [x] Agent validation with `known_profiles` seeded rejects unknown profile references
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

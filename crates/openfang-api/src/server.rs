@@ -225,6 +225,17 @@ pub async fn build_router(
                 .delete(routes::delete_agent),
         )
         .route(
+            "/api/v1/provider-profiles",
+            axum::routing::get(routes::list_provider_profiles)
+                .post(routes::create_provider_profile),
+        )
+        .route(
+            "/api/v1/provider-profiles/{id}",
+            axum::routing::get(routes::get_provider_profile)
+                .put(routes::update_provider_profile)
+                .delete(routes::delete_provider_profile),
+        )
+        .route(
             "/api/agents",
             axum::routing::get(routes::list_agents_legacy).post(routes::spawn_agent),
         )
