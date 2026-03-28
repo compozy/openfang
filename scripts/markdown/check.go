@@ -1,6 +1,6 @@
 package main
 
-import app "github.com/pedronauck/polybot-go/scripts/markdown/internal/app"
+import app "compozy.com/openfang/scripts/markdown/internal/app"
 
 func main() {
 	app.Main()
