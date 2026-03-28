@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -35,18 +35,18 @@ Build the HITL (Human-in-the-Loop) Inbox page — the most operationally critica
 
 ## Subtasks
 
-- [ ] 3.1 Wire global HITL SSE in `app.js` — connect to `/api/v1/hitl-requests/stream?status=pending` on boot, update `$store.app.pendingHitlCount`
-- [ ] 3.2 Update nav badge in `index_body.html` — show pending count next to "HITL Inbox" nav item using `$store.app.pendingHitlCount`
-- [ ] 3.3 Create `js/pages/hitl.js` — `hitlPage()` Alpine component with list, filters, detail view
-- [ ] 3.4 Implement request list view — fetch from `OpenFangAPI.v1.hitl.list()`, display cards with kind badge, run link, time waiting
-- [ ] 3.5 Implement status filter — tabs or dropdown for pending/answered/cancelled/timed_out
-- [ ] 3.6 Implement answer form for `freeform` and `clarification` kinds — text input + submit
-- [ ] 3.7 Implement answer form for `approval` kind — approve/reject buttons
-- [ ] 3.8 Implement answer form for `choice` kind — choice buttons from `context_json`
-- [ ] 3.9 Implement cancel action with confirmation dialog
-- [ ] 3.10 Wire page-scoped SSE for real-time list updates — `hitl.created` adds to list, `hitl.answered`/`hitl.cancelled` updates status
-- [ ] 3.11 Add HITL page template section in `index_body.html`
-- [ ] 3.12 Add badge CSS styles for HITL kinds and status in `components.css`
+- [x] 3.1 Wire global HITL SSE in `app.js` — connect to `/api/v1/hitl-requests/stream?status=pending` on boot, update `$store.app.pendingHitlCount`
+- [x] 3.2 Update nav badge in `index_body.html` — show pending count next to "HITL Inbox" nav item using `$store.app.pendingHitlCount`
+- [x] 3.3 Create `js/pages/hitl.js` — `hitlPage()` Alpine component with list, filters, detail view
+- [x] 3.4 Implement request list view — fetch from `OpenFangAPI.v1.hitl.list()`, display cards with kind badge, run link, time waiting
+- [x] 3.5 Implement status filter — tabs or dropdown for pending/answered/cancelled/timed_out
+- [x] 3.6 Implement answer form for `freeform` and `clarification` kinds — text input + submit
+- [x] 3.7 Implement answer form for `approval` kind — approve/reject buttons
+- [x] 3.8 Implement answer form for `choice` kind — choice buttons from `context_json`
+- [x] 3.9 Implement cancel action with confirmation dialog
+- [x] 3.10 Wire page-scoped SSE for real-time list updates — `hitl.created` adds to list, `hitl.answered`/`hitl.cancelled` updates status
+- [x] 3.11 Add HITL page template section in `index_body.html`
+- [x] 3.12 Add badge CSS styles for HITL kinds and status in `components.css`
 
 ## Implementation Details
 
@@ -109,14 +109,14 @@ const hitlSSE = OpenFangSSE.connect('/api/v1/hitl-requests/stream?status=pending
 
 ### Manual Browser Tests (Required)
 
-- [ ] Navigate to HITL Inbox — verify page loads, list displays (may be empty)
-- [ ] Verify nav badge shows pending count (or 0 if none pending)
-- [ ] If HITL requests exist: verify cards display question, kind, run link, time waiting
-- [ ] Submit an answer — verify request status changes to "answered"
-- [ ] Cancel a request — verify confirmation dialog, then status changes
-- [ ] Filter by status — verify correct filtering
-- [ ] Verify SSE connection in Network tab (EventSource to `/api/v1/hitl-requests/stream`)
-- [ ] Verify badge updates when new HITL request arrives (requires triggering a workflow with HITL)
+- [x] Navigate to HITL Inbox — verify page loads, list displays (may be empty)
+- [x] Verify nav badge shows pending count (or 0 if none pending)
+- [x] If HITL requests exist: verify cards display question, kind, run link, time waiting
+- [x] Submit an answer — verify request status changes to "answered"
+- [x] Cancel a request — verify confirmation dialog, then status changes
+- [x] Filter by status — verify correct filtering
+- [x] Verify SSE connection in Network tab (EventSource to `/api/v1/hitl-requests/stream`)
+- [x] Verify badge updates when new HITL request arrives (requires triggering a workflow with HITL)
 
 ### Verification Commands
 

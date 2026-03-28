@@ -20,7 +20,7 @@
 
 | Task | Title | Complexity | Dependencies | Status |
 |------|-------|------------|--------------|--------|
-| 3 | HITL Inbox | high | 1, 2 | pending |
+| 3 | HITL Inbox | high | 1, 2 | completed |
 | 4 | Workflow Runs | high | 1, 2 | pending |
 | 5 | Dispatches | medium | 1, 2 | pending |
 

@@ -1847,6 +1847,196 @@ async fn hitl_stream_with_pending_filter_should_emit_only_pending_events() {
 }
 
 #[tokio::test]
+async fn hitl_stream_with_pending_filter_should_emit_answered_event_for_pending_request() {
+    let server = start_dispatch_hitl_test_server(Vec::new()).await;
+    let client = reqwest::Client::new();
+    let run_id = Uuid::new_v4().to_string();
+    let dispatch_id = "dispatch-hitl-answer-stream";
+    seed_run(
+        &server,
+        &durable_run_record(&run_id, "hitl-stream-answer", WorkflowRunStatus::Running),
+    )
+    .await;
+    seed_dispatch(
+        &server,
+        &durable_dispatch_record(dispatch_id, &run_id, DispatchStatus::WaitingHitl),
+    )
+    .await;
+
+    let mut response = open_sse_stream(
+        &client,
+        format!(
+            "{}/api/v1/hitl-requests/stream?status=pending",
+            server.base_url
+        ),
+        None,
+    )
+    .await;
+    let mut buffer = String::new();
+    let snapshot = read_sse_event(&mut response, &mut buffer, Duration::from_secs(5)).await;
+    assert_eq!(snapshot.event, "stream.snapshot");
+
+    let hitl_request_id = create_hitl_request(&server, &run_id, dispatch_id).await;
+    for _ in 0..10 {
+        let event = read_sse_event(&mut response, &mut buffer, Duration::from_secs(5)).await;
+        if event.event == "hitl.requested" && event.data["id"] == json!(hitl_request_id) {
+            break;
+        }
+    }
+
+    server
+        .state
+        .kernel
+        .workflow_stores
+        .hitl
+        .answer(
+            &hitl_request_id,
+            &json!({
+                "type": "choice",
+                "value": "answered",
+            }),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("answered HITL request should persist");
+
+    let mut answered = None;
+    for _ in 0..10 {
+        let event = read_sse_event(&mut response, &mut buffer, Duration::from_secs(5)).await;
+        if event.event == "hitl.answered" {
+            answered = Some(event);
+            break;
+        }
+    }
+
+    let answered = answered.expect("expected hitl.answered event");
+    assert_eq!(answered.data["id"], json!(hitl_request_id));
+    assert_eq!(answered.data["status"], json!("answered"));
+}
+
+#[tokio::test]
+async fn hitl_stream_with_pending_filter_should_emit_cancelled_event_for_pending_request() {
+    let server = start_dispatch_hitl_test_server(Vec::new()).await;
+    let client = reqwest::Client::new();
+    let run_id = Uuid::new_v4().to_string();
+    let dispatch_id = "dispatch-hitl-cancel-stream";
+    seed_run(
+        &server,
+        &durable_run_record(&run_id, "hitl-stream-cancel", WorkflowRunStatus::Running),
+    )
+    .await;
+    seed_dispatch(
+        &server,
+        &durable_dispatch_record(dispatch_id, &run_id, DispatchStatus::WaitingHitl),
+    )
+    .await;
+
+    let mut response = open_sse_stream(
+        &client,
+        format!(
+            "{}/api/v1/hitl-requests/stream?status=pending",
+            server.base_url
+        ),
+        None,
+    )
+    .await;
+    let mut buffer = String::new();
+    let snapshot = read_sse_event(&mut response, &mut buffer, Duration::from_secs(5)).await;
+    assert_eq!(snapshot.event, "stream.snapshot");
+
+    let hitl_request_id = create_hitl_request(&server, &run_id, dispatch_id).await;
+    for _ in 0..10 {
+        let event = read_sse_event(&mut response, &mut buffer, Duration::from_secs(5)).await;
+        if event.event == "hitl.requested" && event.data["id"] == json!(hitl_request_id) {
+            break;
+        }
+    }
+
+    server
+        .state
+        .kernel
+        .workflow_stores
+        .hitl
+        .cancel(&hitl_request_id)
+        .await
+        .expect("cancelled HITL request should persist");
+
+    let mut cancelled = None;
+    for _ in 0..10 {
+        let event = read_sse_event(&mut response, &mut buffer, Duration::from_secs(5)).await;
+        if event.event == "hitl.cancelled" {
+            cancelled = Some(event);
+            break;
+        }
+    }
+
+    let cancelled = cancelled.expect("expected hitl.cancelled event");
+    assert_eq!(cancelled.data["id"], json!(hitl_request_id));
+    assert_eq!(cancelled.data["status"], json!("cancelled"));
+}
+
+#[tokio::test]
+async fn hitl_stream_with_pending_filter_should_emit_timed_out_event_for_pending_request() {
+    let server = start_dispatch_hitl_test_server(Vec::new()).await;
+    let client = reqwest::Client::new();
+    let run_id = Uuid::new_v4().to_string();
+    let dispatch_id = "dispatch-hitl-timeout-stream";
+    seed_run(
+        &server,
+        &durable_run_record(&run_id, "hitl-stream-timeout", WorkflowRunStatus::Running),
+    )
+    .await;
+    seed_dispatch(
+        &server,
+        &durable_dispatch_record(dispatch_id, &run_id, DispatchStatus::WaitingHitl),
+    )
+    .await;
+
+    let mut response = open_sse_stream(
+        &client,
+        format!(
+            "{}/api/v1/hitl-requests/stream?status=pending",
+            server.base_url
+        ),
+        None,
+    )
+    .await;
+    let mut buffer = String::new();
+    let snapshot = read_sse_event(&mut response, &mut buffer, Duration::from_secs(5)).await;
+    assert_eq!(snapshot.event, "stream.snapshot");
+
+    let hitl_request_id = create_hitl_request(&server, &run_id, dispatch_id).await;
+    for _ in 0..10 {
+        let event = read_sse_event(&mut response, &mut buffer, Duration::from_secs(5)).await;
+        if event.event == "hitl.requested" && event.data["id"] == json!(hitl_request_id) {
+            break;
+        }
+    }
+
+    server
+        .state
+        .kernel
+        .workflow_stores
+        .hitl
+        .mark_timed_out(&hitl_request_id)
+        .await
+        .expect("timed out HITL request should persist");
+
+    let mut timed_out = None;
+    for _ in 0..10 {
+        let event = read_sse_event(&mut response, &mut buffer, Duration::from_secs(5)).await;
+        if event.event == "hitl.timed_out" {
+            timed_out = Some(event);
+            break;
+        }
+    }
+
+    let timed_out = timed_out.expect("expected hitl.timed_out event");
+    assert_eq!(timed_out.data["id"], json!(hitl_request_id));
+    assert_eq!(timed_out.data["status"], json!("timed_out"));
+}
+
+#[tokio::test]
 async fn run_sse_should_emit_run_updated_with_api_spec_summary_shape() {
     let server = start_dispatch_hitl_test_server(Vec::new()).await;
     let client = reqwest::Client::new();

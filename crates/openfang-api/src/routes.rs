@@ -8432,7 +8432,10 @@ fn hitl_stream_event_matches_filters(
     event: &BufferedSseEvent,
     filters: &HitlStreamFilters,
 ) -> bool {
-    if !matches!(event.event.as_str(), "hitl.requested" | "hitl.answered") {
+    if !matches!(
+        event.event.as_str(),
+        "hitl.requested" | "hitl.answered" | "hitl.cancelled" | "hitl.timed_out"
+    ) {
         return true;
     }
     let Some(payload) = event.data.as_object() else {
@@ -8454,7 +8457,17 @@ fn hitl_stream_event_matches_filters(
             .get("status")
             .and_then(serde_json::Value::as_str)
             .and_then(|value| value.parse::<HitlStatus>().ok())
-            .is_some_and(|status| status == expected_status);
+            .is_some_and(|status| {
+                if status == expected_status {
+                    return true;
+                }
+
+                matches!(expected_status, HitlStatus::Pending)
+                    && matches!(
+                        status,
+                        HitlStatus::Answered | HitlStatus::Cancelled | HitlStatus::TimedOut
+                    )
+            });
         if !status_matches {
             return false;
         }
@@ -8629,7 +8642,8 @@ pub async fn stream_run_events_v1(
                                     let event_name = match hitl.status {
                                         HitlStatus::Pending => Some("hitl.requested"),
                                         HitlStatus::Answered => Some("hitl.answered"),
-                                        HitlStatus::Cancelled | HitlStatus::TimedOut => None,
+                                        HitlStatus::Cancelled => Some("hitl.cancelled"),
+                                        HitlStatus::TimedOut => Some("hitl.timed_out"),
                                     };
                                     if let Some(event_name) = event_name {
                                         let _ = handle.publish_if_changed(
@@ -8867,7 +8881,8 @@ pub async fn stream_dispatch_events_v1(
                                     let event_name = match hitl.status {
                                         HitlStatus::Pending => Some("hitl.requested"),
                                         HitlStatus::Answered => Some("hitl.answered"),
-                                        HitlStatus::Cancelled | HitlStatus::TimedOut => None,
+                                        HitlStatus::Cancelled => Some("hitl.cancelled"),
+                                        HitlStatus::TimedOut => Some("hitl.timed_out"),
                                     };
                                     if let Some(event_name) = event_name {
                                         let _ = handle.publish_if_changed(
@@ -9131,7 +9146,8 @@ pub async fn stream_hitl_requests_v1(
                                     let event_name = match record.status {
                                         HitlStatus::Pending => Some("hitl.requested"),
                                         HitlStatus::Answered => Some("hitl.answered"),
-                                        HitlStatus::Cancelled | HitlStatus::TimedOut => None,
+                                        HitlStatus::Cancelled => Some("hitl.cancelled"),
+                                        HitlStatus::TimedOut => Some("hitl.timed_out"),
                                     };
                                     if let Some(event_name) = event_name {
                                         let _ = handle.publish_if_changed(

@@ -5109,16 +5109,166 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
       </div>
     </template>
 
-    <!-- Placeholder: HITL Inbox -->
+    <!-- Page: HITL Inbox -->
     <template x-if="page === 'hitl'">
-      <div>
-        <div class="page-header"><h2>HITL Inbox</h2></div>
-        <div class="page-body">
-          <div class="empty-state">
-            <div class="empty-state-icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></div>
-            <h3>Coming Soon</h3>
-            <p class="text-dim text-xs">Human-in-the-loop requests will appear here.</p>
+      <div x-data="hitlPage()" x-init="init()">
+        <div class="page-header">
+          <div>
+            <h2>HITL Inbox</h2>
+            <div class="text-xs text-dim">Durable human decisions for blocked workflow steps.</div>
           </div>
+          <div class="flex items-center gap-2">
+            <span class="badge badge-warn" x-show="pendingCount > 0" x-text="pendingCount + ' pending'"></span>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Refresh</button>
+          </div>
+        </div>
+        <div class="page-body">
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading HITL requests...</span></div>
+          <div x-show="!loading && loadError" class="error-state">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
+          </div>
+          <template x-if="!loading && !loadError">
+            <div class="hitl-layout">
+              <section class="hitl-list">
+                <div class="filter-pills">
+                  <button class="filter-pill" :class="{ active: filterStatus === 'pending' }" @click="setFilterStatus('pending')">Pending</button>
+                  <button class="filter-pill" :class="{ active: filterStatus === 'answered' }" @click="setFilterStatus('answered')">Answered</button>
+                  <button class="filter-pill" :class="{ active: filterStatus === 'cancelled' }" @click="setFilterStatus('cancelled')">Cancelled</button>
+                  <button class="filter-pill" :class="{ active: filterStatus === 'timed_out' }" @click="setFilterStatus('timed_out')">Timed Out</button>
+                </div>
+
+                <div x-show="filteredRequests.length === 0" class="empty-state hitl-empty">
+                  <div class="empty-state-icon">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                  </div>
+                  <h4>No <span x-text="statusLabel(filterStatus)"></span> requests</h4>
+                  <p class="hint">New HITL prompts will appear here automatically when a workflow pauses for human input.</p>
+                </div>
+
+                <div class="hitl-list-stack" x-show="filteredRequests.length > 0">
+                  <template x-for="request in filteredRequests" :key="request.id">
+                    <article class="card hitl-card" :class="{ 'is-selected': selectedRequestId === request.id }" @click="selectRequest(request.id)">
+                      <div class="flex justify-between items-start gap-2">
+                        <div class="flex items-center gap-2" style="flex-wrap:wrap">
+                          <span :class="kindBadgeClass(request.kind)" x-text="kindLabel(request.kind)"></span>
+                          <span :class="statusBadgeClass(request.status)" x-text="statusLabel(request.status)"></span>
+                        </div>
+                        <span class="text-xs text-dim font-mono" x-text="timeWaiting(request)" :title="createdAt(request)"></span>
+                      </div>
+
+                      <p class="hitl-question" x-text="request.question"></p>
+
+                      <div class="hitl-link-row">
+                        <a href="#runs" class="hitl-link" @click.stop>
+                          Run <span class="font-mono" x-text="request.run_id"></span>
+                        </a>
+                        <a href="#dispatches" class="hitl-link" x-show="request.dispatch_id" @click.stop>
+                          Dispatch <span class="font-mono" x-text="request.dispatch_id"></span>
+                        </a>
+                        <span class="hitl-meta-chip">Step <span class="font-mono" x-text="request.step_id"></span></span>
+                        <span class="hitl-meta-chip">Seq <span class="font-mono" x-text="request.sequence_no"></span></span>
+                      </div>
+
+                      <div class="hitl-actions" x-show="isPending(request)">
+                        <template x-if="isTextKind(request.kind)">
+                          <div @click.stop>
+                            <div class="form-group" style="margin-bottom:10px">
+                              <label>Answer</label>
+                              <textarea
+                                class="form-textarea hitl-answer-input"
+                                x-model="responseDrafts[request.id]"
+                                placeholder="Provide the human response that should resume this step."
+                              ></textarea>
+                            </div>
+                            <div class="hitl-action-row">
+                              <button class="btn btn-primary btn-sm" @click.stop="submitTextAnswer(request)" :disabled="submittingId === request.id">
+                                <span x-text="submittingId === request.id ? 'Submitting...' : 'Submit Answer'"></span>
+                              </button>
+                              <button class="btn btn-ghost btn-sm" @click.stop="confirmCancel(request)" :disabled="cancellingId === request.id">
+                                <span x-text="cancellingId === request.id ? 'Cancelling...' : 'Cancel Request'"></span>
+                              </button>
+                            </div>
+                          </div>
+                        </template>
+
+                        <template x-if="isApprovalKind(request.kind)">
+                          <div class="hitl-action-row" @click.stop>
+                            <button class="btn btn-success btn-sm" @click.stop="submitApproval(request, 'approved')" :disabled="submittingId === request.id">Approve</button>
+                            <button class="btn btn-danger btn-sm" @click.stop="submitApproval(request, 'rejected')" :disabled="submittingId === request.id">Reject</button>
+                            <button class="btn btn-ghost btn-sm" @click.stop="confirmCancel(request)" :disabled="cancellingId === request.id">
+                              <span x-text="cancellingId === request.id ? 'Cancelling...' : 'Cancel Request'"></span>
+                            </button>
+                          </div>
+                        </template>
+
+                        <template x-if="isChoiceKind(request.kind)">
+                          <div @click.stop>
+                            <div class="hitl-choice-grid">
+                              <template x-for="choice in choicesFor(request)" :key="request.id + ':' + choice.value">
+                                <button class="btn btn-ghost btn-sm hitl-choice-btn" @click.stop="submitChoice(request, choice)" :title="choice.description || choice.label">
+                                  <span x-text="choice.label"></span>
+                                </button>
+                              </template>
+                            </div>
+                            <div class="hitl-action-row">
+                              <button class="btn btn-ghost btn-sm" @click.stop="confirmCancel(request)" :disabled="cancellingId === request.id">
+                                <span x-text="cancellingId === request.id ? 'Cancelling...' : 'Cancel Request'"></span>
+                              </button>
+                            </div>
+                          </div>
+                        </template>
+                      </div>
+
+                      <div class="hitl-terminal-note" x-show="!isPending(request) && responseSummary(request)">
+                        <span class="text-xs text-dim">Response:</span>
+                        <span class="font-mono" x-text="responseSummary(request)"></span>
+                      </div>
+                    </article>
+                  </template>
+                </div>
+              </section>
+
+              <aside class="card hitl-detail" x-show="selectedRequest">
+                <template x-if="selectedRequest">
+                  <div>
+                    <div class="flex justify-between items-start gap-2">
+                      <div>
+                        <div class="text-xs text-dim">Selected Request</div>
+                        <h3 class="hitl-detail-title" x-text="selectedRequest.question"></h3>
+                      </div>
+                      <div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:flex-end">
+                        <span :class="kindBadgeClass(selectedRequest.kind)" x-text="kindLabel(selectedRequest.kind)"></span>
+                        <span :class="statusBadgeClass(selectedRequest.status)" x-text="statusLabel(selectedRequest.status)"></span>
+                      </div>
+                    </div>
+
+                    <div class="detail-grid hitl-detail-grid">
+                      <div class="detail-row"><span class="detail-label">Request ID</span><span class="detail-value" x-text="selectedRequest.id"></span></div>
+                      <div class="detail-row"><span class="detail-label">Run</span><span class="detail-value" x-text="selectedRequest.run_id"></span></div>
+                      <div class="detail-row"><span class="detail-label">Dispatch</span><span class="detail-value" x-text="selectedRequest.dispatch_id || '-'"></span></div>
+                      <div class="detail-row"><span class="detail-label">Step</span><span class="detail-value" x-text="selectedRequest.step_id"></span></div>
+                      <div class="detail-row"><span class="detail-label">Created</span><span class="detail-value" x-text="createdAt(selectedRequest)"></span></div>
+                      <div class="detail-row"><span class="detail-label">Answered</span><span class="detail-value" x-text="answeredAt(selectedRequest) || '-'"></span></div>
+                      <div class="detail-row"><span class="detail-label">Timeout</span><span class="detail-value" x-text="timeoutAt(selectedRequest) || '-'"></span></div>
+                      <div class="detail-row"><span class="detail-label">Waiting</span><span class="detail-value" x-text="timeWaiting(selectedRequest)"></span></div>
+                    </div>
+
+                    <div class="hitl-detail-section">
+                      <div class="hitl-detail-label">Context</div>
+                      <pre class="tool-pre" x-text="formatJson(selectedRequest.context)"></pre>
+                    </div>
+
+                    <div class="hitl-detail-section" x-show="selectedRequest.response">
+                      <div class="hitl-detail-label">Recorded Response</div>
+                      <pre class="tool-pre" x-text="formatJson(selectedRequest.response)"></pre>
+                    </div>
+                  </div>
+                </template>
+              </aside>
+            </div>
+          </template>
         </div>
       </div>
     </template>

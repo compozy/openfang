@@ -137,6 +137,8 @@ document.addEventListener('alpine:init', function() {
     pendingApprovalCount: 0,
     lastPendingApprovalSignature: '',
     pendingHitlCount: 0,
+    pendingHitlIds: {},
+    hitlSSE: null,
     pendingAgent: null,
     focusMode: localStorage.getItem('openfang-focus') === 'true',
     showOnboarding: false,
@@ -172,6 +174,76 @@ document.addEventListener('alpine:init', function() {
         this.pendingApprovalCount = pending.length;
         this.lastPendingApprovalSignature = signature;
       } catch(e) { /* silent */ }
+    },
+
+    syncPendingHitlCount() {
+      this.pendingHitlCount = Object.keys(this.pendingHitlIds || {}).length;
+    },
+
+    rebuildPendingHitlIds(items) {
+      var next = {};
+      var list = Array.isArray(items) ? items : [];
+
+      for (var i = 0; i < list.length; i++) {
+        var request = list[i];
+        if (!request || !request.id) continue;
+        if (request.status === 'pending') {
+          next[request.id] = true;
+        }
+      }
+
+      this.pendingHitlIds = next;
+      this.syncPendingHitlCount();
+    },
+
+    applyPendingHitlEvent(request) {
+      if (!request || !request.id) return;
+
+      if (request.status === 'pending') {
+        this.pendingHitlIds[request.id] = true;
+      } else {
+        delete this.pendingHitlIds[request.id];
+      }
+
+      this.pendingHitlIds = Object.assign({}, this.pendingHitlIds);
+      this.syncPendingHitlCount();
+    },
+
+    closePendingHitlStream() {
+      if (this.hitlSSE) {
+        this.hitlSSE.close();
+        this.hitlSSE = null;
+      }
+      this.pendingHitlIds = {};
+      this.pendingHitlCount = 0;
+    },
+
+    connectPendingHitlStream() {
+      this.closePendingHitlStream();
+      if (typeof OpenFangSSE === 'undefined') return;
+
+      var self = this;
+      this.hitlSSE = OpenFangSSE.connect('/api/v1/hitl-requests/stream?status=pending', {
+        'stream.snapshot': function(data) {
+          self.rebuildPendingHitlIds(data && Array.isArray(data.items) ? data.items : []);
+        },
+        'stream.reset': function() {
+          self.pendingHitlIds = {};
+          self.syncPendingHitlCount();
+        },
+        'hitl.requested': function(data) {
+          self.applyPendingHitlEvent(data);
+        },
+        'hitl.answered': function(data) {
+          self.applyPendingHitlEvent(data);
+        },
+        'hitl.cancelled': function(data) {
+          self.applyPendingHitlEvent(data);
+        },
+        'hitl.timed_out': function(data) {
+          self.applyPendingHitlEvent(data);
+        }
+      }, { reconnect: true });
     },
 
     async checkStatus() {
@@ -222,9 +294,11 @@ document.addEventListener('alpine:init', function() {
           if (authInfo.authenticated) {
             this.sessionUser = authInfo.username;
             this.showAuthPrompt = false;
+            this.connectPendingHitlStream();
             return;
           }
           // Session auth enabled but not authenticated — show login prompt
+          this.closePendingHitlStream();
           this.showAuthPrompt = true;
           return;
         }
@@ -234,6 +308,7 @@ document.addEventListener('alpine:init', function() {
       try {
         await OpenFangAPI.get('/api/tools');
         this.showAuthPrompt = false;
+        this.connectPendingHitlStream();
       } catch(e) {
         if (e.message && (e.message.indexOf('Not authorized') >= 0 || e.message.indexOf('401') >= 0 || e.message.indexOf('Missing Authorization') >= 0 || e.message.indexOf('Unauthorized') >= 0)) {
           var saved = localStorage.getItem('openfang-api-key');
@@ -241,6 +316,7 @@ document.addEventListener('alpine:init', function() {
             OpenFangAPI.setAuthToken('');
             localStorage.removeItem('openfang-api-key');
           }
+          this.closePendingHitlStream();
           this.showAuthPrompt = true;
         }
       }
@@ -252,6 +328,7 @@ document.addEventListener('alpine:init', function() {
       localStorage.setItem('openfang-api-key', key.trim());
       this.showAuthPrompt = false;
       this.refreshAgents();
+      this.connectPendingHitlStream();
     },
 
     async sessionLogin(username, password) {
@@ -261,6 +338,7 @@ document.addEventListener('alpine:init', function() {
           this.sessionUser = result.username;
           this.showAuthPrompt = false;
           this.refreshAgents();
+          this.connectPendingHitlStream();
         } else {
           OpenFangToast.error(result.error || 'Login failed');
         }
@@ -275,11 +353,13 @@ document.addEventListener('alpine:init', function() {
       } catch(e) { /* ignore */ }
       this.sessionUser = null;
       this.showAuthPrompt = true;
+      this.closePendingHitlStream();
     },
 
     clearApiKey() {
       OpenFangAPI.setAuthToken('');
       localStorage.removeItem('openfang-api-key');
+      this.closePendingHitlStream();
     }
   });
 });
