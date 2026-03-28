@@ -6122,17 +6122,872 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
       </div>
     </template>
 
-    <!-- Placeholder: Tasks -->
+    <!-- Page: Tasks -->
     <template x-if="page === 'tasks'">
-      <div>
-        <div class="page-header"><h2>Tasks</h2></div>
-        <div class="page-body">
-          <div class="empty-state">
-            <div class="empty-state-icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg></div>
-            <h3>Coming Soon</h3>
-            <p class="text-dim text-xs">Task management will appear here.</p>
+      <div x-data="tasksPage()" x-init="init()">
+        <div class="page-header">
+          <div>
+            <h2>Tasks</h2>
+            <div class="text-xs text-dim">Primary task workspace for durable planning, subtask control, and linked task context.</div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="badge badge-priority-medium" x-show="tasks.length" x-text="tasks.length + ' loaded'"></span>
+            <button class="btn btn-ghost btn-sm" @click="loadTasks({ refreshDetail: true })">Refresh</button>
+            <button class="btn btn-primary btn-sm" @click="openCreateModal()">+ New Task</button>
           </div>
         </div>
+
+        <div class="page-body">
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading tasks...</span></div>
+
+          <div x-show="!loading && loadError" class="error-state">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
+          </div>
+
+          <template x-if="!loading && !loadError">
+            <div class="tasks-layout">
+              <section class="tasks-list">
+                <div class="card tasks-filters">
+                  <div class="tasks-filter-grid">
+                    <div class="form-group">
+                      <label>Status</label>
+                      <select class="form-select" x-model="filterStatus" @change="loadTasks({ refreshDetail: true })">
+                        <template x-for="option in taskStatusOptions" :key="'task-status-' + option.value">
+                          <option :value="option.value" x-text="option.label"></option>
+                        </template>
+                      </select>
+                    </div>
+
+                    <div class="form-group">
+                      <label>Priority</label>
+                      <select class="form-select" x-model="filterPriority" @change="loadTasks({ refreshDetail: true })">
+                        <template x-for="option in priorityOptions" :key="'task-priority-' + option.value">
+                          <option :value="option.value" x-text="option.label"></option>
+                        </template>
+                      </select>
+                    </div>
+
+                    <div class="form-group tasks-filter-search">
+                      <label>Search</label>
+                      <div class="search-input">
+                        <input
+                          type="text"
+                          x-model="searchQuery"
+                          placeholder="Search title, slug, or task ID..."
+                          @input.debounce.300ms="loadTasks({ refreshDetail: true })"
+                        >
+                        <button x-show="searchQuery" @click="searchQuery = ''; loadTasks({ refreshDetail: true })" class="search-clear-btn" title="Clear search">&times;</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="text-xs text-dim">List data is filtered via <span class="font-mono">/api/v1/tasks</span>, then hydrated with task detail for owner, complexity, and created timestamps.</div>
+                </div>
+
+                <div x-show="tasks.length === 0" class="empty-state tasks-empty">
+                  <div class="empty-state-icon">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+                  </div>
+                  <h4>No matching tasks</h4>
+                  <p class="hint">Create a task or widen the status, priority, and search filters to inspect a different slice of durable work.</p>
+                </div>
+
+                <div class="table-wrap" x-show="tasks.length > 0">
+                  <table class="tasks-table">
+                    <thead>
+                      <tr>
+                        <th>Title</th>
+                        <th>Status</th>
+                        <th>Priority</th>
+                        <th>Owner</th>
+                        <th>Complexity</th>
+                        <th>Created</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <template x-for="task in tasks" :key="task.id">
+                        <tr class="tasks-table-row" :class="{ 'is-selected': selectedTaskId === task.id }" @click="selectTask(task.id, true)">
+                          <td>
+                            <div class="tasks-title-cell">
+                              <span class="tasks-title-text" x-text="task.title"></span>
+                              <span class="font-mono text-xs text-dim" x-text="task.slug || task.id"></span>
+                              <div class="tasks-title-meta">
+                                <span class="run-card-chip">ID <span class="font-mono" x-text="task.id"></span></span>
+                                <span class="run-card-chip" x-text="sourceLabel(task.source)"></span>
+                              </div>
+                            </div>
+                          </td>
+                          <td><span :class="statusBadgeClass(task.status)" x-text="statusLabel(task.status)"></span></td>
+                          <td><span :class="priorityBadgeClass(task.priority)" x-text="priorityLabel(task.priority)"></span></td>
+                          <td class="text-xs" x-text="ownerLabel(task.owner)"></td>
+                          <td><span :class="complexityBadgeClass(task.complexity)" x-text="complexityLabel(task.complexity)"></span></td>
+                          <td class="text-xs" x-text="taskCreatedAt(task)"></td>
+                          <td>
+                            <div class="run-action-row">
+                              <button class="btn btn-ghost btn-sm" @click.stop="selectTask(task.id, true)">Open</button>
+                              <button class="btn btn-danger btn-sm" @click.stop="confirmDeleteTask(task)" :disabled="taskDeletingId === task.id">
+                                <span x-text="taskDeletingId === task.id ? 'Deleting...' : 'Delete'"></span>
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <aside class="card tasks-detail">
+                <template x-if="!selectedTaskId">
+                  <div class="empty-state tasks-detail-empty">
+                    <div class="empty-state-icon">
+                      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18"/><path d="M12 3v18"/></svg>
+                    </div>
+                    <h4>Select a task</h4>
+                    <p class="hint">Choose a task to inspect durable metadata, manage subtasks, replan work, and browse linked artifacts, docs, and files.</p>
+                  </div>
+                </template>
+
+                <template x-if="selectedTaskId">
+                  <div>
+                    <div x-show="detailLoading" class="loading-state"><div class="spinner"></div><span>Loading task detail...</span></div>
+
+                    <div x-show="!detailLoading && detailError" class="error-state">
+                      <span class="error-icon">!</span>
+                      <p x-text="detailError"></p>
+                      <button class="btn btn-ghost btn-sm" @click="refreshSelectedTask({ force: true })">Retry</button>
+                    </div>
+
+                    <template x-if="!detailLoading && !detailError && selectedTask">
+                      <div>
+                        <div class="tasks-detail-header">
+                          <div class="tasks-detail-heading">
+                            <div class="text-xs text-dim">Selected Task</div>
+                            <h3 class="tasks-detail-title" x-text="selectedTask.title"></h3>
+                            <div class="tasks-detail-subtitle">
+                              <span class="run-card-chip">Slug <span class="font-mono" x-text="selectedTask.slug"></span></span>
+                              <span class="run-card-chip">ID <span class="font-mono" x-text="selectedTask.id"></span></span>
+                              <span class="run-card-chip" x-show="sourceHint(selectedTask.source)" x-text="sourceHint(selectedTask.source)"></span>
+                            </div>
+                          </div>
+
+                          <div class="tasks-detail-actions">
+                            <div class="run-card-badges">
+                              <span :class="statusBadgeClass(selectedTask.status)" x-text="statusLabel(selectedTask.status)"></span>
+                              <span :class="priorityBadgeClass(selectedTask.priority)" x-text="priorityLabel(selectedTask.priority)"></span>
+                              <span :class="complexityBadgeClass(selectedTask.complexity)" x-text="complexityLabel(selectedTask.complexity)"></span>
+                            </div>
+                            <div class="run-action-row">
+                              <button class="btn btn-ghost btn-sm" @click="refreshSelectedTask({ force: true })">Refresh</button>
+                              <button class="btn btn-ghost btn-sm" @click="copyTaskId(selectedTask)">Copy ID</button>
+                              <button class="btn btn-ghost btn-sm" @click="openEditModal()">Edit</button>
+                              <button class="btn btn-primary btn-sm" @click="openReplanModal()">Replan</button>
+                              <button class="btn btn-danger btn-sm" @click="confirmDeleteTask(selectedTask)" :disabled="taskDeletingId === selectedTask.id">
+                                <span x-text="taskDeletingId === selectedTask.id ? 'Deleting...' : 'Delete'"></span>
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div class="tasks-replan-banner" x-show="replanResult && replanResult.effects">
+                          <span class="badge badge-task-ready">Latest Replan</span>
+                          <p>
+                            Accepted with
+                            <strong x-text="replanResult.effects.created_subtasks"></strong> created,
+                            <strong x-text="replanResult.effects.updated_subtasks"></strong> updated, and
+                            <strong x-text="replanResult.effects.cancelled_subtasks"></strong> cancelled subtasks.
+                          </p>
+                        </div>
+
+                        <div class="tasks-replan-banner" x-show="lastReplanMetadata">
+                          <span class="badge badge-priority-medium">Stored Replan</span>
+                          <p x-text="lastReplanMetadata.reason || 'This task carries replan metadata in its durable record.'"></p>
+                        </div>
+
+                        <div class="detail-grid tasks-detail-grid">
+                          <div class="detail-row"><span class="detail-label">Status</span><span :class="statusBadgeClass(selectedTask.status)" x-text="statusLabel(selectedTask.status)"></span></div>
+                          <div class="detail-row"><span class="detail-label">Priority</span><span :class="priorityBadgeClass(selectedTask.priority)" x-text="priorityLabel(selectedTask.priority)"></span></div>
+                          <div class="detail-row"><span class="detail-label">Complexity</span><span :class="complexityBadgeClass(selectedTask.complexity)" x-text="complexityLabel(selectedTask.complexity)"></span></div>
+                          <div class="detail-row"><span class="detail-label">Owner</span><span class="detail-value" x-text="ownerLabel(selectedTask.owner)"></span></div>
+                          <div class="detail-row"><span class="detail-label">Created By</span><span class="detail-value" x-text="ownerLabel(selectedTask.created_by)"></span></div>
+                          <div class="detail-row"><span class="detail-label">Source</span><span class="detail-value" x-text="sourceLabel(selectedTask.source)"></span></div>
+                          <div class="detail-row"><span class="detail-label">Created</span><span class="detail-value" x-text="taskCreatedAt(selectedTask)"></span></div>
+                          <div class="detail-row"><span class="detail-label">Updated</span><span class="detail-value" x-text="taskUpdatedAt(selectedTask)"></span></div>
+                          <div class="detail-row"><span class="detail-label">Completed</span><span class="detail-value" x-text="selectedTask.completed_at ? formatDateTime(selectedTask.completed_at) : '-'"></span></div>
+                        </div>
+
+                        <div class="tasks-summary-card">
+                          <div class="runs-json-label">Description</div>
+                          <p x-text="selectedTask.description || 'No task description provided.'"></p>
+                        </div>
+
+                        <div class="tasks-context-grid" x-show="selectedTaskRepositoryRefs.length || selectedTaskLabelRefs.length">
+                          <div class="tasks-context-card" x-show="selectedTaskRepositoryRefs.length">
+                            <div class="runs-json-label">Repositories</div>
+                            <div class="tasks-chip-list">
+                              <template x-for="repository in selectedTaskRepositoryRefs" :key="repository.repository_id">
+                                <span class="run-card-chip"><span class="font-mono" x-text="repository.repository_id"></span><span x-show="repository.role" x-text="' · ' + repository.role"></span></span>
+                              </template>
+                            </div>
+                          </div>
+
+                          <div class="tasks-context-card" x-show="selectedTaskLabelRefs.length">
+                            <div class="runs-json-label">Labels</div>
+                            <div class="tasks-chip-list">
+                              <template x-for="label in selectedTaskLabelRefs" :key="label">
+                                <span class="run-card-chip" x-text="label"></span>
+                              </template>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div class="tabs tasks-tabs">
+                          <button class="tab" :class="{ active: selectedTab === 'subtasks' }" @click="setTab('subtasks')">
+                            Subtasks
+                            <span class="badge badge-dim" x-text="subtasks.length"></span>
+                          </button>
+                          <button class="tab" :class="{ active: selectedTab === 'artifacts' }" @click="setTab('artifacts')">
+                            Artifacts
+                            <span class="badge badge-dim" x-text="artifacts.length"></span>
+                          </button>
+                          <button class="tab" :class="{ active: selectedTab === 'docs' }" @click="setTab('docs')">
+                            Docs
+                            <span class="badge badge-dim" x-text="docs.length"></span>
+                          </button>
+                          <button class="tab" :class="{ active: selectedTab === 'files' }" @click="setTab('files')">
+                            Files
+                            <span class="badge badge-dim" x-text="files.length"></span>
+                          </button>
+                        </div>
+
+                        <div class="tasks-tab-panel" x-show="selectedTab === 'subtasks'">
+                          <div class="tasks-panel-header">
+                            <div>
+                              <div class="runs-json-label">Subtasks</div>
+                              <div class="text-xs text-dim">Subtask rows are hydrated from <span class="font-mono">GET /api/v1/subtasks/{id}</span> so dependency badges and inline state controls stay accurate.</div>
+                            </div>
+                            <button class="btn btn-primary btn-sm" @click="openCreateSubtaskModal()">+ Add Subtask</button>
+                          </div>
+
+                          <div x-show="subtasks.length === 0" class="empty-state tasks-empty-inline">
+                            <h4>No subtasks yet</h4>
+                            <p class="hint">Create subtasks to break the task into reviewable, dependency-aware units of work.</p>
+                          </div>
+
+                          <div class="tasks-subtask-list" x-show="subtasks.length > 0">
+                            <template x-for="row in selectedTaskSubtaskRows" :key="row.key">
+                              <article class="tasks-subtask-item">
+                                <div class="tasks-subtask-shell" :style="'padding-left:' + (row.level * 22) + 'px'">
+                                  <div class="tasks-subtask-marker"></div>
+                                  <div class="tasks-subtask-body">
+                                    <div class="tasks-subtask-header">
+                                      <div class="tasks-subtask-heading">
+                                        <h4 x-text="row.subtask.title"></h4>
+                                        <div class="tasks-subtask-meta">
+                                          <span class="run-card-chip">ID <span class="font-mono" x-text="row.subtask.id"></span></span>
+                                          <span class="run-card-chip">Position <span x-text="row.subtask.position"></span></span>
+                                          <span class="run-card-chip" x-text="'Updated ' + (relativeTime(row.subtask.updated_at) || '-')"></span>
+                                        </div>
+                                      </div>
+
+                                      <div class="tasks-subtask-actions">
+                                        <div class="run-card-badges">
+                                          <span :class="subtaskKindBadgeClass(row.subtask.kind)" x-text="titleCase(row.subtask.kind)"></span>
+                                          <span :class="subtaskStatusBadgeClass(row.subtask.status)" x-text="statusLabel(row.subtask.status)"></span>
+                                          <span x-show="row.readiness" :class="readinessBadgeClass(row.readiness)" x-text="readinessLabel(row.readiness)"></span>
+                                          <span class="badge badge-dim" x-show="row.subtask.parallelizable">Parallel</span>
+                                        </div>
+                                        <div class="run-action-row">
+                                          <button class="btn btn-ghost btn-sm" @click="advanceSubtaskStatus(row.subtask)" :disabled="subtaskActionId === 'advance:' + row.subtask.id || !nextSubtaskStatus(row.subtask)">
+                                            <span x-text="subtaskActionId === 'advance:' + row.subtask.id ? 'Saving...' : nextSubtaskStatusLabel(row.subtask)"></span>
+                                          </button>
+                                          <button class="btn btn-ghost btn-sm" @click="openEditSubtaskModal(row.subtask)">Edit</button>
+                                          <button class="btn btn-danger btn-sm" @click="confirmDeleteSubtask(row.subtask)" :disabled="subtaskActionId === 'delete:' + row.subtask.id">
+                                            <span x-text="subtaskActionId === 'delete:' + row.subtask.id ? 'Deleting...' : 'Delete'"></span>
+                                          </button>
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    <p class="tasks-subtask-description" x-text="row.subtask.description || 'No subtask description provided.'"></p>
+
+                                    <div class="tasks-subtask-detail-grid">
+                                      <span class="run-card-chip">Assignee <span x-text="subtaskAssigneeLabel(row.subtask)"></span></span>
+                                      <span class="run-card-chip">Complexity <span x-text="complexityLabel(row.subtask.complexity)"></span></span>
+                                      <span class="run-card-chip">Created <span x-text="formatDateTime(row.subtask.created_at) || '-'"></span></span>
+                                    </div>
+
+                                    <div class="tasks-dependency-stack" x-show="row.dependencies.length">
+                                      <div class="runs-json-label">Depends On</div>
+                                      <div class="tasks-chip-list">
+                                        <template x-for="dependency in row.dependencies" :key="row.subtask.id + ':' + dependency.id">
+                                          <span class="run-card-chip">
+                                            <span class="font-mono" x-text="dependency.id"></span>
+                                            <span x-text="' · ' + titleCase(dependency.status)"></span>
+                                          </span>
+                                        </template>
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                              </article>
+                            </template>
+                          </div>
+                        </div>
+
+                        <div class="tasks-tab-panel" x-show="selectedTab === 'artifacts'">
+                          <div class="tasks-panel-header">
+                            <div>
+                              <div class="runs-json-label">Artifacts</div>
+                              <div class="text-xs text-dim">Projected from <span class="font-mono">OpenFangAPI.v1.tasks.artifacts(id)</span>.</div>
+                            </div>
+                          </div>
+
+                          <div x-show="artifacts.length === 0" class="empty-state tasks-empty-inline">
+                            <h4>No linked artifacts</h4>
+                            <p class="hint">Artifacts referenced by this task will appear here with their current durable version IDs.</p>
+                          </div>
+
+                          <div class="tasks-resource-grid" x-show="artifacts.length > 0">
+                            <template x-for="artifact in artifacts" :key="artifact.artifact_id">
+                              <article class="tasks-resource-card">
+                                <div class="tasks-resource-header">
+                                  <span class="badge badge-info" x-text="titleCase(artifact.type)"></span>
+                                </div>
+                                <h4 class="font-mono" x-text="artifact.artifact_id"></h4>
+                                <p class="text-xs text-dim" x-text="'Current version: ' + resourceVersionLabel(artifact)"></p>
+                              </article>
+                            </template>
+                          </div>
+                        </div>
+
+                        <div class="tasks-tab-panel" x-show="selectedTab === 'docs'">
+                          <div class="tasks-panel-header">
+                            <div>
+                              <div class="runs-json-label">Docs</div>
+                              <div class="text-xs text-dim">Projected from <span class="font-mono">OpenFangAPI.v1.tasks.docs(id)</span>.</div>
+                            </div>
+                          </div>
+
+                          <div x-show="docs.length === 0" class="empty-state tasks-empty-inline">
+                            <h4>No linked docs</h4>
+                            <p class="hint">Document references attached to the task will show their type and current version here.</p>
+                          </div>
+
+                          <div class="tasks-resource-grid" x-show="docs.length > 0">
+                            <template x-for="doc in docs" :key="doc.doc_id">
+                              <article class="tasks-resource-card">
+                                <div class="tasks-resource-header">
+                                  <span class="badge badge-info" x-text="titleCase(doc.type)"></span>
+                                </div>
+                                <h4 class="font-mono" x-text="doc.doc_id"></h4>
+                                <p class="text-xs text-dim" x-text="'Current version: ' + resourceVersionLabel(doc)"></p>
+                              </article>
+                            </template>
+                          </div>
+                        </div>
+
+                        <div class="tasks-tab-panel" x-show="selectedTab === 'files'">
+                          <div class="tasks-panel-header">
+                            <div>
+                              <div class="runs-json-label">Files</div>
+                              <div class="text-xs text-dim">Projected from <span class="font-mono">OpenFangAPI.v1.tasks.files(id)</span>.</div>
+                            </div>
+                          </div>
+
+                          <div x-show="files.length === 0" class="empty-state tasks-empty-inline">
+                            <h4>No linked files</h4>
+                            <p class="hint">Workspace file references will appear here with their path, kind, and optional description.</p>
+                          </div>
+
+                          <div class="tasks-resource-grid" x-show="files.length > 0">
+                            <template x-for="file in files" :key="file.path">
+                              <article class="tasks-resource-card">
+                                <div class="tasks-resource-header">
+                                  <span class="badge badge-dim" x-text="titleCase(file.kind)"></span>
+                                </div>
+                                <h4 class="font-mono" x-text="file.path"></h4>
+                                <p class="text-xs text-dim" x-text="file.description || 'No description provided.'"></p>
+                              </article>
+                            </template>
+                          </div>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </aside>
+            </div>
+          </template>
+        </div>
+
+        <template x-if="showCreateModal">
+          <div class="modal-overlay" @click.self="closeCreateModal()" @keydown.escape.window="closeCreateModal()">
+            <div class="modal" style="max-width:640px">
+              <div class="modal-header">
+                <h3>Create Task</h3>
+                <button class="modal-close" @click="closeCreateModal()">&times;</button>
+              </div>
+
+              <div class="tasks-modal-grid">
+                <div class="form-group">
+                  <label>Title</label>
+                  <input class="form-input" x-model="createForm.title" placeholder="Prepare onboarding task breakdown">
+                </div>
+
+                <div class="form-group">
+                  <label>Slug</label>
+                  <input class="form-input font-mono" x-model="createForm.slug" placeholder="auto-generated from title">
+                </div>
+
+                <div class="form-group tasks-modal-full">
+                  <label>Description</label>
+                  <textarea class="form-textarea" x-model="createForm.description" placeholder="Describe the durable work item and intended outcome."></textarea>
+                </div>
+
+                <div class="form-group">
+                  <label>Priority</label>
+                  <select class="form-select" x-model="createForm.priority">
+                    <template x-for="option in priorityOptions.slice(1)" :key="'create-priority-' + option.value">
+                      <option :value="option.value" x-text="option.label"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Complexity</label>
+                  <select class="form-select" x-model="createForm.complexity">
+                    <template x-for="option in complexityOptions" :key="'create-complexity-' + option.value">
+                      <option :value="option.value" x-text="option.label"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Owner Kind</label>
+                  <select class="form-select" x-model="createForm.ownerKind">
+                    <template x-for="option in ownerKindOptions" :key="'create-owner-kind-' + option.value">
+                      <option :value="option.value" x-text="option.label"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Owner</label>
+                  <input class="form-input" x-model="createForm.ownerRef" placeholder="sdlc">
+                </div>
+              </div>
+
+              <div class="run-action-row">
+                <button class="btn btn-ghost" @click="closeCreateModal()">Cancel</button>
+                <button class="btn btn-primary" @click="createTask()" :disabled="taskSubmitting">
+                  <span x-text="taskSubmitting ? 'Creating...' : 'Create Task'"></span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <template x-if="showEditModal">
+          <div class="modal-overlay" @click.self="closeEditModal()" @keydown.escape.window="closeEditModal()">
+            <div class="modal" style="max-width:700px">
+              <div class="modal-header">
+                <h3>Edit Task</h3>
+                <button class="modal-close" @click="closeEditModal()">&times;</button>
+              </div>
+
+              <div class="tasks-modal-grid">
+                <div class="form-group">
+                  <label>Title</label>
+                  <input class="form-input" x-model="editForm.title">
+                </div>
+
+                <div class="form-group">
+                  <label>Slug</label>
+                  <input class="form-input font-mono" x-model="editForm.slug">
+                </div>
+
+                <div class="form-group tasks-modal-full">
+                  <label>Description</label>
+                  <textarea class="form-textarea" x-model="editForm.description"></textarea>
+                </div>
+
+                <div class="form-group">
+                  <label>Status</label>
+                  <select class="form-select" x-model="editForm.status">
+                    <template x-for="option in editTaskStatusOptions" :key="'edit-status-' + option.value">
+                      <option :value="option.value" x-text="option.label"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Priority</label>
+                  <select class="form-select" x-model="editForm.priority">
+                    <template x-for="option in priorityOptions.slice(1)" :key="'edit-priority-' + option.value">
+                      <option :value="option.value" x-text="option.label"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Complexity</label>
+                  <select class="form-select" x-model="editForm.complexity">
+                    <template x-for="option in complexityOptions" :key="'edit-complexity-' + option.value">
+                      <option :value="option.value" x-text="option.label"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Owner Kind</label>
+                  <select class="form-select" x-model="editForm.ownerKind">
+                    <template x-for="option in ownerKindOptions" :key="'edit-owner-kind-' + option.value">
+                      <option :value="option.value" x-text="option.label"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Owner</label>
+                  <input class="form-input" x-model="editForm.ownerRef">
+                </div>
+              </div>
+
+              <div class="run-action-row">
+                <button class="btn btn-ghost" @click="closeEditModal()">Cancel</button>
+                <button class="btn btn-primary" @click="saveTask()" :disabled="taskSubmitting">
+                  <span x-text="taskSubmitting ? 'Saving...' : 'Save Changes'"></span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <template x-if="showSubtaskModal">
+          <div class="modal-overlay" @click.self="closeSubtaskModal()" @keydown.escape.window="closeSubtaskModal()">
+            <div class="modal" style="max-width:760px">
+              <div class="modal-header">
+                <h3 x-text="editingSubtaskId ? 'Edit Subtask' : 'Create Subtask'"></h3>
+                <button class="modal-close" @click="closeSubtaskModal()">&times;</button>
+              </div>
+
+              <div class="tasks-modal-grid">
+                <div class="form-group">
+                  <label>Subtask ID</label>
+                  <input class="form-input font-mono" x-model="subtaskForm.id" placeholder="optional explicit id">
+                </div>
+
+                <div class="form-group">
+                  <label>Position</label>
+                  <input class="form-input" x-model="subtaskForm.position" placeholder="auto">
+                </div>
+
+                <div class="form-group tasks-modal-full">
+                  <label>Title</label>
+                  <input class="form-input" x-model="subtaskForm.title" placeholder="Draft initial PRD outline">
+                </div>
+
+                <div class="form-group tasks-modal-full">
+                  <label>Description</label>
+                  <textarea class="form-textarea" x-model="subtaskForm.description" placeholder="Describe the expected outcome or deliverable."></textarea>
+                </div>
+
+                <div class="form-group">
+                  <label>Kind</label>
+                  <select class="form-select" x-model="subtaskForm.kind">
+                    <template x-for="option in subtaskKindOptions" :key="'subtask-kind-' + option.value">
+                      <option :value="option.value" x-text="option.label"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Status</label>
+                  <select class="form-select" x-model="subtaskForm.status">
+                    <template x-for="option in subtaskStatusOptions" :key="'subtask-status-' + option.value">
+                      <option :value="option.value" x-text="option.label"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Complexity</label>
+                  <select class="form-select" x-model="subtaskForm.complexity">
+                    <template x-for="option in complexityOptions" :key="'subtask-complexity-' + option.value">
+                      <option :value="option.value" x-text="option.label"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Parallelizable</label>
+                  <label class="form-checkbox tasks-checkbox">
+                    <input type="checkbox" x-model="subtaskForm.parallelizable">
+                    <span>Allow this subtask to run in parallel when dependencies are satisfied.</span>
+                  </label>
+                </div>
+
+                <div class="form-group">
+                  <label>Assignee Kind</label>
+                  <select class="form-select" x-model="subtaskForm.assigneeKind">
+                    <template x-for="option in ownerKindOptions" :key="'assignee-kind-' + option.value">
+                      <option :value="option.value" x-text="option.label"></option>
+                    </template>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Assignee Ref</label>
+                  <input class="form-input" x-model="subtaskForm.assigneeRef" placeholder="prd-writer">
+                </div>
+
+                <div class="form-group tasks-modal-full">
+                  <label>Depends On</label>
+                  <textarea class="form-textarea tasks-code-input" x-model="subtaskForm.dependsOnText" placeholder="One subtask ID per line or comma-separated list"></textarea>
+                </div>
+              </div>
+
+              <div class="run-action-row">
+                <button class="btn btn-ghost" @click="closeSubtaskModal()">Cancel</button>
+                <button class="btn btn-primary" @click="saveSubtask()" :disabled="subtaskSubmitting">
+                  <span x-text="subtaskSubmitting ? 'Saving...' : (editingSubtaskId ? 'Save Subtask' : 'Create Subtask')"></span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <template x-if="showReplanModal">
+          <div class="modal-overlay" @click.self="closeReplanModal()" @keydown.escape.window="closeReplanModal()">
+            <div class="modal" style="max-width:900px">
+              <div class="modal-header">
+                <h3>Replan Task</h3>
+                <button class="modal-close" @click="closeReplanModal()">&times;</button>
+              </div>
+
+              <div class="form-group">
+                <label>Reason</label>
+                <textarea class="form-textarea" x-model="replanForm.reason" placeholder="Explain why the task plan needs to change."></textarea>
+              </div>
+
+              <div class="tasks-replan-grid">
+                <section class="tasks-replan-card">
+                  <div class="tasks-panel-header">
+                    <div>
+                      <div class="runs-json-label">Cancel Subtasks</div>
+                      <div class="text-xs text-dim">Provide one or more durable subtask IDs to cancel atomically.</div>
+                    </div>
+                  </div>
+                  <div class="form-group">
+                    <label>Subtask IDs</label>
+                    <textarea class="form-textarea tasks-code-input" x-model="replanForm.cancelSubtaskIds" placeholder="subtask_001&#10;subtask_002"></textarea>
+                  </div>
+                </section>
+
+                <section class="tasks-replan-card">
+                  <div class="tasks-panel-header">
+                    <div>
+                      <div class="runs-json-label">Create Subtasks</div>
+                      <div class="text-xs text-dim">Add new planned work items with dependency and assignee metadata.</div>
+                    </div>
+                    <button class="btn btn-ghost btn-sm" @click="addReplanCreateItem()">+ Add</button>
+                  </div>
+
+                  <div class="tasks-replan-stack">
+                    <template x-for="(item, index) in replanForm.createItems" :key="'replan-create-' + index">
+                      <article class="tasks-replan-item">
+                        <div class="tasks-replan-item-header">
+                          <span class="badge badge-dim" x-text="'Create #' + (index + 1)"></span>
+                          <button class="btn btn-ghost btn-sm" @click="removeReplanCreateItem(index)">Remove</button>
+                        </div>
+                        <div class="tasks-modal-grid">
+                          <div class="form-group">
+                            <label>ID</label>
+                            <input class="form-input font-mono" x-model="item.id" placeholder="optional">
+                          </div>
+                          <div class="form-group">
+                            <label>Position</label>
+                            <input class="form-input" x-model="item.position" placeholder="auto">
+                          </div>
+                          <div class="form-group tasks-modal-full">
+                            <label>Title</label>
+                            <input class="form-input" x-model="item.title" placeholder="Address review comments">
+                          </div>
+                          <div class="form-group tasks-modal-full">
+                            <label>Description</label>
+                            <textarea class="form-textarea" x-model="item.description"></textarea>
+                          </div>
+                          <div class="form-group">
+                            <label>Kind</label>
+                            <select class="form-select" x-model="item.kind">
+                              <template x-for="option in subtaskKindOptions" :key="'replan-create-kind-' + index + '-' + option.value">
+                                <option :value="option.value" x-text="option.label"></option>
+                              </template>
+                            </select>
+                          </div>
+                          <div class="form-group">
+                            <label>Status</label>
+                            <select class="form-select" x-model="item.status">
+                              <template x-for="option in subtaskStatusOptions" :key="'replan-create-status-' + index + '-' + option.value">
+                                <option :value="option.value" x-text="option.label"></option>
+                              </template>
+                            </select>
+                          </div>
+                          <div class="form-group">
+                            <label>Complexity</label>
+                            <select class="form-select" x-model="item.complexity">
+                              <template x-for="option in complexityOptions" :key="'replan-create-complexity-' + index + '-' + option.value">
+                                <option :value="option.value" x-text="option.label"></option>
+                              </template>
+                            </select>
+                          </div>
+                          <div class="form-group">
+                            <label>Assignee Kind</label>
+                            <select class="form-select" x-model="item.assigneeKind">
+                              <template x-for="option in ownerKindOptions" :key="'replan-create-assignee-kind-' + index + '-' + option.value">
+                                <option :value="option.value" x-text="option.label"></option>
+                              </template>
+                            </select>
+                          </div>
+                          <div class="form-group">
+                            <label>Assignee Ref</label>
+                            <input class="form-input" x-model="item.assigneeRef" placeholder="prd-writer">
+                          </div>
+                          <div class="form-group">
+                            <label>Parallelizable</label>
+                            <label class="form-checkbox tasks-checkbox">
+                              <input type="checkbox" x-model="item.parallelizable">
+                              <span>Allow parallel execution.</span>
+                            </label>
+                          </div>
+                          <div class="form-group tasks-modal-full">
+                            <label>Depends On</label>
+                            <textarea class="form-textarea tasks-code-input" x-model="item.dependsOnText" placeholder="subtask_001"></textarea>
+                          </div>
+                        </div>
+                      </article>
+                    </template>
+                  </div>
+                </section>
+
+                <section class="tasks-replan-card">
+                  <div class="tasks-panel-header">
+                    <div>
+                      <div class="runs-json-label">Update Subtasks</div>
+                      <div class="text-xs text-dim">Patch durable subtask metadata without recreating the subtask.</div>
+                    </div>
+                    <button class="btn btn-ghost btn-sm" @click="addReplanUpdateItem()">+ Add</button>
+                  </div>
+
+                  <div class="tasks-replan-stack">
+                    <template x-for="(item, index) in replanForm.updateItems" :key="'replan-update-' + index">
+                      <article class="tasks-replan-item">
+                        <div class="tasks-replan-item-header">
+                          <span class="badge badge-dim" x-text="'Update #' + (index + 1)"></span>
+                          <button class="btn btn-ghost btn-sm" @click="removeReplanUpdateItem(index)">Remove</button>
+                        </div>
+
+                        <div class="tasks-modal-grid">
+                          <div class="form-group tasks-modal-full">
+                            <label>Subtask ID</label>
+                            <input class="form-input font-mono" x-model="item.id" placeholder="subtask_002">
+                          </div>
+                          <div class="form-group">
+                            <label>Title</label>
+                            <input class="form-input" x-model="item.title" placeholder="optional">
+                          </div>
+                          <div class="form-group">
+                            <label>Position</label>
+                            <input class="form-input" x-model="item.position" placeholder="optional">
+                          </div>
+                          <div class="form-group tasks-modal-full">
+                            <label>Description</label>
+                            <textarea class="form-textarea" x-model="item.description" placeholder="optional"></textarea>
+                          </div>
+                          <div class="form-group">
+                            <label>Kind</label>
+                            <select class="form-select" x-model="item.kind">
+                              <option value="">No change</option>
+                              <template x-for="option in subtaskKindOptions" :key="'replan-update-kind-' + index + '-' + option.value">
+                                <option :value="option.value" x-text="option.label"></option>
+                              </template>
+                            </select>
+                          </div>
+                          <div class="form-group">
+                            <label>Status</label>
+                            <select class="form-select" x-model="item.status">
+                              <option value="">No change</option>
+                              <template x-for="option in subtaskStatusOptions" :key="'replan-update-status-' + index + '-' + option.value">
+                                <option :value="option.value" x-text="option.label"></option>
+                              </template>
+                            </select>
+                          </div>
+                          <div class="form-group">
+                            <label>Complexity</label>
+                            <select class="form-select" x-model="item.complexity">
+                              <option value="">No change</option>
+                              <template x-for="option in complexityOptions" :key="'replan-update-complexity-' + index + '-' + option.value">
+                                <option :value="option.value" x-text="option.label"></option>
+                              </template>
+                            </select>
+                          </div>
+                          <div class="form-group">
+                            <label>Parallelizable</label>
+                            <select class="form-select" x-model="item.parallelizableMode">
+                              <option value="">No change</option>
+                              <option value="true">Set true</option>
+                              <option value="false">Set false</option>
+                            </select>
+                          </div>
+                          <div class="form-group">
+                            <label>Assignee Kind</label>
+                            <select class="form-select" x-model="item.assigneeKind">
+                              <template x-for="option in ownerKindOptions" :key="'replan-update-assignee-kind-' + index + '-' + option.value">
+                                <option :value="option.value" x-text="option.label"></option>
+                              </template>
+                            </select>
+                          </div>
+                          <div class="form-group">
+                            <label>Assignee Ref</label>
+                            <input class="form-input" x-model="item.assigneeRef" placeholder="optional">
+                          </div>
+                          <div class="form-group">
+                            <label>Clear Assignee</label>
+                            <label class="form-checkbox tasks-checkbox">
+                              <input type="checkbox" x-model="item.clearAssignee">
+                              <span>Set assignee to null.</span>
+                            </label>
+                          </div>
+                          <div class="form-group tasks-modal-full">
+                            <label>Depends On</label>
+                            <textarea class="form-textarea tasks-code-input" x-model="item.dependsOnText" placeholder="optional replacement list"></textarea>
+                          </div>
+                          <div class="form-group tasks-modal-full">
+                            <label>Clear Dependencies</label>
+                            <label class="form-checkbox tasks-checkbox">
+                              <input type="checkbox" x-model="item.clearDependencies">
+                              <span>Replace dependency list with an empty array.</span>
+                            </label>
+                          </div>
+                        </div>
+                      </article>
+                    </template>
+                  </div>
+                </section>
+              </div>
+
+              <div class="run-action-row">
+                <button class="btn btn-ghost" @click="closeReplanModal()">Cancel</button>
+                <button class="btn btn-primary" @click="submitReplan()" :disabled="replanSubmitting">
+                  <span x-text="replanSubmitting ? 'Submitting...' : 'Submit Replan'"></span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </template>
       </div>
     </template>
 

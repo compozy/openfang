@@ -125,6 +125,9 @@
       subtasks: function(id, params) {
         return unwrap(OpenFangAPI.get('/api/v1/tasks/' + id + '/subtasks' + qs(params)));
       },
+      createSubtask: function(id, body) {
+        return unwrap(OpenFangAPI.post('/api/v1/tasks/' + id + '/subtasks', body));
+      },
       replan: function(id, body) {
         return unwrap(OpenFangAPI.post('/api/v1/tasks/' + id + '/replan', body));
       },
