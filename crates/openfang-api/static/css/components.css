@@ -242,6 +242,24 @@ tr:hover td { background: var(--surface2); }
   accent-color: var(--accent);
 }
 
+/* Driver Config Section */
+.driver-config-section {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.driver-config-section .form-group {
+  margin-bottom: 6px;
+}
+
+.driver-config-section .form-group:last-child {
+  margin-bottom: 0;
+}
+
 /* Modals */
 .modal-overlay {
   position: fixed;

@@ -1041,6 +1041,7 @@
               <!-- Tabs -->
               <div class="tabs" style="padding:0 16px">
                 <div class="tab" :class="{ active: detailTab === 'info' }" @click="detailTab = 'info'">Info</div>
+                <div class="tab" :class="{ active: detailTab === 'provider' }" @click="detailTab = 'provider'; loadProviderConfig()">Provider</div>
                 <div class="tab" :class="{ active: detailTab === 'runtime' }" @click="detailTab = 'runtime'; loadRuntime()">Runtime</div>
                 <div class="tab" :class="{ active: detailTab === 'sessions' }" @click="detailTab = 'sessions'; loadSessions()">Sessions</div>
                 <div class="tab" :class="{ active: detailTab === 'skills' }" @click="detailTab = 'skills'; loadSkills()">Skills</div>
@@ -1076,6 +1077,51 @@
                       <div class="text-xs font-mono" style="white-space:pre-wrap;max-height:120px;overflow-y:auto;background:var(--surface2);padding:8px;border-radius:var(--radius);flex:1" x-text="selectedAgent.definition && selectedAgent.definition.model ? selectedAgent.definition.model.system_prompt : (selectedAgent.system_prompt || '-')"></div>
                     </div>
                   </div>
+                </div>
+
+                <!-- Provider Config tab -->
+                <div x-show="detailTab === 'provider'">
+                  <div x-show="providerConfigLoading" class="text-center text-dim" style="padding:24px">Loading provider config...</div>
+                  <div x-show="!providerConfigLoading && providerConfigData">
+                    <div class="detail-grid" style="margin-bottom:16px">
+                      <div class="detail-row"><span class="detail-label">Driver</span><span class="badge badge-dim" x-text="providerConfigData.driver"></span></div>
+                      <div class="detail-row"><span class="detail-label">Model</span><span class="detail-value font-mono" x-text="providerConfigData.model"></span></div>
+                      <div class="detail-row"><span class="detail-label">Profile</span><span class="detail-value" x-text="providerConfigData.profile"></span></div>
+                      <div class="detail-row"><span class="detail-label">Reasoning Effort</span><span class="detail-value" x-text="providerConfigData.reasoning_effort"></span></div>
+                      <div class="detail-row"><span class="detail-label">Max Tokens</span><span class="detail-value" x-text="providerConfigData.max_tokens"></span></div>
+                    </div>
+                    <!-- Driver-specific config -->
+                    <template x-if="providerConfigData.config && Object.keys(providerConfigData.config).length > 0">
+                      <div style="margin-bottom:16px">
+                        <div class="text-xs font-bold mb-2">Driver Config</div>
+                        <div class="code-block" style="font-size:11px;max-height:200px;overflow:auto;padding:8px" x-text="formatJson(providerConfigData.config)"></div>
+                      </div>
+                    </template>
+                    <!-- Inline MCP servers -->
+                    <template x-if="providerConfigData.inline_mcp_servers">
+                      <div style="margin-bottom:16px">
+                        <div class="text-xs font-bold mb-2">Inline MCP Servers <span class="badge badge-dim" style="font-size:10px">provider-scoped</span></div>
+                        <div class="code-block" style="font-size:11px;max-height:120px;overflow:auto;padding:8px" x-text="typeof providerConfigData.inline_mcp_servers === 'string' ? providerConfigData.inline_mcp_servers : formatJson(providerConfigData.inline_mcp_servers)"></div>
+                      </div>
+                    </template>
+                    <!-- Compiled Binding expandable -->
+                    <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:8px">
+                      <button class="btn btn-ghost btn-sm" @click="toggleCompiledBinding()" style="font-size:12px">
+                        <span x-text="showCompiledBinding ? 'Hide Compiled Binding' : 'View Compiled Binding'"></span>
+                        <span x-text="showCompiledBinding ? '\u25B2' : '\u25BC'" style="margin-left:4px;font-size:10px"></span>
+                      </button>
+                      <div x-show="showCompiledBinding" style="margin-top:8px">
+                        <div x-show="compiledBindingLoading" class="text-center text-dim" style="padding:12px;font-size:12px">Loading compiled binding...</div>
+                        <template x-if="compiledBindingData && !compiledBindingLoading">
+                          <div>
+                            <pre class="code-block" style="max-height:400px;overflow:auto;font-size:11px" x-text="formatJson(compiledBindingData.binding || compiledBindingData.provider_binding || compiledBindingData)"></pre>
+                          </div>
+                        </template>
+                        <div x-show="!compiledBindingData && !compiledBindingLoading" class="text-dim text-xs" style="padding:8px">No compiled binding available.</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div x-show="!providerConfigLoading && !providerConfigData" class="text-center text-dim" style="padding:24px">No provider config available.</div>
                 </div>
 
                 <!-- Runtime tab -->
@@ -1211,9 +1257,31 @@
               </div>
               <div class="form-group"><label class="form-checkbox"><input type="checkbox" x-model="form.enabled"> Enabled</label></div>
 
-              <!-- Model -->
+              <!-- Provider / Driver -->
               <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:8px">
-                <div class="flex gap-3">
+                <div class="form-group">
+                  <label>Arky Driver</label>
+                  <select class="form-select" x-model="form.arky_driver" @change="onArkyDriverChange()">
+                    <option value="">Legacy (use Provider below)</option>
+                    <optgroup label="Direct Providers">
+                      <option value="codex">Codex (OpenAI CLI)</option>
+                      <option value="claude-code">Claude Code (CLI)</option>
+                    </optgroup>
+                    <optgroup label="Gateway Providers">
+                      <option value="openrouter">OpenRouter</option>
+                      <option value="bedrock">AWS Bedrock</option>
+                      <option value="vertex">GCP Vertex AI</option>
+                      <option value="ollama">Ollama (Local)</option>
+                      <option value="zai">Zai</option>
+                      <option value="vercel">Vercel AI</option>
+                      <option value="moonshot">Moonshot</option>
+                      <option value="minimax">MiniMax</option>
+                    </optgroup>
+                  </select>
+                </div>
+
+                <!-- Legacy provider (shown when no Arky driver) -->
+                <div x-show="!form.arky_driver" class="flex gap-3">
                   <div class="form-group" style="flex:1"><label>Provider</label>
                     <select class="form-select" x-model="form.provider">
                       <template x-for="p in spawnProviders" :key="p.id || p">
@@ -1227,6 +1295,71 @@
                   </div>
                   <div class="form-group" style="flex:1"><label>Model</label><input class="form-input" x-model="form.model" placeholder="llama-3.3-70b-versatile"></div>
                 </div>
+
+                <!-- Arky provider fields (shown when Arky driver selected) -->
+                <div x-show="form.arky_driver">
+                  <!-- Profile picker -->
+                  <div class="flex gap-3">
+                    <div class="form-group" style="flex:1">
+                      <label>Provider Profile <span class="text-dim text-xs">(optional)</span></label>
+                      <select class="form-select" x-model="form.arky_profile_id" @change="onArkyProfileSelect()">
+                        <option value="">None</option>
+                        <template x-for="pp in arkyProfiles" :key="pp.id">
+                          <option :value="pp.id" x-text="pp.name + ' (' + arkyDriverLabel(pp.driver) + ')'"></option>
+                        </template>
+                      </select>
+                    </div>
+                    <div class="form-group" style="flex:1"><label>Model</label><input class="form-input" x-model="form.model" placeholder="model-id"></div>
+                  </div>
+
+                  <!-- Reasoning effort & max_tokens -->
+                  <div class="flex gap-3">
+                    <div class="form-group" style="flex:1">
+                      <label>Reasoning Effort</label>
+                      <select class="form-select" x-model="form.reasoning_effort">
+                        <option value="">None (default)</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="xhigh">XHigh</option>
+                      </select>
+                    </div>
+                    <div class="form-group" style="flex:1">
+                      <label>Max Tokens <span class="text-dim text-xs">(override)</span></label>
+                      <input class="form-input" type="number" x-model="form.max_tokens" placeholder="default">
+                    </div>
+                  </div>
+
+                  <!-- Driver-specific config fields -->
+                  <template x-if="arkyConfigFields().length > 0">
+                    <div class="driver-config-section">
+                      <div class="text-xs font-bold mb-2" style="color:var(--accent-light)">Driver Config</div>
+                      <template x-for="field in arkyConfigFields()" :key="field.key">
+                        <div class="form-group" style="margin-bottom:6px">
+                          <label class="text-xs" x-text="field.label"></label>
+                          <template x-if="field.type === 'select'">
+                            <select class="form-select" x-model="form.driver_config[field.key]">
+                              <option value="">-</option>
+                              <template x-for="opt in field.options" :key="opt">
+                                <option :value="opt" x-text="opt"></option>
+                              </template>
+                            </select>
+                          </template>
+                          <template x-if="field.type === 'toggle'">
+                            <label class="form-checkbox"><input type="checkbox" x-model="form.driver_config[field.key]"> Enabled</label>
+                          </template>
+                          <template x-if="field.type === 'text'">
+                            <input class="form-input" type="text" x-model="form.driver_config[field.key]" :placeholder="field.placeholder || ''">
+                          </template>
+                          <template x-if="field.type === 'number'">
+                            <input class="form-input" type="number" x-model="form.driver_config[field.key]" :placeholder="field.placeholder || ''">
+                          </template>
+                        </div>
+                      </template>
+                    </div>
+                  </template>
+                </div>
+
                 <div class="form-group"><label>System Prompt</label><textarea class="form-textarea" x-model="form.system_prompt" style="height:80px" placeholder="You are a helpful assistant."></textarea></div>
               </div>
 
@@ -3710,6 +3843,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
           <div x-show="!loading && !loadError">
           <div class="tabs" role="tablist">
             <div class="tab" role="tab" :class="{ active: tab === 'providers' }" @click="tab = 'providers'">Providers</div>
+            <div class="tab" role="tab" :class="{ active: tab === 'profiles' }" @click="tab = 'profiles'; loadProviderProfiles()">Profiles</div>
             <div class="tab" role="tab" :class="{ active: tab === 'models' }" @click="tab = 'models'">Models</div>
             <div class="tab" role="tab" :class="{ active: tab === 'config' }" @click="tab = 'config'; if (!configSchema) loadConfigSchema()">Config</div>
             <div class="tabs-separator"></div>
@@ -3819,6 +3953,139 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <h4>No providers found</h4>
               <p class="hint">Provider information could not be loaded. Check that the API is running.</p>
             </div>
+          </div>
+
+          <!-- Provider Profiles tab -->
+          <div x-show="tab === 'profiles'">
+            <div class="info-card">
+              <h4>Provider Profiles</h4>
+              <p>Manage reusable Arky provider profiles. Profiles pre-configure driver, model, defaults, and driver-specific settings that can be selected when spawning agents.</p>
+            </div>
+
+            <div x-show="profilesLoading" class="text-center text-dim" style="padding:24px"><span class="spinner"></span> Loading profiles...</div>
+
+            <div x-show="!profilesLoading">
+              <div class="flex justify-between items-center mb-3">
+                <span class="text-xs text-dim" x-text="providerProfilesList.length + ' profile(s)'"></span>
+                <button class="btn btn-primary btn-sm" @click="openCreateProfile()">+ New Profile</button>
+              </div>
+
+              <!-- Profile cards -->
+              <div class="card-grid">
+                <template x-for="pp in providerProfilesList" :key="pp.id">
+                  <div class="card" style="padding:14px">
+                    <div class="flex justify-between items-center mb-2">
+                      <div class="card-header" style="margin:0;font-size:14px" x-text="pp.name"></div>
+                      <span class="badge badge-dim" x-text="profileDriverLabel(pp.driver)"></span>
+                    </div>
+                    <div class="text-xs text-dim" x-show="pp.model" x-text="'Model: ' + pp.model"></div>
+                    <div class="text-xs text-dim" x-show="pp.defaults && pp.defaults.reasoning_effort" x-text="'Reasoning: ' + pp.defaults.reasoning_effort"></div>
+                    <div class="text-xs text-dim" x-show="pp.defaults && pp.defaults.max_tokens" x-text="'Max tokens: ' + pp.defaults.max_tokens"></div>
+                    <div class="text-xs font-mono text-dim mt-1" x-show="pp.config && Object.keys(pp.config).length > 0" x-text="Object.keys(pp.config).length + ' config field(s)'"></div>
+                    <div class="flex gap-2 mt-3" style="border-top:1px solid var(--border);padding-top:8px">
+                      <button class="btn btn-ghost btn-sm" @click="openEditProfile(pp)">Edit</button>
+                      <button class="btn btn-ghost btn-sm" style="color:var(--error)" @click="deleteProfile(pp)">Delete</button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+
+              <div class="empty-state" x-show="!providerProfilesList.length && !profilesLoading">
+                <h4>No profiles yet</h4>
+                <p class="hint">Create a provider profile to pre-configure driver settings for agents.</p>
+              </div>
+            </div>
+
+            <!-- Create / Edit Profile Modal -->
+            <template x-if="showProfileForm">
+              <div class="modal-overlay" @click.self="showProfileForm = false" @keydown.escape.window="showProfileForm = false">
+                <div class="modal" style="max-width:560px;max-height:85vh;overflow-y:auto">
+                  <div class="modal-header">
+                    <h3 x-text="editingProfileId ? 'Edit Profile' : 'Create Profile'"></h3>
+                    <button class="modal-close" @click="showProfileForm = false">&times;</button>
+                  </div>
+
+                  <div class="form-group"><label>Name *</label><input class="form-input" x-model="profileForm.name" placeholder="my-profile"></div>
+
+                  <div class="form-group">
+                    <label>Driver *</label>
+                    <select class="form-select" x-model="profileForm.driver">
+                      <option value="">Select driver...</option>
+                      <optgroup label="Direct Providers">
+                        <option value="codex">Codex (OpenAI CLI)</option>
+                        <option value="claude-code">Claude Code (CLI)</option>
+                      </optgroup>
+                      <optgroup label="Gateway Providers">
+                        <option value="openrouter">OpenRouter</option>
+                        <option value="bedrock">AWS Bedrock</option>
+                        <option value="vertex">GCP Vertex AI</option>
+                        <option value="ollama">Ollama (Local)</option>
+                        <option value="zai">Zai</option>
+                        <option value="vercel">Vercel AI</option>
+                        <option value="moonshot">Moonshot</option>
+                        <option value="minimax">MiniMax</option>
+                      </optgroup>
+                    </select>
+                  </div>
+
+                  <div class="form-group"><label>Model</label><input class="form-input" x-model="profileForm.model" placeholder="model-id (optional)"></div>
+
+                  <div class="flex gap-3">
+                    <div class="form-group" style="flex:1">
+                      <label>Reasoning Effort</label>
+                      <select class="form-select" x-model="profileForm.defaults.reasoning_effort">
+                        <option value="">None</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="xhigh">XHigh</option>
+                      </select>
+                    </div>
+                    <div class="form-group" style="flex:1">
+                      <label>Max Tokens</label>
+                      <input class="form-input" type="number" x-model="profileForm.defaults.max_tokens" placeholder="default">
+                    </div>
+                  </div>
+
+                  <!-- Driver-specific config -->
+                  <template x-if="profileForm.driver && profileDriverConfigFields(profileForm.driver).length > 0">
+                    <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:8px">
+                      <div class="text-xs font-bold mb-2" style="color:var(--accent-light)">Driver Config</div>
+                      <template x-for="field in profileDriverConfigFields(profileForm.driver)" :key="field.key">
+                        <div class="form-group" style="margin-bottom:6px">
+                          <label class="text-xs" x-text="field.label"></label>
+                          <template x-if="field.type === 'select'">
+                            <select class="form-select" x-model="profileForm.config[field.key]">
+                              <option value="">-</option>
+                              <template x-for="opt in field.options" :key="opt">
+                                <option :value="opt" x-text="opt"></option>
+                              </template>
+                            </select>
+                          </template>
+                          <template x-if="field.type === 'toggle'">
+                            <label class="form-checkbox"><input type="checkbox" x-model="profileForm.config[field.key]"> Enabled</label>
+                          </template>
+                          <template x-if="field.type === 'text'">
+                            <input class="form-input" type="text" x-model="profileForm.config[field.key]" :placeholder="field.placeholder || ''">
+                          </template>
+                          <template x-if="field.type === 'number'">
+                            <input class="form-input" type="number" x-model="profileForm.config[field.key]" :placeholder="field.placeholder || ''">
+                          </template>
+                        </div>
+                      </template>
+                    </div>
+                  </template>
+
+                  <div class="flex gap-2 mt-4" style="border-top:1px solid var(--border);padding-top:16px">
+                    <button class="btn btn-primary" @click="saveProfile()" :disabled="profileSaving">
+                      <span x-show="!profileSaving" x-text="editingProfileId ? 'Save' : 'Create'"></span>
+                      <span x-show="profileSaving">Saving...</span>
+                    </button>
+                    <button class="btn btn-ghost" @click="showProfileForm = false">Cancel</button>
+                  </div>
+                </div>
+              </div>
+            </template>
           </div>
 
           <!-- Models tab -->

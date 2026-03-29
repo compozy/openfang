@@ -151,6 +151,14 @@ function settingsPage() {
     peersLoadError: '',
     _peerPollTimer: null,
 
+    // -- Provider Profiles state --
+    providerProfilesList: [],
+    profilesLoading: false,
+    showProfileForm: false,
+    editingProfileId: '',
+    profileForm: { name: '', driver: '', model: '', defaults: { max_tokens: null, reasoning_effort: '' }, config: {} },
+    profileSaving: false,
+
     // -- Migration state --
     migStep: 'intro',
     detecting: false,
@@ -540,6 +548,165 @@ function settingsPage() {
         OpenFangToast.error('Failed to add provider: ' + e.message);
       }
       this.addingCustomProvider = false;
+    },
+
+    // -- Provider Profiles methods --
+    async loadProviderProfiles() {
+      this.profilesLoading = true;
+      try {
+        var resp = await OpenFangAPI.v1.providerProfiles.list();
+        this.providerProfilesList = Array.isArray(resp) ? resp : (resp.items || resp.profiles || []);
+      } catch(_) {
+        this.providerProfilesList = [];
+      }
+      this.profilesLoading = false;
+    },
+
+    resetProfileForm() {
+      this.editingProfileId = '';
+      this.profileForm = {
+        name: '', driver: '', model: '',
+        defaults: { max_tokens: null, reasoning_effort: '' },
+        config: {}
+      };
+    },
+
+    openCreateProfile() {
+      this.resetProfileForm();
+      this.showProfileForm = true;
+    },
+
+    openEditProfile(profile) {
+      this.editingProfileId = profile.id;
+      this.profileForm = {
+        name: profile.name || '',
+        driver: profile.driver || '',
+        model: profile.model || '',
+        defaults: {
+          max_tokens: (profile.defaults && profile.defaults.max_tokens) || null,
+          reasoning_effort: (profile.defaults && profile.defaults.reasoning_effort) || ''
+        },
+        config: Object.assign({}, profile.config || {})
+      };
+      this.showProfileForm = true;
+    },
+
+    profileDriverGroup(driver) {
+      if (driver === 'codex' || driver === 'claude-code') return 'direct';
+      return 'gateway';
+    },
+
+    profileDriverConfigFields(driver) {
+      if (driver === 'codex') {
+        return [
+          { key: 'sandbox_mode', label: 'Sandbox Mode', type: 'select', options: ['safe', 'unsafe'] },
+          { key: 'web_search', label: 'Web Search', type: 'toggle' },
+          { key: 'reasoning_summary', label: 'Reasoning Summary', type: 'select', options: ['off', 'brief', 'full'] }
+        ];
+      }
+      if (driver === 'claude-code') {
+        return [
+          { key: 'allowed_tools', label: 'Allowed Tools', type: 'text', placeholder: 'comma-separated tool names' },
+          { key: 'disallowed_tools', label: 'Disallowed Tools', type: 'text', placeholder: 'comma-separated tool names' },
+          { key: 'max_budget_usd', label: 'Max Budget (USD)', type: 'number' },
+          { key: 'fallback_model', label: 'Fallback Model', type: 'text', placeholder: 'model-id' },
+          { key: 'mcp_servers', label: 'MCP Servers', type: 'text', placeholder: 'comma-separated server names' }
+        ];
+      }
+      if (driver === 'bedrock' || driver === 'vertex') {
+        var fields = [
+          { key: 'selected_model', label: 'Model ID', type: 'text', placeholder: 'provider-specific model ID' },
+          { key: 'region', label: 'Region', type: 'text', placeholder: 'e.g. us-east-1' }
+        ];
+        if (driver === 'vertex') {
+          fields.push({ key: 'project_id', label: 'Project ID', type: 'text', placeholder: 'GCP project ID' });
+        }
+        return fields;
+      }
+      // Gateway claude-compatible drivers
+      if (['openrouter', 'ollama', 'zai', 'vercel', 'moonshot', 'minimax'].indexOf(driver) !== -1) {
+        return [
+          { key: 'selected_model', label: 'Model ID', type: 'text', placeholder: 'provider-specific model ID' },
+          { key: 'allowed_tools', label: 'Allowed Tools', type: 'text', placeholder: 'comma-separated tool names' },
+          { key: 'disallowed_tools', label: 'Disallowed Tools', type: 'text', placeholder: 'comma-separated tool names' },
+          { key: 'max_budget_usd', label: 'Max Budget (USD)', type: 'number' },
+          { key: 'fallback_model', label: 'Fallback Model', type: 'text', placeholder: 'model-id' }
+        ];
+      }
+      return [];
+    },
+
+    async saveProfile() {
+      if (!this.profileForm.name.trim()) {
+        OpenFangToast.warn('Profile name is required');
+        return;
+      }
+      if (!this.profileForm.driver) {
+        OpenFangToast.warn('Please select a driver');
+        return;
+      }
+      this.profileSaving = true;
+      try {
+        var body = {
+          name: this.profileForm.name.trim(),
+          driver: this.profileForm.driver,
+          model: this.profileForm.model.trim() || undefined,
+          defaults: {},
+          config: Object.assign({}, this.profileForm.config)
+        };
+        if (this.profileForm.defaults.max_tokens) {
+          body.defaults.max_tokens = parseInt(this.profileForm.defaults.max_tokens, 10) || undefined;
+        }
+        if (this.profileForm.defaults.reasoning_effort) {
+          body.defaults.reasoning_effort = this.profileForm.defaults.reasoning_effort;
+        }
+        if (this.editingProfileId) {
+          await OpenFangAPI.v1.providerProfiles.update(this.editingProfileId, body);
+          OpenFangToast.success('Profile updated: ' + body.name);
+        } else {
+          await OpenFangAPI.v1.providerProfiles.create(body);
+          OpenFangToast.success('Profile created: ' + body.name);
+        }
+        this.showProfileForm = false;
+        this.resetProfileForm();
+        await this.loadProviderProfiles();
+      } catch(e) {
+        OpenFangToast.error('Failed to save profile: ' + (e.message || 'Unknown error'));
+      }
+      this.profileSaving = false;
+    },
+
+    deleteProfile(profile) {
+      var self = this;
+      OpenFangToast.confirm(
+        'Delete Profile',
+        'Delete provider profile "' + (profile.name || profile.id) + '"? This cannot be undone.',
+        async function() {
+          try {
+            await OpenFangAPI.v1.providerProfiles.delete(profile.id);
+            OpenFangToast.success('Profile deleted');
+            await self.loadProviderProfiles();
+          } catch(e) {
+            OpenFangToast.error('Failed to delete profile: ' + (e.message || 'Unknown error'));
+          }
+        }
+      );
+    },
+
+    profileDriverLabel(driver) {
+      var labels = {
+        'codex': 'Codex (OpenAI CLI)',
+        'claude-code': 'Claude Code (CLI)',
+        'openrouter': 'OpenRouter',
+        'bedrock': 'AWS Bedrock',
+        'vertex': 'GCP Vertex AI',
+        'ollama': 'Ollama (Local)',
+        'zai': 'Zai',
+        'vercel': 'Vercel AI',
+        'moonshot': 'Moonshot',
+        'minimax': 'MiniMax'
+      };
+      return labels[driver] || driver || '-';
     },
 
     // -- Security methods --

@@ -4,6 +4,69 @@
 
 // ── Helpers ──
 
+// ── Arky Driver Definitions ──
+
+var ARKY_DRIVERS = [
+  { id: 'codex', label: 'Codex (OpenAI CLI)', group: 'direct' },
+  { id: 'claude-code', label: 'Claude Code (CLI)', group: 'direct' },
+  { id: 'openrouter', label: 'OpenRouter', group: 'gateway' },
+  { id: 'bedrock', label: 'AWS Bedrock', group: 'gateway' },
+  { id: 'vertex', label: 'GCP Vertex AI', group: 'gateway' },
+  { id: 'ollama', label: 'Ollama (Local)', group: 'gateway' },
+  { id: 'zai', label: 'Zai', group: 'gateway' },
+  { id: 'vercel', label: 'Vercel AI', group: 'gateway' },
+  { id: 'moonshot', label: 'Moonshot', group: 'gateway' },
+  { id: 'minimax', label: 'MiniMax', group: 'gateway' }
+];
+
+var REASONING_EFFORT_OPTIONS = [
+  { value: '', label: 'None (default)' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'XHigh' }
+];
+
+function arkyDriverConfigFields(driver) {
+  if (driver === 'codex') {
+    return [
+      { key: 'sandbox_mode', label: 'Sandbox Mode', type: 'select', options: ['safe', 'unsafe'] },
+      { key: 'web_search', label: 'Web Search', type: 'toggle' },
+      { key: 'reasoning_summary', label: 'Reasoning Summary', type: 'select', options: ['off', 'brief', 'full'] }
+    ];
+  }
+  if (driver === 'claude-code') {
+    return [
+      { key: 'allowed_tools', label: 'Allowed Tools', type: 'text', placeholder: 'comma-separated tool names' },
+      { key: 'disallowed_tools', label: 'Disallowed Tools', type: 'text', placeholder: 'comma-separated tool names' },
+      { key: 'max_budget_usd', label: 'Max Budget (USD)', type: 'number' },
+      { key: 'fallback_model', label: 'Fallback Model', type: 'text', placeholder: 'model-id' },
+      { key: 'mcp_servers', label: 'Inline MCP Servers', type: 'text', placeholder: 'comma-separated server names' }
+    ];
+  }
+  if (driver === 'bedrock' || driver === 'vertex') {
+    var fields = [
+      { key: 'selected_model', label: 'Model ID', type: 'text', placeholder: 'provider-specific model ID' },
+      { key: 'region', label: 'Region', type: 'text', placeholder: 'e.g. us-east-1' }
+    ];
+    if (driver === 'vertex') {
+      fields.push({ key: 'project_id', label: 'Project ID', type: 'text', placeholder: 'GCP project ID' });
+    }
+    return fields;
+  }
+  // Gateway claude-compatible drivers
+  if (['openrouter', 'ollama', 'zai', 'vercel', 'moonshot', 'minimax'].indexOf(driver) !== -1) {
+    return [
+      { key: 'selected_model', label: 'Model ID', type: 'text', placeholder: 'provider-specific model ID' },
+      { key: 'allowed_tools', label: 'Allowed Tools', type: 'text', placeholder: 'comma-separated tool names' },
+      { key: 'disallowed_tools', label: 'Disallowed Tools', type: 'text', placeholder: 'comma-separated tool names' },
+      { key: 'max_budget_usd', label: 'Max Budget (USD)', type: 'number' },
+      { key: 'fallback_model', label: 'Fallback Model', type: 'text', placeholder: 'model-id' }
+    ];
+  }
+  return [];
+}
+
 function agentUiDefaultForm() {
   return {
     name: '',
@@ -16,6 +79,12 @@ function agentUiDefaultForm() {
     provider: 'groq',
     model: 'llama-3.3-70b-versatile',
     system_prompt: 'You are a helpful assistant.',
+    // Arky provider fields
+    arky_driver: '',
+    arky_profile_id: '',
+    reasoning_effort: '',
+    max_tokens: '',
+    driver_config: {},
     emoji: '',
     color: '#FF5C00',
     archetype: '',
@@ -65,6 +134,30 @@ function agentUiBuildDefinition(form) {
     if (form.caps_shell) def.capabilities.shell = ['*'];
     if (form.caps_agent_spawn) def.capabilities.agent_spawn = true;
   }
+  // Arky provider block
+  if (form.arky_driver) {
+    def.provider = { driver: form.arky_driver };
+    if (form.model.trim()) def.provider.model = form.model.trim();
+    if (form.arky_profile_id) def.provider.profile = form.arky_profile_id;
+    var defaults = {};
+    if (form.reasoning_effort) defaults.reasoning_effort = form.reasoning_effort;
+    if (form.max_tokens && parseInt(form.max_tokens, 10) > 0) {
+      defaults.max_tokens = parseInt(form.max_tokens, 10);
+    }
+    if (Object.keys(defaults).length) def.provider.defaults = defaults;
+    if (form.driver_config && Object.keys(form.driver_config).length) {
+      var cleanConfig = {};
+      var configKeys = Object.keys(form.driver_config);
+      for (var ci = 0; ci < configKeys.length; ci++) {
+        var ck = configKeys[ci];
+        var cv = form.driver_config[ck];
+        if (cv !== '' && cv !== null && cv !== undefined) {
+          cleanConfig[ck] = cv;
+        }
+      }
+      if (Object.keys(cleanConfig).length) def.provider.config = cleanConfig;
+    }
+  }
   return def;
 }
 
@@ -90,6 +183,18 @@ function agentUiHydrateForm(resource) {
     form.provider = def.model_provider || 'groq';
     form.model = def.model_name || '';
     form.system_prompt = def.system_prompt || '';
+  }
+
+  // Arky provider fields
+  if (def.provider && typeof def.provider === 'object') {
+    form.arky_driver = def.provider.driver || '';
+    form.arky_profile_id = def.provider.profile || '';
+    if (def.provider.model) form.model = def.provider.model;
+    if (def.provider.defaults) {
+      form.reasoning_effort = def.provider.defaults.reasoning_effort || '';
+      form.max_tokens = def.provider.defaults.max_tokens ? String(def.provider.defaults.max_tokens) : '';
+    }
+    form.driver_config = Object.assign({}, def.provider.config || {});
   }
 
   if (def.identity) {
@@ -216,6 +321,17 @@ function agentsPage() {
     // --- Providers ---
     spawnProviders: [],
     spawnProvidersLoading: false,
+
+    // --- Arky Provider Profiles ---
+    arkyProfiles: [],
+    arkyProfilesLoading: false,
+
+    // --- Provider Config (detail panel) ---
+    providerConfigData: null,
+    providerConfigLoading: false,
+    showCompiledBinding: false,
+    compiledBindingData: null,
+    compiledBindingLoading: false,
 
     // --- UI helpers ---
     emojiOptions: [
@@ -345,6 +461,101 @@ function agentsPage() {
         this.spawnProviders = [];
       }
       this.spawnProvidersLoading = false;
+    },
+
+    async loadArkyProfiles() {
+      if (this.arkyProfiles.length) return;
+      this.arkyProfilesLoading = true;
+      try {
+        var resp = await OpenFangAPI.v1.providerProfiles.list();
+        this.arkyProfiles = Array.isArray(resp) ? resp : (resp.items || resp.profiles || []);
+      } catch (_) {
+        this.arkyProfiles = [];
+      }
+      this.arkyProfilesLoading = false;
+    },
+
+    arkyDriverLabel(driverId) {
+      for (var i = 0; i < ARKY_DRIVERS.length; i++) {
+        if (ARKY_DRIVERS[i].id === driverId) return ARKY_DRIVERS[i].label;
+      }
+      return driverId || '-';
+    },
+
+    arkyConfigFields() {
+      return arkyDriverConfigFields(this.form.arky_driver);
+    },
+
+    onArkyDriverChange() {
+      // Reset driver-specific config when driver changes
+      this.form.driver_config = {};
+    },
+
+    onArkyProfileSelect() {
+      var profileId = this.form.arky_profile_id;
+      if (!profileId) return;
+      for (var i = 0; i < this.arkyProfiles.length; i++) {
+        var p = this.arkyProfiles[i];
+        if (p.id === profileId) {
+          if (p.driver && !this.form.arky_driver) this.form.arky_driver = p.driver;
+          if (p.model && !this.form.model) this.form.model = p.model;
+          if (p.defaults) {
+            if (p.defaults.reasoning_effort && !this.form.reasoning_effort) {
+              this.form.reasoning_effort = p.defaults.reasoning_effort;
+            }
+            if (p.defaults.max_tokens && !this.form.max_tokens) {
+              this.form.max_tokens = String(p.defaults.max_tokens);
+            }
+          }
+          if (p.config) {
+            this.form.driver_config = Object.assign({}, p.config, this.form.driver_config);
+          }
+          break;
+        }
+      }
+    },
+
+    // Provider config for detail panel
+    async loadProviderConfig() {
+      if (!this.selectedAgentId) return;
+      this.providerConfigLoading = true;
+      this.providerConfigData = null;
+      this.showCompiledBinding = false;
+      this.compiledBindingData = null;
+      try {
+        var agent = await OpenFangAPI.v1.agents.get(this.selectedAgentId);
+        var def = agent.definition || agent;
+        this.providerConfigData = {
+          driver: (def.provider && def.provider.driver) || (def.model && def.model.provider) || '-',
+          model: (def.provider && def.provider.model) || (def.model && def.model.model) || '-',
+          profile: (def.provider && def.provider.profile) || '-',
+          reasoning_effort: (def.provider && def.provider.defaults && def.provider.defaults.reasoning_effort) || '-',
+          max_tokens: (def.provider && def.provider.defaults && def.provider.defaults.max_tokens) || '-',
+          config: (def.provider && def.provider.config) || {},
+          inline_mcp_servers: (def.provider && def.provider.config && def.provider.config.mcp_servers) || null
+        };
+      } catch (_) {
+        this.providerConfigData = null;
+      }
+      this.providerConfigLoading = false;
+    },
+
+    async loadCompiledBinding() {
+      if (!this.selectedAgentId) return;
+      this.compiledBindingLoading = true;
+      try {
+        this.compiledBindingData = await OpenFangAPI.v1.agents.compiled(this.selectedAgentId);
+      } catch (_) {
+        this.compiledBindingData = null;
+      }
+      this.compiledBindingLoading = false;
+    },
+
+    toggleCompiledBinding() {
+      this.showCompiledBinding = !this.showCompiledBinding;
+      if (this.showCompiledBinding && !this.compiledBindingData) {
+        this.loadCompiledBinding();
+      }
     },
 
     // ═══════════════════════════════════════
@@ -538,6 +749,7 @@ function agentsPage() {
       this.compileResult = null;
       this.showFormModal = true;
       this.loadProviders();
+      this.loadArkyProfiles();
     },
 
     openEditForm() {
@@ -548,6 +760,7 @@ function agentsPage() {
       this.compileResult = null;
       this.showFormModal = true;
       this.loadProviders();
+      this.loadArkyProfiles();
     },
 
     async saveAgent() {
