@@ -4081,6 +4081,231 @@ mark.search-highlight {
   text-decoration-color: var(--accent);
 }
 
+/* ── Packs page ── */
+
+.packs-layout {
+  display: grid;
+  grid-template-columns: minmax(340px, 1.05fr) minmax(380px, 1fr);
+  gap: 16px;
+}
+
+.packs-list,
+.packs-detail {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.packs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.packs-detail {
+  padding: 0 !important;
+  overflow-y: auto;
+  max-height: calc(100vh - 140px);
+}
+
+.packs-list-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.packs-card {
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.packs-card:hover {
+  border-color: var(--text-muted);
+}
+
+.packs-card.is-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.packs-card-head {
+  min-width: 0;
+}
+
+.packs-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.packs-card-subtitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.packs-card-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.packs-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.packs-card-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--surface-raised);
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+}
+
+.packs-card-footer {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 8px;
+}
+
+.packs-empty,
+.packs-detail-empty {
+  padding: 32px 16px;
+}
+
+.packs-detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 16px 12px;
+  flex-wrap: wrap;
+}
+
+.packs-detail-heading {
+  min-width: 0;
+}
+
+.packs-detail-title {
+  font-size: 15px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.packs-detail-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.packs-action-row {
+  display: flex;
+  gap: 6px;
+}
+
+.packs-tabs {
+  padding: 0 16px;
+}
+
+.packs-tab-panel {
+  padding: 16px;
+}
+
+.packs-detail-grid {
+  gap: 6px 12px;
+}
+
+.packs-counts-card {
+  padding: 12px;
+}
+
+.packs-counts-grid {
+  display: flex;
+  gap: 24px;
+}
+
+.packs-count-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.packs-count-number {
+  font-size: 20px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+
+.packs-count-forked {
+  color: var(--warn);
+}
+
+.packs-count-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+/* Dry-run effects grid */
+
+.packs-dryrun-summary {
+  padding: 12px;
+  background: var(--surface-raised);
+  border-radius: var(--radius-lg);
+}
+
+.packs-effects-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.packs-effect-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px;
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.packs-effect-number {
+  font-size: 18px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+
+.packs-effect-label {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  text-align: center;
+}
+
+.packs-effect-added .packs-effect-number { color: var(--success); }
+.packs-effect-updated .packs-effect-number { color: var(--accent); }
+.packs-effect-removed .packs-effect-number { color: var(--error); }
+.packs-effect-forks .packs-effect-number { color: var(--text-dim); }
+
+.packs-dryrun-notes {
+  padding: 8px 12px;
+  background: var(--surface);
+  border-radius: var(--radius-md);
+}
+
 .dispatches-layout {
   display: grid;
   grid-template-columns: minmax(360px, 1.05fr) minmax(380px, 1fr);
@@ -4859,6 +5084,19 @@ mark.search-highlight {
 
   .looper-detail {
     position: static;
+  }
+
+  .packs-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .packs-detail {
+    position: static;
+    max-height: none;
+  }
+
+  .packs-effects-grid {
+    grid-template-columns: repeat(2, 1fr);
   }
 
   .dispatches-layout {

@@ -50,14 +50,14 @@
 | Task | Title | Complexity | Dependencies | Status |
 |------|-------|------------|--------------|--------|
 | 12 | Arky Provider Backend (profiles CRUD endpoint) | high | none (Rust) | pending |
-| 13 | Arky Provider UI (profiles, driver config, spawn wizard) | high | 1, 10, 12 | pending |
+| 13 | Arky Provider UI (profiles, driver config, spawn wizard) | high | 1, 10, 12 | completed |
 
 ## Phase 5: Looper + Packs + Artifacts + Docs
 
 | Task | Title | Complexity | Dependencies | Status |
 |------|-------|------------|--------------|--------|
-| 14 | Looper Runs | medium | 1, 2, 6 | pending |
-| 15 | Packs | medium | 1, 2 | pending |
+| 14 | Looper Runs | medium | 1, 2, 6 | completed |
+| 15 | Packs | medium | 1, 2 | completed |
 | 16 | Artifacts & Documents | medium | 1, 2 | pending |
 
 ## Phase 6: Budget + Integrations + Remaining

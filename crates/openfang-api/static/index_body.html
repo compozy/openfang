@@ -8983,15 +8983,297 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
       </div>
     </template>
 
-    <!-- Placeholder: Packs -->
+    <!-- Page: Packs -->
     <template x-if="page === 'packs'">
-      <div>
-        <div class="page-header"><h2>Packs</h2></div>
+      <div x-data="packsPage()" x-init="init()" @page-leave.window="destroy()">
+        <div class="page-header">
+          <div>
+            <h2>Packs</h2>
+            <div class="text-xs text-dim">Manage agent packs — install, upgrade, uninstall, and fork managed objects.</div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="badge badge-run-pending" x-show="packs.length" x-text="packs.length + ' pack' + (packs.length !== 1 ? 's' : '')"></span>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Refresh</button>
+            <button class="btn btn-primary btn-sm" @click="openInstallModal()">+ Install Pack</button>
+          </div>
+        </div>
+
         <div class="page-body">
-          <div class="empty-state">
-            <div class="empty-state-icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96L12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg></div>
-            <h3>Coming Soon</h3>
-            <p class="text-dim text-xs">Agent packs and bundles will appear here.</p>
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading packs...</span></div>
+          <div x-show="!loading && loadError" class="error-state">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
+          </div>
+
+          <template x-if="!loading && !loadError">
+            <div class="packs-layout">
+              <!-- Pack list -->
+              <section class="packs-list">
+                <div x-show="packs.length === 0" class="empty-state packs-empty">
+                  <div class="empty-state-icon">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96L12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg>
+                  </div>
+                  <h4>No packs installed</h4>
+                  <p class="hint">Install a pack to manage agents, workflows, triggers, and templates as a bundle.</p>
+                  <button class="btn btn-primary btn-sm" @click="openInstallModal()" style="margin-top:12px">+ Install Pack</button>
+                </div>
+
+                <div class="packs-list-stack" x-show="packs.length > 0">
+                  <template x-for="pack in packs" :key="pack.id">
+                    <article class="card packs-card" :class="{ 'is-selected': selectedPackId === pack.id }" @click="selectPack(pack.id)">
+                      <div class="flex justify-between items-start gap-2">
+                        <div class="packs-card-head">
+                          <h3 class="packs-card-title" x-text="pack.name || pack.id"></h3>
+                          <div class="packs-card-subtitle">
+                            <span class="font-mono text-xs" x-text="pack.id"></span>
+                            <span class="text-dim text-xs" x-text="'v' + pack.version"></span>
+                          </div>
+                        </div>
+                        <div class="packs-card-badges">
+                          <span :class="sourceBadgeClass(pack.source)" x-text="sourceBadgeText(pack.source)"></span>
+                          <span class="badge badge-success" x-show="pack.installed">Installed</span>
+                          <span class="badge badge-info" x-show="pack.managed">Managed</span>
+                        </div>
+                      </div>
+                      <div class="packs-card-meta">
+                        <span class="packs-card-chip" x-text="objectCountSummary(pack.objects)"></span>
+                      </div>
+                      <div class="packs-card-footer">
+                        <span class="text-xs text-dim" x-text="'Updated ' + relativeTime(pack.updated_at)" :title="formatDateTime(pack.updated_at)"></span>
+                      </div>
+                    </article>
+                  </template>
+                </div>
+              </section>
+
+              <!-- Pack detail -->
+              <aside class="card packs-detail">
+                <template x-if="!selectedPackId">
+                  <div class="empty-state packs-detail-empty">
+                    <div class="empty-state-icon">
+                      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96L12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg>
+                    </div>
+                    <h4>Select a pack</h4>
+                    <p class="hint">Choose a pack from the list to view its manifest, managed objects, and lifecycle actions.</p>
+                  </div>
+                </template>
+
+                <template x-if="selectedPackId">
+                  <div>
+                    <div x-show="detailLoading" class="loading-state"><div class="spinner"></div><span>Loading pack detail...</span></div>
+                    <div x-show="!detailLoading && detailError" class="error-state">
+                      <span class="error-icon">!</span>
+                      <p x-text="detailError"></p>
+                      <button class="btn btn-ghost btn-sm" @click="refreshDetail()">Retry</button>
+                    </div>
+
+                    <template x-if="!detailLoading && !detailError && selectedPack">
+                      <div>
+                        <!-- Detail header -->
+                        <div class="packs-detail-header">
+                          <div class="packs-detail-heading">
+                            <div class="text-xs text-dim">Pack</div>
+                            <h3 class="packs-detail-title" x-text="selectedPack.name || selectedPack.id"></h3>
+                            <div class="packs-card-subtitle">
+                              <span class="font-mono" x-text="selectedPack.id"></span>
+                              <span class="text-dim" x-text="'v' + selectedPack.version"></span>
+                            </div>
+                          </div>
+                          <div class="packs-detail-actions">
+                            <div class="packs-card-badges">
+                              <span :class="sourceBadgeClass(selectedPack.source)" x-text="sourceBadgeText(selectedPack.source)"></span>
+                              <span class="badge badge-success" x-show="selectedPack.installed">Installed</span>
+                            </div>
+                            <div class="packs-action-row">
+                              <button class="btn btn-ghost btn-sm" @click="openUpgradeModal(selectedPack.id)">Upgrade</button>
+                              <button class="btn btn-danger btn-sm" @click="uninstallPack(selectedPack.id)">Uninstall</button>
+                            </div>
+                          </div>
+                        </div>
+
+                        <!-- Tabs -->
+                        <div class="tabs packs-tabs">
+                          <button class="tab" :class="{ active: selectedTab === 'detail' }" @click="setTab('detail')">Manifest</button>
+                          <button class="tab" :class="{ active: selectedTab === 'objects' }" @click="setTab('objects')">Objects <span class="text-xs text-dim" x-text="'(' + objects.length + ')'"></span></button>
+                        </div>
+
+                        <!-- Tab: Manifest -->
+                        <div class="packs-tab-panel" x-show="selectedTab === 'detail'">
+                          <div class="detail-grid packs-detail-grid">
+                            <div class="detail-row"><span class="detail-label">ID</span><span class="detail-value font-mono" x-text="selectedPack.id"></span></div>
+                            <div class="detail-row"><span class="detail-label">Name</span><span class="detail-value" x-text="selectedPack.name"></span></div>
+                            <div class="detail-row"><span class="detail-label">Version</span><span class="detail-value font-mono" x-text="selectedPack.version"></span></div>
+                            <div class="detail-row"><span class="detail-label">Description</span><span class="detail-value" x-text="selectedPack.description || '-'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Source</span><span :class="sourceBadgeClass(selectedPack.source)" x-text="sourceBadgeText(selectedPack.source)"></span></div>
+                            <div class="detail-row"><span class="detail-label">Installed</span><span class="detail-value" x-text="selectedPack.installed ? 'Yes' : 'No'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Managed</span><span class="detail-value" x-text="selectedPack.managed ? 'Yes' : 'No'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Updated</span><span class="detail-value" x-text="formatDateTime(selectedPack.updated_at) || '-'"></span></div>
+                          </div>
+
+                          <div class="card packs-counts-card" style="margin-top:16px">
+                            <div class="card-header" style="margin-bottom:8px">Object Counts</div>
+                            <div class="packs-counts-grid">
+                              <div class="packs-count-item">
+                                <span class="packs-count-number" x-text="selectedPack.objects ? selectedPack.objects.length : 0"></span>
+                                <span class="packs-count-label">Total</span>
+                              </div>
+                              <div class="packs-count-item" x-show="forkedCount > 0">
+                                <span class="packs-count-number packs-count-forked" x-text="forkedCount"></span>
+                                <span class="packs-count-label">Forked</span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        <!-- Tab: Objects -->
+                        <div class="packs-tab-panel" x-show="selectedTab === 'objects'">
+                          <div x-show="objects.length === 0" class="empty-state" style="min-height:120px">
+                            <h4>No objects</h4>
+                            <p class="hint">This pack has no managed objects.</p>
+                          </div>
+
+                          <div x-show="objects.length > 0" class="table-wrap">
+                            <table>
+                              <thead>
+                                <tr>
+                                  <th>Resource Type</th>
+                                  <th>Resource ID</th>
+                                  <th>Forked</th>
+                                  <th style="width:80px">Actions</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                <template x-for="obj in objects" :key="obj.resource_type + ':' + obj.resource_id">
+                                  <tr>
+                                    <td><span :class="resourceTypeBadgeClass(obj.resource_type)" x-text="resourceTypeLabel(obj.resource_type)"></span></td>
+                                    <td><span class="font-mono text-xs" x-text="obj.resource_id"></span></td>
+                                    <td>
+                                      <span x-show="obj.forked" class="badge badge-warn">Forked</span>
+                                      <span x-show="!obj.forked" class="badge badge-dim">Managed</span>
+                                    </td>
+                                    <td>
+                                      <button class="btn btn-ghost btn-sm" x-show="!obj.forked" @click="forkObject(selectedPackId, obj.resource_type, obj.resource_id)">Fork</button>
+                                      <span x-show="obj.forked" class="text-xs text-dim">User-owned</span>
+                                    </td>
+                                  </tr>
+                                </template>
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </aside>
+            </div>
+          </template>
+
+          <!-- Install Pack Modal -->
+          <div x-show="showInstallModal" class="modal-overlay" @click.self="closeInstallModal()" @keydown.escape.window="closeInstallModal()">
+            <div class="modal">
+              <div class="modal-header">
+                <h3>Install Pack</h3>
+                <button class="modal-close" @click="closeInstallModal()">&times;</button>
+              </div>
+              <div class="form-group">
+                <label>Source Kind</label>
+                <select class="form-select" x-model="installForm.kind">
+                  <option value="bundled">Bundled</option>
+                  <option value="external">External</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Pack ID</label>
+                <input type="text" class="form-input" x-model="installForm.pack_id" placeholder="e.g. sdlc">
+              </div>
+              <div class="form-group">
+                <label>Version</label>
+                <input type="text" class="form-input" x-model="installForm.version" placeholder="e.g. 1.0.0">
+              </div>
+              <div class="flex justify-end gap-2" style="margin-top:16px">
+                <button class="btn btn-ghost btn-sm" @click="closeInstallModal()">Cancel</button>
+                <button class="btn btn-primary btn-sm" @click="submitInstall()" :disabled="installSubmitting">
+                  <span x-text="installSubmitting ? 'Installing...' : 'Install'"></span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Upgrade Dry-Run Modal -->
+          <div x-show="showUpgradeModal" class="modal-overlay" @click.self="closeUpgradeModal()" @keydown.escape.window="closeUpgradeModal()">
+            <div class="modal" style="max-width:650px">
+              <div class="modal-header">
+                <h3>Upgrade Pack</h3>
+                <button class="modal-close" @click="closeUpgradeModal()">&times;</button>
+              </div>
+
+              <!-- Step 1: Enter target version -->
+              <template x-if="!dryRunResult">
+                <div>
+                  <div class="form-group">
+                    <label>Target Version</label>
+                    <input type="text" class="form-input" x-model="upgradeForm.target_version" placeholder="e.g. 2.0.0">
+                  </div>
+                  <div class="flex justify-end gap-2" style="margin-top:16px">
+                    <button class="btn btn-ghost btn-sm" @click="closeUpgradeModal()">Cancel</button>
+                    <button class="btn btn-primary btn-sm" @click="runDryRun()" :disabled="dryRunLoading">
+                      <span x-text="dryRunLoading ? 'Running dry-run...' : 'Preview Changes'"></span>
+                    </button>
+                  </div>
+                </div>
+              </template>
+
+              <!-- Step 2: Review dry-run results -->
+              <template x-if="dryRunResult">
+                <div>
+                  <div class="packs-dryrun-summary">
+                    <div class="card-header" style="margin-bottom:12px">Upgrade Preview</div>
+                    <div class="detail-grid packs-detail-grid">
+                      <div class="detail-row"><span class="detail-label">Pack</span><span class="detail-value font-mono" x-text="dryRunResult.resolved ? dryRunResult.resolved.pack_id : ''"></span></div>
+                      <div class="detail-row"><span class="detail-label">From Version</span><span class="detail-value font-mono" x-text="dryRunResult.resolved ? dryRunResult.resolved.from_version : ''"></span></div>
+                      <div class="detail-row"><span class="detail-label">To Version</span><span class="detail-value font-mono" x-text="dryRunResult.resolved ? dryRunResult.resolved.to_version : ''"></span></div>
+                    </div>
+
+                    <div class="packs-dryrun-effects" style="margin-top:16px">
+                      <div class="card-header" style="margin-bottom:8px">Effects</div>
+                      <div class="packs-effects-grid">
+                        <div class="packs-effect-item packs-effect-added">
+                          <span class="packs-effect-number" x-text="dryRunResult.effects ? dryRunResult.effects.managed_objects_added : 0"></span>
+                          <span class="packs-effect-label">Added</span>
+                        </div>
+                        <div class="packs-effect-item packs-effect-updated">
+                          <span class="packs-effect-number" x-text="dryRunResult.effects ? dryRunResult.effects.managed_objects_updated : 0"></span>
+                          <span class="packs-effect-label">Updated</span>
+                        </div>
+                        <div class="packs-effect-item packs-effect-removed">
+                          <span class="packs-effect-number" x-text="dryRunResult.effects ? dryRunResult.effects.managed_objects_removed : 0"></span>
+                          <span class="packs-effect-label">Removed</span>
+                        </div>
+                        <div class="packs-effect-item packs-effect-forks">
+                          <span class="packs-effect-number" x-text="dryRunResult.effects ? dryRunResult.effects.forks_untouched : 0"></span>
+                          <span class="packs-effect-label">Forks Untouched</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div x-show="dryRunResult.explanation" class="packs-dryrun-notes" style="margin-top:12px">
+                      <div class="text-xs text-dim" x-show="dryRunResult.explanation && dryRunResult.explanation.managed_objects_only">Only managed objects will be affected.</div>
+                      <div class="text-xs text-dim" x-show="dryRunResult.explanation && dryRunResult.explanation.forks_remain_detached">Forked objects remain detached and will not be modified.</div>
+                    </div>
+                  </div>
+
+                  <div class="flex justify-end gap-2" style="margin-top:16px">
+                    <button class="btn btn-ghost btn-sm" @click="closeUpgradeModal()">Cancel</button>
+                    <button class="btn btn-ghost btn-sm" @click="dryRunResult = null">Back</button>
+                    <button class="btn btn-primary btn-sm" @click="confirmUpgrade()" :disabled="upgradeSubmitting">
+                      <span x-text="upgradeSubmitting ? 'Upgrading...' : 'Confirm Upgrade'"></span>
+                    </button>
+                  </div>
+                </div>
+              </template>
+            </div>
           </div>
         </div>
       </div>

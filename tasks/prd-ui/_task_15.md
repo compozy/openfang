@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -34,15 +34,15 @@ Build the Packs page — pack management with install, upgrade (dry-run preview)
 
 ## Subtasks
 
-- [ ] 15.1 Create `js/pages/packs.js` — `packsPage()` Alpine component
-- [ ] 15.2 Implement pack list — source badges, object count summary
-- [ ] 15.3 Implement pack detail — manifest display, metadata
-- [ ] 15.4 Implement objects tab — resource type, resource ID, forked status
-- [ ] 15.5 Implement install form — source kind selector, pack ID, version fields
-- [ ] 15.6 Implement upgrade with dry-run preview — call dry-run first, show diff modal, confirm to commit
-- [ ] 15.7 Implement uninstall with fork-warning dialog
-- [ ] 15.8 Implement fork per-object — `POST /api/v1/packs/{id}/fork`
-- [ ] 15.9 Add Packs page template in `index_body.html`
+- [x] 15.1 Create `js/pages/packs.js` — `packsPage()` Alpine component
+- [x] 15.2 Implement pack list — source badges, object count summary
+- [x] 15.3 Implement pack detail — manifest display, metadata
+- [x] 15.4 Implement objects tab — resource type, resource ID, forked status
+- [x] 15.5 Implement install form — source kind selector, pack ID, version fields
+- [x] 15.6 Implement upgrade with dry-run preview — call dry-run first, show diff modal, confirm to commit
+- [x] 15.7 Implement uninstall with fork-warning dialog
+- [x] 15.8 Implement fork per-object — `POST /api/v1/packs/{id}/fork`
+- [x] 15.9 Add Packs page template in `index_body.html`
 
 ## Implementation Details
 
@@ -83,9 +83,9 @@ All 8 endpoints under `OpenFangAPI.v1.packs.*` from the techspec.
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

@@ -429,19 +429,21 @@
       install: function(body) {
         return unwrap(OpenFangAPI.post('/api/v1/packs/install', body));
       },
-      upgrade: function(id) {
-        return unwrap(OpenFangAPI.post('/api/v1/packs/' + id + '/upgrade'));
+      upgrade: function(id, body) {
+        return unwrap(OpenFangAPI.post('/api/v1/packs/' + id + '/upgrade', body));
       },
-      upgradeDryRun: function(id) {
+      upgradeDryRun: function(id, body) {
         return unwrap(
-          OpenFangAPI.post('/api/v1/packs/' + id + '/upgrade/dry-run')
+          OpenFangAPI.post('/api/v1/packs/' + id + '/upgrade/dry-run', body)
         );
       },
-      uninstall: function(id) {
-        return unwrap(OpenFangAPI.post('/api/v1/packs/' + id + '/uninstall'));
+      uninstall: function(id, body) {
+        return unwrap(
+          OpenFangAPI.post('/api/v1/packs/' + id + '/uninstall', body || { force: false })
+        );
       },
-      fork: function(id) {
-        return unwrap(OpenFangAPI.post('/api/v1/packs/' + id + '/fork'));
+      fork: function(id, body) {
+        return unwrap(OpenFangAPI.post('/api/v1/packs/' + id + '/fork', body));
       }
     },
 
