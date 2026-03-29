@@ -13,36 +13,36 @@
 
 | Task | Title | Complexity | Dependencies | Status |
 |------|-------|------------|--------------|--------|
-| 1 | Shared Infrastructure (SSE client, API v1 client, utils) | high | none | pending |
-| 2 | Bug Fixes + Navigation Restructure | medium | none | pending |
+| 1 | Shared Infrastructure (SSE client, API v1 client, utils) | high | none | completed |
+| 2 | Bug Fixes + Navigation Restructure | medium | none | completed |
 
 ## Phase 1: HITL + Runs + Dispatches (Critical Operations)
 
 | Task | Title | Complexity | Dependencies | Status |
 |------|-------|------------|--------------|--------|
 | 3 | HITL Inbox | high | 1, 2 | completed |
-| 4 | Workflow Runs | high | 1, 2 | pending |
-| 5 | Dispatches | medium | 1, 2 | pending |
+| 4 | Workflow Runs | high | 1, 2 | completed |
+| 5 | Dispatches | medium | 1, 2 | completed |
 
 ## Phase 2: Tasks + Subtasks (Core Domain)
 
 | Task | Title | Complexity | Dependencies | Status |
 |------|-------|------------|--------------|--------|
-| 6 | Tasks & Subtasks | high | 1, 2 | pending |
+| 6 | Tasks & Subtasks | high | 1, 2 | completed |
 
 ## Phase 3: Workflows v2 + Triggers v2 + Schedules v2 + Events (Authoring)
 
 | Task | Title | Complexity | Dependencies | Status |
 |------|-------|------------|--------------|--------|
-| 7 | Workflows v2 (CRUD + Editor + Visual Builder) | critical | 1, 2 | pending |
-| 8 | Triggers v2 | high | 1, 2 | pending |
-| 9 | Schedules v2 + Event Ingress | medium | 1, 2 | pending |
+| 7 | Workflows v2 (CRUD + Editor + Visual Builder) | critical | 1, 2 | completed |
+| 8 | Triggers v2 | high | 1, 2 | completed |
+| 9 | Schedules v2 + Event Ingress | medium | 1, 2 | completed |
 
 ## Phase 4: Agents v1 Migration
 
 | Task | Title | Complexity | Dependencies | Status |
 |------|-------|------------|--------------|--------|
-| 10 | Agents v1 Migration | critical | 1, 2 | pending |
+| 10 | Agents v1 Migration | critical | 1, 2 | completed |
 | 11 | Chat SSE Streaming + Dry-Run | medium | 1, 10 | pending |
 
 ## Phase 4.5: Arky Provider System

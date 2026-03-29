@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -37,19 +37,19 @@ Rebuild the Agents page on the `/api/v1/agents` API. The largest existing page g
 
 ## Subtasks
 
-- [ ] 10.1 Migrate agent list to v1 — `OpenFangAPI.v1.agents.list()`, add enabled/group/tags/origin/runtime columns
-- [ ] 10.2 Rebuild spawn wizard to create agents via v1 — structured form instead of TOML
-- [ ] 10.3 Implement agent edit form — structured `AgentDefinition` fields
-- [ ] 10.4 Implement agent delete using v1 endpoint
-- [ ] 10.5 Implement validate action with per-field issue display
-- [ ] 10.6 Implement compile action with 3-layer output viewer (manifest, binding, metadata)
-- [ ] 10.7 Implement runtime panel — state, mode, health from `GET /api/v1/agents/{id}/runtime`
-- [ ] 10.8 Implement runtime actions — start/stop/restart with confirmation dialogs
-- [ ] 10.9 Implement mode selector dropdown — `PUT /api/v1/agents/{id}/runtime/mode`
-- [ ] 10.10 Implement sessions tab — list, create, activate, reset, compact
-- [ ] 10.11 Implement skills assignment — list and update agent skills
-- [ ] 10.12 Implement MCP servers assignment — list and update agent MCP servers
-- [ ] 10.13 Update `index_body.html` agents template section
+- [x] 10.1 Migrate agent list to v1 — `OpenFangAPI.v1.agents.list()`, add enabled/group/tags/origin/runtime columns
+- [x] 10.2 Rebuild spawn wizard to create agents via v1 — structured form instead of TOML
+- [x] 10.3 Implement agent edit form — structured `AgentDefinition` fields
+- [x] 10.4 Implement agent delete using v1 endpoint
+- [x] 10.5 Implement validate action with per-field issue display
+- [x] 10.6 Implement compile action with 3-layer output viewer (manifest, binding, metadata)
+- [x] 10.7 Implement runtime panel — state, mode, health from `GET /api/v1/agents/{id}/runtime`
+- [x] 10.8 Implement runtime actions — start/stop/restart with confirmation dialogs
+- [x] 10.9 Implement mode selector dropdown — `PUT /api/v1/agents/{id}/runtime/mode`
+- [x] 10.10 Implement sessions tab — list, create, activate, reset, compact
+- [x] 10.11 Implement skills assignment — list and update agent skills
+- [x] 10.12 Implement MCP servers assignment — list and update agent MCP servers
+- [x] 10.13 Update `index_body.html` agents template section
 
 ## Implementation Details
 
@@ -59,9 +59,9 @@ All endpoints under `OpenFangAPI.v1.agents.*` from the techspec (22 endpoints).
 
 ### Relevant Files
 
-- `crates/openfang-api/static/js/pages/agents.js` (REBUILD)
-- `crates/openfang-api/static/index_body.html` (MODIFY)
-- `crates/openfang-api/static/css/components.css` (MODIFY)
+- `crates/openfang-api/static/js/pages/agents.js` (REBUILT)
+- `crates/openfang-api/static/index_body.html` (MODIFIED)
+- `crates/openfang-api/static/css/components.css` (MODIFIED)
 
 ## Deliverables
 
@@ -73,21 +73,21 @@ All endpoints under `OpenFangAPI.v1.agents.*` from the techspec (22 endpoints).
 
 ### Manual Browser Tests (Required)
 
-- [ ] Agent list loads with new columns from v1 API
-- [ ] Create agent via structured form — verify agent appears
-- [ ] Edit agent — verify changes persist via v1 API
-- [ ] Validate agent — verify inline issue display
-- [ ] Compile agent — verify 3-layer output viewer
-- [ ] Runtime panel — verify state, mode, health display
-- [ ] Start/stop/restart — verify actions work with confirmations
-- [ ] Sessions tab — verify list, create, activate, reset, compact
-- [ ] Inline chat still works after migration
+- [x] Agent list loads with new columns from v1 API
+- [x] Create agent via structured form — verify agent appears
+- [x] Edit agent — verify changes persist via v1 API
+- [x] Validate agent — verify inline issue display
+- [x] Compile agent — verify 3-layer output viewer
+- [x] Runtime panel — verify state, mode, health display
+- [x] Start/stop/restart — verify actions work with confirmations
+- [x] Sessions tab — verify list, create, activate, reset, compact
+- [x] Inline chat still works after migration
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test` (pre-existing CLI test failures unrelated to this task)
 
 ## Success Criteria
 
