@@ -7899,29 +7899,533 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
       </div>
     </template>
 
-    <!-- Placeholder: Schedules -->
+    <!-- Page: Schedules -->
     <template x-if="page === 'schedules'">
-      <div>
-        <div class="page-header"><h2>Schedules</h2></div>
-        <div class="page-body">
-          <div class="empty-state">
-            <div class="empty-state-icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></div>
-            <h3>Coming Soon</h3>
-            <p class="text-dim text-xs">Cron schedules and time-based automation will appear here.</p>
+      <div x-data="schedulesPage()" x-init="init()">
+        <div class="page-header">
+          <div>
+            <h2>Schedules</h2>
+            <div class="text-xs text-dim">Schedule v2 authoring, cron configuration, enable/disable, run-now, dry-run, and runtime status on the v1 API.</div>
           </div>
+          <div class="flex gap-2">
+            <button class="btn btn-ghost btn-sm" @click="loadSchedules({ preserveSelection: true, refreshDetail: true })">Refresh</button>
+            <button class="btn btn-primary btn-sm" @click="createScheduleDraft()">New Schedule</button>
+          </div>
+        </div>
+
+        <div class="page-body">
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading schedule definitions...</span></div>
+          <div x-show="!loading && loadError" class="error-state">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
+          </div>
+
+          <template x-if="!loading && !loadError">
+            <div class="tr2-stack">
+              <!-- Catalog / filter bar -->
+              <div class="card">
+                <div class="tr2-toolbar">
+                  <div>
+                    <div class="card-header">Catalog</div>
+                    <p class="text-xs text-dim">Schedule definitions from <code>/api/v1/schedules</code> with runtime status, action kind, and pack ownership.</p>
+                  </div>
+                  <div class="tr2-filter-grid">
+                    <div class="form-group">
+                      <label>Search</label>
+                      <div class="search-input">
+                        <input type="text" x-model="searchQuery" placeholder="Search schedule names, cron, actions...">
+                        <button x-show="searchQuery" @click="searchQuery = ''" class="search-clear-btn" title="Clear search">&times;</button>
+                      </div>
+                    </div>
+                    <div class="form-group">
+                      <label>Enabled</label>
+                      <select class="form-select" x-model="filterEnabled">
+                        <option value="">All</option>
+                        <option value="enabled">Enabled</option>
+                        <option value="disabled">Disabled</option>
+                      </select>
+                    </div>
+                    <div class="form-group">
+                      <label>Action Kind</label>
+                      <select class="form-select" x-model="filterActionKind">
+                        <option value="">All Actions</option>
+                        <template x-for="option in actionKindOptions" :key="'sched-filter-' + option.value">
+                          <option :value="option.value" x-text="option.label"></option>
+                        </template>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Schedule list table -->
+              <div class="table-wrap" x-show="filteredSchedules.length > 0">
+                <table class="tr2-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Cron</th>
+                      <th>Action</th>
+                      <th>Enabled</th>
+                      <th>Last Run</th>
+                      <th>Next Run</th>
+                      <th>Status</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="sched in filteredSchedules" :key="sched.id">
+                      <tr class="tr2-table-row" :class="{ 'is-selected': selectedScheduleId === sched.id }" @click="selectSchedule(sched.id, false)">
+                        <td>
+                          <div class="tr2-name-cell">
+                            <div class="tr2-name-header">
+                              <span class="font-bold" x-text="sched.name"></span>
+                              <span class="badge" :class="originBadgeClass(sched.origin)" x-text="originLabel(sched.origin)"></span>
+                            </div>
+                            <div class="text-xs text-dim font-mono" x-text="sched.id"></div>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="text-xs">
+                            <div class="font-mono" x-text="sched.schedule && sched.schedule.expr ? sched.schedule.expr : '-'"></div>
+                            <div class="text-dim" x-text="describeCron(sched.schedule && sched.schedule.expr)"></div>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="tr2-target-cell">
+                            <span class="badge badge-info" x-text="actionKindLabel(sched.action)"></span>
+                            <div class="text-xs text-dim" x-text="actionSummary(sched.action)"></div>
+                          </div>
+                        </td>
+                        <td>
+                          <div
+                            class="toggle"
+                            :class="{
+                              active: runtimeForListItem(sched).enabled,
+                              'is-disabled': togglingId === sched.id || (sched.origin && sched.origin.kind === 'pack')
+                            }"
+                            @click.stop="toggleScheduleEnabled(sched)"
+                            :title="sched.origin && sched.origin.kind === 'pack'
+                              ? 'Pack-managed schedules must be forked before changes.'
+                              : (runtimeForListItem(sched).enabled ? 'Disable' : 'Enable')"
+                          >
+                            <div class="toggle-track"><div class="toggle-thumb"></div></div>
+                          </div>
+                        </td>
+                        <td><span class="text-xs" x-text="lastRunLabel(sched)"></span></td>
+                        <td><span class="text-xs" x-text="nextRunLabel(sched)"></span></td>
+                        <td>
+                          <span class="text-xs" :class="lastStatusBadge(sched)" x-text="runtimeForListItem(sched).last_status || 'none'"></span>
+                        </td>
+                        <td>
+                          <div class="flex gap-1">
+                            <button class="btn btn-ghost btn-xs" title="Run Now" :disabled="runningNowId === sched.id" @click.stop="runNow(sched)">
+                              <template x-if="runningNowId === sched.id"><span class="spinner-xs"></span></template>
+                              <template x-if="runningNowId !== sched.id"><span>&#9654;</span></template>
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+
+              <!-- Empty state -->
+              <div x-show="filteredSchedules.length === 0 && schedules.length > 0" class="empty-state">
+                <h4>No schedules match filters</h4>
+                <p class="text-xs text-dim">Adjust your search or filter criteria.</p>
+              </div>
+              <div x-show="schedules.length === 0" class="empty-state">
+                <h4>No schedules loaded</h4>
+                <p class="text-xs text-dim">Create a new schedule to begin.</p>
+                <button class="btn btn-primary btn-sm" @click="createScheduleDraft()">New Schedule</button>
+              </div>
+
+              <!-- Detail panel -->
+              <div class="card" x-show="selectedScheduleId || !selectedScheduleId">
+                <div x-show="detailLoading" class="loading-state"><div class="spinner"></div><span>Loading detail...</span></div>
+                <div x-show="detailError && !detailLoading" class="error-state">
+                  <span class="error-icon">!</span>
+                  <p x-text="detailError"></p>
+                </div>
+
+                <template x-if="!detailLoading && !detailError">
+                  <div class="tr2-stack">
+                    <!-- Editor card -->
+                    <div class="card">
+                      <div class="card-header">
+                        <span x-text="selectedScheduleId ? 'Edit Schedule' : 'New Schedule'"></span>
+                        <p class="text-xs text-dim" x-text="selectedScheduleId ? 'Persisted schedule definition loaded from /api/v1/schedules.' : 'Draft a schedule definition and save it to the v1 control plane.'"></p>
+                      </div>
+                      <div class="card-body">
+                        <div class="form-grid">
+                          <div class="form-group" x-show="selectedScheduleId">
+                            <label>ID</label>
+                            <input type="text" class="form-input" x-model="form.id" readonly>
+                          </div>
+                          <div class="form-group">
+                            <label>Name</label>
+                            <input type="text" class="form-input" x-model="form.name" placeholder="my-schedule">
+                            <template x-for="issue in issuesForPath('name')" :key="issue.path + issue.message">
+                              <span :class="issueSeverityClass(issue)" x-text="issue.message"></span>
+                            </template>
+                          </div>
+                          <div class="form-group">
+                            <label>Description</label>
+                            <input type="text" class="form-input" x-model="form.description" placeholder="Optional description">
+                          </div>
+                        </div>
+
+                        <!-- Cron fields -->
+                        <div class="form-section">
+                          <h5>Schedule</h5>
+                          <div class="form-grid">
+                            <div class="form-group">
+                              <label>Cron Expression</label>
+                              <input type="text" class="form-input font-mono" x-model="form.cron_expr" placeholder="0 * * * *">
+                              <div class="text-xs text-dim" x-text="describeCron(form.cron_expr)"></div>
+                              <template x-for="issue in issuesForPath('schedule.expr')" :key="issue.path + issue.message">
+                                <span :class="issueSeverityClass(issue)" x-text="issue.message"></span>
+                              </template>
+                            </div>
+                            <div class="form-group">
+                              <label>Timezone</label>
+                              <select class="form-select" x-model="form.timezone">
+                                <template x-for="tz in timezoneOptions" :key="tz">
+                                  <option :value="tz" x-text="tz"></option>
+                                </template>
+                              </select>
+                            </div>
+                          </div>
+                          <div class="form-group">
+                            <label>Presets</label>
+                            <div class="flex flex-wrap gap-1">
+                              <template x-for="preset in cronPresets" :key="preset.cron">
+                                <button class="btn btn-ghost btn-xs" @click="applyCronPreset(preset)" x-text="preset.label"></button>
+                              </template>
+                            </div>
+                          </div>
+                        </div>
+
+                        <!-- Action kind -->
+                        <div class="form-section">
+                          <h5>Action</h5>
+                          <div class="form-group">
+                            <label>Action Kind</label>
+                            <select class="form-select" x-model="form.action_kind">
+                              <template x-for="option in actionKindOptions" :key="'sched-action-' + option.value">
+                                <option :value="option.value" x-text="option.label"></option>
+                              </template>
+                            </select>
+                          </div>
+
+                          <!-- Agent Message fields -->
+                          <template x-if="form.action_kind === 'agent_message'">
+                            <div class="form-grid">
+                              <div class="form-group">
+                                <label>Agent ID</label>
+                                <input type="text" class="form-input font-mono" x-model="form.action_agent" placeholder="agent-id">
+                              </div>
+                              <div class="form-group">
+                                <label>Message</label>
+                                <textarea class="form-input" rows="3" x-model="form.action_message_text" placeholder="Message text for the agent"></textarea>
+                              </div>
+                              <div class="form-group">
+                                <label>Metadata (JSON)</label>
+                                <textarea class="form-input font-mono" rows="3" x-model="form.action_metadata_text" placeholder="{}"></textarea>
+                              </div>
+                            </div>
+                          </template>
+
+                          <!-- Workflow Start fields -->
+                          <template x-if="form.action_kind === 'workflow_start'">
+                            <div class="form-grid">
+                              <div class="form-group">
+                                <label>Workflow ID</label>
+                                <input type="text" class="form-input font-mono" x-model="form.action_workflow" placeholder="workflow-id">
+                              </div>
+                              <div class="form-group">
+                                <label>Input (JSON)</label>
+                                <textarea class="form-input font-mono" rows="4" x-model="form.action_input_text" placeholder="{}"></textarea>
+                              </div>
+                            </div>
+                          </template>
+
+                          <!-- Workflow Signal fields -->
+                          <template x-if="form.action_kind === 'workflow_signal'">
+                            <div class="form-grid">
+                              <div class="form-group">
+                                <label>Signal Name</label>
+                                <input type="text" class="form-input" x-model="form.action_signal" placeholder="signal-name">
+                              </div>
+                              <div class="form-group">
+                                <label>Selector: Workflow ID</label>
+                                <input type="text" class="form-input font-mono" x-model="form.action_selector_workflow_id" placeholder="workflow-id">
+                              </div>
+                              <div class="form-group">
+                                <label>Payload (JSON)</label>
+                                <textarea class="form-input font-mono" rows="4" x-model="form.action_payload_text" placeholder="{}"></textarea>
+                              </div>
+                            </div>
+                          </template>
+                        </div>
+
+                        <!-- Options -->
+                        <div class="form-section">
+                          <h5>Options</h5>
+                          <div class="form-grid">
+                            <div class="form-group">
+                              <label class="flex items-center gap-2">
+                                <input type="checkbox" x-model="form.enabled"> Enabled
+                              </label>
+                            </div>
+                            <div class="form-group">
+                              <label class="flex items-center gap-2">
+                                <input type="checkbox" x-model="form.one_shot"> One-Shot (runs once then disables)
+                              </label>
+                            </div>
+                          </div>
+                        </div>
+
+                        <!-- Action buttons -->
+                        <div class="tr2-actions">
+                          <div class="flex gap-2">
+                            <button class="btn btn-primary btn-sm" :disabled="saving || !canSaveSelected" @click="saveSchedule()">
+                              <template x-if="saving"><span class="spinner-xs"></span></template>
+                              <span x-text="selectedScheduleId ? 'Update' : 'Create'"></span>
+                            </button>
+                            <button class="btn btn-ghost btn-sm" :disabled="validating" @click="validateSchedule()">
+                              <template x-if="validating"><span class="spinner-xs"></span></template>
+                              <span>Validate</span>
+                            </button>
+                            <button x-show="canForkSelected" class="btn btn-ghost btn-sm" :disabled="!!forkingId" @click="forkSelectedSchedule()">
+                              <template x-if="!!forkingId"><span class="spinner-xs"></span></template>
+                              <span>Fork</span>
+                            </button>
+                          </div>
+                          <div class="flex gap-2">
+                            <button x-show="selectedScheduleId" class="btn btn-ghost btn-sm" :disabled="!!runningNowId" @click="runNow(selectedSchedule)">
+                              <template x-if="!!runningNowId"><span class="spinner-xs"></span></template>
+                              <span>Run Now</span>
+                            </button>
+                            <button x-show="selectedScheduleId" class="btn btn-ghost btn-sm" :disabled="dryRunning" @click="dryRun()">
+                              <template x-if="dryRunning"><span class="spinner-xs"></span></template>
+                              <span>Dry Run</span>
+                            </button>
+                            <button x-show="canDeleteSelected" class="btn btn-danger btn-sm" :disabled="!!deletingId" @click="confirmDeleteSelected()">Delete</button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <!-- Validation results -->
+                    <div class="card" x-show="validationResult">
+                      <div class="card-header">
+                        <span>Validation</span>
+                        <span class="badge" :class="validationResult && validationResult.valid ? 'badge-success' : 'badge-error'" x-text="validationResult && validationResult.valid ? 'Valid' : 'Issues Found'"></span>
+                        <p class="text-xs text-dim">Returned by <code>/api/v1/schedules/validate</code>.</p>
+                      </div>
+                      <div class="card-body" x-show="validationIssues.length > 0">
+                        <template x-for="issue in validationIssues" :key="issue.path + issue.message">
+                          <div class="tr2-issue-row">
+                            <span :class="issueSeverityClass(issue)" x-text="issue.severity"></span>
+                            <code class="text-xs" x-text="issue.path"></code>
+                            <span class="text-xs" x-text="issue.message"></span>
+                          </div>
+                        </template>
+                      </div>
+                    </div>
+
+                    <!-- Runtime status -->
+                    <div class="card" x-show="selectedRuntimeSnapshot">
+                      <div class="card-header">
+                        <span>Runtime Status</span>
+                        <p class="text-xs text-dim">Snapshot from <code>/api/v1/schedules/{id}/runtime</code>.</p>
+                      </div>
+                      <div class="card-body">
+                        <template x-if="selectedRuntimeSnapshot">
+                          <div class="kv-grid">
+                            <div class="kv-row"><span class="kv-key">Enabled</span><span class="kv-val" x-text="selectedRuntimeSnapshot.enabled ? 'Yes' : 'No'"></span></div>
+                            <div class="kv-row"><span class="kv-key">One-Shot</span><span class="kv-val" x-text="selectedRuntimeSnapshot.one_shot ? 'Yes' : 'No'"></span></div>
+                            <div class="kv-row"><span class="kv-key">Consecutive Errors</span><span class="kv-val" x-text="selectedRuntimeSnapshot.consecutive_errors || 0"></span></div>
+                            <div class="kv-row"><span class="kv-key">Last Status</span><span class="kv-val" x-text="selectedRuntimeSnapshot.last_status || 'none'"></span></div>
+                            <div class="kv-row"><span class="kv-key">Last Run</span><span class="kv-val" x-text="selectedRuntimeSnapshot.last_run_at ? formatDateTime(selectedRuntimeSnapshot.last_run_at) : 'Never'"></span></div>
+                            <div class="kv-row"><span class="kv-key">Next Run</span><span class="kv-val" x-text="selectedRuntimeSnapshot.next_run_at ? formatDateTime(selectedRuntimeSnapshot.next_run_at) : '-'"></span></div>
+                          </div>
+                        </template>
+                      </div>
+                    </div>
+
+                    <!-- Dry-run result -->
+                    <div class="card" x-show="dryRunResult">
+                      <div class="card-header">
+                        <span>Dry-Run Result</span>
+                        <p class="text-xs text-dim">Preview from <code>/api/v1/schedules/{id}/run-now/dry-run</code>.</p>
+                      </div>
+                      <div class="card-body">
+                        <pre class="code-block text-xs" x-text="JSON.stringify(dryRunResult, null, 2)"></pre>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </template>
         </div>
       </div>
     </template>
 
-    <!-- Placeholder: Events -->
+    <!-- Page: Events -->
     <template x-if="page === 'events'">
-      <div>
-        <div class="page-header"><h2>Events</h2></div>
+      <div x-data="eventsPage()" x-init="init()">
+        <div class="page-header">
+          <div>
+            <h2>Events</h2>
+            <div class="text-xs text-dim">Event ingress tester: send synthetic events through the trigger match engine via the v1 API.</div>
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-ghost btn-sm" @click="resetForm()">Reset</button>
+          </div>
+        </div>
+
         <div class="page-body">
-          <div class="empty-state">
-            <div class="empty-state-icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
-            <h3>Coming Soon</h3>
-            <p class="text-dim text-xs">System event log will appear here.</p>
+          <div class="tr2-stack">
+            <!-- Event composer -->
+            <div class="card">
+              <div class="card-header">
+                <span>Event Payload</span>
+                <p class="text-xs text-dim">Compose a JSON event to send via <code>POST /api/v1/events</code> or preview via <code>POST /api/v1/events/dry-run</code>.</p>
+              </div>
+              <div class="card-body">
+                <div class="form-group">
+                  <label>Event JSON</label>
+                  <textarea
+                    class="form-input font-mono"
+                    rows="10"
+                    x-model="eventJson"
+                    placeholder='{"event": "issue.created", "source": "api", "payload": {}, "idempotency_key": ""}'
+                    spellcheck="false"
+                  ></textarea>
+                  <div x-show="jsonError" class="text-xs" style="color:var(--error);" x-text="jsonError"></div>
+                </div>
+
+                <div class="tr2-actions">
+                  <div class="flex gap-2">
+                    <button class="btn btn-primary btn-sm" :disabled="sending" @click="sendEvent()">
+                      <template x-if="sending"><span class="spinner-xs"></span></template>
+                      <span>Send Event</span>
+                    </button>
+                    <button class="btn btn-ghost btn-sm" :disabled="dryRunning" @click="dryRun()">
+                      <template x-if="dryRunning"><span class="spinner-xs"></span></template>
+                      <span>Dry Run</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Dry-run result -->
+            <div class="card" x-show="dryRunResult">
+              <div class="card-header">
+                <span>Dry-Run Result</span>
+                <span class="badge badge-info" x-text="matchedTriggersDryRun.length + ' trigger(s) matched'"></span>
+                <p class="text-xs text-dim">Preview of matched triggers without dispatching actions.</p>
+              </div>
+              <div class="card-body">
+                <div x-show="matchedTriggersDryRun.length > 0">
+                  <h5>Matched Triggers</h5>
+                  <div class="table-wrap">
+                    <table class="tr2-table">
+                      <thead><tr><th>Trigger ID</th><th>Name</th><th>Action</th></tr></thead>
+                      <tbody>
+                        <template x-for="t in matchedTriggersDryRun" :key="t.id || t.trigger_id">
+                          <tr>
+                            <td><span class="font-mono text-xs" x-text="t.id || t.trigger_id"></span></td>
+                            <td><span class="text-xs" x-text="t.name || '-'"></span></td>
+                            <td><span class="badge badge-info text-xs" x-text="t.action_kind || (t.target && t.target.kind) || '-'"></span></td>
+                          </tr>
+                        </template>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                <div x-show="matchedTriggersDryRun.length === 0" class="text-xs text-dim">No triggers matched this event.</div>
+                <details class="mt-2">
+                  <summary class="text-xs text-dim" style="cursor:pointer">Raw response</summary>
+                  <pre class="code-block text-xs" x-text="formatJson(dryRunResult)"></pre>
+                </details>
+              </div>
+            </div>
+
+            <!-- Send result -->
+            <div class="card" x-show="sendResult">
+              <div class="card-header">
+                <span>Send Result</span>
+                <span class="badge badge-success" x-text="matchedTriggersSend.length + ' trigger(s) matched'"></span>
+                <p class="text-xs text-dim">Event was ingested and actions dispatched.</p>
+              </div>
+              <div class="card-body">
+                <div x-show="matchedTriggersSend.length > 0">
+                  <h5>Matched Triggers</h5>
+                  <div class="table-wrap">
+                    <table class="tr2-table">
+                      <thead><tr><th>Trigger ID</th><th>Name</th><th>Action</th></tr></thead>
+                      <tbody>
+                        <template x-for="t in matchedTriggersSend" :key="t.id || t.trigger_id">
+                          <tr>
+                            <td><span class="font-mono text-xs" x-text="t.id || t.trigger_id"></span></td>
+                            <td><span class="text-xs" x-text="t.name || '-'"></span></td>
+                            <td><span class="badge badge-info text-xs" x-text="t.action_kind || (t.target && t.target.kind) || '-'"></span></td>
+                          </tr>
+                        </template>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                <div x-show="dispatchedRunsSend.length > 0" class="mt-2">
+                  <h5>Dispatched Runs</h5>
+                  <template x-for="run in dispatchedRunsSend" :key="run.id || run.run_id">
+                    <div class="kv-row">
+                      <span class="kv-key font-mono text-xs" x-text="run.id || run.run_id"></span>
+                      <a class="text-xs" style="color:var(--accent);cursor:pointer" @click="location.hash = 'runs'">View Run</a>
+                    </div>
+                  </template>
+                </div>
+                <details class="mt-2">
+                  <summary class="text-xs text-dim" style="cursor:pointer">Raw response</summary>
+                  <pre class="code-block text-xs" x-text="formatJson(sendResult)"></pre>
+                </details>
+              </div>
+            </div>
+
+            <!-- Recent events history -->
+            <div class="card" x-show="recentEvents.length > 0">
+              <div class="card-header">
+                <span>Recent Events</span>
+                <span class="badge badge-dim" x-text="recentEvents.length + ' event(s)'"></span>
+                <button class="btn btn-ghost btn-xs" @click="clearHistory()">Clear</button>
+              </div>
+              <div class="card-body">
+                <div class="table-wrap">
+                  <table class="tr2-table">
+                    <thead><tr><th>Time</th><th>Event</th><th>Source</th><th>Mode</th><th>Matched</th></tr></thead>
+                    <tbody>
+                      <template x-for="(entry, idx) in recentEvents" :key="idx">
+                        <tr>
+                          <td><span class="text-xs" x-text="relativeTime(entry.timestamp)"></span></td>
+                          <td><span class="font-mono text-xs" x-text="entry.event"></span></td>
+                          <td><span class="text-xs" x-text="entry.source || '-'"></span></td>
+                          <td><span class="badge" :class="entry.mode === 'dry-run' ? 'badge-warn' : 'badge-success'" x-text="entry.mode"></span></td>
+                          <td><span class="text-xs" x-text="entry.matched"></span></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>

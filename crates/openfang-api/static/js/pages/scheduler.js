@@ -1,4 +1,8 @@
-// OpenFang Scheduler Page — Cron job management + event triggers unified view
+// DEPRECATED: This file is legacy and replaced by:
+//   - js/pages/schedules.js  (Schedule v2 CRUD on /api/v1/schedules)
+//   - js/pages/triggers.js   (Trigger v2 CRUD on /api/v1/triggers)
+// The old scheduler page remains for backward compatibility with the #scheduler hash.
+// New development should use the dedicated Schedules and Triggers pages.
 'use strict';
 
 function schedulerPage() {
