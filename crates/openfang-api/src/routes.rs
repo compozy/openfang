@@ -6873,17 +6873,10 @@ pub async fn update_workflow_definition_v1(
         );
     }
 
-    let store = workflow_definition_store(&state);
-    let existing = match store.load(&id) {
+    let existing = match load_workflow_definition_resource(&state, &id) {
         Ok(Some(resource)) => resource,
         Ok(None) => return workflow_definition_not_found_response(),
-        Err(error) => {
-            return workflow_store_load_error_response(
-                "definition_load_failed",
-                "Failed to load workflow definition",
-                error,
-            )
-        }
+        Err(response) => return response,
     };
     if existing.origin.kind == WorkflowOriginKind::Pack {
         return workflow_pack_conflict_response(&id, existing.origin.pack_id.as_deref());
@@ -6901,7 +6894,7 @@ pub async fn update_workflow_definition_v1(
         Err(response) => return response,
     };
 
-    if let Err(error) = store.persist(&resource) {
+    if let Err(error) = workflow_definition_store(&state).persist(&resource) {
         return workflow_store_load_error_response(
             "definition_persist_failed",
             "Failed to persist workflow definition",
@@ -6993,17 +6986,10 @@ pub async fn fork_workflow_definition_v1(
         );
     }
 
-    let store = workflow_definition_store(&state);
-    let existing = match store.load(&id) {
+    let existing = match load_workflow_definition_resource(&state, &id) {
         Ok(Some(resource)) => resource,
         Ok(None) => return workflow_definition_not_found_response(),
-        Err(error) => {
-            return workflow_store_load_error_response(
-                "definition_load_failed",
-                "Failed to load workflow definition",
-                error,
-            )
-        }
+        Err(response) => return response,
     };
     if existing.origin.kind != WorkflowOriginKind::Pack {
         return workflow_v2_error_response(
@@ -7035,7 +7021,7 @@ pub async fn fork_workflow_definition_v1(
         Err(response) => return response,
     };
 
-    if let Err(error) = store.persist(&resource) {
+    if let Err(error) = workflow_definition_store(&state).persist(&resource) {
         return workflow_store_load_error_response(
             "definition_persist_failed",
             "Failed to persist workflow definition",

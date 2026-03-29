@@ -184,8 +184,13 @@
       compiled: function(id) {
         return unwrap(OpenFangAPI.get('/api/v1/workflows/' + id + '/compiled'));
       },
-      fork: function(id) {
-        return unwrap(OpenFangAPI.post('/api/v1/workflows/' + id + '/fork'));
+      fork: function(id, body) {
+        return unwrap(
+          OpenFangAPI.post(
+            '/api/v1/workflows/' + id + '/fork',
+            body || { mode: 'shadow' }
+          )
+        );
       },
       runtime: function(id) {
         return unwrap(OpenFangAPI.get('/api/v1/workflows/' + id + '/runtime'));

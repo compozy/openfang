@@ -19,20 +19,25 @@ function workflowBuilder() {
     nextId: 1,
     workflowName: '',
     workflowDescription: '',
+    workflowVersion: '1.0.0',
     showSaveModal: false,
     showNodeEditor: false,
     showTomlPreview: false,
     tomlOutput: '',
     agents: [],
+    workflows: [],
     _canvasEl: null,
 
     // Node types with their configs
     nodeTypes: [
-      { type: 'agent', label: 'Agent Step', color: '#6366f1', icon: 'A', ports: { in: 1, out: 1 } },
-      { type: 'parallel', label: 'Parallel Fan-out', color: '#f59e0b', icon: 'P', ports: { in: 1, out: 3 } },
-      { type: 'condition', label: 'Condition', color: '#10b981', icon: '?', ports: { in: 1, out: 2 } },
-      { type: 'loop', label: 'Loop', color: '#ef4444', icon: 'L', ports: { in: 1, out: 1 } },
-      { type: 'collect', label: 'Collect', color: '#8b5cf6', icon: 'C', ports: { in: 3, out: 1 } },
+      { type: 'agent', label: 'Agent', color: '#6366f1', icon: 'A', ports: { in: 1, out: 1 } },
+      { type: 'primitive', label: 'Primitive', color: '#f59e0b', icon: 'P', ports: { in: 1, out: 1 } },
+      { type: 'workflow', label: 'Workflow', color: '#10b981', icon: 'W', ports: { in: 1, out: 1 } },
+      { type: 'wait_signal', label: 'Wait Signal', color: '#eab308', icon: 'S', ports: { in: 1, out: 1 } },
+      { type: 'start_looper', label: 'Start Looper', color: '#ef4444', icon: 'L', ports: { in: 1, out: 1 } },
+      { type: 'emit_event', label: 'Emit Event', color: '#0ea5e9', icon: 'E', ports: { in: 1, out: 1 } },
+      { type: 'collect', label: 'Collect', color: '#8b5cf6', icon: 'C', ports: { in: 2, out: 1 } },
+      { type: 'noop', label: 'Noop', color: '#94a3b8', icon: 'N', ports: { in: 1, out: 1 } },
       { type: 'start', label: 'Start', color: '#22c55e', icon: 'S', ports: { in: 0, out: 1 } },
       { type: 'end', label: 'End', color: '#ef4444', icon: 'E', ports: { in: 1, out: 0 } }
     ],
@@ -46,12 +51,17 @@ function workflowBuilder() {
 
     async init() {
       var self = this;
-      // Load agents for the agent step dropdown
+      // Load authoring references for picker dropdowns.
       try {
-        var list = await OpenFangAPI.get('/api/agents');
-        self.agents = Array.isArray(list) ? list : [];
+        var responses = await Promise.all([
+          OpenFangAPI.v1.agents.list(),
+          OpenFangAPI.v1.workflows.list()
+        ]);
+        self.agents = workflowUiNormalizeList(responses[0]);
+        self.workflows = workflowUiNormalizeList(responses[1]);
       } catch(_) {
         self.agents = [];
+        self.workflows = [];
       }
       // Add default start node
       self.addNode('start', 60, 200);
@@ -169,11 +179,14 @@ function workflowBuilder() {
         subLabel.setAttribute('x', '50'); subLabel.setAttribute('y', node.height / 2 + 12);
         subLabel.setAttribute('fill', 'var(--text-dim)');
         subLabel.setAttribute('style', 'font-size:10px;pointer-events:none');
-        if (node.type === 'agent') subLabel.textContent = node.config.agent_name || 'No agent';
-        else if (node.type === 'condition') subLabel.textContent = node.config.expression || 'No condition';
-        else if (node.type === 'loop') subLabel.textContent = 'max ' + (node.config.max_iterations || 5) + ' iters';
-        else if (node.type === 'parallel') subLabel.textContent = (node.config.fan_count || 3) + ' branches';
-        else if (node.type === 'collect') subLabel.textContent = node.config.strategy || 'all';
+        if (node.type === 'agent') subLabel.textContent = node.config.agent_id || 'Select agent';
+        else if (node.type === 'primitive') subLabel.textContent = node.config.action || 'Set action';
+        else if (node.type === 'workflow') subLabel.textContent = node.config.workflow_id || 'Select workflow';
+        else if (node.type === 'wait_signal') subLabel.textContent = node.config.signal_name || 'Signal required';
+        else if (node.type === 'start_looper') subLabel.textContent = node.config.task_id || 'Task reference';
+        else if (node.type === 'emit_event') subLabel.textContent = node.config.event || 'Event required';
+        else if (node.type === 'collect') subLabel.textContent = node.config.aggregation || 'all';
+        else if (node.type === 'noop') subLabel.textContent = node.config.save_as || 'No operation';
         g.appendChild(subLabel);
 
         // Input ports
@@ -230,15 +243,92 @@ function workflowBuilder() {
         config: {}
       };
       if (type === 'agent') {
-        node.config = { agent_name: '', prompt: '{{input}}', model: '' };
-      } else if (type === 'condition') {
-        node.config = { expression: '', true_label: 'Yes', false_label: 'No' };
-      } else if (type === 'loop') {
-        node.config = { max_iterations: 5, until: '' };
-      } else if (type === 'parallel') {
-        node.config = { fan_count: 3 };
+        node.config = {
+          step_id: 'agent-step-' + this.nextId,
+          save_as: '',
+          flow_mode: 'sequential',
+          flow_when: '',
+          flow_until: '',
+          flow_max_iterations: 3,
+          agent_id: '',
+          instructions: '',
+          provider_override: ''
+        };
+      } else if (type === 'primitive') {
+        node.config = {
+          step_id: 'primitive-step-' + this.nextId,
+          save_as: '',
+          flow_mode: 'sequential',
+          flow_when: '',
+          flow_until: '',
+          flow_max_iterations: 3,
+          action: '',
+          params_text: '{\n}'
+        };
+      } else if (type === 'workflow') {
+        node.config = {
+          step_id: 'workflow-step-' + this.nextId,
+          save_as: '',
+          flow_mode: 'sequential',
+          flow_when: '',
+          flow_until: '',
+          flow_max_iterations: 3,
+          workflow_id: ''
+        };
+      } else if (type === 'wait_signal') {
+        node.config = {
+          step_id: 'wait-signal-step-' + this.nextId,
+          save_as: '',
+          flow_mode: 'sequential',
+          flow_when: '',
+          flow_until: '',
+          flow_max_iterations: 3,
+          signal_name: '',
+          timeout_secs: ''
+        };
+      } else if (type === 'start_looper') {
+        node.config = {
+          step_id: 'start-looper-step-' + this.nextId,
+          save_as: '',
+          flow_mode: 'sequential',
+          flow_when: '',
+          flow_until: '',
+          flow_max_iterations: 3,
+          task_id: '',
+          execution_policy: '{\n}'
+        };
+      } else if (type === 'emit_event') {
+        node.config = {
+          step_id: 'emit-event-step-' + this.nextId,
+          save_as: '',
+          flow_mode: 'sequential',
+          flow_when: '',
+          flow_until: '',
+          flow_max_iterations: 3,
+          event: '',
+          source: '',
+          payload: ''
+        };
       } else if (type === 'collect') {
-        node.config = { strategy: 'all' };
+        node.config = {
+          step_id: 'collect-step-' + this.nextId,
+          save_as: '',
+          flow_mode: 'sequential',
+          flow_when: '',
+          flow_until: '',
+          flow_max_iterations: 3,
+          from_step: '',
+          aggregation: 'all'
+        };
+      } else if (type === 'noop') {
+        node.config = {
+          step_id: 'noop-step-' + this.nextId,
+          save_as: '',
+          flow_mode: 'sequential',
+          flow_when: '',
+          flow_until: '',
+          flow_max_iterations: 3
+        };
       }
       this.nodes.push(node);
       this.scheduleRender();
@@ -469,102 +559,164 @@ function workflowBuilder() {
 
     // ── TOML Generation ──────────────────────────────────
 
-    generateToml: function() {
-      var self = this;
-      var lines = [];
-      lines.push('[workflow]');
-      lines.push('name = "' + (this.workflowName || 'untitled') + '"');
-      lines.push('description = "' + (this.workflowDescription || '') + '"');
-      lines.push('');
-
-      // Topological sort the nodes (skip start/end for step generation)
+    _buildDefinitionSteps: function() {
       var stepNodes = this.nodes.filter(function(n) {
         return n.type !== 'start' && n.type !== 'end';
       });
 
-      for (var i = 0; i < stepNodes.length; i++) {
-        var node = stepNodes[i];
-        lines.push('[[workflow.steps]]');
-        lines.push('name = "' + (node.label || 'step-' + (i + 1)) + '"');
+      return stepNodes.map(function(node, index) {
+        var step = {
+          id: workflowUiSlugify(
+            node.config.step_id || node.label || node.type,
+            'step-' + (index + 1)
+          ),
+          name: node.label || workflowUiTitleCase(node.type) + ' Step',
+          kind: node.type,
+          flow: {
+            mode: node.config.flow_mode || 'sequential'
+          }
+        };
+        var bindings = {};
+        var uses = null;
+
+        if (step.flow.mode === 'conditional') {
+          step.flow.when = node.config.flow_when || '';
+        } else if (step.flow.mode === 'loop') {
+          step.flow.until = node.config.flow_until || '';
+          step.flow.max_iterations = Number(node.config.flow_max_iterations || 0);
+        }
+
+        if (node.config.save_as) {
+          step.save_as = node.config.save_as;
+        }
 
         if (node.type === 'agent') {
-          lines.push('type = "agent"');
-          if (node.config.agent_name) lines.push('agent_name = "' + node.config.agent_name + '"');
-          lines.push('prompt = "' + (node.config.prompt || '{{input}}') + '"');
-          if (node.config.model) lines.push('model = "' + node.config.model + '"');
-        } else if (node.type === 'parallel') {
-          lines.push('type = "fan_out"');
-          lines.push('fan_count = ' + (node.config.fan_count || 3));
-        } else if (node.type === 'condition') {
-          lines.push('type = "conditional"');
-          lines.push('expression = "' + (node.config.expression || '') + '"');
-        } else if (node.type === 'loop') {
-          lines.push('type = "loop"');
-          lines.push('max_iterations = ' + (node.config.max_iterations || 5));
-          if (node.config.until) lines.push('until = "' + node.config.until + '"');
-        } else if (node.type === 'collect') {
-          lines.push('type = "collect"');
-          lines.push('strategy = "' + (node.config.strategy || 'all') + '"');
-        }
-
-        // Find what this node connects to
-        var outConns = self.connections.filter(function(c) { return c.from === node.id; });
-        if (outConns.length === 1) {
-          var target = self.getNode(outConns[0].to);
-          if (target && target.type !== 'end') {
-            lines.push('next = "' + target.label + '"');
+          uses = { agent: node.config.agent_id || '' };
+          if (node.config.instructions) bindings.instructions = node.config.instructions;
+          if (node.config.provider_override) {
+            bindings.provider_override = node.config.provider_override;
           }
-        } else if (outConns.length > 1 && node.type === 'condition') {
-          for (var j = 0; j < outConns.length; j++) {
-            var t2 = self.getNode(outConns[j].to);
-            if (t2 && t2.type !== 'end') {
-              var branchLabel = j === 0 ? 'true' : 'false';
-              lines.push('next_' + branchLabel + ' = "' + t2.label + '"');
+        } else if (node.type === 'primitive') {
+          uses = { primitive: node.config.action || '' };
+          if (workflowUiNormalizeText(node.config.params_text).trim()) {
+            try {
+              var params = JSON.parse(node.config.params_text);
+              var keys = Object.keys(params || {});
+              for (var i = 0; i < keys.length; i++) {
+                bindings[keys[i]] = typeof params[keys[i]] === 'string'
+                  ? params[keys[i]]
+                  : JSON.stringify(params[keys[i]]);
+              }
+            } catch (_) {
+              bindings.params = node.config.params_text;
             }
           }
-        } else if (outConns.length > 1 && node.type === 'parallel') {
-          var targets = [];
-          for (var k = 0; k < outConns.length; k++) {
-            var t3 = self.getNode(outConns[k].to);
-            if (t3 && t3.type !== 'end') targets.push('"' + t3.label + '"');
+        } else if (node.type === 'workflow') {
+          uses = { workflow: node.config.workflow_id || '' };
+        } else if (node.type === 'wait_signal') {
+          uses = { signal_name: node.config.signal_name || '' };
+          if (node.config.timeout_secs) {
+            step.runtime = { timeout_secs: Number(node.config.timeout_secs) };
           }
-          if (targets.length) lines.push('fan_targets = [' + targets.join(', ') + ']');
+        } else if (node.type === 'start_looper') {
+          uses = {};
+          if (workflowUiNormalizeText(node.config.task_id).indexOf('{{') >= 0) {
+            uses.task_id_binding = node.config.task_id;
+          } else if (node.config.task_id) {
+            uses.task_ref = node.config.task_id;
+          }
+          if (node.config.execution_policy) {
+            bindings.execution_policy = node.config.execution_policy;
+          }
+        } else if (node.type === 'emit_event') {
+          uses = { event: node.config.event || '' };
+          if (node.config.payload) {
+            uses.payload_template = node.config.payload;
+          }
+          if (node.config.source) {
+            bindings.source = node.config.source;
+          }
+        } else if (node.type === 'collect') {
+          if (node.config.from_step) bindings.from_step = node.config.from_step;
+          if (node.config.aggregation) bindings.aggregation = node.config.aggregation;
         }
 
-        lines.push('');
-      }
+        if (uses && Object.keys(uses).length) {
+          step.uses = uses;
+        }
+        if (Object.keys(bindings).length) {
+          step.with = bindings;
+        }
 
-      this.tomlOutput = lines.join('\n');
+        return step;
+      });
+    },
+
+    _defaultOutputs: function() {
+      var stepNodes = this.nodes.filter(function(n) {
+        return n.type !== 'start' && n.type !== 'end';
+      });
+      var last = stepNodes.length ? stepNodes[stepNodes.length - 1] : null;
+      var saveAs = last && last.config && last.config.save_as ? last.config.save_as : 'result';
+      var outputs = {};
+      outputs[saveAs] = '{{ vars.' + saveAs + ' }}';
+      return outputs;
+    },
+
+    generateToml: function() {
+      this.tomlOutput = JSON.stringify({
+        id: workflowUiSlugify(this.workflowName || 'visual-builder', 'visual-builder'),
+        name: this.workflowName || 'Visual Builder Workflow',
+        version: this.workflowVersion || '1.0.0',
+        description: this.workflowDescription || '',
+        enabled: true,
+        tags: ['visual-builder'],
+        input: workflowUiDefaultContract('object'),
+        output: workflowUiDefaultContract('object'),
+        defaults: {
+          timeout_secs: 120,
+          error_mode: 'fail'
+        },
+        steps: this._buildDefinitionSteps(),
+        outputs: this._defaultOutputs()
+      }, null, 2);
       this.showTomlPreview = true;
     },
 
     // ── Save Workflow ────────────────────────────────────
 
     async saveWorkflow() {
-      var steps = [];
-      var stepNodes = this.nodes.filter(function(n) {
-        return n.type !== 'start' && n.type !== 'end';
-      });
-      for (var i = 0; i < stepNodes.length; i++) {
-        var node = stepNodes[i];
-        var step = {
-          name: node.label || 'step-' + (i + 1),
-          mode: node.type === 'parallel' ? 'fan_out' : node.type === 'loop' ? 'loop' : 'sequential'
-        };
-        if (node.type === 'agent') {
-          step.agent_name = node.config.agent_name || '';
-          step.prompt = node.config.prompt || '{{input}}';
-        }
-        steps.push(step);
-      }
+      var definition = {
+        id: workflowUiSlugify(this.workflowName || 'visual-builder', 'visual-builder'),
+        name: this.workflowName || 'Visual Builder Workflow',
+        version: this.workflowVersion || '1.0.0',
+        description: this.workflowDescription || '',
+        enabled: true,
+        tags: ['visual-builder'],
+        input: {
+          kind: 'object',
+          required: [],
+          open: false,
+          fields: {}
+        },
+        output: {
+          kind: 'object',
+          required: [],
+          open: false,
+          fields: {}
+        },
+        defaults: {
+          timeout_secs: 120,
+          error_mode: 'fail'
+        },
+        steps: this._buildDefinitionSteps(),
+        outputs: this._defaultOutputs()
+      };
       try {
-        await OpenFangAPI.post('/api/workflows', {
-          name: this.workflowName || 'untitled',
-          description: this.workflowDescription || '',
-          steps: steps
-        });
+        await OpenFangAPI.v1.workflows.create(definition);
         OpenFangToast.success('Workflow saved!');
         this.showSaveModal = false;
+        window.dispatchEvent(new CustomEvent('openfang:workflows-changed'));
       } catch(e) {
         OpenFangToast.error('Failed to save: ' + e.message);
       }

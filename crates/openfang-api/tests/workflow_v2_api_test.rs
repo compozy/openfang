@@ -1,15 +1,21 @@
 //! Real HTTP integration tests for the Workflow v2 API surface.
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 
 use openfang_api::routes::AppState;
 use openfang_api::server::build_router;
-use openfang_api::types::{WorkflowOrigin, WorkflowOriginKind, WorkflowResponse};
+use openfang_api::types::{
+    PackManifest, PackObjectRef, PackResourceType, PackSource, PackSourceKind, WorkflowOrigin,
+    WorkflowOriginKind, WorkflowResponse,
+};
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentManifest;
 use openfang_types::config::{DefaultModelConfig, KernelConfig};
 use openfang_types::workflow::WorkflowV2Definition;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 struct TestServer {
@@ -43,7 +49,12 @@ memory_write = ["self.*"]
 "#;
 
 async fn start_workflow_v2_test_server() -> TestServer {
+    start_workflow_v2_test_server_with_seed(|_| {}).await
+}
+
+async fn start_workflow_v2_test_server_with_seed(seed: impl FnOnce(&Path)) -> TestServer {
     let tmp = tempfile::tempdir().expect("temporary directory should be created");
+    seed(tmp.path());
     let config = KernelConfig {
         home_dir: tmp.path().to_path_buf(),
         data_dir: tmp.path().join("data"),
@@ -89,6 +100,18 @@ async fn start_workflow_v2_test_server() -> TestServer {
         state,
         _tmp: tmp,
     }
+}
+
+fn write_file(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("parent directory should exist");
+    }
+    fs::write(path, content).expect("fixture file should be written");
+}
+
+fn write_toml_file<T: Serialize>(path: &Path, value: &T) {
+    let payload = toml::to_string_pretty(value).expect("fixture should serialize to TOML");
+    write_file(path, &payload);
 }
 
 fn available_agent_refs(kernel: &OpenFangKernel) -> Vec<String> {
@@ -336,6 +359,28 @@ fn persist_workflow_resource(server: &TestServer, resource: &WorkflowResponse) {
     .expect("workflow resource should be written");
 }
 
+fn seed_managed_pack_workflow_fixture(home_dir: &Path, workflow_id: &str) {
+    let manifest = PackManifest {
+        id: "sdlc".to_string(),
+        name: "SDLC".to_string(),
+        version: "1.2.0".to_string(),
+        description: "Pack-backed workflow fixture".to_string(),
+        source: PackSource {
+            kind: PackSourceKind::Bundled,
+        },
+        objects: vec![PackObjectRef {
+            resource_type: PackResourceType::Workflow,
+            resource_id: workflow_id.to_string(),
+        }],
+    };
+
+    write_toml_file(&home_dir.join("packs/sdlc/pack.toml"), &manifest);
+    write_toml_file(
+        &home_dir.join(format!("packs/sdlc/workflows/{workflow_id}.toml")),
+        &simple_workflow_definition(workflow_id, "Managed pack workflow"),
+    );
+}
+
 async fn post_json(
     client: &reqwest::Client,
     server: &TestServer,
@@ -433,7 +478,10 @@ async fn post_validate_returns_valid_true_for_correct_definition() {
     )
     .await;
 
-    assert!(status == reqwest::StatusCode::OK);
+    assert!(
+        status == reqwest::StatusCode::OK,
+        "expected fork to succeed, got status {status} with body {body}"
+    );
     assert!(body["valid"] == Value::Bool(true));
     assert!(body["issues"] == Value::Array(Vec::new()));
     assert!(body["normalized"]["input"]["kind"] == Value::String("object".to_string()));
@@ -811,6 +859,42 @@ async fn post_fork_creates_user_owned_shadow_with_provenance() {
     assert!(get_status == reqwest::StatusCode::OK);
     assert!(get_body["origin"]["kind"] == Value::String("user".to_string()));
     assert!(get_body["forked_from"]["pack_id"] == Value::String("pack-sdlc".to_string()));
+}
+
+#[tokio::test]
+async fn post_fork_creates_shadow_for_pack_registry_workflow() {
+    let server = start_workflow_v2_test_server_with_seed(|home_dir| {
+        seed_managed_pack_workflow_fixture(home_dir, "sdlc-main");
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let (before_status, before_body) =
+        get_json(&client, &server, "/api/v1/workflows/sdlc-main").await;
+    assert!(before_status == reqwest::StatusCode::OK);
+    assert!(before_body["origin"]["kind"] == Value::String("pack".to_string()));
+    assert!(before_body["origin"]["pack_id"] == Value::String("sdlc".to_string()));
+
+    let (status, body) = post_json(
+        &client,
+        &server,
+        "/api/v1/workflows/sdlc-main/fork",
+        json!({ "mode": "shadow" }),
+    )
+    .await;
+
+    assert!(status == reqwest::StatusCode::OK);
+    assert!(body["origin"]["kind"] == Value::String("user".to_string()));
+    assert!(body["forked_from"]["kind"] == Value::String("pack".to_string()));
+    assert!(body["forked_from"]["pack_id"] == Value::String("sdlc".to_string()));
+    assert!(body["forked_from"]["resource_id"] == Value::String("sdlc-main".to_string()));
+
+    let (after_status, after_body) =
+        get_json(&client, &server, "/api/v1/workflows/sdlc-main").await;
+    assert!(after_status == reqwest::StatusCode::OK);
+    assert!(after_body["origin"]["kind"] == Value::String("user".to_string()));
+    assert!(after_body["forked_from"]["pack_id"] == Value::String("sdlc".to_string()));
+    assert!(after_body["forked_from"]["resource_id"] == Value::String("sdlc-main".to_string()));
 }
 
 #[tokio::test]

@@ -1392,346 +1392,830 @@
 
     <!-- Page: Workflows -->
     <template x-if="page === 'workflows'">
-      <div x-data="{ wfTab: 'list' }">
+      <div x-data="{ wfTab: 'editor' }">
         <div class="page-header">
-          <h2>Workflows</h2>
+          <div>
+            <h2>Workflows</h2>
+            <div class="text-xs text-dim">Workflow v2 authoring, runtime insight, validation, compile, fork, and run controls on the v1 API.</div>
+          </div>
           <div class="flex gap-2">
-            <button class="btn btn-ghost btn-sm" :class="{ active: wfTab === 'list' }" @click="wfTab = 'list'">List</button>
+            <button class="btn btn-ghost btn-sm" :class="{ active: wfTab === 'editor' }" @click="wfTab = 'editor'">Editor</button>
             <button class="btn btn-ghost btn-sm" :class="{ active: wfTab === 'builder' }" @click="wfTab = 'builder'">Visual Builder</button>
           </div>
         </div>
 
-        <!-- Tab: List -->
-        <template x-if="wfTab === 'list'">
-        <div x-data="workflowsPage" style="display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden">
-        <div class="page-body" x-init="loadWorkflows()">
-          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading workflows...</span></div>
-          <div x-show="!loading && loadError" class="error-state">
-            <span class="error-icon">!</span>
-            <p x-text="loadError"></p>
-            <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
-          </div>
-          <div x-show="!loading && !loadError">
-          <div class="card mb-4" style="border-left:3px solid var(--accent)">
-            <div class="font-bold" style="font-size:13px;margin-bottom:4px">What are Workflows?</div>
-            <div class="text-sm text-dim" style="line-height:1.6">
-              Workflows chain multiple agents into automated pipelines. Each step runs an agent with a prompt template,
-              passing output from one step as input to the next. Steps can run sequentially, fan out in parallel, loop, or branch conditionally.
-              <br><span style="margin-top:4px;display:inline-block">Try the <strong style="color:var(--accent);cursor:pointer" @click="$dispatch('wf-switch-tab','builder')">Visual Builder</strong> to drag and drop workflow steps.</span>
+        <template x-if="wfTab === 'editor'">
+          <div x-data="workflowsPage()" x-init="init()" class="page-body">
+            <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading workflow definitions...</span></div>
+            <div x-show="!loading && loadError" class="error-state">
+              <span class="error-icon">!</span>
+              <p x-text="loadError"></p>
+              <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
             </div>
-          </div>
-          <div class="flex gap-2 mb-4">
-            <button class="btn btn-primary btn-sm" @click="showCreateModal = true">+ New Workflow</button>
-          </div>
-          <div class="table-wrap" x-show="workflows.length">
-            <table>
-              <thead><tr><th>Name</th><th>Steps</th><th>Created</th><th>Actions</th></tr></thead>
-              <tbody>
-                <template x-for="wf in workflows" :key="wf.id">
-                  <tr>
-                    <td><span class="font-bold" x-text="wf.name"></span><br><span class="text-xs text-dim" x-text="wf.description"></span></td>
-                    <td x-text="Array.isArray(wf.steps) ? wf.steps.length + ' step' + (wf.steps.length !== 1 ? 's' : '') : wf.steps"></td>
-                    <td class="text-xs" x-text="new Date(wf.created_at).toLocaleDateString()"></td>
-                    <td>
-                      <button class="btn btn-primary btn-sm" @click="showRunModal(wf)">Run</button>
-                      <button class="btn btn-ghost btn-sm" @click="showEditModal(wf)">Edit</button>
-                      <button class="btn btn-ghost btn-sm" @click="viewRuns(wf)">History</button>
-                      <button class="btn btn-danger btn-sm" @click="deleteWorkflow(wf)">Delete</button>
-                    </td>
-                  </tr>
-                </template>
-              </tbody>
-            </table>
-          </div>
-          <div class="empty-state" x-show="!workflows.length">
-            <div class="empty-state-icon">
-              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v12M18 9a9 9 0 0 1-9 9"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/></svg>
-            </div>
-            <h3>No workflows yet</h3>
-            <p>Chain multiple agents into automated pipelines with branching, fan-out, and loops.</p>
-            <button class="btn btn-primary" @click="showCreateModal = true">Create Workflow</button>
-          </div>
-          </div>
-          <!-- Create modal -->
-          <template x-if="showCreateModal">
-            <div class="modal-overlay" @click.self="showCreateModal = false" @keydown.escape.window="showCreateModal = false">
-              <div class="modal">
-                <div class="modal-header"><h3>Create Workflow</h3><button class="modal-close" @click="showCreateModal = false">&times;</button></div>
-                <div class="form-group"><label>Name</label><input class="form-input" x-model="newWf.name" placeholder="my-workflow"></div>
-                <div class="form-group"><label>Description</label><input class="form-input" x-model="newWf.description" placeholder="What does this workflow do?"></div>
-                <div class="mb-4">
-                  <div class="form-group" style="margin:0"><label>Steps</label></div>
-                  <div class="text-xs text-dim mb-2">Each step runs an agent. Use <code style="color:var(--accent)">{{input}}</code> in prompts to pass the previous step's output.</div>
-                  <template x-for="(step, i) in newWf.steps" :key="i">
-                    <div class="card mt-2" style="padding:10px">
-                      <div class="flex gap-2 items-center">
-                        <span class="text-xs text-dim font-bold" x-text="'#' + (i+1)" style="width:24px"></span>
-                        <input class="form-input" style="flex:1" x-model="step.name" placeholder="Step name">
-                        <input class="form-input" style="flex:1" x-model="step.agent_name" placeholder="Agent name">
-                        <select class="form-select" style="width:120px" x-model="step.mode">
-                          <option value="sequential">Sequential</option>
-                          <option value="fan_out">Fan Out</option>
-                          <option value="conditional">Conditional</option>
-                          <option value="loop">Loop</option>
-                        </select>
-                        <button class="btn btn-danger btn-sm" @click="newWf.steps.splice(i,1)">&times;</button>
+
+            <div x-show="!loading && !loadError" class="wf2-layout">
+              <aside class="wf2-sidebar">
+                <div class="card">
+                  <div class="card-header">Catalog</div>
+                  <div class="search-input mb-3">
+                    <input type="text" placeholder="Search workflows, tags, or origin..." x-model="workflowSearch">
+                  </div>
+                  <div class="flex gap-2">
+                    <button class="btn btn-primary btn-sm" @click="createWorkflowDraft()">New Workflow</button>
+                    <button class="btn btn-ghost btn-sm" @click="loadWorkflows({ preserveSelection: true, refreshDetail: true })">Refresh</button>
+                  </div>
+                  <p class="text-xs text-dim mt-3" x-show="agentsLoadError" x-text="'Agent picker fallback: ' + agentsLoadError"></p>
+                </div>
+
+                <div class="wf2-workflow-list">
+                  <template x-for="workflow in filteredWorkflows" :key="workflow.id">
+                    <div class="card wf2-workflow-card" :class="{ active: selectedWorkflowId === workflow.id }">
+                      <div class="wf2-workflow-card-head">
+                        <div>
+                          <div class="wf2-workflow-card-title" x-text="workflow.name"></div>
+                          <div class="text-xs text-dim font-mono" x-text="workflow.id"></div>
+                        </div>
+                        <div class="flex gap-2 items-center">
+                          <span class="badge" :class="originBadgeClass(workflow.origin)" x-text="workflowOriginLabel(workflow.origin)"></span>
+                          <div class="toggle" :class="{ active: workflow.enabled }" @click.stop="toggleWorkflowEnabled(workflow)" :title="workflow.enabled ? 'Disable workflow' : 'Enable workflow'"></div>
+                        </div>
                       </div>
-                      <input class="form-input mt-2" x-model="step.prompt" placeholder="Prompt template (use {{input}})">
+                      <p class="wf2-workflow-card-description" x-text="workflow.description || 'No description yet.'"></p>
+                      <div class="wf2-workflow-card-metrics">
+                        <div><span class="wf2-metric-label">Steps</span><span class="wf2-metric-value" x-text="workflow.steps"></span></div>
+                        <div><span class="wf2-metric-label">Active</span><span class="wf2-metric-value" x-text="runtimeSnapshot(workflow).active_runs"></span></div>
+                        <div><span class="wf2-metric-label">Waiting</span><span class="wf2-metric-value" x-text="runtimeSnapshot(workflow).waiting_runs"></span></div>
+                      </div>
+                      <div class="text-xs text-dim mb-2" x-text="'Last run: ' + workflowLastRunText(workflow)"></div>
+                      <div class="card-flex" x-show="workflow.tags && workflow.tags.length">
+                        <template x-for="tag in workflow.tags" :key="workflow.id + '-tag-' + tag">
+                          <span class="badge badge-dim" x-text="tag"></span>
+                        </template>
+                      </div>
+                      <div class="flex gap-2 mt-3">
+                        <button class="btn btn-ghost btn-sm" @click="selectWorkflow(workflow.id, true)">Open</button>
+                        <button class="btn btn-ghost btn-sm" @click="location.hash = 'runs'" x-show="runtimeSnapshot(workflow).active_runs || runtimeSnapshot(workflow).waiting_runs">Runs</button>
+                      </div>
                     </div>
                   </template>
-                  <button class="btn btn-ghost btn-sm mt-2" @click="newWf.steps.push({name:'',agent_name:'',mode:'sequential',prompt:'{{input}}'})">+ Add Step</button>
-                </div>
-                <button class="btn btn-primary btn-block" @click="createWorkflow()">Create</button>
-              </div>
-            </div>
-          </template>
-          <!-- Run modal -->
-          <template x-if="runModal">
-            <div class="modal-overlay" @click.self="runModal = null" @keydown.escape.window="runModal = null">
-              <div class="modal">
-                <div class="modal-header"><h3 x-text="'Run: ' + runModal.name"></h3><button class="modal-close" @click="runModal = null">&times;</button></div>
-                <div class="form-group"><label>Input</label><textarea class="form-textarea" x-model="runInput" placeholder="Enter workflow input..."></textarea></div>
-                <button class="btn btn-primary btn-block" @click="executeWorkflow()" :disabled="running">
-                  <span x-show="!running">Execute</span><span x-show="running">Running...</span>
-                </button>
-                <div class="card mt-4" x-show="runResult">
-                  <div class="card-header">Result</div>
-                  <pre style="font-size:11px;white-space:pre-wrap;margin-top:8px;color:var(--text-dim)" x-text="runResult"></pre>
-                </div>
-              </div>
-            </div>
-          </template>
-          <!-- Edit modal -->
-          <template x-if="editModal">
-            <div class="modal-overlay" @click.self="editModal = null" @keydown.escape.window="editModal = null">
-              <div class="modal">
-                <div class="modal-header"><h3 x-text="'Edit: ' + editModal.name"></h3><button class="modal-close" @click="editModal = null">&times;</button></div>
-                <div class="form-group"><label>Name</label><input class="form-input" x-model="editWf.name" placeholder="Workflow name"></div>
-                <div class="form-group"><label>Description</label><input class="form-input" x-model="editWf.description" placeholder="What does this workflow do?"></div>
-                <div class="mb-4">
-                  <div class="form-group" style="margin:0"><label>Steps</label></div>
-                  <div class="text-xs text-dim mb-2">Each step runs an agent. Use <code style="color:var(--accent)">{{input}}</code> in prompts to pass the previous step's output.</div>
-                  <template x-for="(step, i) in editWf.steps" :key="i">
-                    <div class="card mt-2" style="padding:10px">
-                      <div class="flex gap-2 items-center">
-                        <span class="text-xs text-dim font-bold" x-text="'#' + (i+1)" style="width:24px"></span>
-                        <input class="form-input" style="flex:1" x-model="step.name" placeholder="Step name">
-                        <input class="form-input" style="flex:1" x-model="step.agent_name" placeholder="Agent name">
-                        <select class="form-select" style="width:120px" x-model="step.mode">
-                          <option value="sequential">Sequential</option>
-                          <option value="fan_out">Fan Out</option>
-                          <option value="conditional">Conditional</option>
-                          <option value="loop">Loop</option>
-                        </select>
-                        <button class="btn btn-danger btn-sm" @click="editWf.steps.splice(i,1)">&times;</button>
-                      </div>
-                      <input class="form-input mt-2" x-model="step.prompt" placeholder="Prompt template (use {{input}})">
+
+                  <div class="empty-state" x-show="!filteredWorkflows.length">
+                    <div class="empty-state-icon">
+                      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v12M18 9a9 9 0 0 1-9 9"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/></svg>
                     </div>
-                  </template>
-                  <button class="btn btn-ghost btn-sm mt-2" @click="editWf.steps.push({name:'',agent_name:'',mode:'sequential',prompt:'{{input}}'})">+ Add Step</button>
+                    <h3>No workflows</h3>
+                    <p class="hint">Create a new workflow definition or adjust the search to load a different part of the catalog.</p>
+                    <button class="btn btn-primary btn-sm" @click="createWorkflowDraft()">Create Draft</button>
+                  </div>
                 </div>
-                <button class="btn btn-primary btn-block" @click="saveWorkflow()">Save Changes</button>
-              </div>
-            </div>
-          </template>
-        </div>
-        </div>
-        </template>
+              </aside>
 
-        <!-- Tab: Visual Builder -->
-        <template x-if="wfTab === 'builder'">
-        <div x-data="workflowBuilder()" x-init="init()">
-          <div class="wf-builder-layout">
-            <!-- Node palette (left sidebar) -->
-            <div class="wf-palette">
-              <div class="wf-palette-title">Node Palette</div>
-              <div class="text-xs text-dim mb-3">Drag nodes onto the canvas</div>
-              <template x-for="nt in nodeTypes" :key="nt.type">
-                <div class="wf-palette-node" draggable="true" @dragstart="onPaletteDragStart(nt.type, $event)"
-                     :style="'border-left: 3px solid ' + nt.color">
-                  <span class="wf-palette-icon" :style="'background:' + nt.color" x-text="nt.icon"></span>
-                  <span class="text-xs" x-text="nt.label"></span>
+              <section class="wf2-main">
+                <div x-show="detailLoading" class="loading-state"><div class="spinner"></div><span>Loading workflow detail...</span></div>
+                <div x-show="!detailLoading && detailError" class="error-state">
+                  <span class="error-icon">!</span>
+                  <p x-text="detailError"></p>
+                  <button class="btn btn-ghost btn-sm" @click="selectedWorkflowId ? selectWorkflow(selectedWorkflowId, true) : createWorkflowDraft()">Retry</button>
                 </div>
-              </template>
-              <hr style="border-color:var(--border);margin:12px 0">
-              <div class="text-xs text-dim mb-2">Workflow</div>
-              <div class="form-group" style="margin-bottom:8px">
-                <input class="form-input" x-model="workflowName" placeholder="Workflow name" style="font-size:11px">
-              </div>
-              <div class="form-group" style="margin-bottom:8px">
-                <input class="form-input" x-model="workflowDescription" placeholder="Description" style="font-size:11px">
-              </div>
-              <div class="flex flex-col gap-1">
-                <button class="btn btn-primary btn-sm btn-block" @click="generateToml()">Export TOML</button>
-                <button class="btn btn-primary btn-sm btn-block" @click="showSaveModal = true">Save Workflow</button>
-                <button class="btn btn-ghost btn-sm btn-block" @click="autoLayout()">Auto Layout</button>
-                <button class="btn btn-ghost btn-sm btn-block" @click="clearCanvas()">Clear</button>
-              </div>
-            </div>
 
-            <!-- Canvas -->
-            <div class="wf-canvas-wrap">
-              <!-- Zoom controls -->
-              <div class="wf-zoom-controls">
-                <button class="btn btn-ghost btn-sm" @click="zoomOut()" title="Zoom out">-</button>
-                <span class="text-xs" x-text="Math.round(zoom * 100) + '%'" style="min-width:36px;text-align:center"></span>
-                <button class="btn btn-ghost btn-sm" @click="zoomIn()" title="Zoom in">+</button>
-                <button class="btn btn-ghost btn-sm" @click="zoomReset()" title="Reset view">Fit</button>
-              </div>
+                <div x-show="!detailLoading && !detailError" class="wf2-main-stack">
+                  <div class="card">
+                    <div class="wf2-section-header">
+                      <div>
+                        <div class="card-header" x-text="selectedWorkflowId ? 'Edit Workflow' : 'New Workflow Draft'"></div>
+                        <p class="text-xs text-dim" x-text="selectedWorkflowId ? 'Persisted workflow definition loaded from /api/v1/workflows.' : 'Draft a workflow definition and save it to the v1 control plane.'"></p>
+                      </div>
+                      <div class="flex gap-2 flex-wrap">
+                        <button class="btn btn-ghost btn-sm" @click="validateWorkflow()" :disabled="validating"><span x-show="!validating">Validate</span><span x-show="validating">Validating...</span></button>
+                        <button class="btn btn-ghost btn-sm" @click="compileWorkflow()" :disabled="compiling"><span x-show="!compiling">Compile</span><span x-show="compiling">Compiling...</span></button>
+                        <button class="btn btn-primary btn-sm" @click="saveWorkflow()" :disabled="saving"><span x-show="!saving">Save</span><span x-show="saving">Saving...</span></button>
+                        <button class="btn btn-ghost btn-sm" @click="forkSelectedWorkflow()" :disabled="forkingId === selectedWorkflowId" x-show="canForkSelected">Fork</button>
+                        <button class="btn btn-danger btn-sm" @click="confirmDeleteSelected()" :disabled="deletingId === selectedWorkflowId" x-show="canDeleteSelected">Delete</button>
+                      </div>
+                    </div>
 
-              <svg id="wf-canvas" class="wf-canvas"
-                   @mousedown="onCanvasMouseDown($event)"
-                   @mousemove="onCanvasMouseMove($event)"
-                   @mouseup="onCanvasMouseUp()"
-                   @mouseleave="onCanvasMouseUp()"
-                   @wheel.prevent="onCanvasWheel($event)"
-                   @drop="onCanvasDrop($event)"
-                   @dragover="onCanvasDragOver($event)">
-                <g :transform="'translate(' + (canvasOffset.x * zoom) + ',' + (canvasOffset.y * zoom) + ') scale(' + zoom + ')'">
-                  <!-- Grid pattern -->
-                  <defs>
-                    <pattern id="wf-grid" width="20" height="20" patternUnits="userSpaceOnUse">
-                      <circle cx="1" cy="1" r="0.5" fill="var(--text-dim)" opacity="0.15"/>
-                    </pattern>
-                  </defs>
-                  <rect x="-2000" y="-2000" width="6000" height="6000" fill="url(#wf-grid)"/>
-
-                  <!-- Manually rendered nodes & connections (Alpine x-for breaks inside SVG) -->
-                  <g id="wf-render-group" x-effect="nodes.length; connections.length; selectedNode; selectedConnection; connecting; connectPreview; scheduleRender()"></g>
-                </g>
-              </svg>
-
-              <!-- Canvas hints -->
-              <div class="wf-canvas-hint" x-show="nodes.length <= 1">
-                Drag nodes from the palette onto the canvas. Connect output ports (bottom) to input ports (top). Double-click to edit.
-              </div>
-            </div>
-
-            <!-- Node editor panel (right sidebar) -->
-            <div class="wf-editor-panel" x-show="showNodeEditor && selectedNode" x-transition>
-              <div class="wf-editor-header">
-                <span class="font-bold text-sm" x-text="selectedNode ? selectedNode.label : ''"></span>
-                <button class="btn btn-ghost btn-sm" @click="showNodeEditor = false">&times;</button>
-              </div>
-              <template x-if="selectedNode">
-                <div>
-                  <div class="form-group">
-                    <label class="text-xs">Label</label>
-                    <input class="form-input" x-model="selectedNode.label" @input="applyNodeEdit()" style="font-size:11px">
+                    <div class="wf2-form-grid">
+                      <div class="form-group">
+                        <label>ID</label>
+                        <input class="form-input font-mono" x-model="form.id" placeholder="workflow-id">
+                      </div>
+                      <div class="form-group">
+                        <label>Name</label>
+                        <input class="form-input" x-model="form.name" placeholder="Workflow name">
+                      </div>
+                      <div class="form-group">
+                        <label>Version</label>
+                        <input class="form-input font-mono" x-model="form.version" placeholder="1.0.0">
+                      </div>
+                      <div class="form-group">
+                        <label>Enabled</label>
+                        <label class="form-checkbox"><input type="checkbox" x-model="form.enabled"> Workflow is active</label>
+                      </div>
+                      <div class="form-group">
+                        <label>Tags</label>
+                        <input class="form-input" x-model="form.tags_text" placeholder="planning, review, pack">
+                      </div>
+                      <div class="form-group">
+                        <label>Default Timeout</label>
+                        <input class="form-input" type="number" min="1" x-model.number="form.defaults_timeout_secs">
+                      </div>
+                      <div class="form-group wf2-span-full">
+                        <label>Description</label>
+                        <textarea class="form-textarea" x-model="form.description" placeholder="Describe what this workflow coordinates."></textarea>
+                      </div>
+                    </div>
                   </div>
 
-                  <!-- Agent config -->
-                  <template x-if="selectedNode.type === 'agent'">
-                    <div>
-                      <div class="form-group">
-                        <label class="text-xs">Agent</label>
-                        <select class="form-select" x-model="selectedNode.config.agent_name" @change="applyNodeEdit()" style="font-size:11px">
-                          <option value="">Select agent...</option>
-                          <template x-for="a in agents" :key="a.id || a.name">
-                            <option :value="a.name" x-text="a.name"></option>
+                  <div class="card" x-show="selectedRuntime || selectedWorkflow">
+                    <div class="wf2-section-header">
+                      <div>
+                        <div class="card-header">Runtime Status</div>
+                        <p class="text-xs text-dim">Snapshot from <code>/api/v1/workflows/{id}/runtime</code> plus workflow provenance.</p>
+                      </div>
+                      <div class="card-flex">
+                        <span class="badge" :class="selectedRuntime && selectedRuntime.loaded ? 'badge-success' : 'badge-dim'" x-text="selectedRuntime && selectedRuntime.loaded ? 'loaded' : 'not loaded'"></span>
+                        <span class="badge" :class="selectedRuntime && selectedRuntime.healthy ? 'badge-success' : 'badge-error'" x-text="selectedRuntime && selectedRuntime.healthy ? 'healthy' : 'unhealthy'"></span>
+                        <span class="badge" :class="selectedWorkflow && selectedWorkflow.definition && selectedWorkflow.definition.enabled ? 'badge-success' : 'badge-dim'" x-text="selectedWorkflow && selectedWorkflow.definition && selectedWorkflow.definition.enabled ? 'enabled' : 'disabled'"></span>
+                      </div>
+                    </div>
+                    <div class="wf2-runtime-grid">
+                      <div><span class="wf2-metric-label">Origin</span><span class="wf2-metric-value" x-text="selectedWorkflow ? workflowOriginLabel(selectedWorkflow.origin) : '-'"></span></div>
+                      <div><span class="wf2-metric-label">Active Runs</span><span class="wf2-metric-value" x-text="selectedRuntime ? selectedRuntime.active_runs : 0"></span></div>
+                      <div><span class="wf2-metric-label">Waiting Runs</span><span class="wf2-metric-value" x-text="selectedRuntime ? selectedRuntime.waiting_runs : 0"></span></div>
+                      <div><span class="wf2-metric-label">Last Run</span><span class="wf2-metric-value" x-text="selectedRuntime && selectedRuntime.last_run_at ? OpenFangUtils.formatDateTime(selectedRuntime.last_run_at) : 'Never'"></span></div>
+                    </div>
+                    <div class="text-xs text-dim mt-3" x-show="selectedWorkflow && selectedWorkflow.forked_from">
+                      Forked from <span class="font-mono" x-text="selectedWorkflow.forked_from.resource_id"></span>
+                      via <span x-text="selectedWorkflow.forked_from.kind"></span>.
+                    </div>
+                  </div>
+
+                  <div class="wf2-contract-grid">
+                    <div class="card" :class="{ 'wf2-has-issues': issueCountForPath('input') }">
+                      <div class="wf2-section-header">
+                        <div>
+                          <div class="card-header">Input Contract</div>
+                          <p class="text-xs text-dim">Use the contract vocabulary from the workflow definition schema.</p>
+                        </div>
+                        <select class="form-select wf2-contract-select" @change="applyContractPreset('input', $event.target.value)">
+                          <option value="">Preset...</option>
+                          <template x-for="option in contractKindOptions" :key="'input-' + option.value">
+                            <option :value="option.value" x-text="option.label"></option>
                           </template>
                         </select>
                       </div>
-                      <div class="form-group">
-                        <label class="text-xs">Prompt Template</label>
-                        <textarea class="form-textarea" x-model="selectedNode.config.prompt" @input="applyNodeEdit()" style="font-size:11px;min-height:60px" placeholder="{{input}}"></textarea>
-                      </div>
-                      <div class="form-group">
-                        <label class="text-xs">Model (optional)</label>
-                        <input class="form-input" x-model="selectedNode.config.model" @input="applyNodeEdit()" style="font-size:11px" placeholder="Default model">
-                      </div>
-                    </div>
-                  </template>
-
-                  <!-- Condition config -->
-                  <template x-if="selectedNode.type === 'condition'">
-                    <div>
-                      <div class="form-group">
-                        <label class="text-xs">Expression</label>
-                        <input class="form-input" x-model="selectedNode.config.expression" @input="applyNodeEdit()" style="font-size:11px" placeholder="output.contains('yes')">
-                      </div>
-                      <div class="text-xs text-dim">Top port = true, bottom port = false</div>
-                    </div>
-                  </template>
-
-                  <!-- Loop config -->
-                  <template x-if="selectedNode.type === 'loop'">
-                    <div>
-                      <div class="form-group">
-                        <label class="text-xs">Max Iterations</label>
-                        <input type="number" class="form-input" x-model.number="selectedNode.config.max_iterations" @input="applyNodeEdit()" style="font-size:11px" min="1" max="100">
-                      </div>
-                      <div class="form-group">
-                        <label class="text-xs">Until (stop condition)</label>
-                        <input class="form-input" x-model="selectedNode.config.until" @input="applyNodeEdit()" style="font-size:11px" placeholder="output === 'done'">
+                      <textarea class="form-textarea wf2-contract-editor font-mono" x-model="form.input_text" placeholder='{"kind":"object","fields":{}}'></textarea>
+                      <div class="wf2-inline-issues" x-show="issueCountForPath('input')">
+                        <template x-for="issue in issuesForPath('input')" :key="'input-' + issue.path + issue.code">
+                          <div class="wf2-inline-issue">
+                            <span class="badge" :class="issueSeverityClass(issue)" x-text="issue.severity"></span>
+                            <div>
+                              <div class="font-mono text-xs" x-text="issue.path"></div>
+                              <div class="text-xs text-dim" x-text="issue.message"></div>
+                            </div>
+                          </div>
+                        </template>
                       </div>
                     </div>
-                  </template>
 
-                  <!-- Parallel config -->
-                  <template x-if="selectedNode.type === 'parallel'">
-                    <div>
-                      <div class="form-group">
-                        <label class="text-xs">Fan-out Count</label>
-                        <input type="number" class="form-input" x-model.number="selectedNode.config.fan_count" @input="applyNodeEdit()" style="font-size:11px" min="2" max="10">
-                      </div>
-                    </div>
-                  </template>
-
-                  <!-- Collect config -->
-                  <template x-if="selectedNode.type === 'collect'">
-                    <div>
-                      <div class="form-group">
-                        <label class="text-xs">Strategy</label>
-                        <select class="form-select" x-model="selectedNode.config.strategy" @change="applyNodeEdit()" style="font-size:11px">
-                          <option value="all">Wait for all</option>
-                          <option value="first">First to finish</option>
-                          <option value="majority">Majority vote</option>
+                    <div class="card" :class="{ 'wf2-has-issues': issueCountForPath('output') || issueCountForPath('outputs') }">
+                      <div class="wf2-section-header">
+                        <div>
+                          <div class="card-header">Output Contract</div>
+                          <p class="text-xs text-dim">Define the final contract and the symbol projections that satisfy it.</p>
+                        </div>
+                        <select class="form-select wf2-contract-select" @change="applyContractPreset('output', $event.target.value)">
+                          <option value="">Preset...</option>
+                          <template x-for="option in contractKindOptions" :key="'output-' + option.value">
+                            <option :value="option.value" x-text="option.label"></option>
+                          </template>
                         </select>
                       </div>
+                      <textarea class="form-textarea wf2-contract-editor font-mono" x-model="form.output_text" placeholder='{"kind":"object","fields":{}}'></textarea>
+                      <div class="wf2-output-bindings">
+                        <div class="wf2-section-header">
+                          <div class="card-header">Output Projections</div>
+                          <button class="btn btn-ghost btn-sm" @click="addOutputRow()">Add Projection</button>
+                        </div>
+                        <template x-for="(outputRow, outputIndex) in form.outputs" :key="'output-row-' + outputIndex">
+                          <div class="wf2-binding-row">
+                            <input class="form-input font-mono" x-model="outputRow.key" placeholder="result">
+                            <input class="form-input font-mono" x-model="outputRow.value" placeholder="{{ vars.result }}">
+                            <button class="btn btn-danger btn-sm" @click="removeOutputRow(outputIndex)">&times;</button>
+                          </div>
+                        </template>
+                      </div>
                     </div>
-                  </template>
+                  </div>
 
-                  <hr style="border-color:var(--border);margin:12px 0">
-                  <div class="flex gap-2">
-                    <button class="btn btn-ghost btn-sm" @click="duplicateNode(selectedNode)">Duplicate</button>
-                    <button class="btn btn-danger btn-sm" @click="deleteNode(selectedNode.id)">Delete</button>
+                  <div class="card">
+                    <div class="wf2-section-header">
+                      <div>
+                        <div class="card-header">Workflow Steps</div>
+                        <p class="text-xs text-dim">All 8 workflow step kinds are supported, including flow-mode-specific fields and <code>save_as</code> bindings.</p>
+                      </div>
+                    </div>
+                    <div class="card-flex wf2-step-adders">
+                      <template x-for="option in stepKindOptions" :key="'add-step-' + option.value">
+                        <button class="btn btn-ghost btn-sm" @click="addStep(option.value)" x-text="'Add ' + option.label"></button>
+                      </template>
+                    </div>
+
+                    <div class="wf2-step-list">
+                      <template x-for="(step, stepIndex) in form.steps" :key="'step-' + formRevision + '-' + stepIndex + '-' + step.id">
+                        <div class="card wf2-step-card" :class="{ 'wf2-has-issues': stepIssues(stepIndex).length }">
+                          <div class="wf2-step-card-head">
+                            <div>
+                              <div class="card-header" x-text="'Step ' + (stepIndex + 1) + ' · ' + (step.name || workflowStepKindLabel(step.kind))"></div>
+                              <div class="text-xs text-dim font-mono" x-text="step.id || 'unspecified-step-id'"></div>
+                            </div>
+                            <div class="flex gap-2 flex-wrap">
+                              <span class="badge badge-dim" x-text="workflowStepKindLabel(step.kind)"></span>
+                              <span class="badge badge-warn" x-show="stepIssues(stepIndex).length" x-text="stepIssues(stepIndex).length + ' issue(s)'"></span>
+                              <button class="btn btn-ghost btn-sm" @click="moveStep(stepIndex, -1)" :disabled="stepIndex === 0">↑</button>
+                              <button class="btn btn-ghost btn-sm" @click="moveStep(stepIndex, 1)" :disabled="stepIndex === form.steps.length - 1">↓</button>
+                              <button class="btn btn-ghost btn-sm" @click="duplicateStep(stepIndex)">Duplicate</button>
+                              <button class="btn btn-danger btn-sm" @click="removeStep(stepIndex)">Delete</button>
+                            </div>
+                          </div>
+
+                          <div class="wf2-form-grid">
+                            <div class="form-group">
+                              <label>Step ID</label>
+                              <input class="form-input font-mono" x-model="step.id" placeholder="step-id">
+                            </div>
+                            <div class="form-group">
+                              <label>Name</label>
+                              <input class="form-input" x-model="step.name" placeholder="Human readable step name">
+                            </div>
+                            <div class="form-group">
+                              <label>Kind</label>
+                              <select class="form-select" x-model="step.kind" x-effect="$nextTick(() => { $el.value = step.kind; })" @change="changeStepKind(step, stepIndex)">
+                                <template x-for="option in stepKindOptions" :key="'kind-' + stepIndex + '-' + option.value">
+                                  <option :value="option.value" :selected="step.kind === option.value" x-text="option.label"></option>
+                                </template>
+                              </select>
+                            </div>
+                            <div class="form-group">
+                              <label>save_as</label>
+                              <input class="form-input font-mono" x-model="step.save_as" placeholder="analysis">
+                            </div>
+                            <div class="form-group">
+                              <label>Flow Mode</label>
+                              <select class="form-select" x-model="step.flow_mode" x-effect="$nextTick(() => { $el.value = step.flow_mode; })">
+                                <template x-for="option in flowOptions" :key="'flow-' + stepIndex + '-' + option.value">
+                                  <option :value="option.value" :selected="step.flow_mode === option.value" x-text="option.label"></option>
+                                </template>
+                              </select>
+                            </div>
+                            <div class="form-group">
+                              <label>Timeout (secs)</label>
+                              <input class="form-input" type="number" min="1" x-model="step.runtime_timeout_secs" placeholder="120">
+                            </div>
+                            <div class="form-group" x-show="step.flow_mode === 'conditional'">
+                              <label>when</label>
+                              <input class="form-input font-mono" x-model="step.flow_when" placeholder="{{ vars.analysis }}">
+                            </div>
+                            <div class="form-group" x-show="step.flow_mode === 'loop'">
+                              <label>until</label>
+                              <input class="form-input font-mono" x-model="step.flow_until" placeholder="{{ vars.final_result }}">
+                            </div>
+                            <div class="form-group" x-show="step.flow_mode === 'loop'">
+                              <label>max_iterations</label>
+                              <input class="form-input" type="number" min="1" x-model.number="step.flow_max_iterations" placeholder="3">
+                            </div>
+                          </div>
+
+                          <div class="wf2-kind-fields">
+                            <template x-if="step.kind === 'agent'">
+                              <div class="wf2-form-grid">
+                                <div class="form-group">
+                                  <label>agent_id</label>
+                                  <select class="form-select" x-model="step.agent_id">
+                                    <option value="">Select agent...</option>
+                                    <template x-for="agent in agents" :key="'workflow-agent-' + (agent.id || agent.name)">
+                                      <option :value="agent.id || agent.name" x-text="agent.name || agent.id"></option>
+                                    </template>
+                                  </select>
+                                </div>
+                                <div class="form-group">
+                                  <label>instructions</label>
+                                  <input class="form-input" x-model="step.instructions" placeholder="Optional dispatch instructions">
+                                </div>
+                                <div class="form-group">
+                                  <label>provider_override</label>
+                                  <input class="form-input font-mono" x-model="step.provider_override" placeholder="profile-name">
+                                </div>
+                              </div>
+                            </template>
+
+                            <template x-if="step.kind === 'primitive'">
+                              <div class="wf2-form-grid">
+                                <div class="form-group">
+                                  <label>action</label>
+                                  <input class="form-input font-mono" x-model="step.action" placeholder="artifact.write">
+                                </div>
+                                <div class="form-group wf2-span-full">
+                                  <label>params</label>
+                                  <textarea class="form-textarea font-mono" x-model="step.params_text" placeholder='{"source":"{{ vars.analysis }}"}'></textarea>
+                                </div>
+                              </div>
+                            </template>
+
+                            <template x-if="step.kind === 'workflow'">
+                              <div class="wf2-form-grid">
+                                <div class="form-group">
+                                  <label>workflow_id</label>
+                                  <select class="form-select" x-model="step.workflow_id">
+                                    <option value="">Select workflow...</option>
+                                    <template x-for="workflow in workflows" :key="'workflow-ref-' + workflow.id">
+                                      <option :value="workflow.id" x-text="workflow.name + ' (' + workflow.id + ')'"></option>
+                                    </template>
+                                  </select>
+                                </div>
+                              </div>
+                            </template>
+
+                            <template x-if="step.kind === 'wait_signal'">
+                              <div class="wf2-form-grid">
+                                <div class="form-group">
+                                  <label>signal_name</label>
+                                  <input class="form-input font-mono" x-model="step.signal_name" placeholder="approval_ready">
+                                </div>
+                                <div class="form-group">
+                                  <label>timeout_secs</label>
+                                  <input class="form-input" type="number" min="1" x-model="step.timeout_secs" placeholder="300">
+                                </div>
+                              </div>
+                            </template>
+
+                            <template x-if="step.kind === 'start_looper'">
+                              <div class="wf2-form-grid">
+                                <div class="form-group">
+                                  <label>task_id</label>
+                                  <input class="form-input font-mono" x-model="step.task_id" placeholder="task-1 or {{ vars.task_id }}">
+                                </div>
+                                <div class="form-group wf2-span-full">
+                                  <label>execution_policy</label>
+                                  <textarea class="form-textarea font-mono" x-model="step.execution_policy" placeholder='{"mode":"parallel","max_parallelism":2}'></textarea>
+                                </div>
+                              </div>
+                            </template>
+
+                            <template x-if="step.kind === 'emit_event'">
+                              <div class="wf2-form-grid">
+                                <div class="form-group">
+                                  <label>event</label>
+                                  <input class="form-input font-mono" x-model="step.event" placeholder="artifact.created">
+                                </div>
+                                <div class="form-group">
+                                  <label>source</label>
+                                  <input class="form-input font-mono" x-model="step.source" placeholder="workflow">
+                                </div>
+                                <div class="form-group wf2-span-full">
+                                  <label>payload</label>
+                                  <textarea class="form-textarea font-mono" x-model="step.payload" placeholder="{{ vars.artifact }}"></textarea>
+                                </div>
+                              </div>
+                            </template>
+
+                            <template x-if="step.kind === 'collect'">
+                              <div class="wf2-form-grid">
+                                <div class="form-group">
+                                  <label>from_step</label>
+                                  <input class="form-input font-mono" x-model="step.from_step" placeholder="primitive-step">
+                                </div>
+                                <div class="form-group">
+                                  <label>aggregation</label>
+                                  <input class="form-input font-mono" x-model="step.aggregation" placeholder="all">
+                                </div>
+                              </div>
+                            </template>
+
+                            <template x-if="step.kind === 'noop'">
+                              <p class="hint">Noop steps are placeholders or terminal bindings. Use <code>save_as</code> to project a final symbol into the workflow outputs.</p>
+                            </template>
+                          </div>
+
+                          <div class="wf2-advanced-bindings" x-show="step.kind !== 'primitive'">
+                            <div class="wf2-section-header">
+                              <div class="card-header">Input Bindings</div>
+                              <button class="btn btn-ghost btn-sm" @click="addBindingRow(step)">Add Binding</button>
+                            </div>
+                            <template x-for="(binding, bindingIndex) in step.with_rows" :key="'binding-' + stepIndex + '-' + bindingIndex">
+                              <div class="wf2-binding-row">
+                                <input class="form-input font-mono" x-model="binding.key" placeholder="field_name">
+                                <input class="form-input font-mono" x-model="binding.value" placeholder="{{ input.topic }}">
+                                <button class="btn btn-danger btn-sm" @click="removeBindingRow(step, bindingIndex)">&times;</button>
+                              </div>
+                            </template>
+                          </div>
+
+                          <div class="wf2-inline-issues" x-show="stepIssues(stepIndex).length">
+                            <template x-for="issue in stepIssues(stepIndex)" :key="'step-issue-' + stepIndex + '-' + issue.path + issue.code">
+                              <div class="wf2-inline-issue">
+                                <span class="badge" :class="issueSeverityClass(issue)" x-text="issue.severity"></span>
+                                <div>
+                                  <div class="font-mono text-xs" x-text="issue.path"></div>
+                                  <div class="text-xs text-dim" x-text="issue.message"></div>
+                                </div>
+                              </div>
+                            </template>
+                          </div>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+
+                  <div class="wf2-result-grid">
+                    <div class="card">
+                      <div class="wf2-section-header">
+                        <div>
+                          <div class="card-header">Validation</div>
+                          <p class="text-xs text-dim">Structured issues from <code>POST /api/v1/workflows/validate</code>.</p>
+                        </div>
+                        <span class="badge" :class="validationResult && validationResult.valid ? 'badge-success' : 'badge-dim'" x-text="validationResult ? (validationResult.valid ? 'valid' : 'has issues') : 'not run'"></span>
+                      </div>
+                      <div class="empty-state" x-show="!validationIssues.length">
+                        <h4>No validation output yet</h4>
+                        <p class="hint">Run Validate to collect inline issues with severity, code, and path metadata.</p>
+                      </div>
+                      <div class="wf2-result-list" x-show="validationIssues.length">
+                        <template x-for="issue in validationIssues" :key="'validation-' + issue.path + issue.code">
+                          <div class="wf2-inline-issue">
+                            <span class="badge" :class="issueSeverityClass(issue)" x-text="issue.severity"></span>
+                            <div>
+                              <div class="font-mono text-xs" x-text="issue.path"></div>
+                              <div class="text-xs text-dim"><span class="font-mono" x-text="issue.code"></span> · <span x-text="issue.message"></span></div>
+                            </div>
+                          </div>
+                        </template>
+                      </div>
+                    </div>
+
+                    <div class="card">
+                      <div class="wf2-section-header">
+                        <div>
+                          <div class="card-header">Compiled IR</div>
+                          <p class="text-xs text-dim">Summary and raw payload from <code>POST /api/v1/workflows/compile</code>.</p>
+                        </div>
+                        <span class="badge badge-dim" x-text="compileSummary ? (compileSummary.step_count + ' step(s)') : 'not run'"></span>
+                      </div>
+                      <div class="wf2-runtime-grid" x-show="compileSummary">
+                        <div><span class="wf2-metric-label">Workflow ID</span><span class="wf2-metric-value font-mono" x-text="compileSummary ? compileSummary.workflow_id : '-'"></span></div>
+                        <div><span class="wf2-metric-label">Version</span><span class="wf2-metric-value font-mono" x-text="compileSummary ? compileSummary.workflow_version : '-'"></span></div>
+                        <div><span class="wf2-metric-label">Steps</span><span class="wf2-metric-value" x-text="compileSummary ? compileSummary.step_count : 0"></span></div>
+                        <div><span class="wf2-metric-label">Symbols</span><span class="wf2-metric-value" x-text="compileSummary ? compileSummary.symbol_count : 0"></span></div>
+                      </div>
+                      <div class="empty-state" x-show="!compileResult">
+                        <h4>No compile output yet</h4>
+                        <p class="hint">Compile the draft to inspect the normalized definition and stable workflow IR.</p>
+                      </div>
+                      <pre class="wf2-json-preview" x-show="compileResult" x-text="compileResult ? JSON.stringify(compileResult, null, 2) : ''"></pre>
+                    </div>
+                  </div>
+
+                  <div class="card">
+                    <div class="wf2-section-header">
+                      <div>
+                        <div class="card-header">Run Trigger</div>
+                        <p class="text-xs text-dim">Inputs are generated from the current workflow input contract and submitted to the durable run endpoints.</p>
+                      </div>
+                      <div class="flex gap-2">
+                        <button class="btn btn-ghost btn-sm" @click="dryRunWorkflow()" :disabled="!selectedWorkflowId || dryRunning"><span x-show="!dryRunning">Dry Run</span><span x-show="dryRunning">Previewing...</span></button>
+                        <button class="btn btn-primary btn-sm" @click="startRun()" :disabled="!selectedWorkflowId || running"><span x-show="!running">Start Run</span><span x-show="running">Submitting...</span></button>
+                      </div>
+                    </div>
+
+                    <div class="empty-state" x-show="!selectedWorkflowId">
+                      <h4>Save the draft first</h4>
+                      <p class="hint">Run and dry-run actions require a persisted workflow ID.</p>
+                    </div>
+
+                    <div x-show="selectedWorkflowId">
+                      <div class="wf2-run-field-grid">
+                        <template x-for="field in runInputFields" :key="'run-field-' + field.key">
+                          <div class="form-group">
+                            <label x-text="field.label + (field.required ? ' *' : '')"></label>
+                            <template x-if="runFieldIsBoolean(field)">
+                              <label class="form-checkbox"><input type="checkbox" x-model="runForm.values[field.key]"> true / false</label>
+                            </template>
+                            <template x-if="!runFieldIsBoolean(field) && !runFieldRequiresJson(field)">
+                              <input class="form-input font-mono" :type="runFieldInputType(field)" x-model="runForm.values[field.key]" :placeholder="field.kind">
+                            </template>
+                            <template x-if="runFieldRequiresJson(field)">
+                              <textarea class="form-textarea font-mono" x-model="runForm.values[field.key]" placeholder='{} or []'></textarea>
+                            </template>
+                            <div class="text-xs text-dim" x-text="field.description || field.kind"></div>
+                          </div>
+                        </template>
+                      </div>
+                      <div class="wf2-form-grid">
+                        <div class="form-group">
+                          <label>Labels</label>
+                          <input class="form-input" x-model="runForm.labels_text" placeholder="manual, dashboard">
+                        </div>
+                        <div class="form-group wf2-span-full">
+                          <label>Metadata</label>
+                          <textarea class="form-textarea font-mono" x-model="runForm.metadata_text" placeholder='{"source":"dashboard"}'></textarea>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="wf2-result-grid">
+                      <div class="card" x-show="runResult">
+                        <div class="card-header">Run Accepted</div>
+                        <pre class="wf2-json-preview" x-text="runResult ? JSON.stringify(runResult, null, 2) : ''"></pre>
+                      </div>
+                      <div class="card" x-show="dryRunResult">
+                        <div class="card-header">Dry-Run Preview</div>
+                        <pre class="wf2-json-preview" x-text="dryRunResult ? JSON.stringify(dryRunResult, null, 2) : ''"></pre>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="card">
+                    <div class="wf2-section-header">
+                      <div>
+                        <div class="card-header">Workflow Runs</div>
+                        <p class="text-xs text-dim">Sub-list from <code>GET /api/v1/workflows/{id}/runs</code>.</p>
+                      </div>
+                      <button class="btn btn-ghost btn-sm" @click="location.hash = 'runs'" x-show="selectedWorkflowId">Open Runs Page</button>
+                    </div>
+
+                    <div class="empty-state" x-show="selectedWorkflowId && !workflowRuns.length">
+                      <h4>No runs yet</h4>
+                      <p class="hint">Trigger a run or dry-run preview from this page to populate runtime history.</p>
+                    </div>
+
+                    <div class="wf2-run-list" x-show="workflowRuns.length">
+                      <template x-for="run in workflowRuns" :key="'workflow-run-' + run.id">
+                        <div class="wf2-run-row">
+                          <div>
+                            <div class="font-mono text-xs" x-text="run.id"></div>
+                            <div class="text-xs text-dim" x-text="run.started_at ? OpenFangUtils.formatDateTime(run.started_at) : 'No start timestamp'"></div>
+                          </div>
+                          <div class="card-flex">
+                            <span class="badge" :class="OpenFangUtils.statusBadge(run.status)" x-text="run.status"></span>
+                            <span class="badge badge-dim" x-show="run.waiting_kind" x-text="run.waiting_kind"></span>
+                            <span class="badge badge-dim" x-show="run.active_dispatch_id">dispatch</span>
+                            <span class="badge badge-dim" x-show="run.active_hitl_request_id">hitl</span>
+                          </div>
+                        </div>
+                      </template>
+                    </div>
                   </div>
                 </div>
-              </template>
+              </section>
             </div>
           </div>
+        </template>
 
-          <!-- Delete connection hint -->
-          <div class="wf-conn-hint" x-show="selectedConnection" x-transition>
-            <span class="text-xs">Connection selected</span>
-            <button class="btn btn-danger btn-sm" @click="deleteConnection(selectedConnection.id)">Delete Connection</button>
+        <template x-if="wfTab === 'builder'">
+          <div x-data="workflowBuilder()" x-init="init()">
+            <div class="wf-builder-layout">
+              <div class="wf-palette">
+                <div class="wf-palette-title">Node Palette</div>
+                <div class="text-xs text-dim mb-3">Drag v2 step kinds onto the canvas and configure flow metadata in the side panel.</div>
+                <template x-for="nt in nodeTypes" :key="nt.type">
+                  <div class="wf-palette-node" draggable="true" @dragstart="onPaletteDragStart(nt.type, $event)" :style="'border-left: 3px solid ' + nt.color">
+                    <span class="wf-palette-icon" :style="'background:' + nt.color" x-text="nt.icon"></span>
+                    <span class="text-xs" x-text="nt.label"></span>
+                  </div>
+                </template>
+                <hr style="border-color:var(--border);margin:12px 0">
+                <div class="text-xs text-dim mb-2">Workflow</div>
+                <div class="form-group" style="margin-bottom:8px">
+                  <input class="form-input" x-model="workflowName" placeholder="Workflow name" style="font-size:11px">
+                </div>
+                <div class="form-group" style="margin-bottom:8px">
+                  <input class="form-input font-mono" x-model="workflowVersion" placeholder="1.0.0" style="font-size:11px">
+                </div>
+                <div class="form-group" style="margin-bottom:8px">
+                  <input class="form-input" x-model="workflowDescription" placeholder="Description" style="font-size:11px">
+                </div>
+                <div class="flex flex-col gap-1">
+                  <button class="btn btn-ghost btn-sm btn-block" @click="generateToml()">Preview Definition</button>
+                  <button class="btn btn-primary btn-sm btn-block" @click="showSaveModal = true">Save Workflow</button>
+                  <button class="btn btn-ghost btn-sm btn-block" @click="autoLayout()">Auto Layout</button>
+                  <button class="btn btn-ghost btn-sm btn-block" @click="clearCanvas()">Clear</button>
+                </div>
+              </div>
+
+              <div class="wf-canvas-wrap">
+                <div class="wf-zoom-controls">
+                  <button class="btn btn-ghost btn-sm" @click="zoomOut()" title="Zoom out">-</button>
+                  <span class="text-xs" x-text="Math.round(zoom * 100) + '%'" style="min-width:36px;text-align:center"></span>
+                  <button class="btn btn-ghost btn-sm" @click="zoomIn()" title="Zoom in">+</button>
+                  <button class="btn btn-ghost btn-sm" @click="zoomReset()" title="Reset view">Fit</button>
+                </div>
+
+                <svg id="wf-canvas" class="wf-canvas"
+                     @mousedown="onCanvasMouseDown($event)"
+                     @mousemove="onCanvasMouseMove($event)"
+                     @mouseup="onCanvasMouseUp()"
+                     @mouseleave="onCanvasMouseUp()"
+                     @wheel.prevent="onCanvasWheel($event)"
+                     @drop="onCanvasDrop($event)"
+                     @dragover="onCanvasDragOver($event)">
+                  <g :transform="'translate(' + (canvasOffset.x * zoom) + ',' + (canvasOffset.y * zoom) + ') scale(' + zoom + ')'">
+                    <defs>
+                      <pattern id="wf-grid" width="20" height="20" patternUnits="userSpaceOnUse">
+                        <circle cx="1" cy="1" r="0.5" fill="var(--text-dim)" opacity="0.15"></circle>
+                      </pattern>
+                    </defs>
+                    <rect x="-2000" y="-2000" width="6000" height="6000" fill="url(#wf-grid)"></rect>
+                    <g id="wf-render-group" x-effect="nodes.length; connections.length; selectedNode; selectedConnection; connecting; connectPreview; scheduleRender()"></g>
+                  </g>
+                </svg>
+
+                <div class="wf-canvas-hint" x-show="nodes.length <= 1">
+                  Drag step kinds from the palette onto the canvas. Double-click any node to edit its v2 step metadata.
+                </div>
+              </div>
+
+              <div class="wf-editor-panel" x-show="showNodeEditor && selectedNode" x-transition>
+                <div class="wf-editor-header">
+                  <span class="font-bold text-sm" x-text="selectedNode ? selectedNode.label : ''"></span>
+                  <button class="btn btn-ghost btn-sm" @click="showNodeEditor = false">&times;</button>
+                </div>
+                <template x-if="selectedNode">
+                  <div>
+                    <div class="form-group">
+                      <label class="text-xs">Label</label>
+                      <input class="form-input" x-model="selectedNode.label" @input="applyNodeEdit()" style="font-size:11px">
+                    </div>
+                    <div class="form-group">
+                      <label class="text-xs">Step ID</label>
+                      <input class="form-input font-mono" x-model="selectedNode.config.step_id" @input="applyNodeEdit()" style="font-size:11px">
+                    </div>
+                    <div class="form-group">
+                      <label class="text-xs">save_as</label>
+                      <input class="form-input font-mono" x-model="selectedNode.config.save_as" @input="applyNodeEdit()" style="font-size:11px">
+                    </div>
+                    <div class="form-group">
+                      <label class="text-xs">Flow Mode</label>
+                      <select class="form-select" x-model="selectedNode.config.flow_mode" @change="applyNodeEdit()" style="font-size:11px">
+                        <option value="sequential">Sequential</option>
+                        <option value="fan_out">Fan Out</option>
+                        <option value="conditional">Conditional</option>
+                        <option value="loop">Loop</option>
+                      </select>
+                    </div>
+                    <div class="form-group" x-show="selectedNode.config.flow_mode === 'conditional'">
+                      <label class="text-xs">when</label>
+                      <input class="form-input font-mono" x-model="selectedNode.config.flow_when" @input="applyNodeEdit()" style="font-size:11px">
+                    </div>
+                    <div class="form-group" x-show="selectedNode.config.flow_mode === 'loop'">
+                      <label class="text-xs">until</label>
+                      <input class="form-input font-mono" x-model="selectedNode.config.flow_until" @input="applyNodeEdit()" style="font-size:11px">
+                    </div>
+                    <div class="form-group" x-show="selectedNode.config.flow_mode === 'loop'">
+                      <label class="text-xs">max_iterations</label>
+                      <input type="number" class="form-input" min="1" x-model.number="selectedNode.config.flow_max_iterations" @input="applyNodeEdit()" style="font-size:11px">
+                    </div>
+
+                    <template x-if="selectedNode.type === 'agent'">
+                      <div>
+                        <div class="form-group">
+                          <label class="text-xs">agent_id</label>
+                          <select class="form-select" x-model="selectedNode.config.agent_id" @change="applyNodeEdit()" style="font-size:11px">
+                            <option value="">Select agent...</option>
+                            <template x-for="agent in agents" :key="'builder-agent-' + (agent.id || agent.name)">
+                              <option :value="agent.id || agent.name" x-text="agent.name || agent.id"></option>
+                            </template>
+                          </select>
+                        </div>
+                        <div class="form-group">
+                          <label class="text-xs">instructions</label>
+                          <input class="form-input" x-model="selectedNode.config.instructions" @input="applyNodeEdit()" style="font-size:11px">
+                        </div>
+                        <div class="form-group">
+                          <label class="text-xs">provider_override</label>
+                          <input class="form-input font-mono" x-model="selectedNode.config.provider_override" @input="applyNodeEdit()" style="font-size:11px">
+                        </div>
+                      </div>
+                    </template>
+
+                    <template x-if="selectedNode.type === 'primitive'">
+                      <div>
+                        <div class="form-group">
+                          <label class="text-xs">action</label>
+                          <input class="form-input font-mono" x-model="selectedNode.config.action" @input="applyNodeEdit()" style="font-size:11px">
+                        </div>
+                        <div class="form-group">
+                          <label class="text-xs">params</label>
+                          <textarea class="form-textarea font-mono" x-model="selectedNode.config.params_text" @input="applyNodeEdit()" style="font-size:11px;min-height:60px"></textarea>
+                        </div>
+                      </div>
+                    </template>
+
+                    <template x-if="selectedNode.type === 'workflow'">
+                      <div class="form-group">
+                        <label class="text-xs">workflow_id</label>
+                        <select class="form-select" x-model="selectedNode.config.workflow_id" @change="applyNodeEdit()" style="font-size:11px">
+                          <option value="">Select workflow...</option>
+                          <template x-for="workflow in workflows" :key="'builder-workflow-' + workflow.id">
+                            <option :value="workflow.id" x-text="workflow.name + ' (' + workflow.id + ')'"></option>
+                          </template>
+                        </select>
+                      </div>
+                    </template>
+
+                    <template x-if="selectedNode.type === 'wait_signal'">
+                      <div>
+                        <div class="form-group">
+                          <label class="text-xs">signal_name</label>
+                          <input class="form-input font-mono" x-model="selectedNode.config.signal_name" @input="applyNodeEdit()" style="font-size:11px">
+                        </div>
+                        <div class="form-group">
+                          <label class="text-xs">timeout_secs</label>
+                          <input type="number" class="form-input" min="1" x-model="selectedNode.config.timeout_secs" @input="applyNodeEdit()" style="font-size:11px">
+                        </div>
+                      </div>
+                    </template>
+
+                    <template x-if="selectedNode.type === 'start_looper'">
+                      <div>
+                        <div class="form-group">
+                          <label class="text-xs">task_id</label>
+                          <input class="form-input font-mono" x-model="selectedNode.config.task_id" @input="applyNodeEdit()" style="font-size:11px">
+                        </div>
+                        <div class="form-group">
+                          <label class="text-xs">execution_policy</label>
+                          <textarea class="form-textarea font-mono" x-model="selectedNode.config.execution_policy" @input="applyNodeEdit()" style="font-size:11px;min-height:60px"></textarea>
+                        </div>
+                      </div>
+                    </template>
+
+                    <template x-if="selectedNode.type === 'emit_event'">
+                      <div>
+                        <div class="form-group">
+                          <label class="text-xs">event</label>
+                          <input class="form-input font-mono" x-model="selectedNode.config.event" @input="applyNodeEdit()" style="font-size:11px">
+                        </div>
+                        <div class="form-group">
+                          <label class="text-xs">source</label>
+                          <input class="form-input font-mono" x-model="selectedNode.config.source" @input="applyNodeEdit()" style="font-size:11px">
+                        </div>
+                        <div class="form-group">
+                          <label class="text-xs">payload</label>
+                          <textarea class="form-textarea font-mono" x-model="selectedNode.config.payload" @input="applyNodeEdit()" style="font-size:11px;min-height:60px"></textarea>
+                        </div>
+                      </div>
+                    </template>
+
+                    <template x-if="selectedNode.type === 'collect'">
+                      <div>
+                        <div class="form-group">
+                          <label class="text-xs">from_step</label>
+                          <input class="form-input font-mono" x-model="selectedNode.config.from_step" @input="applyNodeEdit()" style="font-size:11px">
+                        </div>
+                        <div class="form-group">
+                          <label class="text-xs">aggregation</label>
+                          <input class="form-input font-mono" x-model="selectedNode.config.aggregation" @input="applyNodeEdit()" style="font-size:11px">
+                        </div>
+                      </div>
+                    </template>
+
+                    <hr style="border-color:var(--border);margin:12px 0">
+                    <div class="flex gap-2">
+                      <button class="btn btn-ghost btn-sm" @click="duplicateNode(selectedNode)">Duplicate</button>
+                      <button class="btn btn-danger btn-sm" @click="deleteNode(selectedNode.id)">Delete</button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <div class="wf-conn-hint" x-show="selectedConnection" x-transition>
+              <span class="text-xs">Connection selected</span>
+              <button class="btn btn-danger btn-sm" @click="deleteConnection(selectedConnection.id)">Delete Connection</button>
+            </div>
+
+            <template x-if="showTomlPreview">
+              <div class="modal-overlay" @click.self="showTomlPreview = false" @keydown.escape.window="showTomlPreview = false">
+                <div class="modal" style="max-width:760px">
+                  <div class="modal-header"><h3>Generated Definition Preview</h3><button class="modal-close" @click="showTomlPreview = false">&times;</button></div>
+                  <pre class="wf-toml-preview" x-text="tomlOutput"></pre>
+                  <button class="btn btn-ghost btn-block mt-2" @click="navigator.clipboard.writeText(tomlOutput); OpenFangToast.success('Copied!')">Copy to Clipboard</button>
+                </div>
+              </div>
+            </template>
+
+            <template x-if="showSaveModal">
+              <div class="modal-overlay" @click.self="showSaveModal = false" @keydown.escape.window="showSaveModal = false">
+                <div class="modal">
+                  <div class="modal-header"><h3>Save Workflow</h3><button class="modal-close" @click="showSaveModal = false">&times;</button></div>
+                  <div class="form-group"><label>Name</label><input class="form-input" x-model="workflowName" placeholder="my-workflow"></div>
+                  <div class="form-group"><label>Version</label><input class="form-input font-mono" x-model="workflowVersion" placeholder="1.0.0"></div>
+                  <div class="form-group"><label>Description</label><input class="form-input" x-model="workflowDescription" placeholder="What does this workflow do?"></div>
+                  <div class="text-xs text-dim mb-4" x-text="nodes.filter(function(n){return n.type!=='start'&&n.type!=='end'}).length + ' steps, ' + connections.length + ' connections'"></div>
+                  <button class="btn btn-primary btn-block" @click="saveWorkflow()">Save</button>
+                </div>
+              </div>
+            </template>
           </div>
-
-          <!-- TOML Preview modal -->
-          <template x-if="showTomlPreview">
-            <div class="modal-overlay" @click.self="showTomlPreview = false" @keydown.escape.window="showTomlPreview = false">
-              <div class="modal" style="max-width:600px">
-                <div class="modal-header"><h3>Generated TOML</h3><button class="modal-close" @click="showTomlPreview = false">&times;</button></div>
-                <pre class="wf-toml-preview" x-text="tomlOutput"></pre>
-                <button class="btn btn-ghost btn-block mt-2" @click="navigator.clipboard.writeText(tomlOutput); OpenFangToast.success('Copied!')">Copy to Clipboard</button>
-              </div>
-            </div>
-          </template>
-
-          <!-- Save modal -->
-          <template x-if="showSaveModal">
-            <div class="modal-overlay" @click.self="showSaveModal = false" @keydown.escape.window="showSaveModal = false">
-              <div class="modal">
-                <div class="modal-header"><h3>Save Workflow</h3><button class="modal-close" @click="showSaveModal = false">&times;</button></div>
-                <div class="form-group"><label>Name</label><input class="form-input" x-model="workflowName" placeholder="my-workflow"></div>
-                <div class="form-group"><label>Description</label><input class="form-input" x-model="workflowDescription" placeholder="What does this workflow do?"></div>
-                <div class="text-xs text-dim mb-4" x-text="nodes.filter(function(n){return n.type!=='start'&&n.type!=='end'}).length + ' steps, ' + connections.length + ' connections'"></div>
-                <button class="btn btn-primary btn-block" @click="saveWorkflow()">Save</button>
-              </div>
-            </div>
-          </template>
-        </div>
         </template>
       </div>
     </template>
@@ -1749,8 +2233,8 @@
           <div class="tab" role="tab" :class="{ active: tab === 'jobs' }" @click="tab = 'jobs'">
             Scheduled Jobs <span class="badge badge-dim" x-show="jobs.length" x-text="jobCount() + '/' + jobs.length + ' active'" style="margin-left:4px"></span>
           </div>
-          <div class="tab" role="tab" :class="{ active: tab === 'triggers' }" @click="tab = 'triggers'; if (!triggers.length && !trigLoading) loadTriggers()">
-            Event Triggers <span class="badge badge-dim" x-show="triggers.length" x-text="triggers.length" style="margin-left:4px"></span>
+          <div class="tab" role="tab" :class="{ active: tab === 'triggers' }" @click="tab = 'triggers'">
+            Event Triggers <span class="badge badge-info" style="margin-left:4px">v2</span>
           </div>
           <div class="tab" :class="{ active: tab === 'history' }" @click="tab = 'history'; loadHistory()">
             Run History
@@ -1898,46 +2382,19 @@
 
           <!-- ── TAB: Event Triggers ── -->
           <div x-show="tab === 'triggers'">
-            <div x-show="trigLoading" class="loading-state"><div class="spinner"></div><span>Loading triggers...</span></div>
-            <div x-show="!trigLoading && trigLoadError" class="error-state">
-              <span class="error-icon">!</span>
-              <p x-text="trigLoadError"></p>
-              <button class="btn btn-ghost btn-sm" @click="loadTriggers()">Retry</button>
-            </div>
-            <div x-show="!trigLoading && !trigLoadError">
-              <div class="card mb-4" style="border-left:3px solid var(--accent)">
-                <div class="font-bold" style="font-size:13px;margin-bottom:4px">Event Triggers</div>
-                <div class="text-sm text-dim" style="line-height:1.6">
-                  Event triggers fire agents in response to system events (agent lifecycle, memory updates, custom events).
-                  Create and manage triggers on the <a href="#workflows" style="color:var(--accent)">Workflows</a> page.
-                  This view shows all active triggers for monitoring.
-                </div>
-              </div>
-              <div class="table-wrap" x-show="triggers.length">
-                <table>
-                  <thead><tr><th>Agent</th><th>Pattern</th><th>Prompt</th><th>Fires</th><th>Enabled</th><th>Created</th><th>Actions</th></tr></thead>
-                  <tbody>
-                    <template x-for="t in triggers" :key="t.id">
-                      <tr>
-                        <td class="font-bold truncate" style="max-width:120px" x-text="agentName(t.agent_id)" :title="t.agent_id"></td>
-                        <td><span class="badge badge-created trigger-type" x-text="triggerType(t.pattern)"></span></td>
-                        <td class="truncate text-xs text-dim" style="max-width:180px" x-text="t.prompt_template" :title="t.prompt_template"></td>
-                        <td x-text="t.fire_count + (t.max_fires > 0 ? '/' + t.max_fires : '')"></td>
-                        <td>
-                          <div class="toggle" :class="{ active: t.enabled }" @click="toggleTrigger(t)"></div>
-                        </td>
-                        <td class="text-xs" x-text="new Date(t.created_at).toLocaleDateString()"></td>
-                        <td>
-                          <button class="btn btn-danger btn-sm" @click="deleteTrigger(t)">Delete</button>
-                        </td>
-                      </tr>
-                    </template>
-                  </tbody>
-                </table>
-              </div>
-              <div class="empty-state" x-show="!triggers.length">
-                <h4>No event triggers</h4>
-                <p class="hint">Create event triggers on the <a href="#workflows" style="color:var(--accent)">Workflows page</a> to fire agents in response to system events.</p>
+            <div class="info-card">
+              <h4>Triggers v2 moved out of Scheduler</h4>
+              <p>
+                Trigger authoring, validation, compile previews, runtime counters, synthetic event
+                testing, and pack forks now live on the dedicated <a href="#triggers" style="color:var(--accent)">Triggers</a> page.
+              </p>
+              <ul>
+                <li>Use the new page for CRUD and enable or disable actions.</li>
+                <li>Runtime fire counts and last-fired timestamps are shown per trigger.</li>
+                <li>Pack-managed triggers must be forked before editing.</li>
+              </ul>
+              <div class="mt-4">
+                <button class="btn btn-primary btn-sm" @click="location.hash = 'triggers'">Open Triggers v2</button>
               </div>
             </div>
           </div>
