@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -32,12 +32,12 @@ Update the chat page to support v1 SSE streaming as an alternative to WebSocket,
 
 ## Subtasks
 
-- [ ] 11.1 Add SSE streaming path in `chat.js` — use `POST /api/v1/agents/{id}/messages/stream` as fallback when WS unavailable
-- [ ] 11.2 Handle SSE event types: `message.delta`, `message.completed`, `tool.started`, `tool.completed`, `error`
-- [ ] 11.3 Add dry-run mode toggle UI — button or toggle in chat input area
-- [ ] 11.4 Implement dry-run request — `POST /api/v1/agents/{id}/messages/dry-run`
-- [ ] 11.5 Display dry-run results — would_execute, resolved provider, effects list, explanation text
-- [ ] 11.6 Update `index_body.html` chat template for dry-run toggle and result display
+- [x] 11.1 Add SSE streaming path in `chat.js` — use `POST /api/v1/agents/{id}/messages/stream` as fallback when WS unavailable
+- [x] 11.2 Handle SSE event types: `message.delta`, `message.completed`, `tool.started`, `tool.completed`, `error`
+- [x] 11.3 Add dry-run mode toggle UI — button or toggle in chat input area
+- [x] 11.4 Implement dry-run request — `POST /api/v1/agents/{id}/messages/dry-run`
+- [x] 11.5 Display dry-run results — would_execute, resolved provider, effects list, explanation text
+- [x] 11.6 Update `index_body.html` chat template for dry-run toggle and result display
 
 ## Implementation Details
 
@@ -67,16 +67,16 @@ Update the chat page to support v1 SSE streaming as an alternative to WebSocket,
 
 ### Manual Browser Tests (Required)
 
-- [ ] Chat via WS still works (primary path)
-- [ ] Disable WS (close connection) — verify SSE fallback works
-- [ ] Toggle dry-run mode — send message — verify preview without execution
-- [ ] Dry-run result shows would_execute, effects, explanation
+- [x] Chat via WS still works (primary path)
+- [x] Disable WS (close connection) — verify SSE fallback works
+- [x] Toggle dry-run mode — send message — verify preview without execution
+- [x] Dry-run result shows would_execute, effects, explanation
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

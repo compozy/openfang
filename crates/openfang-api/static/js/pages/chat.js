@@ -42,6 +42,12 @@ function chatPage() {
     modelSwitching: false,
     _modelCache: null,
     _modelCacheTime: 0,
+    // SSE streaming state
+    _sseAbort: null,
+    // Dry-run mode
+    dryRunMode: false,
+    dryRunRunning: false,
+    dryRunResult: null,
     slashCommands: [
       { cmd: '/help', desc: 'Show available commands' },
       { cmd: '/agents', desc: 'Switch to Agents page' },
@@ -59,7 +65,8 @@ function chatPage() {
       { cmd: '/exit', desc: 'Disconnect from agent' },
       { cmd: '/budget', desc: 'Show spending limits and current costs' },
       { cmd: '/peers', desc: 'Show OFP peer network status' },
-      { cmd: '/a2a', desc: 'List discovered external A2A agents' }
+      { cmd: '/a2a', desc: 'List discovered external A2A agents' },
+      { cmd: '/dryrun', desc: 'Toggle dry-run mode (preview without executing)' }
     ],
     tokenCount: 0,
 
@@ -478,6 +485,9 @@ function chatPage() {
             }
             self.scrollToBottom();
           }).catch(function() {});
+          break;
+        case '/dryrun':
+          self.toggleDryRun();
           break;
       }
     },
@@ -996,7 +1006,13 @@ function chatPage() {
     async _sendPayload(finalText, uploadedFiles, msgImages) {
       this.sending = true;
 
-      // Try WebSocket first
+      // Dry-run mode: preview without execution
+      if (this.dryRunMode) {
+        this._sendDryRun(finalText, uploadedFiles);
+        return;
+      }
+
+      // Try WebSocket first (primary — bidirectional)
       var wsPayload = { type: 'message', content: finalText };
       if (uploadedFiles && uploadedFiles.length) wsPayload.attachments = uploadedFiles;
       if (OpenFangAPI.wsSend(wsPayload)) {
@@ -1005,10 +1021,17 @@ function chatPage() {
         return;
       }
 
-      // HTTP fallback
-      if (!OpenFangAPI.isWsConnected()) {
-        OpenFangToast.info('Using HTTP mode (no streaming)');
+      // SSE streaming fallback (when WS unavailable)
+      if (this.currentAgent) {
+        var ssePayload = { message: finalText };
+        if (uploadedFiles && uploadedFiles.length) ssePayload.attachments = uploadedFiles;
+        OpenFangToast.info('Using SSE streaming (WebSocket unavailable)');
+        this._sendViaSSE(this.currentAgent.id, ssePayload);
+        return;
       }
+
+      // HTTP fallback (no streaming, last resort)
+      OpenFangToast.info('Using HTTP mode (no streaming)');
       this.messages.push({ id: ++msgId, role: 'agent', text: '', meta: '', thinking: true, tools: [], ts: Date.now() });
       this.scrollToBottom();
 
@@ -1038,6 +1061,11 @@ function chatPage() {
     // Stop the current agent run
     stopAgent: function() {
       if (!this.currentAgent) return;
+      // Abort active SSE connection if any
+      if (this._sseAbort) {
+        this._sseAbort.abort();
+        this._sseAbort = null;
+      }
       var self = this;
       OpenFangAPI.post('/api/agents/' + this.currentAgent.id + '/stop', {}).then(function(res) {
         self.messages.push({ id: ++msgId, role: 'system', text: res.message || 'Run cancelled', meta: '', tools: [], ts: Date.now() });
@@ -1063,6 +1091,314 @@ function chatPage() {
         } catch(e) {
           OpenFangToast.error('Failed to stop agent: ' + e.message);
         }
+      });
+    },
+
+    // ── Dry-Run Mode ──
+
+    toggleDryRun: function() {
+      this.dryRunMode = !this.dryRunMode;
+      this.dryRunResult = null;
+      var state = this.dryRunMode ? 'enabled' : 'disabled';
+      this.messages.push({ id: ++msgId, role: 'system', text: 'Dry-run mode **' + state + '**. ' + (this.dryRunMode ? 'Messages will be previewed without execution.' : 'Normal execution resumed.'), meta: '', tools: [] });
+      this.scrollToBottom();
+    },
+
+    dismissDryRun: function() {
+      this.dryRunResult = null;
+    },
+
+    _sendDryRun: async function(text, uploadedFiles) {
+      var self = this;
+      this.dryRunRunning = true;
+      this.dryRunResult = null;
+      try {
+        var body = { message: text };
+        if (uploadedFiles && uploadedFiles.length) body.attachments = uploadedFiles;
+        self.dryRunResult = await OpenFangAPI.v1.agents.dryRunMessage(self.currentAgent.id, body);
+      } catch(e) {
+        OpenFangToast.error('Dry-run failed: ' + e.message);
+      }
+      this.dryRunRunning = false;
+      this.sending = false;
+    },
+
+    // ── SSE Streaming (POST-based fallback) ──
+
+    _sendViaSSE: async function(agentId, payload) {
+      var self = this;
+      var abortController = new AbortController();
+      this._sseAbort = abortController;
+
+      // Add thinking indicator
+      this.messages.push({
+        id: ++msgId, role: 'agent', text: '', meta: '',
+        thinking: true, streaming: true, tools: [], ts: Date.now()
+      });
+      this.scrollToBottom();
+      this._resetTypingTimeout();
+
+      try {
+        var token = typeof OpenFangAPI !== 'undefined' ? OpenFangAPI.getToken() : '';
+        var headers = {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream'
+        };
+        if (token) headers['Authorization'] = 'Bearer ' + token;
+
+        var response = await fetch('/api/v1/agents/' + agentId + '/messages/stream', {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify(payload),
+          signal: abortController.signal
+        });
+
+        if (!response.ok) {
+          throw new Error('SSE stream failed: HTTP ' + response.status);
+        }
+
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+
+        while (true) {
+          var chunk = await reader.read();
+          if (chunk.done) break;
+
+          buffer += decoder.decode(chunk.value, { stream: true });
+
+          // Parse SSE events from buffer
+          var parsed = self._parseSSEBuffer(buffer);
+          buffer = parsed.remaining;
+
+          for (var i = 0; i < parsed.events.length; i++) {
+            self._handleSSEEvent(parsed.events[i]);
+          }
+        }
+
+        // Stream ended — finalize if no message.completed was received
+        if (self.sending) {
+          self._finalizeSSEStream();
+        }
+      } catch(e) {
+        if (e.name === 'AbortError') return; // user cancelled
+        self._clearTypingTimeout();
+        self.messages = self.messages.filter(function(m) { return !m.thinking && !m.streaming; });
+        self.messages.push({
+          id: ++msgId, role: 'system',
+          text: 'SSE Error: ' + e.message, meta: '', tools: [], ts: Date.now()
+        });
+        self.sending = false;
+        self.scrollToBottom();
+        self.$nextTick(function() { self._processQueue(); });
+      } finally {
+        self._sseAbort = null;
+      }
+    },
+
+    // Parse SSE text buffer into discrete events
+    _parseSSEBuffer: function(buffer) {
+      var events = [];
+      var lines = buffer.split('\n');
+      var currentType = null;
+      var currentData = '';
+      var remaining = '';
+
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+
+        // Last line may be incomplete if it doesn't end with \n
+        if (i === lines.length - 1 && line !== '') {
+          remaining = line;
+          break;
+        }
+
+        if (line === '') {
+          // Empty line = event boundary
+          if (currentData) {
+            events.push({ type: currentType || 'message', data: currentData.trim() });
+          }
+          currentType = null;
+          currentData = '';
+        } else if (line.indexOf('event:') === 0) {
+          currentType = line.substring(6).trim();
+        } else if (line.indexOf('data:') === 0) {
+          var val = line.substring(5);
+          if (val.charAt(0) === ' ') val = val.substring(1);
+          currentData += (currentData ? '\n' : '') + val;
+        }
+        // id: and : (comment/keepalive) lines are ignored
+      }
+
+      return { events: events, remaining: remaining };
+    },
+
+    // Dispatch a parsed SSE event to the appropriate handler
+    _handleSSEEvent: function(event) {
+      var data = null;
+      if (event.data) {
+        try { data = JSON.parse(event.data); }
+        catch(e) { data = event.data; }
+      }
+
+      switch (event.type) {
+        case 'message.delta':
+          this._handleSseDelta(data);
+          break;
+        case 'message.completed':
+          this._handleSseCompleted(data);
+          break;
+        case 'tool.started':
+          this._handleSseToolStarted(data);
+          break;
+        case 'tool.completed':
+          this._handleSseToolCompleted(data);
+          break;
+        case 'error':
+          this._handleSseError(data);
+          break;
+        case 'keepalive':
+          // Connection alive signal — reset typing timeout
+          this._resetTypingTimeout();
+          break;
+      }
+    },
+
+    _handleSseDelta: function(data) {
+      if (!data) return;
+      var lastIdx = this.messages.length - 1;
+      var last = lastIdx >= 0 ? this.messages[lastIdx] : null;
+      if (last && last.streaming) {
+        if (last.thinking) { last.text = ''; last.thinking = false; }
+        if (last._toolTextDetected) return;
+        last.text += (data.content || '');
+        this.tokenCount = Math.round(last.text.length / 4);
+        this.messages.splice(lastIdx, 1, last);
+      } else {
+        this.messages.push({
+          id: ++msgId, role: 'agent', text: data.content || '',
+          meta: '', streaming: true, tools: []
+        });
+      }
+      this.scrollToBottom();
+    },
+
+    _handleSseCompleted: function(data) {
+      if (!data) data = {};
+      this._clearTypingTimeout();
+      var streamedText = '';
+      var streamedTools = [];
+      this.messages.forEach(function(m) {
+        if (m.streaming && !m.thinking && m.role === 'agent') {
+          streamedText += m.text || '';
+          streamedTools = streamedTools.concat(m.tools || []);
+        }
+      });
+      streamedTools.forEach(function(t) { t.running = false; });
+      this.messages = this.messages.filter(function(m) { return !m.thinking && !m.streaming; });
+
+      var meta = (data.input_tokens || 0) + ' in / ' + (data.output_tokens || 0) + ' out';
+      if (data.cost_usd != null) meta += ' | $' + data.cost_usd.toFixed(4);
+      meta += ' | via SSE';
+
+      var finalText = (data.content && data.content.trim()) ? data.content : streamedText;
+      finalText = this.sanitizeToolText(finalText);
+
+      this.messages.push({
+        id: ++msgId, role: 'agent', text: finalText,
+        meta: meta, tools: streamedTools, ts: Date.now()
+      });
+      this.sending = false;
+      this.tokenCount = 0;
+      this.scrollToBottom();
+      var self = this;
+      this.$nextTick(function() {
+        var el = document.getElementById('msg-input'); if (el) el.focus();
+        self._processQueue();
+      });
+    },
+
+    _handleSseToolStarted: function(data) {
+      if (!data) return;
+      var lastIdx = this.messages.length - 1;
+      var lastMsg = lastIdx >= 0 ? this.messages[lastIdx] : null;
+      if (lastMsg && lastMsg.streaming) {
+        if (!lastMsg.tools) lastMsg.tools = [];
+        lastMsg.tools.push({
+          id: (data.id || data.tool || 'tool') + '-sse-' + Date.now(),
+          name: data.tool || 'unknown',
+          running: true, expanded: true,
+          input: data.input || '', result: '', is_error: false
+        });
+        this.messages.splice(lastIdx, 1, lastMsg);
+      }
+      this.scrollToBottom();
+    },
+
+    _handleSseToolCompleted: function(data) {
+      if (!data) return;
+      var lastIdx = this.messages.length - 1;
+      var lastMsg = lastIdx >= 0 ? this.messages[lastIdx] : null;
+      if (lastMsg && lastMsg.tools) {
+        for (var i = lastMsg.tools.length - 1; i >= 0; i--) {
+          var t = lastMsg.tools[i];
+          if (t.running && (t.name === data.tool || (data.id && t.id.indexOf(data.id) === 0))) {
+            t.running = false;
+            t.result = data.result || '';
+            t.is_error = !!data.is_error;
+            break;
+          }
+        }
+        this.messages.splice(lastIdx, 1, lastMsg);
+      }
+      this.scrollToBottom();
+    },
+
+    _handleSseError: function(data) {
+      this._clearTypingTimeout();
+      this.messages = this.messages.filter(function(m) { return !m.thinking && !m.streaming; });
+      var errMsg = data ? (data.message || (typeof data === 'string' ? data : JSON.stringify(data))) : 'Unknown error';
+      this.messages.push({
+        id: ++msgId, role: 'system',
+        text: 'Error: ' + errMsg, meta: '', tools: [], ts: Date.now()
+      });
+      this.sending = false;
+      this.tokenCount = 0;
+      this.scrollToBottom();
+      var self = this;
+      this.$nextTick(function() {
+        var el = document.getElementById('msg-input'); if (el) el.focus();
+        self._processQueue();
+      });
+    },
+
+    // Finalize SSE stream when it ends without a message.completed event
+    _finalizeSSEStream: function() {
+      this._clearTypingTimeout();
+      var streamedText = '';
+      var streamedTools = [];
+      this.messages.forEach(function(m) {
+        if (m.streaming && !m.thinking && m.role === 'agent') {
+          streamedText += m.text || '';
+          streamedTools = streamedTools.concat(m.tools || []);
+        }
+      });
+      streamedTools.forEach(function(t) { t.running = false; });
+      this.messages = this.messages.filter(function(m) { return !m.thinking && !m.streaming; });
+      if (streamedText || streamedTools.length) {
+        this.messages.push({
+          id: ++msgId, role: 'agent',
+          text: this.sanitizeToolText(streamedText),
+          meta: 'via SSE', tools: streamedTools, ts: Date.now()
+        });
+      }
+      this.sending = false;
+      this.tokenCount = 0;
+      this.scrollToBottom();
+      var self = this;
+      this.$nextTick(function() {
+        var el = document.getElementById('msg-input'); if (el) el.focus();
+        self._processQueue();
       });
     },
 

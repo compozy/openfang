@@ -43,7 +43,7 @@
 | Task | Title | Complexity | Dependencies | Status |
 |------|-------|------------|--------------|--------|
 | 10 | Agents v1 Migration | critical | 1, 2 | completed |
-| 11 | Chat SSE Streaming + Dry-Run | medium | 1, 10 | pending |
+| 11 | Chat SSE Streaming + Dry-Run | medium | 1, 10 | completed |
 
 ## Phase 4.5: Arky Provider System
 
