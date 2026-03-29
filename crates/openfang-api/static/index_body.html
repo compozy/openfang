@@ -6817,15 +6817,315 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
       </div>
     </template>
 
-    <!-- Placeholder: Looper -->
+    <!-- Page: Looper -->
     <template x-if="page === 'looper'">
-      <div>
-        <div class="page-header"><h2>Looper</h2></div>
+      <div x-data="looperPage()" x-init="init()" @page-leave.window="destroy()">
+        <div class="page-header">
+          <div>
+            <h2>Looper</h2>
+            <div class="text-xs text-dim">Iterative task execution with real-time progress, subtask tracking, and lifecycle controls.</div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="badge badge-run-pending" x-show="looperRuns.length" x-text="looperRuns.length + ' loaded'"></span>
+            <button class="btn btn-ghost btn-sm" @click="loadRuns({ refreshDetail: true })">Refresh</button>
+            <button class="btn btn-primary btn-sm" @click="openCreateForm()">+ New Looper Run</button>
+          </div>
+        </div>
+
         <div class="page-body">
-          <div class="empty-state">
-            <div class="empty-state-icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></div>
-            <h3>Coming Soon</h3>
-            <p class="text-dim text-xs">Looper runs and configuration will appear here.</p>
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading looper runs...</span></div>
+          <div x-show="!loading && loadError" class="error-state">
+            <span class="error-icon">!</span>
+            <p x-text="loadError"></p>
+            <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
+          </div>
+
+          <template x-if="!loading && !loadError">
+            <div class="looper-layout">
+              <!-- List section -->
+              <section class="looper-list">
+                <div class="card looper-filters">
+                  <div class="looper-filter-grid">
+                    <div class="form-group">
+                      <label>Status</label>
+                      <select class="form-select" x-model="filterStatus" @change="loadRuns({ refreshDetail: true })">
+                        <template x-for="option in statusOptions" :key="'ls-' + option.value">
+                          <option :value="option.value" x-text="option.label"></option>
+                        </template>
+                      </select>
+                    </div>
+                    <div class="form-group">
+                      <label>Mode</label>
+                      <select class="form-select" x-model="filterMode" @change="loadRuns({ refreshDetail: true })">
+                        <template x-for="option in modeOptions" :key="'lm-' + option.value">
+                          <option :value="option.value" x-text="option.label"></option>
+                        </template>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <div x-show="filteredRuns.length === 0" class="empty-state looper-empty">
+                  <div class="empty-state-icon">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+                  </div>
+                  <h4>No looper runs</h4>
+                  <p class="hint">Create a looper run or adjust filters to see results.</p>
+                </div>
+
+                <div class="looper-list-stack" x-show="filteredRuns.length > 0">
+                  <template x-for="run in filteredRuns" :key="run.id">
+                    <article class="card run-card" :class="{ 'is-selected': selectedRunId === run.id }" @click="selectRun(run.id, true)">
+                      <div class="flex justify-between items-start gap-2">
+                        <div class="runs-card-head">
+                          <h3 class="run-card-title" x-text="taskName(run.task_id)"></h3>
+                          <div class="run-card-subtitle">
+                            <span class="font-mono" x-text="run.id"></span>
+                          </div>
+                        </div>
+                        <div class="run-card-badges">
+                          <span :class="statusBadgeClass(run.status)" x-text="statusLabel(run.status)"></span>
+                          <span :class="modeBadgeClass(run.execution_mode)" x-text="modeLabel(run.execution_mode)"></span>
+                        </div>
+                      </div>
+
+                      <div class="run-card-meta">
+                        <span class="run-card-chip">
+                          Task <span class="font-mono" x-text="run.task_id"></span>
+                        </span>
+                        <span class="run-card-chip" x-show="run.execution_mode === 'parallel' && run.max_parallelism">
+                          Max <span x-text="run.max_parallelism"></span> parallel
+                        </span>
+                      </div>
+
+                      <div class="looper-card-progress">
+                        <div class="flex justify-between items-center gap-2">
+                          <span class="text-xs text-dim" x-text="progressLabel(run)"></span>
+                          <span class="font-mono text-xs" x-text="progressPercent(run) + '%'"></span>
+                        </div>
+                        <div class="run-progress-bar" style="margin-top:6px">
+                          <div class="run-progress-fill" :style="'width:' + progressPercent(run) + '%'"></div>
+                        </div>
+                      </div>
+
+                      <div class="run-card-footer">
+                        <span class="text-xs text-dim" x-text="'Created ' + (relativeTime(run.created_at) || 'unknown')"></span>
+                        <span class="text-xs text-dim" x-text="'Updated ' + (relativeTime(run.updated_at) || 'unknown')" :title="formatDateTime(run.updated_at)"></span>
+                      </div>
+                    </article>
+                  </template>
+                </div>
+              </section>
+
+              <!-- Detail section -->
+              <aside class="card looper-detail">
+                <template x-if="!selectedRunId">
+                  <div class="empty-state looper-detail-empty">
+                    <div class="empty-state-icon">
+                      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+                    </div>
+                    <h4>Select a looper run</h4>
+                    <p class="hint">Choose a run from the list to view progress, subtasks, and live event activity.</p>
+                  </div>
+                </template>
+
+                <template x-if="selectedRunId">
+                  <div>
+                    <div x-show="detailLoading" class="loading-state"><div class="spinner"></div><span>Loading run detail...</span></div>
+                    <div x-show="!detailLoading && detailError" class="error-state">
+                      <span class="error-icon">!</span>
+                      <p x-text="detailError"></p>
+                      <button class="btn btn-ghost btn-sm" @click="refreshSelectedRun()">Retry</button>
+                    </div>
+
+                    <template x-if="!detailLoading && !detailError && selectedRun">
+                      <div>
+                        <!-- Detail header -->
+                        <div class="runs-detail-header">
+                          <div class="runs-detail-heading">
+                            <div class="text-xs text-dim">Looper Run</div>
+                            <h3 class="runs-detail-title" x-text="taskName(selectedRun.task_id)"></h3>
+                            <div class="run-card-subtitle">
+                              <span class="font-mono" x-text="selectedRun.id"></span>
+                              <span class="run-card-chip" x-text="modeLabel(selectedRun.execution_mode)"></span>
+                            </div>
+                          </div>
+                          <div class="runs-detail-actions">
+                            <div class="run-card-badges">
+                              <span :class="statusBadgeClass(selectedRun.status)" x-text="statusLabel(selectedRun.status)"></span>
+                            </div>
+                            <div class="run-action-row">
+                              <button class="btn btn-ghost btn-sm" @click="executeRunAction('pause')" :disabled="runAction || !canPause(selectedRun)">
+                                <span x-text="runAction === 'pause' ? 'Pausing...' : 'Pause'"></span>
+                              </button>
+                              <button class="btn btn-primary btn-sm" @click="executeRunAction('resume')" :disabled="runAction || !canResume(selectedRun)">
+                                <span x-text="runAction === 'resume' ? 'Resuming...' : 'Resume'"></span>
+                              </button>
+                              <button class="btn btn-danger btn-sm" @click="confirmCancelRun()" :disabled="runAction || !canCancel(selectedRun)">
+                                <span x-text="runAction === 'cancel' ? 'Cancelling...' : 'Cancel'"></span>
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
+                        <!-- Tabs -->
+                        <div class="tabs runs-tabs">
+                          <button class="tab" :class="{ active: selectedTab === 'overview' }" @click="setTab('overview')">Overview</button>
+                          <button class="tab" :class="{ active: selectedTab === 'subtasks' }" @click="setTab('subtasks')">Subtasks <span class="text-xs text-dim" x-text="'(' + subtasks.length + ')'"></span></button>
+                          <button class="tab" :class="{ active: selectedTab === 'events' }" @click="setTab('events')">Events</button>
+                        </div>
+
+                        <!-- Tab: Overview -->
+                        <div class="runs-tab-panel" x-show="selectedTab === 'overview'">
+                          <div class="card run-progress-card">
+                            <div class="flex justify-between items-center gap-2">
+                              <div>
+                                <div class="card-header" style="margin-bottom:4px">Execution Progress</div>
+                                <div class="text-xs text-dim" x-text="progressLabel(selectedRun)"></div>
+                              </div>
+                              <span class="font-mono text-xs" x-text="progressPercent(selectedRun) + '%'"></span>
+                            </div>
+                            <div class="looper-progress-bar">
+                              <div class="looper-progress-completed" :style="'width:' + progressBarSegments(selectedRun).completed + '%'"></div>
+                              <div class="looper-progress-failed" :style="'width:' + progressBarSegments(selectedRun).failed + '%'"></div>
+                            </div>
+                          </div>
+
+                          <div class="detail-grid looper-detail-grid">
+                            <div class="detail-row"><span class="detail-label">Status</span><span :class="statusBadgeClass(selectedRun.status)" x-text="statusLabel(selectedRun.status)"></span></div>
+                            <div class="detail-row"><span class="detail-label">Task</span><span class="detail-value" x-text="taskName(selectedRun.task_id)"></span></div>
+                            <div class="detail-row"><span class="detail-label">Execution Mode</span><span :class="modeBadgeClass(selectedRun.execution_mode)" x-text="modeLabel(selectedRun.execution_mode)"></span></div>
+                            <div class="detail-row" x-show="selectedRun.execution_mode === 'parallel'"><span class="detail-label">Max Parallelism</span><span class="detail-value" x-text="selectedRun.max_parallelism || '-'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Selection Strategy</span><span class="detail-value" x-text="strategyLabel(selectedRun.selection_strategy)"></span></div>
+                            <div class="detail-row"><span class="detail-label">Total Subtasks</span><span class="detail-value" x-text="selectedRun.total_subtasks || 0"></span></div>
+                            <div class="detail-row"><span class="detail-label">Completed</span><span class="detail-value" x-text="selectedRun.completed_subtasks || 0"></span></div>
+                            <div class="detail-row"><span class="detail-label">Failed</span><span class="detail-value" x-text="selectedRun.failed_subtasks || 0"></span></div>
+                            <div class="detail-row"><span class="detail-label">Created</span><span class="detail-value" x-text="formatDateTime(selectedRun.created_at) || '-'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Started</span><span class="detail-value" x-text="formatDateTime(selectedRun.started_at) || '-'"></span></div>
+                            <div class="detail-row"><span class="detail-label">Updated</span><span class="detail-value" x-text="formatDateTime(selectedRun.updated_at) || '-'"></span></div>
+                          </div>
+                        </div>
+
+                        <!-- Tab: Subtasks -->
+                        <div class="runs-tab-panel" x-show="selectedTab === 'subtasks'">
+                          <div x-show="subtasks.length === 0" class="empty-state" style="min-height:120px">
+                            <h4>No subtasks</h4>
+                            <p class="hint">This looper run has no subtasks yet.</p>
+                          </div>
+
+                          <div x-show="subtasks.length > 0" class="table-wrap">
+                            <table>
+                              <thead>
+                                <tr>
+                                  <th style="width:32px">#</th>
+                                  <th>Title</th>
+                                  <th>Status</th>
+                                  <th>Dispatch</th>
+                                  <th>Started</th>
+                                  <th>Completed</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                <template x-for="(st, idx) in subtasks" :key="st.id">
+                                  <tr>
+                                    <td class="text-dim font-mono text-xs" x-text="idx + 1"></td>
+                                    <td>
+                                      <span x-text="st.title || st.id"></span>
+                                    </td>
+                                    <td>
+                                      <span class="looper-subtask-indicator" :class="subtaskStatusClass(st.status)">
+                                        <span x-text="subtaskStatusIcon(st.status)"></span>
+                                        <span x-text="statusLabel(st.status)"></span>
+                                      </span>
+                                    </td>
+                                    <td>
+                                      <span x-show="st.dispatch_id" class="font-mono text-xs looper-dispatch-link" @click.stop="$dispatch('navigate-page', { page: 'dispatches', id: st.dispatch_id })" x-text="st.dispatch_id"></span>
+                                      <span x-show="!st.dispatch_id" class="text-dim">-</span>
+                                    </td>
+                                    <td class="text-xs" x-text="formatDateTime(st.started_at) || '-'"></td>
+                                    <td class="text-xs" x-text="formatDateTime(st.completed_at) || '-'"></td>
+                                  </tr>
+                                </template>
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+
+                        <!-- Tab: Events -->
+                        <div class="runs-tab-panel" x-show="selectedTab === 'events'">
+                          <div class="flex justify-between items-center gap-2" style="margin-bottom:12px">
+                            <div class="flex items-center gap-2">
+                              <span :class="eventConnectionBadgeClass()" x-text="eventConnectionState"></span>
+                              <span class="text-xs text-dim" x-text="eventEntries.length + ' events'"></span>
+                            </div>
+                            <button class="btn btn-ghost btn-sm" @click="toggleAutoScrollEvents()" x-text="autoScrollEvents ? 'Auto-scroll ON' : 'Auto-scroll OFF'"></button>
+                          </div>
+                          <div class="event-log" x-ref="eventLog" style="max-height:420px;overflow-y:auto">
+                            <template x-for="entry in eventEntries" :key="entry.key">
+                              <div class="event-log-entry">
+                                <span class="event-log-ts" x-text="formatDateTime(entry.received_at)"></span>
+                                <span class="event-log-name" x-text="entry.name"></span>
+                                <pre class="event-log-data" x-show="entry.data !== null" x-text="formatJson(entry.data)"></pre>
+                              </div>
+                            </template>
+                            <div x-show="eventEntries.length === 0" class="text-xs text-dim" style="padding:16px;text-align:center">
+                              No events received yet. Events will appear here in real-time.
+                            </div>
+                          </div>
+                        </div>
+
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </aside>
+            </div>
+          </template>
+
+          <!-- Create Looper Run Modal -->
+          <div x-show="showCreateForm" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);backdrop-filter:blur(4px)" @click.self="closeCreateForm()">
+            <div class="card" style="max-width:480px;width:90%;padding:1.5rem">
+              <h3 style="margin:0 0 1rem">Create Looper Run</h3>
+
+              <div class="form-group" style="margin-bottom:1rem">
+                <label>Task</label>
+                <select class="form-select" x-model="createForm.task_id">
+                  <option value="">Select a task...</option>
+                  <template x-for="t in tasks" :key="t.id">
+                    <option :value="t.id" x-text="(t.title || t.name || t.id)"></option>
+                  </template>
+                </select>
+              </div>
+
+              <div class="form-group" style="margin-bottom:1rem">
+                <label>Execution Mode</label>
+                <select class="form-select" x-model="createForm.execution_mode">
+                  <option value="sequential">Sequential</option>
+                  <option value="parallel">Parallel</option>
+                </select>
+              </div>
+
+              <div class="form-group" style="margin-bottom:1rem" x-show="createForm.execution_mode === 'parallel'">
+                <label>Max Parallelism</label>
+                <input type="number" class="form-input" x-model="createForm.max_parallelism" min="1" max="64">
+              </div>
+
+              <div class="form-group" style="margin-bottom:1.5rem">
+                <label>Selection Strategy</label>
+                <select class="form-select" x-model="createForm.selection_strategy">
+                  <option value="first">First</option>
+                  <option value="random">Random</option>
+                  <option value="priority">Priority</option>
+                </select>
+              </div>
+
+              <div class="flex justify-end gap-2">
+                <button class="btn btn-ghost btn-sm" @click="closeCreateForm()" :disabled="createSubmitting">Cancel</button>
+                <button class="btn btn-primary btn-sm" @click="submitCreateForm()" :disabled="createSubmitting">
+                  <span x-text="createSubmitting ? 'Creating...' : 'Create'"></span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
