@@ -154,6 +154,11 @@
 .badge-dispatch-kind-spawn { background: rgba(45, 212, 191, 0.18); color: #14b8a6; }
 .text-danger { color: var(--error); }
 
+/* Budget progress bars */
+.budget-bar-ok { background: var(--success); }
+.budget-bar-warn { background: var(--warning); }
+.budget-bar-danger { background: var(--error); }
+
 /* Tables */
 .table-wrap {
   overflow-x: auto;

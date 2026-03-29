@@ -1,5 +1,6 @@
 // OpenFang Analytics Page — Full usage analytics with per-model and per-agent breakdowns
 // Includes Cost Dashboard with donut chart, bar chart, projections, and provider breakdown.
+// Budget management: global and per-agent limits via /api/budget endpoints.
 'use strict';
 
 function analyticsPage() {
@@ -16,6 +17,28 @@ function analyticsPage() {
     todayCost: 0,
     firstEventDate: null,
 
+    // Budget tab state
+    globalBudget: null,
+    agentBudgets: [],
+    editingGlobalBudget: false,
+    globalBudgetForm: {
+      max_hourly_usd: 0,
+      max_daily_usd: 0,
+      max_monthly_usd: 0,
+      alert_threshold: 0.8
+    },
+    globalBudgetSaving: false,
+    selectedAgentBudgetId: '',
+    selectedAgentBudget: null,
+    agentBudgetLoading: false,
+    editingAgentBudget: false,
+    agentBudgetForm: {
+      max_cost_per_hour_usd: 0,
+      max_cost_per_day_usd: 0,
+      max_cost_per_month_usd: 0
+    },
+    agentBudgetSaving: false,
+
     // Chart colors for providers (stable palette)
     _chartColors: [
       '#FF5C00', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6',
@@ -31,7 +54,9 @@ function analyticsPage() {
           this.loadSummary(),
           this.loadByModel(),
           this.loadByAgent(),
-          this.loadDailyCosts()
+          this.loadDailyCosts(),
+          this.loadGlobalBudget(),
+          this.loadAgentBudgets()
         ]);
       } catch(e) {
         this.loadError = e.message || 'Could not load usage data.';
@@ -246,6 +271,128 @@ function analyticsPage() {
       if (lower.indexOf('haiku') !== -1 || lower.indexOf('gpt-3.5') !== -1 || lower.indexOf('flash') !== -1 || lower.indexOf('mixtral') !== -1) return 'balanced';
       if (lower.indexOf('llama') !== -1 || lower.indexOf('groq') !== -1 || lower.indexOf('gemma') !== -1) return 'fast';
       return 'balanced';
+    },
+
+    // ── Budget tab methods ──
+
+    async loadGlobalBudget() {
+      try {
+        this.globalBudget = await OpenFangAPI.get('/api/budget');
+      } catch(e) {
+        this.globalBudget = null;
+      }
+    },
+
+    async loadAgentBudgets() {
+      try {
+        var data = await OpenFangAPI.get('/api/budget/agents');
+        this.agentBudgets = data.agents || [];
+      } catch(e) {
+        this.agentBudgets = [];
+      }
+    },
+
+    formatBudgetLimit(v) {
+      if (!v || v === 0) return 'Unlimited';
+      return '$' + v.toFixed(2);
+    },
+
+    budgetPctClass(pct) {
+      if (!pct || pct <= 0) return '';
+      if (pct >= 1.0) return 'budget-bar-danger';
+      if (pct >= 0.8) return 'budget-bar-warn';
+      return 'budget-bar-ok';
+    },
+
+    budgetPctWidth(pct) {
+      if (!pct || pct <= 0) return '0%';
+      return Math.min(100, Math.round(pct * 100)) + '%';
+    },
+
+    openEditGlobalBudget() {
+      var b = this.globalBudget || {};
+      this.globalBudgetForm = {
+        max_hourly_usd: b.hourly_limit || 0,
+        max_daily_usd: b.daily_limit || 0,
+        max_monthly_usd: b.monthly_limit || 0,
+        alert_threshold: b.alert_threshold || 0.8
+      };
+      this.editingGlobalBudget = true;
+    },
+
+    async saveGlobalBudget() {
+      this.globalBudgetSaving = true;
+      try {
+        this.globalBudget = await OpenFangAPI.put('/api/budget', {
+          max_hourly_usd: parseFloat(this.globalBudgetForm.max_hourly_usd) || 0,
+          max_daily_usd: parseFloat(this.globalBudgetForm.max_daily_usd) || 0,
+          max_monthly_usd: parseFloat(this.globalBudgetForm.max_monthly_usd) || 0,
+          alert_threshold: parseFloat(this.globalBudgetForm.alert_threshold) || 0.8
+        });
+        this.editingGlobalBudget = false;
+      } catch(e) {
+        alert('Failed to save budget: ' + (e.message || e));
+      } finally {
+        this.globalBudgetSaving = false;
+      }
+    },
+
+    async openAgentBudgetDetail(agentId) {
+      this.selectedAgentBudgetId = agentId;
+      this.selectedAgentBudget = null;
+      this.editingAgentBudget = false;
+      this.agentBudgetLoading = true;
+      try {
+        this.selectedAgentBudget = await OpenFangAPI.get(
+          '/api/budget/agents/' + encodeURIComponent(agentId)
+        );
+      } catch(e) {
+        this.selectedAgentBudget = null;
+      } finally {
+        this.agentBudgetLoading = false;
+      }
+    },
+
+    closeAgentBudgetDetail() {
+      this.selectedAgentBudgetId = '';
+      this.selectedAgentBudget = null;
+      this.editingAgentBudget = false;
+    },
+
+    openEditAgentBudget() {
+      var a = this.selectedAgentBudget || {};
+      this.agentBudgetForm = {
+        max_cost_per_hour_usd: (a.hourly && a.hourly.limit) || 0,
+        max_cost_per_day_usd: (a.daily && a.daily.limit) || 0,
+        max_cost_per_month_usd: (a.monthly && a.monthly.limit) || 0
+      };
+      this.editingAgentBudget = true;
+    },
+
+    async saveAgentBudget() {
+      this.agentBudgetSaving = true;
+      try {
+        await OpenFangAPI.put(
+          '/api/budget/agents/' + encodeURIComponent(this.selectedAgentBudgetId),
+          {
+            max_cost_per_hour_usd:
+              parseFloat(this.agentBudgetForm.max_cost_per_hour_usd) || 0,
+            max_cost_per_day_usd:
+              parseFloat(this.agentBudgetForm.max_cost_per_day_usd) || 0,
+            max_cost_per_month_usd:
+              parseFloat(this.agentBudgetForm.max_cost_per_month_usd) || 0
+          }
+        );
+        this.editingAgentBudget = false;
+        await Promise.all([
+          this.openAgentBudgetDetail(this.selectedAgentBudgetId),
+          this.loadAgentBudgets()
+        ]);
+      } catch(e) {
+        alert('Failed to save agent budget: ' + (e.message || e));
+      } finally {
+        this.agentBudgetSaving = false;
+      }
     }
   };
 }

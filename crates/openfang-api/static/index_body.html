@@ -4725,6 +4725,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             <div class="tab" :class="{ active: tab === 'by-model' }" @click="tab = 'by-model'">By Model</div>
             <div class="tab" :class="{ active: tab === 'by-agent' }" @click="tab = 'by-agent'">By Agent</div>
             <div class="tab" :class="{ active: tab === 'costs' }" @click="tab = 'costs'">Costs</div>
+            <div class="tab" :class="{ active: tab === 'budget' }" @click="tab = 'budget'">Budget</div>
           </div>
           <div x-show="tab === 'summary'">
             <div class="card mt-4">
@@ -4934,6 +4935,233 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             </div>
 
           </div>
+
+          <!-- Budget Tab -->
+          <div x-show="tab === 'budget'">
+
+            <!-- Global Budget Status -->
+            <div class="card mt-4">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+                <span>Global Budget</span>
+                <button class="btn btn-ghost btn-sm" x-show="!editingGlobalBudget" @click="openEditGlobalBudget()">Edit Limits</button>
+              </div>
+
+              <!-- Display View -->
+              <div x-show="!editingGlobalBudget">
+                <div x-show="!globalBudget" class="text-sm text-dim" style="padding:20px;text-align:center">No budget data available.</div>
+                <div x-show="globalBudget">
+                  <div class="stats-row mt-4">
+                    <div class="stat-card">
+                      <div class="stat-value" x-text="formatCost(globalBudget && globalBudget.hourly_spend)"></div>
+                      <div class="stat-label">Hourly Spend</div>
+                      <div style="margin-top:6px">
+                        <div style="background:var(--surface2);border-radius:4px;height:6px;overflow:hidden">
+                          <div style="height:100%;border-radius:4px;transition:width 0.3s"
+                            :class="budgetPctClass(globalBudget && globalBudget.hourly_pct)"
+                            :style="'width:' + budgetPctWidth(globalBudget && globalBudget.hourly_pct)"></div>
+                        </div>
+                        <div class="text-dim" style="font-size:10px;margin-top:2px" x-text="'Limit: ' + formatBudgetLimit(globalBudget && globalBudget.hourly_limit)"></div>
+                      </div>
+                    </div>
+                    <div class="stat-card">
+                      <div class="stat-value" x-text="formatCost(globalBudget && globalBudget.daily_spend)"></div>
+                      <div class="stat-label">Daily Spend</div>
+                      <div style="margin-top:6px">
+                        <div style="background:var(--surface2);border-radius:4px;height:6px;overflow:hidden">
+                          <div style="height:100%;border-radius:4px;transition:width 0.3s"
+                            :class="budgetPctClass(globalBudget && globalBudget.daily_pct)"
+                            :style="'width:' + budgetPctWidth(globalBudget && globalBudget.daily_pct)"></div>
+                        </div>
+                        <div class="text-dim" style="font-size:10px;margin-top:2px" x-text="'Limit: ' + formatBudgetLimit(globalBudget && globalBudget.daily_limit)"></div>
+                      </div>
+                    </div>
+                    <div class="stat-card">
+                      <div class="stat-value" x-text="formatCost(globalBudget && globalBudget.monthly_spend)"></div>
+                      <div class="stat-label">Monthly Spend</div>
+                      <div style="margin-top:6px">
+                        <div style="background:var(--surface2);border-radius:4px;height:6px;overflow:hidden">
+                          <div style="height:100%;border-radius:4px;transition:width 0.3s"
+                            :class="budgetPctClass(globalBudget && globalBudget.monthly_pct)"
+                            :style="'width:' + budgetPctWidth(globalBudget && globalBudget.monthly_pct)"></div>
+                        </div>
+                        <div class="text-dim" style="font-size:10px;margin-top:2px" x-text="'Limit: ' + formatBudgetLimit(globalBudget && globalBudget.monthly_limit)"></div>
+                      </div>
+                    </div>
+                    <div class="stat-card">
+                      <div class="stat-value" x-text="Math.round((globalBudget && globalBudget.alert_threshold || 0.8) * 100) + '%'"></div>
+                      <div class="stat-label">Alert Threshold</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Edit Form -->
+              <div x-show="editingGlobalBudget" style="padding-top:12px">
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                  <div class="form-group">
+                    <label>Max Hourly USD</label>
+                    <input type="number" class="form-input" x-model.number="globalBudgetForm.max_hourly_usd" step="0.01" min="0" placeholder="0 = unlimited">
+                  </div>
+                  <div class="form-group">
+                    <label>Max Daily USD</label>
+                    <input type="number" class="form-input" x-model.number="globalBudgetForm.max_daily_usd" step="0.01" min="0" placeholder="0 = unlimited">
+                  </div>
+                  <div class="form-group">
+                    <label>Max Monthly USD</label>
+                    <input type="number" class="form-input" x-model.number="globalBudgetForm.max_monthly_usd" step="0.01" min="0" placeholder="0 = unlimited">
+                  </div>
+                  <div class="form-group">
+                    <label>Alert Threshold (0.0 – 1.0)</label>
+                    <input type="number" class="form-input" x-model.number="globalBudgetForm.alert_threshold" step="0.05" min="0" max="1" placeholder="0.8">
+                  </div>
+                </div>
+                <div style="display:flex;gap:8px;margin-top:12px">
+                  <button class="btn btn-primary" @click="saveGlobalBudget()" :disabled="globalBudgetSaving">
+                    <span x-show="!globalBudgetSaving">Save</span>
+                    <span x-show="globalBudgetSaving">Saving...</span>
+                  </button>
+                  <button class="btn btn-ghost" @click="editingGlobalBudget = false">Cancel</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Per-Agent Budget Ranking -->
+            <div class="card mt-4">
+              <div class="card-header">Per-Agent Budget Ranking</div>
+              <div class="table-wrap mt-4" x-show="agentBudgets.length" style="border:none">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Agent</th>
+                      <th>Daily Spend</th>
+                      <th>Hourly Limit</th>
+                      <th>Daily Limit</th>
+                      <th>Monthly Limit</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="a in agentBudgets" :key="a.agent_id">
+                      <tr>
+                        <td class="font-bold" style="font-size:11px" x-text="a.name || a.agent_id"></td>
+                        <td x-text="formatCost(a.daily_cost_usd)"></td>
+                        <td x-text="formatBudgetLimit(a.hourly_limit)"></td>
+                        <td x-text="formatBudgetLimit(a.daily_limit)"></td>
+                        <td x-text="formatBudgetLimit(a.monthly_limit)"></td>
+                        <td>
+                          <button class="btn btn-ghost btn-sm" @click="openAgentBudgetDetail(a.agent_id)">Details</button>
+                        </td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+              <div x-show="!agentBudgets.length" class="text-sm text-dim" style="padding:20px;text-align:center">No per-agent budget data yet.</div>
+            </div>
+
+            <!-- Agent Budget Detail Modal -->
+            <div class="modal" x-show="selectedAgentBudgetId" @click.self="closeAgentBudgetDetail()" style="z-index:200">
+              <div class="modal-content" style="max-width:520px">
+                <div class="modal-header">
+                  <h3 x-text="(selectedAgentBudget && selectedAgentBudget.agent_name) ? 'Budget: ' + selectedAgentBudget.agent_name : 'Agent Budget'"></h3>
+                  <button class="modal-close" @click="closeAgentBudgetDetail()">&times;</button>
+                </div>
+
+                <!-- Loading -->
+                <div x-show="agentBudgetLoading" style="padding:24px;text-align:center">
+                  <div class="spinner"></div>
+                </div>
+
+                <!-- Detail View -->
+                <div x-show="!agentBudgetLoading && selectedAgentBudget && !editingAgentBudget">
+                  <div class="detail-grid" style="margin-top:8px">
+                    <div class="detail-row">
+                      <span class="detail-label">Hourly Spend</span>
+                      <span class="detail-value">
+                        <span x-text="formatCost(selectedAgentBudget.hourly && selectedAgentBudget.hourly.spend)"></span>
+                        <span class="text-dim" x-text="' / ' + formatBudgetLimit(selectedAgentBudget.hourly && selectedAgentBudget.hourly.limit)"></span>
+                      </span>
+                    </div>
+                    <div style="padding:0 16px 8px">
+                      <div style="background:var(--surface2);border-radius:4px;height:6px;overflow:hidden">
+                        <div style="height:100%;border-radius:4px;transition:width 0.3s"
+                          :class="budgetPctClass(selectedAgentBudget.hourly && selectedAgentBudget.hourly.pct)"
+                          :style="'width:' + budgetPctWidth(selectedAgentBudget.hourly && selectedAgentBudget.hourly.pct)"></div>
+                      </div>
+                    </div>
+                    <div class="detail-row">
+                      <span class="detail-label">Daily Spend</span>
+                      <span class="detail-value">
+                        <span x-text="formatCost(selectedAgentBudget.daily && selectedAgentBudget.daily.spend)"></span>
+                        <span class="text-dim" x-text="' / ' + formatBudgetLimit(selectedAgentBudget.daily && selectedAgentBudget.daily.limit)"></span>
+                      </span>
+                    </div>
+                    <div style="padding:0 16px 8px">
+                      <div style="background:var(--surface2);border-radius:4px;height:6px;overflow:hidden">
+                        <div style="height:100%;border-radius:4px;transition:width 0.3s"
+                          :class="budgetPctClass(selectedAgentBudget.daily && selectedAgentBudget.daily.pct)"
+                          :style="'width:' + budgetPctWidth(selectedAgentBudget.daily && selectedAgentBudget.daily.pct)"></div>
+                      </div>
+                    </div>
+                    <div class="detail-row">
+                      <span class="detail-label">Monthly Spend</span>
+                      <span class="detail-value">
+                        <span x-text="formatCost(selectedAgentBudget.monthly && selectedAgentBudget.monthly.spend)"></span>
+                        <span class="text-dim" x-text="' / ' + formatBudgetLimit(selectedAgentBudget.monthly && selectedAgentBudget.monthly.limit)"></span>
+                      </span>
+                    </div>
+                    <div style="padding:0 16px 8px">
+                      <div style="background:var(--surface2);border-radius:4px;height:6px;overflow:hidden">
+                        <div style="height:100%;border-radius:4px;transition:width 0.3s"
+                          :class="budgetPctClass(selectedAgentBudget.monthly && selectedAgentBudget.monthly.pct)"
+                          :style="'width:' + budgetPctWidth(selectedAgentBudget.monthly && selectedAgentBudget.monthly.pct)"></div>
+                      </div>
+                    </div>
+                    <div class="detail-row">
+                      <span class="detail-label">Token Usage</span>
+                      <span class="detail-value">
+                        <span x-text="(selectedAgentBudget.tokens && selectedAgentBudget.tokens.used) || 0"></span>
+                        <span class="text-dim" x-text="' / ' + ((selectedAgentBudget.tokens && selectedAgentBudget.tokens.limit) || 'Unlimited')"></span>
+                      </span>
+                    </div>
+                  </div>
+                  <div style="padding:16px;border-top:1px solid var(--border);margin-top:8px">
+                    <button class="btn btn-primary btn-sm" @click="openEditAgentBudget()">Edit Limits</button>
+                  </div>
+                </div>
+
+                <!-- Edit Form -->
+                <div x-show="!agentBudgetLoading && editingAgentBudget" style="padding-top:8px">
+                  <div class="form-group">
+                    <label>Max Hourly USD</label>
+                    <input type="number" class="form-input" x-model.number="agentBudgetForm.max_cost_per_hour_usd" step="0.01" min="0" placeholder="0 = unlimited">
+                  </div>
+                  <div class="form-group">
+                    <label>Max Daily USD</label>
+                    <input type="number" class="form-input" x-model.number="agentBudgetForm.max_cost_per_day_usd" step="0.01" min="0" placeholder="0 = unlimited">
+                  </div>
+                  <div class="form-group">
+                    <label>Max Monthly USD</label>
+                    <input type="number" class="form-input" x-model.number="agentBudgetForm.max_cost_per_month_usd" step="0.01" min="0" placeholder="0 = unlimited">
+                  </div>
+                  <div style="display:flex;gap:8px;margin-top:12px;border-top:1px solid var(--border);padding-top:16px">
+                    <button class="btn btn-primary" @click="saveAgentBudget()" :disabled="agentBudgetSaving">
+                      <span x-show="!agentBudgetSaving">Save</span>
+                      <span x-show="agentBudgetSaving">Saving...</span>
+                    </button>
+                    <button class="btn btn-ghost" @click="editingAgentBudget = false">Cancel</button>
+                  </div>
+                </div>
+
+                <!-- Error state -->
+                <div x-show="!agentBudgetLoading && !selectedAgentBudget" style="padding:24px;text-align:center" class="text-dim">
+                  Could not load agent budget details.
+                </div>
+              </div>
+            </div>
+
+          </div>
+
           </div>
         </div>
       </div>
