@@ -471,21 +471,36 @@ function wizardPage() {
         model = this.defaultModelForProvider(provider) || tpl.model;
       }
 
-      var toml = '[agent]\n';
-      toml += 'name = "' + wizardTomlBasicEscape(name) + '"\n';
-      toml += 'description = "' + wizardTomlBasicEscape(tpl.description) + '"\n';
-      toml += 'profile = "' + tpl.profile + '"\n\n';
-      toml += '[model]\nprovider = "' + provider + '"\n';
-      toml += 'model = "' + model + '"\n';
-      toml += 'system_prompt = """\n' + wizardTomlMultilineEscape(tpl.system_prompt) + '\n"""\n';
-
       this.creatingAgent = true;
       try {
-        var res = await OpenFangAPI.post('/api/agents', { manifest_toml: toml });
-        if (res.agent_id) {
-          this.createdAgent = { id: res.agent_id, name: res.name || name };
-          this.setupSummary.agent = res.name || name;
-          OpenFangToast.success('Agent "' + (res.name || name) + '" created');
+        // Try v1 API first for structured agent creation
+        var v1Body = {
+          name: name,
+          description: tpl.description,
+          profile: tpl.profile,
+          model: { provider: provider, model: model },
+          system_prompt: tpl.system_prompt
+        };
+        var res;
+        try {
+          res = await OpenFangAPI.v1.agents.create(v1Body);
+        } catch (v1Err) {
+          // Fall back to legacy TOML-based creation
+          var toml = '[agent]\n';
+          toml += 'name = "' + wizardTomlBasicEscape(name) + '"\n';
+          toml += 'description = "' + wizardTomlBasicEscape(tpl.description) + '"\n';
+          toml += 'profile = "' + tpl.profile + '"\n\n';
+          toml += '[model]\nprovider = "' + provider + '"\n';
+          toml += 'model = "' + model + '"\n';
+          toml += 'system_prompt = """\n' + wizardTomlMultilineEscape(tpl.system_prompt) + '\n"""\n';
+          res = await OpenFangAPI.post('/api/agents', { manifest_toml: toml });
+        }
+        var agentId = res.id || res.agent_id;
+        var agentName = res.name || name;
+        if (agentId) {
+          this.createdAgent = { id: agentId, name: agentName };
+          this.setupSummary.agent = agentName;
+          OpenFangToast.success('Agent "' + agentName + '" created');
           await Alpine.store('app').refreshAgents();
         } else {
           OpenFangToast.error('Failed: ' + (res.error || 'Unknown error'));

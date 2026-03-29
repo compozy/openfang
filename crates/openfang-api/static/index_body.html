@@ -451,18 +451,34 @@
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline;margin-right:4px;vertical-align:-2px"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
                 Security Systems
               </div>
-              <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:8px">
-                <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Merkle Audit</span>
-                <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Taint Tracking</span>
-                <span class="badge badge-success" style="font-size:9px;padding:2px 8px">WASM Sandbox</span>
-                <span class="badge badge-success" style="font-size:9px;padding:2px 8px">GCRA Rate Limit</span>
-                <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Ed25519 Signing</span>
-                <span class="badge badge-success" style="font-size:9px;padding:2px 8px">SSRF Protection</span>
-                <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Secret Zeroize</span>
-                <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Loop Guard</span>
-                <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Session Repair</span>
-              </div>
-              <div class="text-xs text-dim" style="margin-top:8px">9 defense-in-depth systems active</div>
+              <!-- Dynamic security from /api/security -->
+              <template x-if="securityData && securityFeatures.length">
+                <div>
+                  <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:8px">
+                    <template x-for="feat in securityFeatures" :key="feat.name">
+                      <span class="badge" :class="feat.active ? 'badge-success' : 'badge-dim'" style="font-size:9px;padding:2px 8px" x-text="securityFeatureLabel(feat.name)"></span>
+                    </template>
+                  </div>
+                  <div class="text-xs text-dim" style="margin-top:8px" x-text="securityActiveCount + ' defense-in-depth systems active'"></div>
+                </div>
+              </template>
+              <!-- Fallback when /api/security unavailable -->
+              <template x-if="!securityData || !securityFeatures.length">
+                <div>
+                  <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:8px">
+                    <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Merkle Audit</span>
+                    <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Taint Tracking</span>
+                    <span class="badge badge-success" style="font-size:9px;padding:2px 8px">WASM Sandbox</span>
+                    <span class="badge badge-success" style="font-size:9px;padding:2px 8px">GCRA Rate Limit</span>
+                    <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Ed25519 Signing</span>
+                    <span class="badge badge-success" style="font-size:9px;padding:2px 8px">SSRF Protection</span>
+                    <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Secret Zeroize</span>
+                    <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Loop Guard</span>
+                    <span class="badge badge-success" style="font-size:9px;padding:2px 8px">Session Repair</span>
+                  </div>
+                  <div class="text-xs text-dim" style="margin-top:8px">9 defense-in-depth systems active</div>
+                </div>
+              </template>
             </div>
 
             <!-- Connected Channels -->
@@ -493,6 +509,36 @@
                     <span class="text-xs text-dim" x-show="s.tool_count" x-text="'(' + s.tool_count + ' tools)'"></span>
                   </div>
                 </template>
+              </div>
+            </div>
+
+            <!-- Per-Database Health -->
+            <div class="card" x-show="dbHealth.length">
+              <div class="card-header">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline;margin-right:4px;vertical-align:-2px"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+                Database Health
+              </div>
+              <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px">
+                <template x-for="db in dbHealth" :key="db.name || db.id">
+                  <div class="detail-row" style="padding:4px 0">
+                    <span class="detail-label" x-text="db.name || db.id || 'Database'"></span>
+                    <span class="badge" :class="dbHealthBadgeClass(db)" style="font-size:9px;padding:2px 8px;text-transform:capitalize" x-text="db.status || db.state || 'unknown'"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- Workflow Registry Readiness -->
+            <div class="card" x-show="workflowRegistryReady !== null">
+              <div class="card-header">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline;margin-right:4px;vertical-align:-2px"><path d="M6 3v12M18 9a9 9 0 0 1-9 9"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/></svg>
+                Workflow Registry
+              </div>
+              <div class="detail-grid" style="margin-top:8px">
+                <div class="detail-row">
+                  <span class="detail-label">Status</span>
+                  <span class="badge" :class="workflowRegistryReady ? 'badge-success' : 'badge-warning'" style="font-size:9px;padding:2px 8px" x-text="workflowRegistryReady ? 'Ready' : 'Not Ready'"></span>
+                </div>
               </div>
             </div>
           </div>
@@ -5196,11 +5242,28 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             </div>
             <div class="table-wrap" x-show="filteredSessions.length">
               <table>
-                <thead><tr><th>Session</th><th>Agent</th><th>Messages</th><th>Created</th><th>Actions</th></tr></thead>
+                <thead><tr><th>Session</th><th>Label</th><th>Agent</th><th>Messages</th><th>Created</th><th>Actions</th></tr></thead>
                 <tbody>
                   <template x-for="s in filteredSessions" :key="s.session_id">
                     <tr>
                       <td class="text-xs truncate" style="font-family:monospace;max-width:120px" x-text="s.session_id ? s.session_id.substring(0, 8) + '...' : '-'" :title="s.session_id"></td>
+                      <td>
+                        <template x-if="editingLabelId !== s.session_id">
+                          <div class="flex items-center gap-1" style="min-width:80px">
+                            <span class="text-xs" x-text="s.label || '-'" style="color:var(--text-dim)"></span>
+                            <button class="btn btn-ghost btn-sm" @click="startEditLabel(s)" style="padding:1px 4px;font-size:10px" title="Edit label">
+                              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 114 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>
+                            </button>
+                          </div>
+                        </template>
+                        <template x-if="editingLabelId === s.session_id">
+                          <div class="flex items-center gap-1">
+                            <input type="text" class="form-input" style="width:120px;padding:2px 6px;font-size:11px" x-model="editingLabelValue" @keydown.enter="saveLabel()" @keydown.escape="cancelEditLabel()" placeholder="Session label...">
+                            <button class="btn btn-primary btn-sm" @click="saveLabel()" :disabled="savingLabel" style="padding:2px 6px;font-size:10px">Save</button>
+                            <button class="btn btn-ghost btn-sm" @click="cancelEditLabel()" style="padding:2px 6px;font-size:10px">X</button>
+                          </div>
+                        </template>
+                      </td>
                       <td class="font-bold" x-text="s.agent_name || s.agent_id"></td>
                       <td x-text="s.message_count"></td>
                       <td class="text-xs" x-text="s.created_at ? new Date(s.created_at).toLocaleString() : '-'"></td>
@@ -5427,24 +5490,38 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
 
     <!-- Page: Comms -->
     <template x-if="page === 'comms'">
-      <div x-data="commsPage" x-init="loadData()" @page-leave.window="stopSSE()">
+      <div x-data="commsPage" x-init="loadData()" @page-leave.window="destroy()">
         <div class="page-header">
           <h2>Agent Comms</h2>
           <div class="flex items-center gap-2">
-            <button class="btn btn-primary btn-sm" @click="openSendModal()">
+            <button class="btn btn-primary btn-sm" @click="openSendModal()" x-show="a2aTab === 'topology'">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/></svg>
               Send Message
             </button>
-            <button class="btn btn-ghost btn-sm" @click="openTaskModal()">
+            <button class="btn btn-ghost btn-sm" @click="openTaskModal()" x-show="a2aTab === 'topology'">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
               Post Task
             </button>
-            <button class="btn btn-ghost btn-sm" @click="loadData()" title="Refresh">
+            <button class="btn btn-primary btn-sm" @click="openDiscoverModal()" x-show="a2aTab === 'a2a'">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+              Discover Agent
+            </button>
+            <button class="btn btn-ghost btn-sm" @click="openA2aSendModal()" x-show="a2aTab === 'a2a' && a2aAgents.length">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/></svg>
+              Send Task
+            </button>
+            <button class="btn btn-ghost btn-sm" @click="a2aTab === 'a2a' ? loadA2aAgents() : loadData()" title="Refresh">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0115-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 01-15 6.7L3 16"/></svg>
             </button>
           </div>
         </div>
+        <div class="tabs">
+          <div class="tab" :class="{ active: a2aTab === 'topology' }" @click="a2aTab = 'topology'">Topology & Events</div>
+          <div class="tab" :class="{ active: a2aTab === 'a2a' }" @click="a2aTab = 'a2a'; if (!a2aAgents.length && !a2aLoading) loadA2aAgents()">A2A Agents</div>
+        </div>
         <div class="page-body">
+          <!-- Topology & Events Tab -->
+          <div x-show="a2aTab === 'topology'">
           <!-- Loading -->
           <div x-show="loading" style="animation:fadeIn 0.2s">
             <div class="card mb-4"><div class="skeleton skeleton-text" style="width:160px;margin-bottom:8px"></div><div class="skeleton skeleton-card" style="height:120px"></div></div>
@@ -5520,6 +5597,81 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               </div>
             </div>
           </div>
+          </div><!-- end Topology & Events Tab -->
+
+          <!-- A2A Agents Tab -->
+          <div x-show="a2aTab === 'a2a'" style="animation:fadeIn 0.3s">
+            <div x-show="a2aLoading" class="loading-state"><div class="spinner"></div><span>Loading A2A agents...</span></div>
+            <div x-show="!a2aLoading && a2aLoadError" class="error-state">
+              <h3 style="color:var(--error)">Error</h3>
+              <p class="text-xs text-dim" x-text="a2aLoadError"></p>
+              <button class="btn btn-primary btn-sm" @click="loadA2aAgents()" style="margin-top:8px">Retry</button>
+            </div>
+            <div x-show="!a2aLoading && !a2aLoadError">
+              <!-- Info card -->
+              <div class="card mb-4" style="border-left:3px solid var(--accent)">
+                <div class="font-bold" style="font-size:13px;margin-bottom:4px">Agent-to-Agent (A2A) Protocol</div>
+                <div class="text-sm text-dim" style="line-height:1.6">
+                  Discover and interact with external A2A-compatible agents. Use <strong>Discover</strong> to register an agent at a URL, then <strong>Send Task</strong> to delegate work.
+                </div>
+              </div>
+
+              <!-- A2A Agents list -->
+              <div class="card mb-4" x-show="a2aAgents.length">
+                <div class="card-header flex justify-between items-center">
+                  <span>Discovered Agents</span>
+                  <span class="text-xs text-dim" x-text="a2aAgents.length + ' agent(s)'"></span>
+                </div>
+                <div class="table-wrap" style="margin-top:8px">
+                  <table>
+                    <thead><tr><th>Name</th><th>URL</th><th>Skills</th><th>Status</th></tr></thead>
+                    <tbody>
+                      <template x-for="agent in a2aAgents" :key="agent.id || agent.url">
+                        <tr>
+                          <td class="font-bold" x-text="agent.name || agent.id || '-'"></td>
+                          <td class="text-xs font-mono truncate" style="max-width:200px" x-text="agent.url || '-'" :title="agent.url"></td>
+                          <td class="text-xs text-dim" x-text="(agent.skills || agent.capabilities || []).join(', ') || '-'"></td>
+                          <td><span class="badge" :class="(agent.status || '').toLowerCase() === 'online' || (agent.status || '').toLowerCase() === 'available' ? 'badge-success' : 'badge-dim'" style="font-size:10px;padding:2px 8px" x-text="agent.status || 'unknown'"></span></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- Empty state -->
+              <div class="empty-state" x-show="!a2aAgents.length">
+                <div class="empty-state-icon">
+                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.59 13.51l6.83 3.98M15.41 6.51l-6.82 3.98"/></svg>
+                </div>
+                <h3>No A2A Agents Discovered</h3>
+                <p class="text-dim text-xs">Use "Discover Agent" to register an external A2A-compatible agent by URL.</p>
+                <button class="btn btn-primary btn-sm" @click="openDiscoverModal()" style="margin-top:8px">Discover Agent</button>
+              </div>
+
+              <!-- Active A2A Tasks -->
+              <div class="card" x-show="a2aTaskList.length">
+                <div class="card-header flex justify-between items-center">
+                  <span>Task Tracker</span>
+                  <span class="text-xs text-dim" x-text="a2aTaskList.length + ' task(s)'"></span>
+                </div>
+                <div class="table-wrap" style="margin-top:8px">
+                  <table>
+                    <thead><tr><th>Task ID</th><th>Status</th><th>Result</th></tr></thead>
+                    <tbody>
+                      <template x-for="t in a2aTaskList" :key="t.id">
+                        <tr>
+                          <td class="text-xs font-mono truncate" style="max-width:120px" x-text="t.id ? t.id.substring(0, 12) + '...' : '-'" :title="t.id"></td>
+                          <td><span :class="a2aStatusBadgeClass(t.status)" style="font-size:10px;padding:2px 8px;text-transform:capitalize" x-text="t.status || 'unknown'"></span></td>
+                          <td class="text-xs text-dim truncate" style="max-width:200px" x-text="t.result || t.output || '-'" :title="t.result || t.output || ''"></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div><!-- end A2A Tab -->
 
           <!-- Send Message Modal -->
           <div x-show="showSendModal" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);backdrop-filter:blur(4px)" @click.self="showSendModal=false" x-transition>
@@ -5586,6 +5738,58 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   <button class="btn btn-primary btn-sm" @click="submitTask()" :disabled="taskLoading || !taskTitle.trim()">
                     <span x-show="taskLoading">Posting...</span>
                     <span x-show="!taskLoading">Post Task</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- A2A Discover Modal -->
+          <div x-show="showDiscoverModal" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);backdrop-filter:blur(4px)" @click.self="showDiscoverModal=false" x-transition>
+            <div class="card" style="width:420px;max-width:90vw" @click.stop>
+              <div class="card-header">Discover A2A Agent</div>
+              <div style="display:flex;flex-direction:column;gap:12px;margin-top:12px">
+                <div>
+                  <label class="text-xs text-dim" style="display:block;margin-bottom:4px">Agent URL</label>
+                  <input type="url" x-model="discoverUrl" class="input" placeholder="https://example.com/.well-known/agent.json" style="width:100%" @keydown.enter="discoverAgent()">
+                </div>
+                <div class="text-xs text-dim" style="line-height:1.6">
+                  Enter the base URL of an A2A-compatible agent. The system will fetch its agent card and register it for task delegation.
+                </div>
+                <div class="flex gap-2" style="justify-content:flex-end">
+                  <button class="btn btn-ghost btn-sm" @click="showDiscoverModal=false">Cancel</button>
+                  <button class="btn btn-primary btn-sm" @click="discoverAgent()" :disabled="discoverLoading || !discoverUrl.trim()">
+                    <span x-show="!discoverLoading">Discover</span>
+                    <span x-show="discoverLoading">Discovering...</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- A2A Send Task Modal -->
+          <div x-show="showA2aSendModal" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);backdrop-filter:blur(4px)" @click.self="showA2aSendModal=false" x-transition>
+            <div class="card" style="width:480px;max-width:90vw" @click.stop>
+              <div class="card-header">Send A2A Task</div>
+              <div style="display:flex;flex-direction:column;gap:12px;margin-top:12px">
+                <div>
+                  <label class="text-xs text-dim" style="display:block;margin-bottom:4px">Target Agent</label>
+                  <select x-model="a2aSendAgent" class="input" style="width:100%">
+                    <option value="">Select agent...</option>
+                    <template x-for="agent in a2aAgents" :key="agent.id || agent.url">
+                      <option :value="agent.id || agent.url" x-text="(agent.name || agent.id || agent.url)"></option>
+                    </template>
+                  </select>
+                </div>
+                <div>
+                  <label class="text-xs text-dim" style="display:block;margin-bottom:4px">Payload (JSON)</label>
+                  <textarea x-model="a2aSendPayload" class="input" rows="5" placeholder='{"message": "Hello"}' style="width:100%;resize:vertical;font-family:var(--font-mono);font-size:11px"></textarea>
+                </div>
+                <div class="flex gap-2" style="justify-content:flex-end">
+                  <button class="btn btn-ghost btn-sm" @click="showA2aSendModal=false">Cancel</button>
+                  <button class="btn btn-primary btn-sm" @click="sendA2aTask()" :disabled="a2aSendLoading || !a2aSendAgent">
+                    <span x-show="!a2aSendLoading">Send Task</span>
+                    <span x-show="a2aSendLoading">Sending...</span>
                   </button>
                 </div>
               </div>
@@ -9905,13 +10109,114 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
 
     <!-- Placeholder: Integrations -->
     <template x-if="page === 'integrations'">
-      <div>
-        <div class="page-header"><h2>Integrations</h2></div>
+      <div x-data="integrationsPage" x-init="loadData().then(() => startAutoRefresh())" @page-leave.window="destroy()">
+        <div class="page-header">
+          <h2>Integrations</h2>
+          <div class="flex items-center gap-2">
+            <input class="form-input" style="width:180px" placeholder="Filter..." x-model="searchFilter">
+            <button class="btn btn-primary btn-sm" @click="openAddModal()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/></svg>
+              Add Integration
+            </button>
+            <button class="btn btn-ghost btn-sm" @click="loadData()" title="Refresh">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0115-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 01-15 6.7L3 16"/></svg>
+            </button>
+          </div>
+        </div>
         <div class="page-body">
-          <div class="empty-state">
-            <div class="empty-state-icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 7h3a5 5 0 0 1 5 5 5 5 0 0 1-5 5h-3m-6 0H6a5 5 0 0 1-5-5 5 5 0 0 1 5-5h3"/><path d="M8 12h8"/></svg></div>
-            <h3>Coming Soon</h3>
-            <p class="text-dim text-xs">External integrations and connectors will appear here.</p>
+          <!-- Loading -->
+          <div x-show="loading" style="animation:fadeIn 0.2s">
+            <div class="card mb-4"><div class="skeleton skeleton-text" style="width:160px;margin-bottom:8px"></div><div class="skeleton skeleton-card" style="height:120px"></div></div>
+          </div>
+          <!-- Error -->
+          <div x-show="!loading && loadError" class="error-state" style="animation:fadeIn 0.3s">
+            <h3 style="color:var(--error)">Connection Error</h3>
+            <p class="text-xs text-dim" x-text="loadError"></p>
+            <button class="btn btn-primary btn-sm" @click="loadData()" style="margin-top:8px">Retry</button>
+          </div>
+          <!-- Content -->
+          <div x-show="!loading && !loadError" style="animation:fadeIn 0.3s">
+            <!-- Info card -->
+            <div class="card mb-4" style="border-left:3px solid var(--accent)">
+              <div class="font-bold" style="font-size:13px;margin-bottom:4px">External Integrations</div>
+              <div class="text-sm text-dim" style="line-height:1.6">
+                Manage external service integrations. Add connectors, check health status, and reconnect when needed.
+              </div>
+            </div>
+
+            <!-- Integrations list -->
+            <div class="table-wrap" x-show="filteredIntegrations.length">
+              <table>
+                <thead><tr><th>Name</th><th>Type</th><th>Health</th><th>Connected</th><th>Actions</th></tr></thead>
+                <tbody>
+                  <template x-for="it in filteredIntegrations" :key="it.id">
+                    <tr>
+                      <td class="font-bold" x-text="it.name || it.id"></td>
+                      <td><span class="badge badge-dim" style="font-size:10px;text-transform:capitalize" x-text="typeLabel(it.type)"></span></td>
+                      <td><span :class="healthBadgeClass(it.id)" style="font-size:10px;padding:2px 8px;text-transform:capitalize" x-text="healthLabel(it.id)"></span></td>
+                      <td class="text-xs text-dim" x-text="it.connected_at ? timeAgo(it.connected_at) : (it.created_at ? timeAgo(it.created_at) : '-')"></td>
+                      <td>
+                        <div class="flex gap-2">
+                          <button class="btn btn-ghost btn-sm" @click="reconnectIntegration(it)" :disabled="reconnecting[it.id]">
+                            <span x-show="!reconnecting[it.id]">Reconnect</span>
+                            <span x-show="reconnecting[it.id]">...</span>
+                          </button>
+                          <button class="btn btn-danger btn-sm" @click="removeIntegration(it)" :disabled="removing[it.id]">Remove</button>
+                        </div>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+
+            <!-- Empty state -->
+            <div class="empty-state" x-show="!filteredIntegrations.length && !searchFilter">
+              <div class="empty-state-icon">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 7h3a5 5 0 0 1 5 5 5 5 0 0 1-5 5h-3m-6 0H6a5 5 0 0 1-5-5 5 5 0 0 1 5-5h3"/><path d="M8 12h8"/></svg>
+              </div>
+              <h3>No Integrations</h3>
+              <p class="text-dim text-xs">Add an external integration to connect services.</p>
+              <button class="btn btn-primary btn-sm" @click="openAddModal()" style="margin-top:8px">Add Integration</button>
+            </div>
+            <div class="empty-state" x-show="!filteredIntegrations.length && searchFilter">
+              <p class="text-dim text-xs">No integrations match your filter.</p>
+            </div>
+          </div>
+
+          <!-- Add Integration Modal -->
+          <div x-show="showAddModal" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);backdrop-filter:blur(4px)" @click.self="showAddModal=false" x-transition>
+            <div class="card" style="width:480px;max-width:90vw" @click.stop>
+              <div class="card-header">Add Integration</div>
+              <div style="margin-top:12px">
+                <div x-show="!addType">
+                  <div class="text-xs text-dim mb-2">Select an integration type:</div>
+                  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px">
+                    <template x-for="av in available" :key="av.type || av.id || av.name">
+                      <div class="card" style="cursor:pointer;padding:10px;border:1px solid var(--border)" @click="selectAddType(av)" @mouseenter="$el.style.borderColor='var(--accent)'" @mouseleave="$el.style.borderColor='var(--border)'">
+                        <div class="font-bold" style="font-size:12px" x-text="av.display_name || av.name || av.type"></div>
+                        <div class="text-xs text-dim" x-text="av.description || ''"></div>
+                      </div>
+                    </template>
+                  </div>
+                  <div class="empty-state" x-show="!available.length" style="padding:16px">
+                    <p class="text-dim text-xs">No integration types available.</p>
+                  </div>
+                </div>
+                <div x-show="addType">
+                  <div class="text-xs text-dim mb-2">Adding: <strong x-text="addType"></strong></div>
+                  <div class="text-xs text-dim mb-3">Configure optional settings below, then click Add.</div>
+                  <div class="flex gap-2" style="justify-content:flex-end;margin-top:12px">
+                    <button class="btn btn-ghost btn-sm" @click="addType='';addConfig={}">Back</button>
+                    <button class="btn btn-ghost btn-sm" @click="showAddModal=false">Cancel</button>
+                    <button class="btn btn-primary btn-sm" @click="addIntegration()" :disabled="addLoading">
+                      <span x-show="!addLoading">Add</span>
+                      <span x-show="addLoading">Adding...</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>

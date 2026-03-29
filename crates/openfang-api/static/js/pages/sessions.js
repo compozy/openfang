@@ -10,6 +10,11 @@ function sessionsPage() {
     loading: true,
     loadError: '',
 
+    // -- Label state --
+    editingLabelId: null,
+    editingLabelValue: '',
+    savingLabel: false,
+
     // -- Memory state --
     memAgentId: '',
     kvPairs: [],
@@ -73,6 +78,41 @@ function sessionsPage() {
           OpenFangToast.error('Failed to delete session: ' + e.message);
         }
       });
+    },
+
+    // -- Label methods --
+    startEditLabel(session) {
+      this.editingLabelId = session.session_id;
+      this.editingLabelValue = session.label || '';
+    },
+
+    cancelEditLabel() {
+      this.editingLabelId = null;
+      this.editingLabelValue = '';
+    },
+
+    async saveLabel() {
+      if (!this.editingLabelId) return;
+      this.savingLabel = true;
+      try {
+        await OpenFangAPI.put('/api/sessions/' + encodeURIComponent(this.editingLabelId) + '/label', {
+          label: this.editingLabelValue.trim()
+        });
+        var id = this.editingLabelId;
+        var val = this.editingLabelValue.trim();
+        for (var i = 0; i < this.sessions.length; i++) {
+          if (this.sessions[i].session_id === id) {
+            this.sessions[i].label = val;
+            break;
+          }
+        }
+        OpenFangToast.success('Label saved');
+        this.editingLabelId = null;
+        this.editingLabelValue = '';
+      } catch (e) {
+        OpenFangToast.error('Failed to save label: ' + (e.message || 'Unknown error'));
+      }
+      this.savingLabel = false;
     },
 
     // -- Memory methods --

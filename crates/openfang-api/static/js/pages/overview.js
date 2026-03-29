@@ -11,6 +11,9 @@ function overviewPage() {
     providers: [],
     mcpServers: [],
     skillCount: 0,
+    securityData: null,
+    dbHealth: [],
+    workflowRegistryReady: null,
     loading: true,
     loadError: '',
     refreshTimer: null,
@@ -28,7 +31,10 @@ function overviewPage() {
           this.loadChannels(),
           this.loadProviders(),
           this.loadMcpServers(),
-          this.loadSkills()
+          this.loadSkills(),
+          this.loadSecurity(),
+          this.loadDbHealth(),
+          this.loadWorkflowRegistry()
         ]);
         this.lastRefresh = Date.now();
       } catch(e) {
@@ -50,7 +56,10 @@ function overviewPage() {
           this.loadChannels(),
           this.loadProviders(),
           this.loadMcpServers(),
-          this.loadSkills()
+          this.loadSkills(),
+          this.loadSecurity(),
+          this.loadDbHealth(),
+          this.loadWorkflowRegistry()
         ]);
         this.lastRefresh = Date.now();
       } catch(e) { /* silent */ }
@@ -136,6 +145,83 @@ function overviewPage() {
         var data = await OpenFangAPI.get('/api/skills');
         this.skillCount = (data.skills || []).length;
       } catch(e) { this.skillCount = 0; }
+    },
+
+    async loadSecurity() {
+      try {
+        this.securityData = await OpenFangAPI.get('/api/security');
+      } catch(e) { this.securityData = null; }
+    },
+
+    async loadDbHealth() {
+      try {
+        var data = await OpenFangAPI.get('/api/health');
+        if (data && data.databases) {
+          this.dbHealth = data.databases;
+        } else if (data && data.db) {
+          this.dbHealth = Array.isArray(data.db) ? data.db : [data.db];
+        } else {
+          this.dbHealth = [];
+        }
+      } catch(e) { this.dbHealth = []; }
+    },
+
+    async loadWorkflowRegistry() {
+      try {
+        var data = await OpenFangAPI.get('/api/status');
+        this.workflowRegistryReady = data.workflow_registry_ready !== undefined
+          ? data.workflow_registry_ready
+          : (data.workflows_ready !== undefined ? data.workflows_ready : null);
+      } catch(e) { this.workflowRegistryReady = null; }
+    },
+
+    get securityFeatures() {
+      if (!this.securityData) return [];
+      var features = [];
+      var core = this.securityData.core_protections || {};
+      var keys = Object.keys(core);
+      for (var i = 0; i < keys.length; i++) {
+        features.push({ name: keys[i], active: core[keys[i]] });
+      }
+      return features;
+    },
+
+    get securityActiveCount() {
+      var features = this.securityFeatures;
+      var count = 0;
+      for (var i = 0; i < features.length; i++) {
+        if (features[i].active) count++;
+      }
+      return count;
+    },
+
+    securityFeatureLabel(key) {
+      var labels = {
+        'path_traversal': 'Path Traversal',
+        'ssrf_protection': 'SSRF Protection',
+        'capability_system': 'Capability System',
+        'privilege_escalation_prevention': 'Privilege Escalation',
+        'subprocess_isolation': 'Subprocess Isolation',
+        'security_headers': 'Security Headers',
+        'wire_hmac_auth': 'Wire HMAC Auth',
+        'request_id_tracking': 'Request ID Tracking',
+        'rate_limiter': 'Rate Limiter',
+        'websocket_limits': 'WebSocket Limits',
+        'wasm_sandbox': 'WASM Sandbox',
+        'auth': 'Authentication',
+        'audit_trail': 'Merkle Audit',
+        'taint_tracking': 'Taint Tracking',
+        'manifest_signing': 'Ed25519 Signing'
+      };
+      return labels[key] || key.replace(/_/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+    },
+
+    dbHealthBadgeClass(db) {
+      var s = (db.status || db.state || '').toLowerCase();
+      if (s === 'ok' || s === 'healthy' || s === 'connected') return 'badge-success';
+      if (s === 'degraded' || s === 'slow') return 'badge-warning';
+      if (s === 'error' || s === 'unreachable') return 'badge-danger';
+      return 'badge-dim';
     },
 
     get configuredProviders() {

@@ -1,4 +1,4 @@
-// OpenFang Comms Page — Agent topology & inter-agent communication feed
+// OpenFang Comms Page — Agent topology, inter-agent communication feed, A2A management
 'use strict';
 
 function commsPage() {
@@ -18,6 +18,21 @@ function commsPage() {
     taskDesc: '',
     taskAssign: '',
     taskLoading: false,
+
+    // -- A2A state --
+    a2aTab: 'topology',
+    a2aAgents: [],
+    a2aLoading: false,
+    a2aLoadError: '',
+    showDiscoverModal: false,
+    discoverUrl: '',
+    discoverLoading: false,
+    showA2aSendModal: false,
+    a2aSendAgent: '',
+    a2aSendPayload: '{\n  "message": "Hello"\n}',
+    a2aSendLoading: false,
+    a2aTaskStatuses: {},
+    a2aPollingTimers: {},
 
     async loadData() {
       this.loading = true;
@@ -58,6 +73,11 @@ function commsPage() {
       }
     },
 
+    destroy() {
+      this.stopSSE();
+      this.stopAllA2aPolling();
+    },
+
     async refreshTopology() {
       try {
         this.topology = await OpenFangAPI.get('/api/comms/topology');
@@ -66,7 +86,6 @@ function commsPage() {
 
     rootNodes() {
       var childIds = {};
-      var self = this;
       this.topology.edges.forEach(function(e) {
         if (e.kind === 'parent_child') childIds[e.to] = true;
       });
@@ -191,6 +210,126 @@ function commsPage() {
         OpenFangToast.error(e.message || 'Task failed');
       }
       this.taskLoading = false;
+    },
+
+    // ── A2A Methods ──
+
+    async loadA2aAgents() {
+      this.a2aLoading = true;
+      this.a2aLoadError = '';
+      try {
+        var data = await OpenFangAPI.get('/api/a2a/agents');
+        this.a2aAgents = data.agents || data || [];
+      } catch (e) {
+        this.a2aAgents = [];
+        this.a2aLoadError = e.message || 'Could not load A2A agents.';
+      }
+      this.a2aLoading = false;
+    },
+
+    openDiscoverModal() {
+      this.discoverUrl = '';
+      this.showDiscoverModal = true;
+    },
+
+    async discoverAgent() {
+      var url = this.discoverUrl.trim();
+      if (!url) return;
+      this.discoverLoading = true;
+      try {
+        await OpenFangAPI.post('/api/a2a/discover', { url: url });
+        OpenFangToast.success('Agent discovered at ' + url);
+        this.showDiscoverModal = false;
+        await this.loadA2aAgents();
+      } catch (e) {
+        OpenFangToast.error('Discovery failed: ' + (e.message || 'Unknown error'));
+      }
+      this.discoverLoading = false;
+    },
+
+    openA2aSendModal() {
+      this.a2aSendAgent = '';
+      this.a2aSendPayload = '{\n  "message": "Hello"\n}';
+      this.showA2aSendModal = true;
+    },
+
+    async sendA2aTask() {
+      if (!this.a2aSendAgent) return;
+      var payload;
+      try {
+        payload = JSON.parse(this.a2aSendPayload);
+      } catch (e) {
+        OpenFangToast.error('Invalid JSON payload');
+        return;
+      }
+      this.a2aSendLoading = true;
+      try {
+        var result = await OpenFangAPI.post('/api/a2a/send', {
+          agent_id: this.a2aSendAgent,
+          payload: payload
+        });
+        var taskId = result.task_id || result.id;
+        if (taskId) {
+          OpenFangToast.success('Task sent (ID: ' + taskId.substring(0, 8) + '...)');
+          this.a2aTaskStatuses[taskId] = { status: 'submitted', id: taskId };
+          this.startA2aTaskPolling(taskId);
+        } else {
+          OpenFangToast.success('Task sent');
+        }
+        this.showA2aSendModal = false;
+      } catch (e) {
+        OpenFangToast.error('Send failed: ' + (e.message || 'Unknown error'));
+      }
+      this.a2aSendLoading = false;
+    },
+
+    startA2aTaskPolling(taskId) {
+      var self = this;
+      if (this.a2aPollingTimers[taskId]) return;
+      this.a2aPollingTimers[taskId] = setInterval(async function () {
+        try {
+          var data = await OpenFangAPI.get('/api/a2a/tasks/' + encodeURIComponent(taskId) + '/status');
+          self.a2aTaskStatuses[taskId] = data;
+          var s = (data.status || '').toLowerCase();
+          if (s === 'completed' || s === 'failed' || s === 'cancelled') {
+            self.stopA2aTaskPolling(taskId);
+          }
+        } catch (e) {
+          self.stopA2aTaskPolling(taskId);
+        }
+      }, 3000);
+    },
+
+    stopA2aTaskPolling(taskId) {
+      if (this.a2aPollingTimers[taskId]) {
+        clearInterval(this.a2aPollingTimers[taskId]);
+        delete this.a2aPollingTimers[taskId];
+      }
+    },
+
+    stopAllA2aPolling() {
+      var ids = Object.keys(this.a2aPollingTimers);
+      for (var i = 0; i < ids.length; i++) {
+        this.stopA2aTaskPolling(ids[i]);
+      }
+    },
+
+    get a2aTaskList() {
+      var list = [];
+      var ids = Object.keys(this.a2aTaskStatuses);
+      for (var i = 0; i < ids.length; i++) {
+        list.push(this.a2aTaskStatuses[ids[i]]);
+      }
+      return list;
+    },
+
+    a2aStatusBadgeClass(status) {
+      var s = (status || '').toLowerCase();
+      if (s === 'completed' || s === 'done') return 'badge badge-success';
+      if (s === 'failed' || s === 'error') return 'badge badge-danger';
+      if (s === 'running' || s === 'in_progress' || s === 'submitted') return 'badge badge-info';
+      if (s === 'cancelled') return 'badge badge-warning';
+      return 'badge badge-dim';
     }
   };
 }
