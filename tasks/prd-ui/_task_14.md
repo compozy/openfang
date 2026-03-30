@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -33,14 +33,14 @@ Build the Looper Runs page — iterative task execution with real-time SSE progr
 
 ## Subtasks
 
-- [ ] 14.1 Create `js/pages/looper.js` — `looperPage()` Alpine component
-- [ ] 14.2 Implement looper run list — status/mode filters, progress column (completed/total)
-- [ ] 14.3 Implement looper run detail — progress bar, execution mode badge, policy config display
-- [ ] 14.4 Implement subtask grid — status indicators per subtask with dispatch links
-- [ ] 14.5 Wire SSE from `GET /api/v1/looper-runs/{id}/events` — update progress bar and subtask grid in real-time
-- [ ] 14.6 Implement pause/resume/cancel actions
-- [ ] 14.7 Implement create looper run form — task selector, mode toggle, max_parallelism, selection strategy
-- [ ] 14.8 Add Looper page template in `index_body.html`
+- [x] 14.1 Create `js/pages/looper.js` — `looperPage()` Alpine component
+- [x] 14.2 Implement looper run list — status/mode filters, progress column (completed/total)
+- [x] 14.3 Implement looper run detail — progress bar, execution mode badge, policy config display
+- [x] 14.4 Implement subtask grid — status indicators per subtask with dispatch links
+- [x] 14.5 Wire SSE from `GET /api/v1/looper-runs/{id}/events` — update progress bar and subtask grid in real-time
+- [x] 14.6 Implement pause/resume/cancel actions
+- [x] 14.7 Implement create looper run form — task selector, mode toggle, max_parallelism, selection strategy
+- [x] 14.8 Add Looper page template in `index_body.html`
 
 ## Implementation Details
 

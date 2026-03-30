@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js</domain>
@@ -36,13 +36,13 @@ Build the three foundational JS modules that all subsequent UI tasks depend on: 
 
 ## Subtasks
 
-- [ ] 1.1 Create `js/sse.js` — `OpenFangSSE` module with `connect(path, handlers, options)`, auto-reconnect, `Last-Event-ID`, auth token injection, connection state tracking
-- [ ] 1.2 Create `js/api-v1.js` — `OpenFangAPI.v1` namespace with all domain methods as specified in the techspec
-- [ ] 1.3 Create `js/utils.js` — `OpenFangUtils` with `timeAgo()`, `formatDate()`, `formatDateTime()`, `statusBadge()`, `confirmAction()`, `truncate()`, `copyToClipboard()`
-- [ ] 1.4 Add `<script>` tags for new files in `index_head.html` (load order: utils.js before api-v1.js before sse.js)
-- [ ] 1.5 Verify all three modules load without errors in the browser console
-- [ ] 1.6 Verify `OpenFangAPI.v1.runs.list()` makes a correct GET request to `/api/v1/runs`
-- [ ] 1.7 Verify `OpenFangSSE.connect('/api/logs/stream', {...})` establishes an EventSource connection
+- [x] 1.1 Create `js/sse.js` — `OpenFangSSE` module with `connect(path, handlers, options)`, auto-reconnect, `Last-Event-ID`, auth token injection, connection state tracking
+- [x] 1.2 Create `js/api-v1.js` — `OpenFangAPI.v1` namespace with all domain methods as specified in the techspec
+- [x] 1.3 Create `js/utils.js` — `OpenFangUtils` with `timeAgo()`, `formatDate()`, `formatDateTime()`, `statusBadge()`, `confirmAction()`, `truncate()`, `copyToClipboard()`
+- [x] 1.4 Add `include_str!()` in `webchat.rs` for new files (load order: utils.js before api-v1.js before sse.js)
+- [x] 1.5 Verify all three modules load without errors in the browser console
+- [x] 1.6 Verify `OpenFangAPI.v1.runs.list()` makes a correct GET request to `/api/v1/runs`
+- [x] 1.7 Verify `OpenFangSSE.connect('/api/logs/stream', {...})` establishes an EventSource connection
 
 ## Implementation Details
 
@@ -55,8 +55,8 @@ const OpenFangSSE = {
     // handlers: { 'hitl.created': fn, 'hitl.answered': fn }
     // options: { reconnect: true, lastEventId: null, token: null }
     // Returns: { close(), isConnected() }
-  }
-}
+  },
+};
 ```
 
 - Use `EventSource` with `?token=` for auth
@@ -72,12 +72,16 @@ Extends `OpenFangAPI` with a `v1` namespace. Each domain method is a thin wrappe
 ```js
 OpenFangAPI.v1 = {
   runs: {
-    list(params) { return OpenFangAPI.get('/api/v1/runs?' + new URLSearchParams(params)) },
-    get(id) { return OpenFangAPI.get(`/api/v1/runs/${id}`) },
+    list(params) {
+      return OpenFangAPI.get("/api/v1/runs?" + new URLSearchParams(params));
+    },
+    get(id) {
+      return OpenFangAPI.get(`/api/v1/runs/${id}`);
+    },
     // ... etc
   },
   // ... all domains from techspec
-}
+};
 ```
 
 See `tasks/prd-ui/techspec.md` section "Core Interfaces > API Client v1" for the full method list.
@@ -86,14 +90,28 @@ See `tasks/prd-ui/techspec.md` section "Core Interfaces > API Client v1" for the
 
 ```js
 const OpenFangUtils = {
-  timeAgo(dateStr) { /* single implementation */ },
-  formatDate(dateStr) { /* "Mar 27, 2026" */ },
-  formatDateTime(dateStr) { /* "Mar 27, 2026 3:45 PM" */ },
-  statusBadge(status) { /* maps to CSS class: 'badge running', 'badge failed', etc */ },
-  confirmAction(title, msg, onConfirm) { /* wraps OpenFangToast.confirm() */ },
-  truncate(str, maxLen) { /* truncate with ellipsis */ },
-  copyToClipboard(text) { /* clipboard API */ }
-}
+  timeAgo(dateStr) {
+    /* single implementation */
+  },
+  formatDate(dateStr) {
+    /* "Mar 27, 2026" */
+  },
+  formatDateTime(dateStr) {
+    /* "Mar 27, 2026 3:45 PM" */
+  },
+  statusBadge(status) {
+    /* maps to CSS class: 'badge running', 'badge failed', etc */
+  },
+  confirmAction(title, msg, onConfirm) {
+    /* wraps OpenFangToast.confirm() */
+  },
+  truncate(str, maxLen) {
+    /* truncate with ellipsis */
+  },
+  copyToClipboard(text) {
+    /* clipboard API */
+  },
+};
 ```
 
 ### Relevant Files
@@ -121,17 +139,17 @@ const OpenFangUtils = {
 
 ### Manual Browser Tests (Required)
 
-- [ ] Open dashboard, verify no console errors from new scripts
-- [ ] Run `OpenFangAPI.v1.runs.list()` in console, verify network request to correct URL
-- [ ] Run `OpenFangSSE.connect('/api/logs/stream', {message: console.log})` in console, verify EventSource connection
-- [ ] Run `OpenFangUtils.timeAgo(new Date(Date.now() - 60000).toISOString())` in console, verify "1 minute ago"
-- [ ] Run `OpenFangUtils.statusBadge('running')` in console, verify returns correct CSS class
+- [x] Open dashboard, verify no console errors from new scripts
+- [x] Run `OpenFangAPI.v1.runs.list()` in console, verify network request to correct URL
+- [x] Run `OpenFangSSE.connect('/api/logs/stream', {message: console.log})` in console, verify EventSource connection
+- [x] Run `OpenFangUtils.timeAgo(new Date(Date.now() - 60000).toISOString())` in console, verify "1 minute ago"
+- [x] Run `OpenFangUtils.statusBadge('running')` in console, verify returns correct CSS class
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

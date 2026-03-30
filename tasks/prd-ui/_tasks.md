@@ -58,14 +58,14 @@
 |------|-------|------------|--------------|--------|
 | 14 | Looper Runs | medium | 1, 2, 6 | completed |
 | 15 | Packs | medium | 1, 2 | completed |
-| 16 | Artifacts & Documents | medium | 1, 2 | pending |
+| 16 | Artifacts & Documents | medium | 1, 2 | completed |
 
 ## Phase 6: Budget + Integrations + Remaining
 
 | Task | Title | Complexity | Dependencies | Status |
 |------|-------|------------|--------------|--------|
-| 17 | Budget & Analytics Enhancement | low | 1 | pending |
-| 18 | Integrations + A2A + Comms + Minor Updates | medium | 1, 2 | pending |
+| 17 | Budget & Analytics Enhancement | low | 1 | completed |
+| 18 | Integrations + A2A + Comms + Minor Updates | medium | 1, 2 | completed |
 
 ---
 

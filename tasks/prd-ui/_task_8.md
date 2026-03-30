@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -34,18 +34,18 @@ Build a new Triggers v2 page replacing the broken trigger tab in the old schedul
 
 ## Subtasks
 
-- [ ] 8.1 Create `js/pages/triggers.js` — `triggersPage()` Alpine component
-- [ ] 8.2 Implement trigger list — columns: name, event match, target, enabled toggle, fire_count, last_fired_at
-- [ ] 8.3 Implement trigger create form — match fields + target kind selector with dynamic fields
-- [ ] 8.4 Implement trigger edit form
-- [ ] 8.5 Implement trigger delete with confirmation
-- [ ] 8.6 Implement enable/disable toggle — `POST .../enable` / `POST .../disable`
-- [ ] 8.7 Implement validate action — `POST /api/v1/triggers/validate` with inline issues
-- [ ] 8.8 Implement compile action — `POST /api/v1/triggers/compile`
-- [ ] 8.9 Implement test panel — JSON editor, "Run Test" button calling `POST /api/v1/triggers/{id}/test`, result display (matched, resolved_target, would_dispatch, explanation)
-- [ ] 8.10 Implement runtime status view from `GET /api/v1/triggers/{id}/runtime`
-- [ ] 8.11 Implement fork action for pack-managed triggers
-- [ ] 8.12 Add Triggers page template in `index_body.html`
+- [x] 8.1 Create `js/pages/triggers.js` — `triggersPage()` Alpine component
+- [x] 8.2 Implement trigger list — columns: name, event match, target, enabled toggle, fire_count, last_fired_at
+- [x] 8.3 Implement trigger create form — match fields + target kind selector with dynamic fields
+- [x] 8.4 Implement trigger edit form
+- [x] 8.5 Implement trigger delete with confirmation
+- [x] 8.6 Implement enable/disable toggle — `POST .../enable` / `POST .../disable`
+- [x] 8.7 Implement validate action — `POST /api/v1/triggers/validate` with inline issues
+- [x] 8.8 Implement compile action — `POST /api/v1/triggers/compile`
+- [x] 8.9 Implement test panel — JSON editor, "Run Test" button calling `POST /api/v1/triggers/{id}/test`, result display (matched, resolved_target, would_dispatch, explanation)
+- [x] 8.10 Implement runtime status view from `GET /api/v1/triggers/{id}/runtime`
+- [x] 8.11 Implement fork action for pack-managed triggers
+- [x] 8.12 Add Triggers page template in `index_body.html`
 
 ## Implementation Details
 
@@ -68,18 +68,18 @@ All 13 endpoints under `OpenFangAPI.v1.triggers.*` from the techspec.
 
 ### Manual Browser Tests (Required)
 
-- [ ] List triggers — verify columns display correctly
-- [ ] Create trigger — verify match/target fields, trigger appears in list
-- [ ] Enable/disable toggle — verify state change
-- [ ] Test panel — enter event JSON, run test, verify match result display
-- [ ] Validate trigger — verify issue display
-- [ ] Delete trigger — verify confirmation and removal
+- [x] List triggers — verify columns display correctly
+- [x] Create trigger — verify match/target fields, trigger appears in list
+- [x] Enable/disable toggle — verify state change
+- [x] Test panel — enter event JSON, run test, verify match result display
+- [x] Validate trigger — verify issue display
+- [x] Delete trigger — verify confirmation and removal
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

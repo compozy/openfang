@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -33,19 +33,19 @@ Build the Tasks page — the core domain management surface. Tasks are the prima
 
 ## Subtasks
 
-- [ ] 6.1 Create `js/pages/tasks.js` — `tasksPage()` Alpine component
-- [ ] 6.2 Implement task list — fetch, status/priority filters, search, columns: title, status, priority, owner, complexity, created
-- [ ] 6.3 Implement task create form — title, description, priority, owner fields
-- [ ] 6.4 Implement task edit form — inline or modal editing
-- [ ] 6.5 Implement task delete with confirmation
-- [ ] 6.6 Implement task detail — Subtasks tab with nested list, ready/blocked badges, depends_on indicators
-- [ ] 6.7 Implement subtask create/edit/delete within task detail
-- [ ] 6.8 Implement subtask inline status toggle (planned -> in_progress -> completed)
-- [ ] 6.9 Implement Artifacts tab — linked artifacts from `OpenFangAPI.v1.tasks.artifacts(id)`
-- [ ] 6.10 Implement Docs tab — linked docs from `OpenFangAPI.v1.tasks.docs(id)`
-- [ ] 6.11 Implement Files tab — files from `OpenFangAPI.v1.tasks.files(id)`
-- [ ] 6.12 Implement Replan modal — operation builder for cancel_subtasks, create_subtasks, update_subtasks with reason field
-- [ ] 6.13 Add Tasks page template in `index_body.html`
+- [x] 6.1 Create `js/pages/tasks.js` — `tasksPage()` Alpine component
+- [x] 6.2 Implement task list — fetch, status/priority filters, search, columns: title, status, priority, owner, complexity, created
+- [x] 6.3 Implement task create form — title, description, priority, owner fields
+- [x] 6.4 Implement task edit form — inline or modal editing
+- [x] 6.5 Implement task delete with confirmation
+- [x] 6.6 Implement task detail — Subtasks tab with nested list, ready/blocked badges, depends_on indicators
+- [x] 6.7 Implement subtask create/edit/delete within task detail
+- [x] 6.8 Implement subtask inline status toggle (planned -> in_progress -> completed)
+- [x] 6.9 Implement Artifacts tab — linked artifacts from `OpenFangAPI.v1.tasks.artifacts(id)`
+- [x] 6.10 Implement Docs tab — linked docs from `OpenFangAPI.v1.tasks.docs(id)`
+- [x] 6.11 Implement Files tab — files from `OpenFangAPI.v1.tasks.files(id)`
+- [x] 6.12 Implement Replan modal — operation builder for cancel_subtasks, create_subtasks, update_subtasks with reason field
+- [x] 6.13 Add Tasks page template in `index_body.html`
 
 ## Implementation Details
 
@@ -82,21 +82,21 @@ Build the Tasks page — the core domain management surface. Tasks are the prima
 
 ### Manual Browser Tests (Required)
 
-- [ ] Navigate to Tasks — verify page loads, list displays
-- [ ] Create a task — verify it appears in list
-- [ ] Edit a task — verify changes persist
-- [ ] Delete a task — verify confirmation and removal
-- [ ] Click task detail — verify Subtasks tab with ready/blocked badges
-- [ ] Create/edit/delete subtasks — verify CRUD works
-- [ ] Toggle subtask status inline — verify status changes
-- [ ] Open Replan modal — verify operation builder works
-- [ ] View Artifacts/Docs/Files tabs — verify linked resources display
+- [x] Navigate to Tasks — verify page loads, list displays
+- [x] Create a task — verify it appears in list
+- [x] Edit a task — verify changes persist
+- [x] Delete a task — verify confirmation and removal
+- [x] Click task detail — verify Subtasks tab with ready/blocked badges
+- [x] Create/edit/delete subtasks — verify CRUD works
+- [x] Toggle subtask status inline — verify status changes
+- [x] Open Replan modal — verify operation builder works
+- [x] View Artifacts/Docs/Files tabs — verify linked resources display
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

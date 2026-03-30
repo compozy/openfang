@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -32,12 +32,12 @@ Add budget management to the analytics/usage page. The existing analytics page s
 
 ## Subtasks
 
-- [ ] 17.1 Add Budget tab to analytics page in `usage.js`
-- [ ] 17.2 Implement global budget display from `GET /api/budget`
-- [ ] 17.3 Implement global budget edit form — hourly/daily/monthly limits via `PUT /api/budget`
-- [ ] 17.4 Implement per-agent budget ranking table from `GET /api/budget/agents`
-- [ ] 17.5 Implement per-agent budget detail and edit from `GET/PUT /api/budget/agents/{id}`
-- [ ] 17.6 Update `index_body.html` analytics template for budget tab
+- [x] 17.1 Add Budget tab to analytics page in `usage.js`
+- [x] 17.2 Implement global budget display from `GET /api/budget`
+- [x] 17.3 Implement global budget edit form — hourly/daily/monthly limits via `PUT /api/budget`
+- [x] 17.4 Implement per-agent budget ranking table from `GET /api/budget/agents`
+- [x] 17.5 Implement per-agent budget detail and edit from `GET/PUT /api/budget/agents/{id}`
+- [x] 17.6 Update `index_body.html` analytics template for budget tab
 
 ## Implementation Details
 
@@ -70,9 +70,9 @@ Add budget management to the analytics/usage page. The existing analytics page s
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test` (4 pre-existing CLI help test failures unrelated to this task)
 
 ## Success Criteria
 

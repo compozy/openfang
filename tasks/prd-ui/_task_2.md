@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static + openfang-api/src</domain>
@@ -35,15 +35,15 @@ Fix the 3 confirmed bugs in the existing UI and restructure the sidebar navigati
 
 ## Subtasks
 
-- [ ] 2.1 Register legacy trigger routes in `crates/openfang-api/src/server.rs` — add `GET /api/triggers`, `PUT /api/triggers/{id}`, `DELETE /api/triggers/{id}` using existing handler functions
-- [ ] 2.2 Fix `comms.js` SSE — replace `${OpenFangAPI.baseUrl}/api/comms/events/stream` with `new EventSource('/api/comms/events/stream?token=' + (OpenFangAPI.getToken() || ''))` or use `OpenFangSSE` if task 1 is complete
-- [ ] 2.3 Fix `workflows.js` — replace `if (confirm(...))` with `OpenFangToast.confirm(title, msg, callback)` pattern
-- [ ] 2.4 Restructure sidebar HTML in `index_body.html` — 7 groups with collapsible sections: Chat, Operations (HITL, Runs, Dispatches, Looper), Workspace (Tasks, Workflows, Triggers, Schedules), Resources (Agents, Skills, Hands, Packs), Outputs (Artifacts, Documents), Monitor (Overview, Analytics, Logs), System (Channels, Integrations, Settings, Runtime)
-- [ ] 2.5 Update `app.js` routing — add new page names to valid pages list, add redirect aliases, add `pendingHitlCount` to store
-- [ ] 2.6 Add placeholder page templates in `index_body.html` for each new page (empty `<template x-if="page === 'hitl'">`... sections)
-- [ ] 2.7 Verify trigger tab in scheduler page no longer returns 404
-- [ ] 2.8 Verify comms SSE event stream connects successfully
-- [ ] 2.9 Verify workflow delete uses styled confirm dialog
+- [x] 2.1 Register legacy trigger routes in `crates/openfang-api/src/server.rs` — add `GET /api/triggers`, `PUT /api/triggers/{id}`, `DELETE /api/triggers/{id}` using existing handler functions
+- [x] 2.2 Fix `comms.js` SSE — replace `${OpenFangAPI.baseUrl}/api/comms/events/stream` with `new EventSource('/api/comms/events/stream?token=' + (OpenFangAPI.getToken() || ''))` or use `OpenFangSSE` if task 1 is complete
+- [x] 2.3 Fix `workflows.js` — replace `if (confirm(...))` with `OpenFangToast.confirm(title, msg, callback)` pattern
+- [x] 2.4 Restructure sidebar HTML in `index_body.html` — 7 groups with collapsible sections: Chat, Operations (HITL, Runs, Dispatches, Looper), Workspace (Tasks, Workflows, Triggers, Schedules), Resources (Agents, Skills, Hands, Packs), Outputs (Artifacts, Documents), Monitor (Overview, Analytics, Logs), System (Channels, Integrations, Settings, Runtime)
+- [x] 2.5 Update `app.js` routing — add new page names to valid pages list, add redirect aliases, add `pendingHitlCount` to store
+- [x] 2.6 Add placeholder page templates in `index_body.html` for each new page (empty `<template x-if="page === 'hitl'">`... sections)
+- [x] 2.7 Verify trigger tab in scheduler page no longer returns 404
+- [x] 2.8 Verify comms SSE event stream connects successfully
+- [x] 2.9 Verify workflow delete uses styled confirm dialog
 
 ## Implementation Details
 
@@ -110,23 +110,23 @@ See `tasks/prd-ui/adr-004-navigation.md` for the full group structure.
 
 ### Unit Tests (Required — Rust)
 
-- [ ] Verify trigger route registration by running `cargo test -p openfang-api --all-features`
-- [ ] Existing API integration tests still pass
+- [x] Verify trigger route registration by running `cargo test -p openfang-api --all-features`
+- [x] Existing API integration tests still pass
 
 ### Manual Browser Tests (Required)
 
-- [ ] Navigate to Scheduler > Triggers tab — verify trigger list loads (not 404)
-- [ ] Navigate to Comms — verify SSE event stream connects (check Network tab)
-- [ ] Navigate to Workflows — delete a workflow — verify styled confirm modal appears
-- [ ] Click each new nav item — verify correct page name in hash, placeholder content shows
-- [ ] Verify all existing pages still work (agents, chat, sessions, approvals, etc.)
-- [ ] Verify sidebar groups collapse/expand correctly
+- [x] Navigate to Scheduler > Triggers tab — verify trigger list loads (not 404)
+- [x] Navigate to Comms — verify SSE event stream connects (check Network tab)
+- [x] Navigate to Workflows — delete a workflow — verify styled confirm modal appears
+- [x] Click each new nav item — verify correct page name in hash, placeholder content shows
+- [x] Verify all existing pages still work (agents, chat, sessions, approvals, etc.)
+- [x] Verify sidebar groups collapse/expand correctly
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

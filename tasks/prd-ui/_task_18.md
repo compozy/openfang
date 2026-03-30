@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -34,20 +34,20 @@ Final polish phase covering: new Integrations page, A2A management in Comms, enh
 
 ## Subtasks
 
-- [ ] 18.1 Create `js/pages/integrations.js` — `integrationsPage()` Alpine component
-- [ ] 18.2 Implement integration list — `GET /api/integrations`, available types from `GET /api/integrations/available`
-- [ ] 18.3 Implement add/remove/reconnect actions
-- [ ] 18.4 Implement health display from `GET /api/integrations/health`
-- [ ] 18.5 Add A2A section to Comms page — discover form (`POST /api/a2a/discover` with URL input)
-- [ ] 18.6 Implement A2A send task — `POST /api/a2a/send` with agent selector + payload
-- [ ] 18.7 Implement A2A task status tracking — `GET /api/a2a/tasks/{id}/status`
-- [ ] 18.8 Wire Comms SSE using `OpenFangSSE` for live event feed (replacing broken SSE)
-- [ ] 18.9 Update Overview — replace hardcoded security with `/api/security` data
-- [ ] 18.10 Update Overview — add per-database health indicators
-- [ ] 18.11 Update Overview — add workflow registry readiness indicator
-- [ ] 18.12 Update Sessions — add label support (`PUT /api/sessions/{id}/label`)
-- [ ] 18.13 Update Wizard — use v1 agent creation flow
-- [ ] 18.14 Add Integrations page template in `index_body.html`
+- [x] 18.1 Create `js/pages/integrations.js` — `integrationsPage()` Alpine component
+- [x] 18.2 Implement integration list — `GET /api/integrations`, available types from `GET /api/integrations/available`
+- [x] 18.3 Implement add/remove/reconnect actions
+- [x] 18.4 Implement health display from `GET /api/integrations/health`
+- [x] 18.5 Add A2A section to Comms page — discover form (`POST /api/a2a/discover` with URL input)
+- [x] 18.6 Implement A2A send task — `POST /api/a2a/send` with agent selector + payload
+- [x] 18.7 Implement A2A task status tracking — `GET /api/a2a/tasks/{id}/status`
+- [x] 18.8 Wire Comms SSE using `OpenFangSSE` for live event feed (replacing broken SSE)
+- [x] 18.9 Update Overview — replace hardcoded security with `/api/security` data
+- [x] 18.10 Update Overview — add per-database health indicators
+- [x] 18.11 Update Overview — add workflow registry readiness indicator
+- [x] 18.12 Update Sessions — add label support (`PUT /api/sessions/{id}/label`)
+- [x] 18.13 Update Wizard — use v1 agent creation flow
+- [x] 18.14 Add Integrations page template in `index_body.html`
 
 ## Implementation Details
 

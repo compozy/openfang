@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -33,20 +33,20 @@ Build two related pages: Schedules v2 (replacing the cron tab in the old schedul
 
 ## Subtasks
 
-- [ ] 9.1 Create `js/pages/schedules.js` — `schedulesPage()` Alpine component
-- [ ] 9.2 Implement schedule list — cron expression display, action kind, enabled toggle, last/next run
-- [ ] 9.3 Implement schedule create/edit form — typed cron fields, timezone, action kind selector
-- [ ] 9.4 Implement enable/disable toggle
-- [ ] 9.5 Implement run-now button
-- [ ] 9.6 Implement dry-run preview — `POST /api/v1/schedules/{id}/run-now/dry-run`
-- [ ] 9.7 Implement validate/fork actions
-- [ ] 9.8 Implement runtime status section
-- [ ] 9.9 Create `js/pages/events.js` — `eventsPage()` Alpine component
-- [ ] 9.10 Implement event ingress form — JSON editor for event, source, payload, idempotency_key
-- [ ] 9.11 Implement dry-run button — `POST /api/v1/events/dry-run` with matched triggers result
-- [ ] 9.12 Implement send button — `POST /api/v1/events` with result and triggered run links
-- [ ] 9.13 Deprecate `scheduler.js` — remove or mark as legacy, update imports
-- [ ] 9.14 Add Schedules and Events page templates in `index_body.html`
+- [x] 9.1 Create `js/pages/schedules.js` — `schedulesPage()` Alpine component
+- [x] 9.2 Implement schedule list — cron expression display, action kind, enabled toggle, last/next run
+- [x] 9.3 Implement schedule create/edit form — typed cron fields, timezone, action kind selector
+- [x] 9.4 Implement enable/disable toggle
+- [x] 9.5 Implement run-now button
+- [x] 9.6 Implement dry-run preview — `POST /api/v1/schedules/{id}/run-now/dry-run`
+- [x] 9.7 Implement validate/fork actions
+- [x] 9.8 Implement runtime status section
+- [x] 9.9 Create `js/pages/events.js` — `eventsPage()` Alpine component
+- [x] 9.10 Implement event ingress form — JSON editor for event, source, payload, idempotency_key
+- [x] 9.11 Implement dry-run button — `POST /api/v1/events/dry-run` with matched triggers result
+- [x] 9.12 Implement send button — `POST /api/v1/events` with result and triggered run links
+- [x] 9.13 Deprecate `scheduler.js` — remove or mark as legacy, update imports
+- [x] 9.14 Add Schedules and Events page templates in `index_body.html`
 
 ## Implementation Details
 
@@ -79,9 +79,9 @@ Events: `OpenFangAPI.v1.events.send()` and `OpenFangAPI.v1.events.dryRun()`
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

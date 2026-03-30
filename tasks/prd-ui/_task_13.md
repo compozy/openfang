@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -36,19 +36,19 @@ Build the Arky provider UI: provider profiles management page, upgrade the agent
 
 ## Subtasks
 
-- [ ] 13.1 Add provider profiles section in Settings page (or new standalone page)
-- [ ] 13.2 Implement profile list — name, driver, model, defaults display
-- [ ] 13.3 Implement profile create form — driver selector -> dynamic config fields per driver
-- [ ] 13.4 Implement profile edit and delete
-- [ ] 13.5 Update spawn wizard Step 3 — replace model-catalog dropdown with Arky driver selector (10 drivers grouped by type)
-- [ ] 13.6 Add driver-specific config fields to spawn wizard — codex fields, claude-code fields, claude-compatible fields
-- [ ] 13.7 Add profile picker dropdown to spawn wizard (optional selection)
-- [ ] 13.8 Add reasoning effort selector (None/Low/Medium/High/XHigh) to spawn wizard
-- [ ] 13.9 Add max_tokens override field to spawn wizard
-- [ ] 13.10 Add "Provider Config" section to agent detail panel — resolved driver, model, profile, defaults, config
-- [ ] 13.11 Implement "View Compiled Binding" expandable — calls `GET /api/v1/agents/{id}/compiled`, displays ProviderBinding
-- [ ] 13.12 Add inline MCP server list in provider config section (distinct from global MCP in Skills page)
-- [ ] 13.13 Update `index_body.html` for all new UI sections
+- [x] 13.1 Add provider profiles section in Settings page (or new standalone page)
+- [x] 13.2 Implement profile list — name, driver, model, defaults display
+- [x] 13.3 Implement profile create form — driver selector -> dynamic config fields per driver
+- [x] 13.4 Implement profile edit and delete
+- [x] 13.5 Update spawn wizard Step 3 — replace model-catalog dropdown with Arky driver selector (10 drivers grouped by type)
+- [x] 13.6 Add driver-specific config fields to spawn wizard — codex fields, claude-code fields, claude-compatible fields
+- [x] 13.7 Add profile picker dropdown to spawn wizard (optional selection)
+- [x] 13.8 Add reasoning effort selector (None/Low/Medium/High/XHigh) to spawn wizard
+- [x] 13.9 Add max_tokens override field to spawn wizard
+- [x] 13.10 Add "Provider Config" section to agent detail panel — resolved driver, model, profile, defaults, config
+- [x] 13.11 Implement "View Compiled Binding" expandable — calls `GET /api/v1/agents/{id}/compiled`, displays ProviderBinding
+- [x] 13.12 Add inline MCP server list in provider config section (distinct from global MCP in Skills page)
+- [x] 13.13 Update `index_body.html` for all new UI sections
 
 ## Implementation Details
 

@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -39,22 +39,22 @@ Rebuild the Workflows page on the `/api/v1/workflows` API. This is the most comp
 
 ## Subtasks
 
-- [ ] 7.1 Migrate workflow list to v1 API — `OpenFangAPI.v1.workflows.list()`, add enabled toggle, runtime status columns, origin badge
-- [ ] 7.2 Implement workflow CRUD — create, update, delete using v1 endpoints
-- [ ] 7.3 Build step editor — support all 8 step kinds with kind-specific form fields
-- [ ] 7.4 Implement flow mode picker — Sequential (default), FanOut, Conditional (`when` field), Loop (`until` + `max_iterations`)
-- [ ] 7.5 Implement `save_as` symbol binding per step
-- [ ] 7.6 Implement `input`/`output` contract editor using ContractKind vocabulary
-- [ ] 7.7 Implement validate action — call `POST /api/v1/workflows/validate`, display issues inline with severity + path highlighting
-- [ ] 7.8 Implement compile action — call `POST /api/v1/workflows/compile`, display compiled IR summary
-- [ ] 7.9 Implement fork action — call `POST /api/v1/workflows/{id}/fork`, navigate to new workflow
-- [ ] 7.10 Implement run trigger form — input fields based on workflow input contract, submit to `POST /api/v1/workflows/{id}/runs`
-- [ ] 7.11 Implement dry-run preview — `POST /api/v1/workflows/{id}/runs/dry-run`, show would_execute/effects
-- [ ] 7.12 Implement runtime status panel — active_runs count, last_run_at, healthy indicator from `GET /api/v1/workflows/{id}/runtime`
-- [ ] 7.13 Implement runs sub-list per workflow — from `GET /api/v1/workflows/{id}/runs`
-- [ ] 7.14 Update Visual Builder (`workflow-builder.js`) node palette for v2 step types
-- [ ] 7.15 Remove or deprecate old `scheduler.js` workflows tab references
-- [ ] 7.16 Update `index_body.html` workflows template section
+- [x] 7.1 Migrate workflow list to v1 API — `OpenFangAPI.v1.workflows.list()`, add enabled toggle, runtime status columns, origin badge
+- [x] 7.2 Implement workflow CRUD — create, update, delete using v1 endpoints
+- [x] 7.3 Build step editor — support all 8 step kinds with kind-specific form fields
+- [x] 7.4 Implement flow mode picker — Sequential (default), FanOut, Conditional (`when` field), Loop (`until` + `max_iterations`)
+- [x] 7.5 Implement `save_as` symbol binding per step
+- [x] 7.6 Implement `input`/`output` contract editor using ContractKind vocabulary
+- [x] 7.7 Implement validate action — call `POST /api/v1/workflows/validate`, display issues inline with severity + path highlighting
+- [x] 7.8 Implement compile action — call `POST /api/v1/workflows/compile`, display compiled IR summary
+- [x] 7.9 Implement fork action — call `POST /api/v1/workflows/{id}/fork`, navigate to new workflow
+- [x] 7.10 Implement run trigger form — input fields based on workflow input contract, submit to `POST /api/v1/workflows/{id}/runs`
+- [x] 7.11 Implement dry-run preview — `POST /api/v1/workflows/{id}/runs/dry-run`, show would_execute/effects
+- [x] 7.12 Implement runtime status panel — active_runs count, last_run_at, healthy indicator from `GET /api/v1/workflows/{id}/runtime`
+- [x] 7.13 Implement runs sub-list per workflow — from `GET /api/v1/workflows/{id}/runs`
+- [x] 7.14 Update Visual Builder (`workflow-builder.js`) node palette for v2 step types
+- [x] 7.15 Remove or deprecate old `scheduler.js` workflows tab references
+- [x] 7.16 Update `index_body.html` workflows template section
 
 ## Implementation Details
 

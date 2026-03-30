@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -32,16 +32,16 @@ Build two new pages for browsing artifacts and documents independently. Both fol
 
 ## Subtasks
 
-- [ ] 16.1 Create `js/pages/artifacts.js` — `artifactsPage()` Alpine component
-- [ ] 16.2 Implement artifact list — type/task filters, search, columns
-- [ ] 16.3 Implement artifact detail — current version content display
-- [ ] 16.4 Implement artifact version history — version_no, SHA-256, provenance, timestamps
-- [ ] 16.5 Implement provenance links — navigate to dispatch or run detail
-- [ ] 16.6 Create `js/pages/documents.js` — `documentsPage()` Alpine component
-- [ ] 16.7 Implement document list — task filter, search
-- [ ] 16.8 Implement document detail — Markdown rendering for body using `renderMarkdown()`
-- [ ] 16.9 Implement document version history — same pattern as artifacts
-- [ ] 16.10 Add Artifacts and Documents page templates in `index_body.html`
+- [x] 16.1 Create `js/pages/artifacts.js` — `artifactsPage()` Alpine component
+- [x] 16.2 Implement artifact list — type/task filters, search, columns
+- [x] 16.3 Implement artifact detail — current version content display
+- [x] 16.4 Implement artifact version history — version_no, SHA-256, provenance, timestamps
+- [x] 16.5 Implement provenance links — navigate to dispatch or run detail
+- [x] 16.6 Create `js/pages/documents.js` — `documentsPage()` Alpine component
+- [x] 16.7 Implement document list — task filter, search
+- [x] 16.8 Implement document detail — Markdown rendering for body using `renderMarkdown()`
+- [x] 16.9 Implement document version history — same pattern as artifacts
+- [x] 16.10 Add Artifacts and Documents page templates in `index_body.html`
 
 ## Implementation Details
 
@@ -66,18 +66,18 @@ Documents: `OpenFangAPI.v1.docs.list()`, `.get(id)`, `.versions(id)`
 
 ### Manual Browser Tests (Required)
 
-- [ ] Artifacts page — list, filter by type, search
-- [ ] Artifact detail — version content display
-- [ ] Artifact version history — verify SHA-256, provenance links work
-- [ ] Documents page — list, filter, search
-- [ ] Document detail — Markdown rendering
-- [ ] Provenance link — click to navigate to dispatch/run
+- [x] Artifacts page — list, filter by type, search
+- [x] Artifact detail — version content display
+- [x] Artifact version history — verify SHA-256, provenance links work
+- [x] Documents page — list, filter, search
+- [x] Document detail — Markdown rendering
+- [x] Provenance link — click to navigate to dispatch/run
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test` (pre-existing CLI test failures in `a2a_peers_budget_commands` unrelated to this task)
 
 ## Success Criteria
 

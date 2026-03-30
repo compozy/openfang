@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -36,18 +36,18 @@ Build the Workflow Runs page — the primary execution visibility surface. Shows
 
 ## Subtasks
 
-- [ ] 4.1 Create `js/pages/runs.js` — `runsPage()` Alpine component
-- [ ] 4.2 Implement run list view — fetch from `OpenFangAPI.v1.runs.list()`, status/workflow filters, search
-- [ ] 4.3 Implement 8 status badges with distinct colors using `OpenFangUtils.statusBadge()`
-- [ ] 4.4 Implement run detail — Overview tab: status, workflow name, timestamps, current step, progress
-- [ ] 4.5 Implement Checkpoints tab — timeline from `OpenFangAPI.v1.runs.checkpoints(id)`, recovery indicator
-- [ ] 4.6 Implement Signals tab — signal list + "Send Signal" form calling `OpenFangAPI.v1.runs.sendSignal(id, sig)`
-- [ ] 4.7 Implement Dispatches tab — table from `OpenFangAPI.v1.runs.dispatches(id)` with status, kind, agent, retry/cancel
-- [ ] 4.8 Implement HITL tab — requests from `OpenFangAPI.v1.runs.hitlRequests(id)` with inline answer forms
-- [ ] 4.9 Implement Events tab — live SSE from `GET /api/v1/runs/{id}/events` rendered as scrollable event log
-- [ ] 4.10 Implement action buttons — Pause/Resume/Cancel with conditional enable states
-- [ ] 4.11 Add Runs page template in `index_body.html`
-- [ ] 4.12 Add waiting_signal and waiting_hitl badge styles in `components.css`
+- [x] 4.1 Create `js/pages/runs.js` — `runsPage()` Alpine component
+- [x] 4.2 Implement run list view — fetch from `OpenFangAPI.v1.runs.list()`, status/workflow filters, search
+- [x] 4.3 Implement 8 status badges with distinct colors using `OpenFangUtils.statusBadge()`
+- [x] 4.4 Implement run detail — Overview tab: status, workflow name, timestamps, current step, progress
+- [x] 4.5 Implement Checkpoints tab — timeline from `OpenFangAPI.v1.runs.checkpoints(id)`, recovery indicator
+- [x] 4.6 Implement Signals tab — signal list + "Send Signal" form calling `OpenFangAPI.v1.runs.sendSignal(id, sig)`
+- [x] 4.7 Implement Dispatches tab — table from `OpenFangAPI.v1.runs.dispatches(id)` with status, kind, agent, retry/cancel
+- [x] 4.8 Implement HITL tab — requests from `OpenFangAPI.v1.runs.hitlRequests(id)` with inline answer forms
+- [x] 4.9 Implement Events tab — live SSE from `GET /api/v1/runs/{id}/events` rendered as scrollable event log
+- [x] 4.10 Implement action buttons — Pause/Resume/Cancel with conditional enable states
+- [x] 4.11 Add Runs page template in `index_body.html`
+- [x] 4.12 Add waiting_signal and waiting_hitl badge styles in `components.css`
 
 ## Implementation Details
 
@@ -107,21 +107,21 @@ pending -> running -> completed
 
 ### Manual Browser Tests (Required)
 
-- [ ] Navigate to Runs — verify page loads, list displays
-- [ ] Filter by status — verify correct filtering
-- [ ] Click a run — verify detail view with 6 tabs
-- [ ] Checkpoints tab — verify timeline displays
-- [ ] Signals tab — send a signal, verify it appears in list
-- [ ] Events tab — verify SSE connection and live events
-- [ ] Pause a running run — verify status changes
-- [ ] Resume a paused run — verify status changes
-- [ ] Cancel a run — verify confirmation and status change
+- [x] Navigate to Runs — verify page loads, list displays
+- [x] Filter by status — verify correct filtering
+- [x] Click a run — verify detail view with 6 tabs
+- [x] Checkpoints tab — verify timeline displays
+- [x] Signals tab — send a signal, verify it appears in list
+- [x] Events tab — verify SSE connection and live events
+- [x] Pause a running run — verify status changes
+- [x] Resume a paused run — verify status changes
+- [x] Cancel a run — verify confirmation and status change
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 

@@ -1,4 +1,4 @@
-## status: pending
+## status: completed
 
 <task_context>
 <domain>openfang-api/static/js/pages</domain>
@@ -32,15 +32,15 @@ Build the Dispatches page showing agent dispatch records with parent-child linea
 
 ## Subtasks
 
-- [ ] 5.1 Create `js/pages/dispatches.js` — `dispatchesPage()` Alpine component
-- [ ] 5.2 Implement dispatch list — fetch, status/kind filters, columns: ID, kind, status, agent, attempt, timestamps
-- [ ] 5.3 Implement dispatch detail — full info, parent link, children list from `OpenFangAPI.v1.dispatches.children(id)`
-- [ ] 5.4 Implement parent-child lineage tree — recursive tree rendering for delegation chains
-- [ ] 5.5 Implement retry action with confirmation
-- [ ] 5.6 Implement cancel action with confirmation
-- [ ] 5.7 Wire SSE from `GET /api/v1/dispatches/{id}/events` for live status updates in detail view
-- [ ] 5.8 Add Dispatches page template in `index_body.html`
-- [ ] 5.9 Add dispatch kind badges (call/send/spawn) in `components.css`
+- [x] 5.1 Create `js/pages/dispatches.js` — `dispatchesPage()` Alpine component
+- [x] 5.2 Implement dispatch list — fetch, status/kind filters, columns: ID, kind, status, agent, attempt, timestamps
+- [x] 5.3 Implement dispatch detail — full info, parent link, children list from `OpenFangAPI.v1.dispatches.children(id)`
+- [x] 5.4 Implement parent-child lineage tree — recursive tree rendering for delegation chains
+- [x] 5.5 Implement retry action with confirmation
+- [x] 5.6 Implement cancel action with confirmation
+- [x] 5.7 Wire SSE from `GET /api/v1/dispatches/{id}/events` for live status updates in detail view
+- [x] 5.8 Add Dispatches page template in `index_body.html`
+- [x] 5.9 Add dispatch kind badges (call/send/spawn) in `components.css`
 
 ## Implementation Details
 
@@ -69,17 +69,17 @@ Build the Dispatches page showing agent dispatch records with parent-child linea
 
 ### Manual Browser Tests (Required)
 
-- [ ] Navigate to Dispatches — verify page loads
-- [ ] Filter by status/kind — verify filtering works
-- [ ] Click a dispatch — verify detail with parent/children
-- [ ] Retry a failed dispatch — verify confirmation and status change
-- [ ] Verify SSE connection in detail view
+- [x] Navigate to Dispatches — verify page loads
+- [x] Filter by status/kind — verify filtering works
+- [x] Click a dispatch — verify detail with parent/children
+- [x] Retry a failed dispatch — verify confirmation and status change
+- [x] Verify SSE connection in detail view
 
 ### Verification Commands
 
-- [ ] `make fmt`
-- [ ] `make lint`
-- [ ] `make test`
+- [x] `make fmt`
+- [x] `make lint`
+- [x] `make test`
 
 ## Success Criteria
 
